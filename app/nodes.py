@@ -63,7 +63,9 @@ async def parse_request(state):
     emit(thought(plan_statement(data)))
     return {
         'plan': data, 'status': 'planned',
-        'usage': state.get('usage', []) + [{'stage': 'parse', 'model': usage}],
+        'usage': state.get('usage', []) + [{
+            'stage': 'parse', 'model_name': settings.llm_model, 'model': usage,
+        }],
     }
 
 

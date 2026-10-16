@@ -723,6 +723,18 @@ class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
         # usage 里要能看出这一阶段用的是哪个模型，便于排查耗时。
         self.assertEqual(result['usage'][-1]['model_name'], settings.llm_compose_model)
 
+    async def test_parse_records_model_name(self):
+        """两个阶段的 usage 都要记模型名，才能从运行记录核查各步用的哪个模型。"""
+        from app.config import settings
+
+        async def fake_call(schema, system, user, model=None):
+            return Plan.model_validate({'topic': 't', 'auto_deploy': False}), None
+
+        with patch.object(nodes, 'structured_call', fake_call), \
+             patch.object(nodes, 'urls_from_input', lambda text: []):
+            result = await nodes.parse_request({'user_input': 't', 'usage': []})
+        self.assertEqual(result['usage'][-1]['model_name'], settings.llm_model)
+
     async def test_parse_stage_keeps_main_model(self):
         # 解析阶段不受影响，仍用主模型。
         captured = {}
