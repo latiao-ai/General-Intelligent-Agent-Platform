@@ -29,6 +29,20 @@ h1{font-size:20px;margin:0 0 4px}
 .thought{color:#3b4757;font-style:normal}
 .detail{color:var(--muted)}
 .hint{color:var(--muted);font-size:13px}
+#process .stage-row{display:flex;gap:8px;align-items:flex-start;padding:4px 0;
+                    margin-top:2px}
+#process .stage-row .stage-ico{flex:0 0 18px;text-align:center;font-size:13px}
+#process .stage-row .stage-text{font-size:14px}
+#process .stage-row .stage-sec{font-size:12px;color:var(--muted);
+  font-variant-numeric:tabular-nums;margin-left:auto;padding:0 2px;
+  white-space:nowrap;flex:0 0 auto;min-width:72px;text-align:right;
+  font-family:ui-monospace,monospace}
+#process .stage-row .stage-sec b{color:var(--fg);font-weight:600}
+/* 每轮一个分组：新一轮的记录追加在后面，不清空之前的 */
+#process .turn{margin-bottom:14px}
+#process .turn-head{display:flex;align-items:center;gap:8px;color:var(--muted);
+  font-size:12px;margin:2px 0 6px;white-space:nowrap}
+#process .turn-head::after{content:"";flex:1;height:1px;background:var(--line)}
 .bar{position:fixed;left:0;right:0;bottom:0;background:var(--card);
      border-top:1px solid var(--line);padding:12px 16px}
 .bar .inner{max-width:860px;margin:0 auto;display:flex;gap:8px}
@@ -58,7 +72,7 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px}
     <div>
       <h1>网页研究与 HTML 报告</h1>
       <div class="sub">
-        输入主题或链接，智能体会实时展示执行过程与各阶段耗时。
+        输入主题或链接，智能体会实时展示执行过程，每个阶段后面跟着它已用的时间（秒）。
         <b>运行中再发一条消息会自动打断当前任务</b>，带着上文改方向，不必先点停止。
       </div>
     </div>
@@ -72,15 +86,6 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px}
     <div id="process"></div>
   </div>
 
-  <div class="card" id="stagesCard">
-    <div class="hint">阶段耗时<span id="total">（尚未开始）</span></div>
-    <div class="hint" id="latency"></div>
-    <table>
-      <thead><tr><th style="width:38%">阶段</th><th style="width:22%">耗时(秒)</th><th>状态</th></tr></thead>
-      <tbody id="stages"></tbody>
-    </table>
-  </div>
-
   <div id="result"></div>
 </div>
 
@@ -92,7 +97,8 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px}
 
 <script>
 const S = { sessionId: null, taskId: null, artifactId: null, es: null,
-            running: false, status: null, stages: [], stageSeq: 0, skew: 0 };
+            running: false, status: null, stages: [], stageSeq: 0, skew: 0,
+            turn: 0 };
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
@@ -116,12 +122,36 @@ function addEvent(ev) {
     row.innerHTML = `<div class="ico">${esc(ev.icon || '•')}</div>` +
                     `<div>${esc(ev.label)}${detail}</div>`;
   } else { return; }
-  $('process').appendChild(row);
-  $('processTitle').textContent = '智能体执行过程';
+  currentTurnEl().appendChild(row);
   row.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
 
-// ---------- 阶段耗时（进行中实时累加） ----------
+// 当前轮次的容器。新一轮只往后追加，不动历史记录（用户要求：不要覆盖之前的时间）。
+function currentTurnEl() {
+  let el = $('process').lastElementChild;
+  if (!el || !el.classList.contains('turn')) {
+    el = document.createElement('div');
+    el.className = 'turn';
+    $('process').appendChild(el);
+  }
+  return el;
+}
+
+// 开始新一轮：追加一个轮次分隔头，保留此前所有过程与耗时记录。
+function startNewTurn() {
+  S.turn += 1;
+  $('result').innerHTML = '';          // 结果区只反映当前任务，其余记录保留
+  const turn = document.createElement('div');
+  turn.className = 'turn';
+  const head = document.createElement('div');
+  head.className = 'turn-head';
+  head.textContent = `第 ${S.turn} 轮`;
+  turn.appendChild(head);
+  $('process').appendChild(turn);
+  $('processTitle').textContent = '智能体执行过程';
+}
+
+// ---------- 阶段耗时（内联到执行过程流，进行中实时累加） ----------
 
 function elapsedOf(st) {
   if (st.done) return st.seconds;
@@ -131,10 +161,15 @@ function elapsedOf(st) {
 }
 
 function onStageStart(ev) {
+  // 「收到指令 → 开始搜索」是跨阶段的时间跨度（≈ 解析需求 + 提交开销，实测只差
+  // 0.05 秒），在当前这种"逐步显示"的视图里和「解析需求」完全重复，因此不展示。
+  // 后端仍会记录它，需要时可用 /api/tasks/{id} 的 state.timings 查看。
+  if (ev.stage === 'instruction') return;
   if (!S.stages.length) S.skew = Date.now() / 1000 - ev.at;
-  S.stages.push({ id: ++S.stageSeq, stage: ev.stage, label: ev.label || ev.stage,
-                  at: ev.at, done: false, seconds: null, status: '' });
-  renderStages();
+  const st = { id: ++S.stageSeq, stage: ev.stage, label: ev.label || ev.stage,
+               at: ev.at, done: false, seconds: null, status: '', turn: S.turn };
+  S.stages.push(st);
+  appendStageRow(st);
 }
 
 function onStageEnd(ev) {
@@ -151,35 +186,45 @@ function onStageEnd(ev) {
   renderStages();
 }
 
-function updateTotal() {
-  // 只累加真实阶段；"收到指令→开始搜索"跨越了解析需求，算进去会重复计数。
-  const total = S.stages
-    .filter(st => st.stage !== 'instruction')
-    .reduce((sum, st) => sum + elapsedOf(st), 0);
-  $('total').textContent = S.stages.length
-    ? `（合计 ${total.toFixed(2)} 秒）` : '（尚未开始）';
+// 每个阶段开始时，在当前轮次里追加一行：「🔹 解析需求 · 进行中…  0.00s」
+// 时间直接跟在这一行后面，实时累加；阶段结束时定格。
+function appendStageRow(st) {
+  const row = document.createElement('div');
+  row.className = 'stage-row';
+  row.dataset.id = st.id;
+  row.innerHTML =
+    `<div class="stage-ico">🔹</div>` +
+    `<div class="stage-text">${esc(st.label)}<span class="detail"> · 进行中…</span></div>` +
+    `<div class="stage-sec"><b>0.00s</b></div>`;
+  currentTurnEl().appendChild(row);
+  row.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
 
-// 「收到指令 → 开始搜索」单独放在表头那行：它跨越了解析需求，
-// 混在阶段表里会让人以为是一个独立的、需要相加的阶段。
-function renderLatency() {
-  const st = S.stages.find(item => item.stage === 'instruction');
-  $('latency').textContent = st
-    ? `从发出指令到开始搜索：${elapsedOf(st).toFixed(2)} 秒`
-      + (st.done ? '' : '（进行中…）')
-    : '';
-}
-
+// 把已关闭阶段的耗时定格显示，并刷新进行中阶段的累计总耗时。
 function renderStages() {
-  const rows = S.stages.filter(st => st.stage !== 'instruction');
-  $('stages').innerHTML = rows.map(st => `
-    <tr data-id="${st.id}">
-      <td>${esc(st.label)}</td>
-      <td class="sec">${elapsedOf(st).toFixed(2)}</td>
-      <td>${st.done ? esc(st.status) : '<b>进行中…</b>'}</td>
-    </tr>`).join('');
+  for (const st of S.stages) {
+    const row = document.querySelector(`#process .stage-row[data-id="${st.id}"]`);
+    if (!row) continue;
+    const sec = row.querySelector('.stage-sec');
+    const label = row.querySelector('.stage-text');
+    if (st.done) {
+      sec.innerHTML = `${st.seconds.toFixed(2)}s`;
+      // 进行中提示保留为实际状态，如「已中断 / 解析完成」
+      label.innerHTML = `${esc(st.label)}<span class="detail"> · ${esc(st.status || '完成')}</span>`;
+    }
+  }
   updateTotal();
-  renderLatency();
+}
+
+function updateTotal() {
+  // 当前轮的合计（跨阶段的 instruction 已不展示，自然也不会重复计数）
+  const turnTotal = S.stages
+    .filter(st => st.turn === S.turn)
+    .reduce((sum, st) => sum + elapsedOf(st), 0);
+  const allTotal = S.stages.reduce((sum, st) => sum + elapsedOf(st), 0);
+  $('processTitle').textContent = allTotal > 0
+    ? `智能体执行过程 · 本轮 ${turnTotal.toFixed(2)}s（累计 ${allTotal.toFixed(2)}s）`
+    : '智能体执行过程';
 }
 
 // 兜底：任务进入终态时关掉所有还开着的阶段行。后端取消时也会补发 stage_end，
@@ -198,25 +243,28 @@ function closeOpenStages(status) {
   if (changed) renderStages();
 }
 
-// 只刷"进行中"那一格，100ms 一次 —— 这就是实时增长的部分。
+// 只刷"进行中"那一格的时间，100ms 一次 —— 这就是实时增长的部分。
 setInterval(() => {
   let ticking = false;
   for (const st of S.stages) {
     if (st.done) continue;
     ticking = true;
-    if (st.stage === 'instruction') continue;   // 渲染在表头那行
-    const cell = document.querySelector(`#stages tr[data-id="${st.id}"] .sec`);
-    if (cell) cell.textContent = elapsedOf(st).toFixed(2);
+    const row = document.querySelector(`#process .stage-row[data-id="${st.id}"]`);
+    if (row) row.querySelector('.stage-sec').innerHTML = `<b>${elapsedOf(st).toFixed(2)}s</b>`;
   }
-  if (ticking) { updateTotal(); renderLatency(); }
+  if (ticking) updateTotal();
 }, 100);
 
-function resetProcess() {
+// 只有「新对话」才真正清空。日常的新一轮走 startNewTurn()，只追加不清空。
+function clearAll() {
   $('process').innerHTML = '';
-  $('processTitle').textContent = '智能体执行过程（尚无动作）';
+  $('messages').innerHTML = '';
   $('result').innerHTML = '';
+  $('processTitle').textContent = '智能体执行过程';
   S.stages = [];
-  renderStages();
+  S.turn = 0;
+  S.stageSeq = 0;
+  S.skew = 0;
 }
 
 function setRunning(on) {
@@ -225,7 +273,6 @@ function setRunning(on) {
   $('send').disabled = false;
   $('send').textContent = on ? '打断并发送' : '发送';
   $('stop').style.display = on ? '' : 'none';
-  if (on) $('processTitle').textContent = '智能体执行过程（进行中）';
 }
 
 // 打断当前任务：取消它，并等它的结束提示经原事件流渲染出来后再继续，
@@ -251,7 +298,7 @@ async function send() {
   // 正在运行时直接打断改方向，不要求用户先点停止
   if (S.running) await interrupt();
   addMessage('user', text);
-  resetProcess();
+  startNewTurn();                      // 追加新一轮，保留此前所有记录
   setRunning(true);
   $('send').disabled = true;          // 提交期间短暂禁用，避免连点起两个任务
   try {
@@ -371,9 +418,7 @@ $('stop').onclick = stop;
 // （会话与任务在服务端 SQLite 里仍然保留，需要时可经 API 查询。）
 $('newSession').onclick = async () => {
   if (S.running) await interrupt();
-  $('messages').innerHTML = '';
-  $('result').innerHTML = '';
-  resetProcess();
+  clearAll();
   setRunning(false);
   S.sessionId = null;
   S.taskId = null;
