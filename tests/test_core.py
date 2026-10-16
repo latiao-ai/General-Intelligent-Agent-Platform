@@ -92,8 +92,6 @@ FILES_SCHEMA = {
     }
 }
 TEXT_SCHEMA = {'properties': {'html': {'type': 'string'}}}
-# AppTest.from_file 的相对路径按调用方文件解析，这里直接用绝对路径。
-UI_SCRIPT = str(Path(__file__).resolve().parents[1] / 'app' / 'ui.py')
 
 
 class DeployGateTests(unittest.IsolatedAsyncioTestCase):
@@ -356,6 +354,10 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertIn('智能体执行过程', res.text)
         self.assertIn('EventSource', res.text)
+        # 阶段耗时面板与实时累加逻辑必须存在
+        self.assertIn('阶段耗时', res.text)
+        self.assertIn('stage_start', res.text)
+        self.assertIn('setInterval', res.text)
 
     def test_unknown_task_returns_404(self):
         self.assertEqual(self.client.get('/api/tasks/nope').status_code, 404)
@@ -463,165 +465,8 @@ class McpPayloadTests(unittest.TestCase):
                 mcp_adapter.result_url({'url': 'ftp://bad'})
 
 
-class UiTests(unittest.TestCase):
-    """用 Streamlit AppTest 校验聊天界面。"""
-
-    def make_session(self, **kw):
-        from app.session import Session
-        session = Session()
-        for key, value in kw.items():
-            setattr(session, key, value)
-        return session
-
-    def run_app(self, session, events=None, streaming=False):
-        from streamlit.testing.v1 import AppTest
-        at = AppTest.from_file(UI_SCRIPT)
-        at.session_state['session'] = session
-        at.session_state['events'] = events or []
-        at.session_state['streaming'] = streaming
-        at.run(timeout=15)
-        return at
-
-    def finished_state(self, folder, deployment=None):
-        html = Path(folder) / 'index.html'
-        html.write_text('<h1>x</h1>', encoding='utf-8')
-        return {
-            'task_id': 'abc123', 'status': 'local_ready',
-            'artifact': {'html_path': str(html)},
-            'deployment': deployment or {'status': 'skipped', 'reason': 'not_requested'},
-            'timings': [
-                {'stage': 'parse_request', 'seconds': 1.2, 'status': 'planned'},
-                {'stage': 'manual_deploy', 'seconds': 0.8, 'status': 'deployed'},
-            ],
-            'elapsed_seconds': 12.5,
-        }
-
-    def test_idle_shows_input_without_stop(self):
-        at = self.run_app(self.make_session(status='idle'))
-        self.assertFalse(list(at.exception))
-        self.assertNotIn('停止', [b.label for b in at.button])
-        self.assertTrue(at.chat_input)
-
-    def test_running_shows_stop_button(self):
-        at = self.run_app(self.make_session(status='running'))
-        self.assertFalse(list(at.exception))
-        self.assertIn('停止', [b.label for b in at.button])
-
-    def test_events_rendered_with_icon_and_detail(self):
-        at = self.run_app(
-            self.make_session(status='running'),
-            events=[
-                {'type': 'thought', 'text': '我先帮你查找「还珠格格」相关资料。'},
-                {'type': 'action', 'icon': '🌐', 'label': '已搜索网页',
-                 'detail': '还珠格格 第一部 第3集 在线观看 芒果TV'},
-            ],
-        )
-        self.assertFalse(list(at.exception))
-        text = ' '.join(m.value for m in at.markdown)
-        # 计划陈述与动作明细都要能看到，这是"看见思考过程"的核心。
-        self.assertIn('我先帮你查找', text)
-        self.assertIn('已搜索网页', text)
-        self.assertIn('芒果TV', text)
-
-    def test_conversation_messages_are_shown(self):
-        at = self.run_app(self.make_session(
-            status='idle',
-            messages=[{'role': 'user', 'content': '找还珠格格资料'},
-                      {'role': 'assistant', 'content': '报告已生成'}],
-        ))
-        text = ' '.join(m.value for m in at.markdown)
-        self.assertIn('找还珠格格资料', text)
-        self.assertIn('报告已生成', text)
-
-    def test_finished_renders_deploy_button_and_timings(self):
-        with tempfile.TemporaryDirectory() as folder:
-            at = self.run_app(self.make_session(
-                status='local_ready', result=self.finished_state(folder)))
-        self.assertFalse(list(at.exception))
-        self.assertIn('部署到服务器', [b.label for b in at.button])
-        self.assertEqual([e.label for e in at.expander], ['各阶段耗时（共 12.5 秒）'])
-        rendered = str(at.dataframe[0].value)
-        # 前端展示的必须是中文阶段名，不能漏出英文节点名。
-        self.assertIn('解析需求', rendered)
-        self.assertIn('手动部署', rendered)
-        self.assertNotIn('parse_request', rendered)
-
-    def test_deploy_button_hidden_once_deployed(self):
-        with tempfile.TemporaryDirectory() as folder:
-            at = self.run_app(self.make_session(
-                status='deployed',
-                result=self.finished_state(folder, deployment={
-                    'status': 'success', 'public_url': 'http://example.com/sites/x/'})))
-        self.assertNotIn('部署到服务器', [b.label for b in at.button])
-        captions = ' '.join(c.value for c in at.caption)
-        self.assertIn('http://example.com/sites/x/', captions)
-
-
-class SessionTests(unittest.TestCase):
-    """会话层：后台执行、事件透传、多轮历史、停止。"""
-
-    def stub(self, captured=None, result=None, delay=0):
-        async def fake_run_task(text, progress=None, on_event=None,
-                                history=None, on_start=None):
-            if captured is not None:
-                captured['history'] = history
-            if on_start:
-                on_start('task123')
-            if on_event:
-                on_event({'type': 'action', 'icon': '🌐', 'label': '已搜索网页',
-                          'detail': '测试查询'})
-            if delay:
-                await asyncio.sleep(delay)
-            return result or {
-                'task_id': 'task123', 'status': 'local_ready',
-                'deployment': {'status': 'skipped'}, 'timings': [],
-            }
-        return fake_run_task
-
-    def test_start_records_reply_and_events(self):
-        import app.session as session_module
-        session = session_module.Session()
-        with patch.object(session_module, 'run_task', self.stub()):
-            session.start('测试需求')
-            session._thread.join(timeout=15)
-        self.assertEqual(session.status, 'local_ready')
-        self.assertEqual(session.task_id, 'task123')
-        self.assertEqual([m['role'] for m in session.messages], ['user', 'assistant'])
-        events = session.drain()
-        self.assertTrue(any(e.get('label') == '已搜索网页' for e in events))
-        self.assertTrue(any(e.get('type') == 'status' for e in events))
-
-    def test_history_is_passed_for_multi_turn(self):
-        import app.session as session_module
-        captured = {}
-        session = session_module.Session()
-        session.messages = [{'role': 'user', 'content': '找还珠格格资料'},
-                            {'role': 'assistant', 'content': '已生成报告'}]
-        with patch.object(session_module, 'run_task', self.stub(captured)):
-            session.start('我只要第一部第三集')
-            session._thread.join(timeout=15)
-        # 追加要求时必须带上上文，否则模型无法理解"第一部第三集"指什么。
-        self.assertEqual([m['content'] for m in captured['history']],
-                         ['找还珠格格资料', '已生成报告'])
-
-    def test_start_refused_while_running(self):
-        from app.session import Session
-        session = Session()
-        session.status = 'running'
-        with self.assertRaises(RuntimeError):
-            session.start('再来一次')
-
-    def test_cancel_marks_cancelled(self):
-        import app.session as session_module
-        session = session_module.Session()
-        with patch.object(session_module, 'run_task', self.stub(delay=30)):
-            session.start('慢任务')
-            time.sleep(1.0)
-            session.cancel()
-            session._thread.join(timeout=15)
-        self.assertEqual(session.status, 'cancelled')
-        events = session.drain()
-        self.assertTrue(any(e.get('status') == 'cancelled' for e in events))
+class MessageTests(unittest.TestCase):
+    """助手回执与停止提示的文案（CLI / API 共用）。"""
 
     def test_reply_mentions_deployed_url(self):
         from app.messages import reply_text
@@ -634,6 +479,37 @@ class SessionTests(unittest.TestCase):
         text = reply_text({'status': 'local_ready', 'task_id': 'abc',
                            'deployment': {'status': 'skipped'}})
         self.assertIn('部署', text)
+
+    def test_reply_for_failed_is_explainable(self):
+        from app.messages import reply_text
+        self.assertIn('没有生成报告', reply_text({'status': 'failed'}))
+
+    def test_cancel_note_warns_when_already_deployed(self):
+        import json
+        from pathlib import Path as P
+        from app.config import settings
+        from app.messages import cancel_note
+        with tempfile.TemporaryDirectory() as folder:
+            # cancel_note 会在 artifact_dir 下再拼一层 task_id
+            task_dir = P(folder) / 'task1'
+            task_dir.mkdir()
+            (task_dir / 'deployment.json').write_text(
+                json.dumps({'public_url': 'http://x/deployed/'}), encoding='utf-8')
+            original = settings.artifact_dir
+            # settings 是 frozen dataclass，patch.object 会抛 FrozenInstanceError
+            object.__setattr__(settings, 'artifact_dir', P(folder))
+            try:
+                note = cancel_note('task1')
+            finally:
+                object.__setattr__(settings, 'artifact_dir', original)
+        # 停止是"取消"不是"撤销"，必须把已发布的站点地址告诉用户。
+        self.assertIn('http://x/deployed/', note)
+        self.assertIn('不会撤销', note)
+
+    def test_cancel_note_without_artifact(self):
+        from app.messages import cancel_note
+        self.assertIn('已停止', cancel_note(None))
+
 
 
 class TimingLabelTests(unittest.TestCase):
@@ -770,6 +646,63 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
                           lambda model=None: self.fake_llm([self.good(9)], calls)):
             _, usage = await services.structured_call(object(), 's', 'u', attempts=1)
         self.assertEqual(usage, {'total_tokens': 9})
+
+
+class InstrumentTests(unittest.IsolatedAsyncioTestCase):
+    """节点包装层发出的阶段事件——前端实时计时的数据来源。"""
+
+    async def test_sync_node_emits_start_and_end(self):
+        from app import graph as graph_module
+        seen = []
+        with patch.object(graph_module, 'emit', seen.append):
+            wrapped = graph_module.instrument(
+                'render_html', lambda state: {'status': 'rendered'})
+            result = await wrapped({})
+        self.assertEqual(result, {'status': 'rendered'})
+        self.assertEqual([e['type'] for e in seen], ['stage_start', 'stage_end'])
+        self.assertEqual(seen[0]['label'], '渲染 HTML')
+        self.assertEqual(seen[1]['status'], 'rendered')
+        self.assertIn('at', seen[0])          # 前端按服务端开始时刻实时累加
+        self.assertGreaterEqual(seen[1]['seconds'], 0)
+
+    async def test_async_node_emits_start_and_end(self):
+        from app import graph as graph_module
+        seen = []
+
+        async def node(state):
+            return {'status': 'planned'}
+
+        with patch.object(graph_module, 'emit', seen.append):
+            result = await graph_module.instrument('parse_request', node)({})
+        self.assertEqual(result['status'], 'planned')
+        self.assertEqual([e['type'] for e in seen], ['stage_start', 'stage_end'])
+
+    async def test_failed_node_still_closes_the_stage(self):
+        from app import graph as graph_module
+        seen = []
+
+        def boom(state):
+            raise ValueError('x')
+
+        with patch.object(graph_module, 'emit', seen.append):
+            with self.assertRaises(ValueError):
+                await graph_module.instrument('render_html', boom)({})
+        # 异常路径也要发结束事件，否则前端那一行会永远停在"进行中"。
+        self.assertEqual(seen[-1]['type'], 'stage_end')
+        self.assertEqual(seen[-1]['status'], 'failed')
+
+    async def test_wrapper_is_async_even_for_sync_node(self):
+        # LangGraph 会把同步节点丢进线程池，而 stream writer 依赖 contextvars；
+        # 统一包成 async 才能保证事件不丢。
+        import inspect
+        from app import graph as graph_module
+        wrapped = graph_module.instrument('render_html', lambda state: {})
+        self.assertTrue(inspect.iscoroutinefunction(wrapped))
+
+    def test_all_stage_labels_are_chinese(self):
+        from app.events import STAGE_LABELS
+        for stage, label in STAGE_LABELS.items():
+            self.assertNotEqual(stage, label, f'{stage} 缺少中文名')
 
 
 if __name__ == '__main__':

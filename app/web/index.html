@@ -11,6 +11,8 @@
 body{margin:0;background:var(--bg);color:var(--fg);
      font:15px/1.7 system-ui,-apple-system,"PingFang SC",sans-serif}
 .wrap{max-width:860px;margin:0 auto;padding:20px 16px 140px}
+.head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+.head button{flex:0 0 auto}
 h1{font-size:20px;margin:0 0 4px}
 .sub{color:var(--muted);font-size:13px;margin-bottom:18px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
@@ -52,9 +54,14 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px}
 </head>
 <body>
 <div class="wrap">
-  <h1>网页研究与 HTML 报告</h1>
-  <div class="sub">
-    输入主题或链接，智能体会实时展示执行过程；随时可以停止，也可以直接补充要求来调整方向。
+  <div class="head">
+    <div>
+      <h1>网页研究与 HTML 报告</h1>
+      <div class="sub">
+        输入主题或链接，智能体会实时展示执行过程；随时可以停止，也可以直接补充要求来调整方向。
+      </div>
+    </div>
+    <button id="newSession" class="ghost" style="height:34px">新对话</button>
   </div>
 
   <div id="messages"></div>
@@ -303,9 +310,26 @@ async function stop() {
 
 $('send').onclick = send;
 $('stop').onclick = stop;
+$('newSession').onclick = () => {
+  localStorage.removeItem('sessionId');
+  location.reload();
+};
 $('msg').addEventListener('keydown', e => {
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
 });
+
+// 刷新页面后恢复本会话的历史对话（会话存在服务端 SQLite，不依赖浏览器缓存）
+async function restoreSession() {
+  if (!S.sessionId) return;
+  try {
+    const res = await fetch(`/api/sessions/${S.sessionId}/messages`);
+    if (!res.ok) return;
+    const data = await res.json();
+    (data.messages || []).forEach(m => addMessage(m.role, m.content));
+  } catch { /* 拉不到历史不影响开新对话 */ }
+}
+
+restoreSession();
 </script>
 </body>
 </html>

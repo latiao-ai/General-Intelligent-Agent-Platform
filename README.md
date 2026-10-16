@@ -40,6 +40,7 @@ python --version             # Python 3.12.15
 | `MCP_URL` / `MCP_BEARER_TOKEN` | 远端 MCP 部署服务地址与鉴权 |
 | `MCP_TOOL_NAME` | 部署工具名（当前远端为 `deploy_site`） |
 | `MCP_EXTRA_ARGS` | 额外入参，如 `{"ttl":"7d"}` 控制站点有效期 |
+| `DB_PATH` | SQLite 持久化文件，默认 `agent.db` |
 
 > 改了 `.env` 必须重启进程才生效。
 > `LLM_MODEL` 必须与网关实际可用模型名完全一致（`model_not_found` 多为名称不匹配）。
@@ -50,27 +51,55 @@ python --version             # Python 3.12.15
 conda activate demo
 cd webpage-agent-demo
 
-# 主题模式：搜索 → 整理 → 生成报告
+# 网页界面（推荐）：启动后在浏览器打开 http://127.0.0.1:8010
+python -m scripts.serve_api --port 8010
+python -m scripts.serve_api --reload        # 开发模式，改代码自动重启
+
+# 命令行模式
 python -m app.main '整理 SQLite 的适用场景和限制，生成中文报告'
-
-# 用户明确要求部署时，生成后自动部署
 python -m app.main '整理 SQLite 的适用场景，生成中文报告，然后部署到服务器'
-
-# 指定 URL 模式：跳过搜索，直接提取正文
 python -m app.main '阅读 https://www.sqlite.org/whentouse.html ，整理适用场景'
-
-# Streamlit 聊天界面（实时展示执行过程 + 可中途停止 + 可追加要求）
-python -m streamlit run app/ui.py
 ```
 
 产物在 `artifacts/<task_id>/`：`index.html`、`report.json`、`sources.json`、
 `manifest.json`、`state.json`、`deployment.json`。
 
-## 3.1 聊天界面：看见过程、中途停止、追加要求
+## 3.1 界面：过程可见、可停止、可追加要求、阶段实时计时
 
-界面是**对话式**的，每轮输入走一次完整流程，但有三点不同于普通表单：
+技术栈是 **FastAPI + SSE + 原生 HTML/JS**（后端 `app/api.py`，前端 `app/web/index.html`）。
+选它而不是 Streamlit，是因为后者在实时交互上处处受限：
 
-**实时展示执行过程**。节点内部会发出细粒度事件，前端每 0.5 秒轮询一次并展示：
+| | Streamlit | **FastAPI + SSE（当前）** |
+|---|---|---|
+| 实时推送 | 0.5 秒轮询 | 事件驱动，**到达即推** |
+| 计时刷新 | 0.5 秒一跳 | **100ms 平滑累加** |
+| 多客户端 | ❌ 单会话 | ✅ 可订阅同一任务 |
+| 状态持久化 | ❌ 纯内存 | ✅ SQLite |
+| 改代码生效 | 必须重启进程（模块不热重载） | `--reload` 自动 |
+
+### 阶段耗时实时累加
+
+每个节点进出时由 `app/graph.py` 的包装层发出 `stage_start` / `stage_end` 事件。
+前端收到 `stage_start` 就开一行，并按**服务端给的开始时刻**每 100ms 刷新；收到
+`stage_end` 冻结为该阶段实际耗时：
+
+```
+阶段          耗时(秒)   状态
+解析需求         5.32    planned
+检索来源         9.08    sources_discovered
+抓取正文         0.00    fetched
+整理报告        62.31    进行中…        ← 实时增长
+```
+
+用服务端时刻（事件里的 `at`）而不是"前端收到的时刻"来算：事件经网络/轮询到达会晚
+几十到几百毫秒，按收到时刻计时会偏短。本机与服务端的时钟差在首个事件时自动校正。
+
+> 节点包装层统一包成 `async` 是有意为之：LangGraph 会把**同步**节点丢进线程池，
+> 而 `get_stream_writer()` 依赖 contextvars，跨线程会拿不到 writer、事件静默丢失。
+
+### 实时展示执行过程
+
+节点内部通过 `app/events.py` 的 `emit()` 发出动作事件：
 
 ```
 💭 我先帮你查找「SQLite 的适用场景和限制」相关资料，整理成概述、适用场景、限制…等章节。
@@ -84,45 +113,25 @@ python -m streamlit run app/ui.py
    ⏸️ 未部署：用户未要求部署，可在界面点击「部署到服务器」
 ```
 
-事件由 `app/events.py` 的 `emit()` 在节点内部发出（LangGraph 的
-`get_stream_writer()`），执行器用 `stream_mode=['updates', 'custom']` 同时消费
-节点级进度与细粒度动作。
+执行器用 `stream_mode=['updates', 'custom']` 同时消费节点级进度与细粒度动作。
 
-**中途停止**。任务跑在 `app/session.py` 的独立线程里，点「停止」会取消该任务
-（实测在整理报告阶段约 0.5 秒内生效）。
+### 中途停止
+
+点「停止」调用 `POST /api/tasks/{id}/cancel`，取消该任务（实测在整理报告阶段
+约 0.5 秒内生效）。
 
 > ⚠️ **停止是"取消"不是"撤销"**。如果停止发生在部署之后，站点已经发布在公网，
-> 停止不会回滚。会话会自动检测这种副作用并给出提示，例如
+> 停止不会回滚。服务端会检测这种副作用并给出提示，例如
 > 「注意：停止前部署已完成，站点仍在 http://…，停止不会撤销已发布的内容。」
 
-**追加要求（修正方向）**。停止后或完成后直接输入新要求即可，会话会把之前的对话
-一并交给规划模型，因此 `我只要第一部第三集` 这类指代型追加要求能被正确还原成
-完整意图。
+### 追加要求（修正方向）
 
-### 为什么任务要放在后台线程
+完成后直接输入新要求即可；会话消息存在 SQLite 里，新一轮会把之前的对话一并交给
+规划模型，因此 `我只要第一部第三集` 这类指代型追加要求能被正确还原成完整意图。
 
-Streamlit 的脚本执行期间**不响应任何交互**，原来那种
-`st.button → asyncio.run(...)` 阻塞 100 秒的写法中途点按钮是无效的。
-所以任务必须放在独立线程跑，前端用 `st.fragment(run_every=0.5)` 轮询事件队列，
-才能做到"边跑边看、随时能停"。
+刷新页面也会从服务端恢复历史对话；「新对话」按钮清空当前会话。
 
-> 变更 `app/ui.py` 之外的核心模块（`app/main.py`、`app/nodes.py`、`app/session.py`）后
-> **必须重启 Streamlit 进程**：Streamlit 只重跑主脚本，已导入的模块不会热重载。
-
-## 3.2 FastAPI + SSE 服务（真流式，适合对外）
-
-Streamlit 版是"后台线程 + 0.5 秒轮询"的准实时。若要对多人开放或集成进别的系统，
-用这一版——事件驱动、到达即推送，且天然支持多客户端订阅同一任务：
-
-```bash
-python -m scripts.serve_api                 # 默认 127.0.0.1:8000
-python -m scripts.serve_api --port 8010     # 换端口
-python -m scripts.serve_api --reload        # 开发模式
-```
-
-浏览器打开服务地址即是聊天界面（`app/web/index.html`）。
-
-### 接口
+## 3.2 接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -141,10 +150,11 @@ python -m scripts.serve_api --reload        # 开发模式
 
 ```jsonc
 {"type":"task","task_id":"976ec2ce0099","artifact_id":"765beaa5..."}
+{"type":"stage_start","stage":"compose_report","label":"整理报告","at":1792126225.4}
 {"type":"thought","text":"我先帮你查找「SQLite 的适用场景」相关资料…"}
 {"type":"action","icon":"🌐","label":"已搜索网页","detail":"SQLite 适用场景 应用场景"}
-{"type":"action","icon":"✅","label":"正文就绪","detail":"5 个来源，共 52203 字符"}
-{"type":"result","public_url":"http://…/sites/xxx/"}   // 手动部署后
+{"type":"stage_end","stage":"compose_report","label":"整理报告","seconds":62.31,"status":"composed"}
+{"type":"result","public_url":"http://…/sites/xxx/"}              // 手动部署后
 {"type":"status","status":"local_ready","detail":"报告已生成…"}   // 终态，带助手回执
 {"type":"end","status":"local_ready"}
 ```
@@ -165,13 +175,6 @@ curl -s -X POST localhost:8010/api/tasks -H 'Content-Type: application/json' \
   -d "{\"message\":\"只要其中关于限制和不足的部分\",\"session_id\":\"$SID\"}"
 # → 模型还原为 topic「SQLite 的限制与不足」，查询「SQLite 限制 不足 缺点」
 ```
-
-### 两个实现要点
-
-- **`app/api_hub.py`**：异步原生的任务中枢。与 Streamlit 的 `app/session.py`（后台线程
-  + 轮询）不同，这里直接跑在服务器事件循环上，用 asyncio 队列向所有 SSE 订阅者广播。
-- **进程内状态**：会话与任务都在内存里，这是单进程 demo 的取舍。多副本部署需把状态
-  外置（Redis / 数据库）并把事件广播换成消息总线，否则订阅者连不到同一个进程。
 
 ## 3.3 SQLite 持久化
 
@@ -254,8 +257,8 @@ python -m scripts.list_mcp_tools
 
 ## 5. 耗时统计
 
-执行器逐个节点计时，结果写入 `state.json` 的 `timings` 与 `elapsed_seconds`，
-CLI 打印汇总表，前端以「各阶段耗时」表格展示。
+两处都有：执行器把每个节点的耗时写入 `state.json` 的 `timings` 与 `elapsed_seconds`
+（CLI 打印汇总表），节点包装层发出 `stage_start` / `stage_end` 事件供界面实时累加。
 
 实测参考（正文预算 35000 字符）：
 
@@ -283,5 +286,6 @@ CLI 打印汇总表，前端以「各阶段耗时」表格展示。
 python -m unittest discover -s tests -v
 ```
 
-覆盖：URL 安全校验、引用存在性、表格列数、HTML 自动转义、补搜上限、
-无来源禁止部署、部署意图门控、MCP 参数组装（base64）、耗时标签、前端界面状态。
+覆盖：URL 安全校验、引用存在性、表格列数、HTML 自动转义、补搜上限、无来源禁止部署、
+部署意图门控、结构化输出重试、MCP 参数组装（base64）、阶段事件与实时计时、
+SQLite 存储与重启恢复、任务中枢、HTTP 接口与 SSE 事件流、助手回执文案。
