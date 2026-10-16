@@ -14,16 +14,21 @@
 线程 + 轮询），这里服务 FastAPI，直接跑在服务器事件循环上。
 """
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass, field
 
 from app.config import settings
+from app.events import stage_end, stage_start
 from app.main import run_task
 from app.messages import cancel_note, reply_text
 from app.store import Store
 
 TERMINAL_STATUS = {'deployed', 'deploy_needs_check', 'local_ready', 'failed',
                    'cancelled', 'interrupted'}
+
+# 合成阶段：衡量"用户发出指令"到"真正开始搜索"之间的空档。
+INSTRUCTION_STAGE = 'instruction'
 
 # 哨兵：通知订阅者流已结束
 CLOSE = object()
@@ -39,6 +44,8 @@ class TaskRecord:
     artifact_id: str | None = None      # run_task 内部的任务 ID，即产物目录名
     error: str | None = None
     state: dict | None = None
+    started_at: float = field(default_factory=time.time)
+    latency: float | None = None        # 收到指令 → 开始搜索 的耗时
     _subscribers: set = field(default_factory=set)
     _task: asyncio.Task | None = None
 
@@ -107,6 +114,9 @@ class Hub:
                             message=message, store=self.store)
         self.store.create_task(record.task_id, session_id, message)
         self.tasks[record.task_id] = record
+        # 先占位一条"收到指令"的开始事件，让它排在阶段表第一行；
+        # 真正进入检索阶段时再补齐耗时。
+        record.publish(stage_start(INSTRUCTION_STAGE))
         record._task = asyncio.create_task(self._run(record, history))
         return record
 
@@ -116,26 +126,51 @@ class Hub:
             record.publish({'type': 'task', 'task_id': record.task_id,
                             'artifact_id': artifact_id})
 
+        def close_instruction(status: str) -> None:
+            """补齐"收到指令"的耗时。只补一次；中断/失败也要补，否则那一行会一直停在"进行中"。"""
+            if record.latency is None:
+                record.latency = time.time() - record.started_at
+                record.publish(stage_end(INSTRUCTION_STAGE, record.latency, status))
+
+        def relay(event: dict) -> None:
+            if (event.get('type') == 'stage_start'
+                    and event.get('stage') == 'discover_sources'):
+                close_instruction('解析完成')
+            record.publish(event)
+
         try:
             state = await run_task(
-                record.message, on_event=record.publish,
+                record.message, on_event=relay,
                 on_start=on_start, history=history,
             )
         except asyncio.CancelledError:
+            close_instruction('已中断')
             detail = cancel_note(record.artifact_id)
             record.persist(status='cancelled')
+            # 给会话补一条助手回复：否则下一轮上下文里会出现两条连续的用户消息，
+            # 模型会看不出上一轮其实是被打断的。
+            self.store.append_message(record.session_id, 'assistant', '（上一轮被用户中断）')
             record.publish({'type': 'status', 'status': 'cancelled', 'detail': detail})
             raise
         except Exception as exc:
+            close_instruction('已失败')
             record.error = f'{type(exc).__name__}: {exc}'
             record.persist(status='failed', error=record.error)
             record.publish({'type': 'status', 'status': 'failed',
                             'detail': record.error})
         else:
+            close_instruction('解析完成')
             record.state = state
             status = state.get('status', 'failed')
             reply = reply_text(state)
             self.store.append_message(record.session_id, 'assistant', reply)
+            if record.latency is not None:
+                # 同步写进持久化的 timings，state.json 与 CLI 汇总表同样能看到
+                state.setdefault('timings', []).insert(0, {
+                    'stage': INSTRUCTION_STAGE,
+                    'seconds': round(record.latency, 2),
+                    'status': '解析完成，开始搜索',
+                })
             record.persist(status=status, state=state)
             record.publish({'type': 'status', 'status': status, 'detail': reply})
         finally:

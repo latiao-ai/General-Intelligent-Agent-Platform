@@ -58,7 +58,8 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px}
     <div>
       <h1>网页研究与 HTML 报告</h1>
       <div class="sub">
-        输入主题或链接，智能体会实时展示执行过程；随时可以停止，也可以直接补充要求来调整方向。
+        输入主题或链接，智能体会实时展示执行过程与各阶段耗时。
+        <b>运行中再发一条消息会自动打断当前任务</b>，带着上文改方向，不必先点停止。
       </div>
     </div>
     <button id="newSession" class="ghost" style="height:34px">新对话</button>
@@ -188,18 +189,39 @@ function resetProcess() {
 
 function setRunning(on) {
   S.running = on;
-  $('send').disabled = on;
+  // 运行中依然可以发送：发送会自动打断当前任务并开启新一轮，不必先点停止。
+  $('send').disabled = false;
+  $('send').textContent = on ? '打断并发送' : '发送';
   $('stop').style.display = on ? '' : 'none';
   if (on) $('processTitle').textContent = '智能体执行过程（进行中）';
 }
 
+// 打断当前任务：取消它，并等它的结束提示经原事件流渲染出来后再继续，
+// 这样"上一轮被中断"的提示不会丢，也避免两条任务的日志混在一起。
+async function interrupt() {
+  if (!S.taskId || !S.running) return;
+  const stream = S.es;
+  try {
+    await fetch(`/api/tasks/${S.taskId}/cancel`, {method: 'POST'});
+  } catch { /* 取消失败也让新一轮继续 */ }
+  const deadline = Date.now() + 2000;
+  while (S.running && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 50));
+  }
+  if (S.es === stream) { S.es.close(); S.es = null; }
+  S.running = false;
+}
+
 async function send() {
   const text = $('msg').value.trim();
-  if (!text || S.running) return;
+  if (!text) return;
   $('msg').value = '';
+  // 正在运行时直接打断改方向，不要求用户先点停止
+  if (S.running) await interrupt();
   addMessage('user', text);
   resetProcess();
   setRunning(true);
+  $('send').disabled = true;          // 提交期间短暂禁用，避免连点起两个任务
   try {
     const res = await fetch('/api/tasks', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -210,10 +232,13 @@ async function send() {
     S.sessionId = data.session_id;
     localStorage.setItem('sessionId', S.sessionId);
     S.taskId = data.task_id;
+    S.status = null;
     openStream(S.taskId);
   } catch (err) {
     addMessage('assistant', '提交失败：' + err.message);
     setRunning(false);
+  } finally {
+    $('send').disabled = false;
   }
 }
 

@@ -327,6 +327,84 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
             received.append(item)
         self.assertTrue(received)
 
+    async def test_instruction_stage_is_first_and_closes_on_search(self):
+        """「收到指令 → 开始搜索」应排在阶段表第一行，并在检索开始时补齐耗时。"""
+        import app.api_hub as hub_module
+        hub = self.hub()
+
+        async def fake(text, progress=None, on_event=None, history=None, on_start=None):
+            on_event({'type': 'stage_start', 'stage': 'parse_request'})
+            on_event({'type': 'stage_end', 'stage': 'parse_request', 'seconds': 1.0})
+            # 这一条到达时，"收到指令"应当被补齐
+            on_event({'type': 'stage_start', 'stage': 'discover_sources'})
+            return {'task_id': 'a1', 'status': 'local_ready',
+                    'deployment': {}, 'timings': []}
+
+        with patch.object(hub_module, 'run_task', fake):
+            record = hub.start('测试')
+            await asyncio.wait_for(record._task, timeout=10)
+
+        events = self.events_of(record)
+        starts = [e for e in events if e['type'] == 'stage_start']
+        self.assertEqual(starts[0]['stage'], 'instruction')
+        self.assertEqual(starts[0]['label'], '收到指令 → 开始搜索')
+        ends = [e for e in events
+                if e['type'] == 'stage_end' and e['stage'] == 'instruction']
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0]['status'], '解析完成')
+        search_at = next(i for i, e in enumerate(events)
+                         if e['type'] == 'stage_start' and e['stage'] == 'discover_sources')
+        self.assertLess(events.index(ends[0]), search_at)
+        # 也要进持久化的 timings，state.json 与 CLI 汇总表才能看到
+        self.assertEqual(record.state['timings'][0]['stage'], 'instruction')
+
+    async def test_instruction_stage_closed_on_cancel(self):
+        """中断时也要补齐，否则那一行会一直停在"进行中"。"""
+        import app.api_hub as hub_module
+        hub = self.hub()
+        with patch.object(hub_module, 'run_task', self.stub(delay=30)):
+            record = hub.start('慢任务')
+            await asyncio.sleep(0.3)
+            hub.cancel(record.task_id)
+            with self.assertRaises(asyncio.CancelledError):
+                await record._task
+        ends = [e for e in self.events_of(record)
+                if e['type'] == 'stage_end' and e['stage'] == 'instruction']
+        self.assertEqual(len(ends), 1)
+        self.assertEqual(ends[0]['status'], '已中断')
+
+    async def test_cancel_leaves_assistant_marker_in_history(self):
+        """中断也要留下助手回复，否则下一轮上下文是两条连续 user 消息。"""
+        import app.api_hub as hub_module
+        hub = self.hub()
+        with patch.object(hub_module, 'run_task', self.stub(delay=30)):
+            record = hub.start('慢任务')
+            await asyncio.sleep(0.3)
+            hub.cancel(record.task_id)
+            with self.assertRaises(asyncio.CancelledError):
+                await record._task
+        self.assertEqual([m['role'] for m in hub.history(record.session_id)],
+                         ['user', 'assistant'])
+
+    async def test_send_while_running_starts_new_turn_same_session(self):
+        """运行中直接发第二条消息：同会话开新一轮，历史照常带上。"""
+        import app.api_hub as hub_module
+        hub = self.hub()
+        captured = {}
+        with patch.object(hub_module, 'run_task', self.stub(delay=30)):
+            first = hub.start('第一轮要求')
+            await asyncio.sleep(0.3)
+            # 模拟前端"打断并发送"：取消旧任务后立刻用同一会话开新一轮
+            hub.cancel(first.task_id)
+            with self.assertRaises(asyncio.CancelledError):
+                await first._task
+        with patch.object(hub_module, 'run_task', self.stub(captured)):
+            second = hub.start('第二轮要求', first.session_id)
+            await asyncio.wait_for(second._task, timeout=10)
+        contents = [m['content'] for m in captured['history']]
+        self.assertEqual(contents[0], '第一轮要求')
+        self.assertIn('（上一轮被用户中断）', contents)
+
     async def test_cancel_done_task_is_noop(self):
         import app.api_hub as hub_module
         hub = self.hub()

@@ -7,7 +7,7 @@ import time
 
 from langgraph.config import get_stream_writer
 
-# 各阶段的中文名，CLI / Streamlit / Web 三处共用。
+# 各阶段的中文名，CLI / Streamlit / API 三处共用。
 STAGE_LABELS = {
     'parse_request': '解析需求',
     'discover_sources': '检索来源',
@@ -18,6 +18,10 @@ STAGE_LABELS = {
     'deploy_report': '部署站点',
     'finish_failed': '提前终止',
     'manual_deploy': '手动部署',
+    # 合成阶段：从服务端收到指令，到解析完成、真正开始搜索之间的空档。
+    # 它跨越了 parse_request，因此与"解析需求"的耗时会有重叠，这是刻意的：
+    # 用户关心的是"我发出去之后多久才真正开始干活"。
+    'instruction': '收到指令 → 开始搜索',
 }
 
 
