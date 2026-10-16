@@ -1,0 +1,14 @@
+.venv/
+.env
+artifacts/
+__pycache__/
+*.pyc
+# SQLite 持久化（会话、任务、事件日志）
+agent.db
+agent.db-wal
+agent.db-shm
+# 本地 AI 助手技能目录（软链接指向虚拟环境，换机器即失效）
+.agents/
+.claude/
+.idea/
+.DS_Store

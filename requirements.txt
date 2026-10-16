@@ -1,0 +1,12 @@
+langgraph>=1,<2
+langchain-openai>=1,<2
+tavily-python>=0.7,<1
+pydantic>=2,<3
+jinja2>=3.1,<4
+python-dotenv>=1,<2
+mcp>=1.28,<2
+jsonschema>=4,<5
+streamlit>=1.40,<2
+httpx>=0.27,<1
+# FastAPI + SSE 服务（app/api.py），随 mcp 已带入 uvicorn / sse-starlette
+fastapi>=0.115,<1

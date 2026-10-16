@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{{ report.title }}</title>
+<style>
+body{margin:0;background:#f3f5f7;color:#18212b;font:16px/1.8 system-ui,sans-serif}
+main{max-width:960px;margin:32px auto;background:white;padding:40px;border-radius:12px}
+h1{font-size:32px;line-height:1.3}h2{margin-top:36px}
+a{color:#165eb4;overflow-wrap:anywhere}p,li{overflow-wrap:anywhere}
+.meta{color:#657180;font-size:13px}.summary{background:#edf3fa;padding:18px}
+.table-wrap{overflow-x:auto}table{border-collapse:collapse;width:100%}
+th,td{border:1px solid #d9e0e7;padding:10px;vertical-align:top;min-width:110px}
+th{background:#eef2f6}.limitations{background:#fff6df;padding:16px}
+@media(max-width:640px){main{margin:0;padding:20px;border-radius:0}h1{font-size:26px}}
+@media print{body{background:white}main{margin:0;padding:0}.table-wrap{overflow:visible}}
+</style>
+</head>
+<body><main>
+<h1>{{ report.title }}</h1>
+<p class="meta">生成时间（UTC）：{{ generated_at }} · 任务：{{ task_id }}</p>
+<div class="summary">
+<p>{{ report.summary }}</p>
+{% for sid in report.summary_source_ids %}<a href="#source-{{ sid }}">[{{ sid }}]</a> {% endfor %}
+</div>
+<nav><strong>目录</strong><ol>
+{% for section in report.sections %}
+<li><a href="#section-{{ loop.index }}">{{ section.heading }}</a></li>
+{% endfor %}
+</ol></nav>
+{% for section in report.sections %}
+<section id="section-{{ loop.index }}"><h2>{{ section.heading }}</h2>
+{% for paragraph in section.paragraphs %}
+<p>{{ paragraph.text }}
+{% for sid in paragraph.source_ids %}<a href="#source-{{ sid }}">[{{ sid }}]</a> {% endfor %}
+</p>
+{% endfor %}
+</section>
+{% endfor %}
+{% if report.comparison_table.rows %}
+<h2>对比表</h2><div class="table-wrap"><table>
+<thead><tr>{% for col in report.comparison_table.columns %}<th>{{ col }}</th>{% endfor %}<th>来源</th></tr></thead>
+<tbody>{% for row in report.comparison_table.rows %}<tr>
+{% for cell in row.cells %}<td>{{ cell }}</td>{% endfor %}
+<td>{% for sid in row.source_ids %}<a href="#source-{{ sid }}">[{{ sid }}]</a> {% endfor %}</td>
+</tr>{% endfor %}</tbody></table></div>
+{% endif %}
+{% if report.limitations %}
+<div class="limitations"><h2>资料限制</h2><ul>
+{% for item in report.limitations %}<li>{{ item }}</li>{% endfor %}
+</ul></div>
+{% endif %}
+<h2>参考来源</h2><ol>
+{% for source in sources %}
+<li id="source-{{ source.source_id }}">
+[{{ source.source_id }}] <a href="{{ source.url }}" target="_blank" rel="noopener noreferrer">{{ source.title }}</a>
+<span class="meta">资料返回时间：{{ source.fetched_at }}</span>
+</li>
+{% endfor %}
+</ol></main></body></html>
