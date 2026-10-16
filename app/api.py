@@ -96,10 +96,12 @@ async def task_events(task_id: str):
                     yield sse({'type': 'end', 'status': record.status})
                     return
                 seq, event = item
-                if seq <= last_seq:
-                    # 订阅与读快照之间重复投递的事件，按序号丢弃。
-                    continue
-                last_seq = seq
+                if seq is not None:
+                    if seq <= last_seq:
+                        # 订阅与读快照之间重复投递的事件，按序号丢弃。
+                        continue
+                    last_seq = seq
+                # seq 为 None 的是不落库的过程事件（如 draft），始终透传
                 yield sse(event)
         finally:
             record.unsubscribe(queue)

@@ -43,6 +43,15 @@ h1{font-size:20px;margin:0 0 4px}
 #process .turn-head{display:flex;align-items:center;gap:8px;color:var(--muted);
   font-size:12px;margin:2px 0 6px;white-space:nowrap}
 #process .turn-head::after{content:"";flex:1;height:1px;background:var(--line)}
+/* 整理报告过程中的半成品预览 */
+#process .draft{background:#fafbfc;border:1px solid var(--line);
+  border-left:3px solid var(--accent);border-radius:8px;padding:10px 12px;
+  margin:6px 0;font-size:14px;max-height:340px;overflow:auto}
+#process .draft-head{color:var(--muted);font-size:12px;margin-bottom:6px}
+#process .draft-title{font-weight:600;margin-bottom:6px}
+#process .draft-sum{color:#3b4757;margin-bottom:6px}
+#process .draft-sec{font-weight:600;margin:8px 0 2px}
+#process .draft-p{color:#3b4757;overflow-wrap:anywhere;margin:2px 0}
 .bar{position:fixed;left:0;right:0;bottom:0;background:var(--card);
      border-top:1px solid var(--line);padding:12px 16px}
 .bar .inner{max-width:860px;margin:0 auto;display:flex;gap:8px}
@@ -110,6 +119,45 @@ function addMessage(role, text) {
   el.innerHTML = `<div class="bubble">${esc(text)}</div>`;
   $('messages').appendChild(el);
   el.scrollIntoView({block: 'end', behavior: 'smooth'});
+}
+
+// 整理报告阶段是全程最长的静默期（占 85%~90%）。模型是流式生成工具调用参数的，
+// 后端边收边解析出"半成品报告"推过来，这里就地渲染，让用户看到报告在长出来。
+function renderDraft(report) {
+  const parts = [];
+  if (report.title) parts.push(`<div class="draft-title">${esc(report.title)}</div>`);
+  if (report.summary) parts.push(`<div class="draft-sum">${esc(report.summary)}</div>`);
+  for (const sec of (report.sections || [])) {
+    if (sec.heading) parts.push(`<div class="draft-sec">${esc(sec.heading)}</div>`);
+    for (const p of (sec.paragraphs || [])) {
+      if (p.text) parts.push(`<div class="draft-p">${esc(p.text)}</div>`);
+    }
+  }
+  return parts.join('');
+}
+
+function onDraft(ev) {
+  const turn = currentTurnEl();
+  let box = turn.querySelector('.draft');
+  if (!ev.report) {                 // null = 清空（重试用，避免两次内容混在一起）
+    if (box) box.remove();
+    return;
+  }
+  if (!box) {
+    box = document.createElement('div');
+    box.className = 'draft';
+    turn.appendChild(box);
+  }
+  box.innerHTML = '<div class="draft-head">📝 报告草稿（生成中）</div>'
+                  + renderDraft(ev.report);
+  box.scrollIntoView({block: 'end', behavior: 'smooth'});
+}
+
+// 任务结束后把草稿的标题改成"报告内容"——它已经是最终内容了
+function sealDraft() {
+  document.querySelectorAll('#process .draft-head').forEach(el => {
+    el.textContent = '📝 报告内容';
+  });
 }
 
 function addEvent(ev) {
@@ -327,6 +375,7 @@ function openStream(taskId) {
   es.onmessage = e => {
     let ev; try { ev = JSON.parse(e.data); } catch { return; }
     if (ev.type === 'task') { S.artifactId = ev.artifact_id; return; }
+    if (ev.type === 'draft') { onDraft(ev); return; }
     if (ev.type === 'stage_start') { onStageStart(ev); return; }
     if (ev.type === 'stage_end') { onStageEnd(ev); return; }
     if (ev.type === 'result') { showDeployed(ev.public_url, ev.deployment_id); return; }
@@ -347,6 +396,7 @@ async function finish(status) {
   setRunning(false);
   if (S.es) { S.es.close(); S.es = null; }
   closeOpenStages(status);
+  sealDraft();
   if (!S.taskId) return;
   try {
     const res = await fetch(`/api/tasks/${S.taskId}`);

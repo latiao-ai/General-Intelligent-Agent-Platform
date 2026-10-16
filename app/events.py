@@ -59,6 +59,16 @@ def outcome(**payload) -> dict:
     return {'type': 'result', **payload}
 
 
+def draft(report: dict | None) -> dict:
+    """整理报告过程中的"半成品"报告，或 None 表示清空。
+
+    这类事件体积大（每份都是一整份报告的快照）且是过程性的，
+    **不写入 SQLite**（见 api_hub.TaskRecord.publish）；重连的客户端看不到草稿
+    也不影响——最终报告本来就在 report.json / index.html 里。
+    """
+    return {'type': 'draft', 'report': report}
+
+
 def stage_start(stage: str) -> dict:
     """阶段开始。
 

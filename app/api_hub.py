@@ -60,7 +60,16 @@ class TaskRecord:
         return self.status in TERMINAL_STATUS
 
     def publish(self, event: dict) -> None:
-        """先落库再投递：库里是权威记录，内存只保证实时性。"""
+        """先落库再投递：库里是权威记录，内存只保证实时性。
+
+        例外是 draft（半成品报告）：它体积大（每份都是整份报告的快照）、
+        过程性强，落库会让 events 表膨胀几百 KB，因此只做实时投递。
+        序号传 None，SSE 端的去重逻辑会跳过它。
+        """
+        if event.get('type') == 'draft':
+            for queue in list(self._subscribers):
+                queue.put_nowait((None, event))
+            return
         seq = self.store.append_event(self.task_id, event)
         for queue in list(self._subscribers):
             queue.put_nowait((seq, event))

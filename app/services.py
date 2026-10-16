@@ -1,6 +1,10 @@
 import re
+import json
+import time
 import ipaddress
 from urllib.parse import urlsplit, urlunsplit
+from pydantic import ValidationError
+from langchain_core.utils.json import parse_partial_json
 from langchain_openai import ChatOpenAI
 from tavily import AsyncTavilyClient
 from app.config import settings
@@ -75,27 +79,93 @@ def _combine_usage(usages: list):
     return combined
 
 
+def _draft_of(buf: str, schema):
+    """把"已生成完的那部分"工具调用参数解析成半成品对象。
+
+    工具调用参数是逐字吐出来的，用 parse_partial_json 能取出已完成的部分
+    （例如标题已到、章节还在写）；字段还不齐或语法不完整时返回 None。
+    """
+    if not buf.strip():
+        return None
+    try:
+        return schema.model_validate(parse_partial_json(buf))
+    except Exception:
+        return None
+
+
+def _final_of(accumulated, schema):
+    """从累积分片里取出完整的工具调用参数并做 Pydantic 校验。"""
+    if accumulated is None:
+        return None
+    for call in (getattr(accumulated, 'tool_calls', None) or []):
+        args = call.get('args')
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                continue
+        try:
+            return schema.model_validate(args)
+        except ValidationError:
+            continue
+    return None
+
+
 async def structured_call(
     schema, system: str, user: str, model: str | None = None, attempts: int = 2,
-    disable_thinking: bool = False,
+    disable_thinking: bool = False, on_draft=None, draft_interval: float = 1.0,
 ):
-    """结构化调用，解析失败时重试。
+    """结构化调用，流式获取 + 解析失败时重试。
 
-    快模型偶发会产出不符合 schema 的结构（例如空 source_ids），
-    单次失败就中断整个任务代价太大，因此默认重试一次。
+    为什么用 bind_tools + astream 而不是 with_structured_output：
+    `with_structured_output(include_raw=True)` 在流式下**拿不到 usage**（分片里没有 raw），
+    而成本统计依赖它。手动累积分片可以同时得到三样东西：渐进可显示的半成品、
+    完整结果、以及 usage_metadata。
+
+    on_draft(partial_or_None)：每次拿到新的半成品时回调；传 None 表示清空
+    （重试时会先清空，避免两次尝试的内容混在一起）。
     返回 (Pydantic 对象, usage)，usage 为各次尝试的合计。
     """
     usages = []
+    messages = [('system', system), ('human', user)]
     for _ in range(max(1, attempts)):
-        llm = new_llm(model, disable_thinking=disable_thinking).with_structured_output(
-            schema, method='function_calling', include_raw=True
-        )
-        response = await llm.ainvoke([
-            ('system', system), ('human', user)
-        ])
-        usages.append(getattr(response.get('raw'), 'usage_metadata', None))
-        if not response.get('parsing_error') and response.get('parsed') is not None:
-            return response['parsed'], _combine_usage(usages)
+        if on_draft:
+            on_draft(None)
+        llm = new_llm(model, disable_thinking=disable_thinking).bind_tools(
+            [schema], tool_choice=schema.__name__)
+        accumulated = None
+        buf = ''                 # 增量累积工具调用参数，避免每次重新拼接全部分片
+        last_emit = 0.0
+        last_fingerprint = None
+        async for chunk in llm.astream(messages):
+            accumulated = chunk if accumulated is None else accumulated + chunk
+            for piece in (getattr(chunk, 'tool_call_chunks', None) or []):
+                if isinstance(piece, dict) and piece.get('args'):
+                    buf += piece['args']
+            if on_draft is None:
+                continue
+            now = time.monotonic()
+            if now - last_emit < draft_interval:
+                continue
+            # 关键：无论这次解析成不成功都要推进节流时间戳。
+            # 否则字段还没凑齐时会退化成"每个分片都重试一次"，
+            # 对不断增长的缓冲区反复做解析与校验，O(n²) 会把事件循环堵死。
+            last_emit = now
+            draft = _draft_of(buf, schema)
+            if draft is None:
+                continue
+            # 内容没变化就别重复推，省带宽也省前端重绘
+            fingerprint = len(draft.model_dump_json())
+            if fingerprint == last_fingerprint:
+                continue
+            last_fingerprint = fingerprint
+            on_draft(draft)
+        usages.append(getattr(accumulated, 'usage_metadata', None))
+        parsed = _final_of(accumulated, schema)
+        if parsed is not None:
+            if on_draft:
+                on_draft(parsed)
+            return parsed, _combine_usage(usages)
     raise RuntimeError('模型结构化输出失败；检查 tool calling 支持及 schema')
 
 

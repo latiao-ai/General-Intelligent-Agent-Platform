@@ -10,7 +10,7 @@ from app.services import (
 )
 from app.rendering import render_report, save_json
 from app.mcp_adapter import deploy_html
-from app.events import action, emit, outcome, thought
+from app.events import action, draft, emit, outcome, thought
 
 
 def error_entry(stage, exc):
@@ -189,6 +189,10 @@ async def compose_report(state):
     emit(action('正在整理报告',
                f"{len(selected)} 个来源 · {used_chars} 字符 · 模型 {settings.llm_compose_model}",
                '✍️'))
+    def on_draft(partial) -> None:
+        # 把"写到一半的报告"推给前端渐进展示（None 表示清空，重试时会用到）
+        emit(draft(partial.model_dump() if partial is not None else None))
+
     report, usage = await structured_call(
         Report,
         '你负责根据提供的网页正文生成结构化中文报告。'
@@ -200,6 +204,7 @@ async def compose_report(state):
         '资料不足时明确写入 limitations；不得把抓取时间当发布日期；冲突资料保留差异。',
         json.dumps({'需求': state['plan'], '资料': selected}, ensure_ascii=False),
         model=settings.llm_compose_model,
+        on_draft=on_draft,
     )
     data = report.model_dump()
     if len(documents) < 2:

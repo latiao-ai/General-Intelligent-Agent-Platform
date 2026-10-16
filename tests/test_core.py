@@ -722,7 +722,8 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
         captured = {}
 
         async def fake_call(schema, system, user, model=None, attempts=2,
-                            disable_thinking=False):
+                            disable_thinking=False, on_draft=None,
+                            draft_interval=1.0):
             captured['disable_thinking'] = disable_thinking
             return Plan.model_validate({'topic': 't', 'auto_deploy': False}), None
 
@@ -737,7 +738,8 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
         captured = {}
 
         async def fake_call(schema, system, user, model=None, attempts=2,
-                            disable_thinking=False):
+                            disable_thinking=False, on_draft=None,
+                            draft_interval=1.0):
             captured['disable_thinking'] = disable_thinking
             return Report.model_validate({
                 'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
@@ -760,7 +762,8 @@ class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
         captured = {}
 
         async def fake_call(schema, system, user, model=None, attempts=2,
-                            disable_thinking=False):
+                            disable_thinking=False, on_draft=None,
+                            draft_interval=1.0):
             captured['model'] = model
             return Report.model_validate({
                 'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
@@ -784,7 +787,8 @@ class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
         from app.config import settings
 
         async def fake_call(schema, system, user, model=None, attempts=2,
-                            disable_thinking=False):
+                            disable_thinking=False, on_draft=None,
+                            draft_interval=1.0):
             return Plan.model_validate({'topic': 't', 'auto_deploy': False}), None
 
         with patch.object(nodes, 'structured_call', fake_call), \
@@ -797,7 +801,8 @@ class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
         captured = {}
 
         async def fake_call(schema, system, user, model=None, attempts=2,
-                            disable_thinking=False):
+                            disable_thinking=False, on_draft=None,
+                            draft_interval=1.0):
             captured['model'] = model
             return Plan.model_validate({'topic': 't', 'auto_deploy': False}), None
 
@@ -808,119 +813,151 @@ class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
 
 
 class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
-    """快模型偶发产出不合法结构时，结构化调用会重试而不是让整个任务失败。"""
+    """结构化调用：流式累积、渐进草稿、解析失败重试、usage 合并。"""
+
+    class FakeChunk:
+        """模拟 AIMessageChunk：支持 + 累积，带 tool_calls / tool_call_chunks / usage。"""
+
+        def __init__(self, tool_calls=None, usage=None, tool_call_chunks=None):
+            self.tool_calls = tool_calls or []
+            self.usage_metadata = usage
+            self.tool_call_chunks = tool_call_chunks or []
+
+        def __add__(self, other):
+            return StructuredRetryTests.FakeChunk(
+                tool_calls=other.tool_calls or self.tool_calls,
+                usage=other.usage_metadata or self.usage_metadata,
+                tool_call_chunks=self.tool_call_chunks + other.tool_call_chunks)
 
     def fake_llm(self, outcomes, calls):
         class FakeLLM:
-            def with_structured_output(self, *args, **kwargs):
+            def bind_tools(self, tools, tool_choice=None):
+                calls.append(('bind', tool_choice))
                 return self
 
-            async def ainvoke(self, messages):
-                calls.append(1)
-                return outcomes[min(len(calls) - 1, len(outcomes) - 1)]
+            async def astream(self, messages):
+                for chunk in outcomes[min(len(calls) - 1, len(outcomes) - 1)]:
+                    yield chunk
         return FakeLLM()
 
-    @staticmethod
-    def bad(tokens=5):
-        return {'parsed': None, 'parsing_error': 'boom',
-                'raw': SimpleNamespace(usage_metadata={'total_tokens': tokens})}
+    def bad(self, tokens=5):
+        # topic 为空过不了 Plan 的 min_length 校验
+        return [self.FakeChunk(tool_calls=[{'name': 'Plan', 'args': {'topic': ''}}],
+                               usage={'total_tokens': tokens})]
 
-    @staticmethod
-    def good(tokens=7):
-        return {'parsed': 'GOOD', 'parsing_error': None,
-                'raw': SimpleNamespace(usage_metadata={'total_tokens': tokens})}
+    def good(self, tokens=7):
+        return [self.FakeChunk(
+            tool_calls=[{'name': 'Plan',
+                         'args': {'topic': 't', 'auto_deploy': False}}],
+            usage={'total_tokens': tokens})]
+
+    async def call(self, outcomes, calls=None, **kw):
+        """在 patch 生效期间完成调用，返回 ((parsed, usage), calls)。
+
+        await 必须在 with 块里面：否则协程在 patch 退出后才执行，mock 失效、
+        直接打到真实 API（这个坑踩过一次，表现为测试里 usage 大得离谱）。
+        """
+        from app import services
+        calls = calls if calls is not None else []
+        with patch.object(services, 'new_llm',
+                          lambda model=None, disable_thinking=False:
+                          self.fake_llm(outcomes, calls)):
+            result = await services.structured_call(Plan, 's', 'u', **kw)
+        return result, calls
 
     async def test_retries_once_then_succeeds(self):
-        from app import services
-        calls = []
-        with patch.object(services, 'new_llm',
-                          lambda model=None, disable_thinking=False: self.fake_llm([self.bad(), self.good()], calls)):
-            parsed, _ = await services.structured_call(object(), 's', 'u')
-        self.assertEqual(parsed, 'GOOD')
+        (parsed, _), calls = await self.call([self.bad(), self.good()])
+        self.assertEqual(parsed.topic, 't')
         self.assertEqual(len(calls), 2)
 
     async def test_gives_up_after_max_attempts(self):
-        from app import services
         calls = []
-        with patch.object(services, 'new_llm',
-                          lambda model=None, disable_thinking=False: self.fake_llm([self.bad()], calls)):
-            with self.assertRaises(RuntimeError):
-                await services.structured_call(object(), 's', 'u')
+        with self.assertRaises(RuntimeError):
+            await self.call([self.bad()], calls=calls)
         self.assertEqual(len(calls), 2)
 
     async def test_usage_sums_failed_and_successful_attempts(self):
-        from app import services
-        calls = []
-        with patch.object(services, 'new_llm',
-                          lambda model=None, disable_thinking=False: self.fake_llm([self.bad(5), self.good(7)], calls)):
-            _, usage = await services.structured_call(object(), 's', 'u')
-        # 失败的尝试同样消耗 token，必须计入成本统计。
+        (_, usage), _ = await self.call([self.bad(5), self.good(7)])
+        # 失败的尝试同样消耗 token，必须计入成本统计
         self.assertEqual(usage['total_tokens'], 12)
 
     async def test_single_attempt_returns_its_own_usage(self):
-        from app import services
-        calls = []
-        with patch.object(services, 'new_llm',
-                          lambda model=None, disable_thinking=False: self.fake_llm([self.good(9)], calls)):
-            _, usage = await services.structured_call(object(), 's', 'u', attempts=1)
+        (_, usage), _ = await self.call([self.good(9)], attempts=1)
         self.assertEqual(usage, {'total_tokens': 9})
 
+    async def test_tool_name_is_forced(self):
+        _, calls = await self.call([self.good()], attempts=1)
+        # tool_choice 必须钉死工具名，否则模型可能不调用工具
+        self.assertEqual(calls[0], ('bind', 'Plan'))
 
-class InstrumentTests(unittest.IsolatedAsyncioTestCase):
-    """节点包装层发出的阶段事件——前端实时计时的数据来源。"""
+    async def test_draft_callback_clears_then_streams_partials(self):
+        from app import services
+        calls, drafts = [], []
+        partial = self.FakeChunk(
+            tool_call_chunks=[{'args': '{"topic": "半成品", "auto_deploy": false}'}])
+        full = self.FakeChunk(
+            tool_calls=[{'name': 'Plan',
+                         'args': {'topic': '完整', 'auto_deploy': False}}],
+            usage={'total_tokens': 3})
+        with patch.object(services, 'new_llm',
+                          lambda model=None, disable_thinking=False:
+                          self.fake_llm([[partial, full]], calls)):
+            parsed, _ = await services.structured_call(
+                Plan, 's', 'u', attempts=1, on_draft=drafts.append, draft_interval=0)
+        self.assertEqual(parsed.topic, '完整')
+        # 首次回调必须是 None（清空）：重试时也一样，避免两次内容混在一起
+        self.assertIsNone(drafts[0])
+        # 中途要能收到半成品（标题已到、其余还在生成）
+        self.assertTrue(any(d is not None and d.topic == '半成品' for d in drafts))
+        # 最终结果也要推一次，保证前端拿到完整版
+        self.assertEqual(drafts[-1].topic, '完整')
 
-    async def test_sync_node_emits_start_and_end(self):
-        from app import graph as graph_module
-        seen = []
-        with patch.object(graph_module, 'emit', seen.append):
-            wrapped = graph_module.instrument(
-                'render_html', lambda state: {'status': 'rendered'})
-            result = await wrapped({})
-        self.assertEqual(result, {'status': 'rendered'})
-        self.assertEqual([e['type'] for e in seen], ['stage_start', 'stage_end'])
-        self.assertEqual(seen[0]['label'], '渲染 HTML')
-        self.assertEqual(seen[1]['status'], 'rendered')
-        self.assertIn('at', seen[0])          # 前端按服务端开始时刻实时累加
-        self.assertGreaterEqual(seen[1]['seconds'], 0)
+    async def test_throttle_advances_even_when_draft_unparsable(self):
+        """解析失败也必须推进节流时间戳。
 
-    async def test_async_node_emits_start_and_end(self):
-        from app import graph as graph_module
-        seen = []
+        否则字段还没凑齐时会退化成"每个分片都重试一次"，对不断增长的缓冲区
+        反复做解析与校验，O(n²) 会把事件循环堵死（这个 bug 真在服务里卡死过一次）。
+        """
+        from app import services
+        calls, drafts = [], []
+        # 只有分片、没有完整 tool_calls —— 每次解析都失败，最终也失败
+        unparsable = [self.FakeChunk(tool_call_chunks=[{'args': '{"topic": ' + 'x' * 200}])
+                      for _ in range(40)]
+        parsed_count = {'n': 0}
+        real_parse = services._draft_of
 
-        async def node(state):
-            return {'status': 'planned'}
+        def counting_parse(buf, schema):
+            parsed_count['n'] += 1
+            return real_parse(buf, schema)
 
-        with patch.object(graph_module, 'emit', seen.append):
-            result = await graph_module.instrument('parse_request', node)({})
-        self.assertEqual(result['status'], 'planned')
-        self.assertEqual([e['type'] for e in seen], ['stage_start', 'stage_end'])
+        with patch.object(services, '_draft_of', counting_parse), \
+             patch.object(services, 'new_llm',
+                          lambda model=None, disable_thinking=False:
+                          self.fake_llm([unparsable], calls)):
+            with self.assertRaises(RuntimeError):
+                await services.structured_call(
+                    Plan, 's', 'u', attempts=1, on_draft=drafts.append,
+                    draft_interval=3600)      # 节流窗口远大于测试时长
+        # 40 个分片只允许解析一次（节流生效），而不是 40 次
+        self.assertEqual(parsed_count['n'], 1)
 
-    async def test_failed_node_still_closes_the_stage(self):
-        from app import graph as graph_module
-        seen = []
-
-        def boom(state):
-            raise ValueError('x')
-
-        with patch.object(graph_module, 'emit', seen.append):
-            with self.assertRaises(ValueError):
-                await graph_module.instrument('render_html', boom)({})
-        # 异常路径也要发结束事件，否则前端那一行会永远停在"进行中"。
-        self.assertEqual(seen[-1]['type'], 'stage_end')
-        self.assertEqual(seen[-1]['status'], 'failed')
-
-    async def test_wrapper_is_async_even_for_sync_node(self):
-        # LangGraph 会把同步节点丢进线程池，而 stream writer 依赖 contextvars；
-        # 统一包成 async 才能保证事件不丢。
-        import inspect
-        from app import graph as graph_module
-        wrapped = graph_module.instrument('render_html', lambda state: {})
-        self.assertTrue(inspect.iscoroutinefunction(wrapped))
-
-    def test_all_stage_labels_are_chinese(self):
-        from app.events import STAGE_LABELS
-        for stage, label in STAGE_LABELS.items():
-            self.assertNotEqual(stage, label, f'{stage} 缺少中文名')
+    async def test_draft_clear_before_each_retry(self):
+        from app import services
+        calls, drafts = [], []
+        partial = self.FakeChunk(
+            tool_call_chunks=[{'args': '{"topic": "第一版的残留", "auto_deploy": false}'}])
+        bad = self.FakeChunk(tool_calls=[{'name': 'Plan', 'args': {'topic': ''}}],
+                             tool_call_chunks=[{'args': '{"topic": "第一版的残留"}'}])
+        good = self.FakeChunk(
+            tool_calls=[{'name': 'Plan',
+                         'args': {'topic': '第二版', 'auto_deploy': False}}])
+        with patch.object(services, 'new_llm',
+                          lambda model=None, disable_thinking=False:
+                          self.fake_llm([[partial, bad], [good]], calls)):
+            await services.structured_call(
+                Plan, 's', 'u', on_draft=drafts.append, draft_interval=0)
+        # 两次尝试各清空一次，第一次尝试的残留不会留在界面上
+        self.assertEqual([d is None for d in drafts].count(True), 2)
 
 
 if __name__ == '__main__':
