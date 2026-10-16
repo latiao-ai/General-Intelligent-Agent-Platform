@@ -43,7 +43,7 @@ def urls_from_input(text: str) -> list[str]:
     return result[:settings.max_pages]
 
 
-def new_llm(model: str | None = None):
+def new_llm(model: str | None = None, disable_thinking: bool = False):
     options = dict(
         model=model or settings.llm_model,
         api_key=settings.llm_key,
@@ -53,6 +53,10 @@ def new_llm(model: str | None = None):
     )
     if settings.llm_base_url:
         options['base_url'] = settings.llm_base_url
+    if disable_thinking:
+        # 只有 'none' 与 thinking.disabled 能真正关掉推理；
+        # reasoning_effort 的 low / minimal 会被网关忽略（实测推理 token 不变）。
+        options['extra_body'] = {'thinking': {'type': 'disabled'}}
     return ChatOpenAI(**options)
 
 
@@ -72,7 +76,8 @@ def _combine_usage(usages: list):
 
 
 async def structured_call(
-    schema, system: str, user: str, model: str | None = None, attempts: int = 2
+    schema, system: str, user: str, model: str | None = None, attempts: int = 2,
+    disable_thinking: bool = False,
 ):
     """结构化调用，解析失败时重试。
 
@@ -82,7 +87,7 @@ async def structured_call(
     """
     usages = []
     for _ in range(max(1, attempts)):
-        llm = new_llm(model).with_structured_output(
+        llm = new_llm(model, disable_thinking=disable_thinking).with_structured_output(
             schema, method='function_calling', include_raw=True
         )
         response = await llm.ainvoke([

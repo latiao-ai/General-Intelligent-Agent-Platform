@@ -14,6 +14,10 @@ class Settings:
     # 整理报告阶段的模型。空值时沿用 LLM_MODEL。
     # 该阶段要读完整正文并产出结构化报告，往往是耗时大头，可单独换更快的模型。
     llm_compose_model: str = os.getenv('LLM_COMPOSE_MODEL', '') or os.getenv('LLM_MODEL', '')
+    # 解析阶段关闭模型推理。实测多轮场景 4.4s → 2.3s（约 2 倍），
+    # auto_deploy 判断准确率不变（5/5）。耗时几乎全在推理 token 上，与输入长度无关。
+    llm_parse_disable_thinking: bool = (
+        os.getenv('LLM_PARSE_DISABLE_THINKING', 'false').lower() == 'true')
     llm_base_url: str = os.getenv('LLM_BASE_URL', '')
     max_pages: int = min(5, max(1, int(os.getenv('MAX_PAGES', '5'))))
     max_queries: int = min(2, max(1, int(os.getenv('MAX_QUERIES', '2'))))

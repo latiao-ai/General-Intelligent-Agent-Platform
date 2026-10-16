@@ -699,12 +699,68 @@ class ModelOverrideTests(unittest.TestCase):
         self.assertTrue(settings.llm_compose_model)
 
 
+class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
+    """解析阶段关推理：实测约 2 倍提速，且不影响 auto_deploy 判断。"""
+
+    def test_disable_thinking_sets_thinking_disabled(self):
+        from app.services import new_llm
+        llm = new_llm('m', disable_thinking=True)
+        # langchain 把它放进 model_kwargs / extra_body，两者都检查
+        body = getattr(llm, 'extra_body', None) or llm.model_kwargs.get('extra_body')
+        self.assertEqual(body, {'thinking': {'type': 'disabled'}})
+
+    def test_default_keeps_thinking_enabled(self):
+        from app.services import new_llm
+        llm = new_llm('m')
+        body = getattr(llm, 'extra_body', None) or llm.model_kwargs.get('extra_body')
+        # 整理报告阶段依赖推理：默认不能带关闭参数，否则结构化输出会失败
+        self.assertIsNone(body)
+
+    async def test_parse_passes_the_flag(self):
+        from app.config import settings
+        from app import nodes
+        captured = {}
+
+        async def fake_call(schema, system, user, model=None, attempts=2,
+                            disable_thinking=False):
+            captured['disable_thinking'] = disable_thinking
+            return Plan.model_validate({'topic': 't', 'auto_deploy': False}), None
+
+        with patch.object(nodes, 'structured_call', fake_call), \
+             patch.object(nodes, 'urls_from_input', lambda text: []):
+            await nodes.parse_request({'user_input': 't', 'usage': []})
+        self.assertEqual(captured['disable_thinking'],
+                         settings.llm_parse_disable_thinking)
+
+    async def test_compose_never_disables_thinking(self):
+        from app import nodes
+        captured = {}
+
+        async def fake_call(schema, system, user, model=None, attempts=2,
+                            disable_thinking=False):
+            captured['disable_thinking'] = disable_thinking
+            return Report.model_validate({
+                'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
+                'sections': [{'heading': 'h', 'paragraphs': [
+                    {'text': 'x', 'source_ids': ['s1']}]}]}), None
+
+        state = {'documents': [{'source_id': 's1', 'title': 't', 'status': 'success',
+                                'url': 'https://e.com/', 'raw_content': '正文'}],
+                 'plan': {'mode': 'topic', 'topic': 't'}, 'usage': []}
+        with patch.object(nodes, 'structured_call', fake_call):
+            await nodes.compose_report(state)
+        # 关掉推理会让整理阶段产不出合法的 tool_call（实测 output token 有、
+        # 但既无 content 也无 tool_call），所以这里必须是 False
+        self.assertFalse(captured['disable_thinking'])
+
+
 class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
     async def test_compose_passes_compose_model_and_records_it(self):
         from app.config import settings
         captured = {}
 
-        async def fake_call(schema, system, user, model=None):
+        async def fake_call(schema, system, user, model=None, attempts=2,
+                            disable_thinking=False):
             captured['model'] = model
             return Report.model_validate({
                 'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
@@ -727,7 +783,8 @@ class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
         """两个阶段的 usage 都要记模型名，才能从运行记录核查各步用的哪个模型。"""
         from app.config import settings
 
-        async def fake_call(schema, system, user, model=None):
+        async def fake_call(schema, system, user, model=None, attempts=2,
+                            disable_thinking=False):
             return Plan.model_validate({'topic': 't', 'auto_deploy': False}), None
 
         with patch.object(nodes, 'structured_call', fake_call), \
@@ -739,7 +796,8 @@ class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
         # 解析阶段不受影响，仍用主模型。
         captured = {}
 
-        async def fake_call(schema, system, user, model=None):
+        async def fake_call(schema, system, user, model=None, attempts=2,
+                            disable_thinking=False):
             captured['model'] = model
             return Plan.model_validate({'topic': 't', 'auto_deploy': False}), None
 
@@ -776,7 +834,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         from app import services
         calls = []
         with patch.object(services, 'new_llm',
-                          lambda model=None: self.fake_llm([self.bad(), self.good()], calls)):
+                          lambda model=None, disable_thinking=False: self.fake_llm([self.bad(), self.good()], calls)):
             parsed, _ = await services.structured_call(object(), 's', 'u')
         self.assertEqual(parsed, 'GOOD')
         self.assertEqual(len(calls), 2)
@@ -785,7 +843,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         from app import services
         calls = []
         with patch.object(services, 'new_llm',
-                          lambda model=None: self.fake_llm([self.bad()], calls)):
+                          lambda model=None, disable_thinking=False: self.fake_llm([self.bad()], calls)):
             with self.assertRaises(RuntimeError):
                 await services.structured_call(object(), 's', 'u')
         self.assertEqual(len(calls), 2)
@@ -794,7 +852,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         from app import services
         calls = []
         with patch.object(services, 'new_llm',
-                          lambda model=None: self.fake_llm([self.bad(5), self.good(7)], calls)):
+                          lambda model=None, disable_thinking=False: self.fake_llm([self.bad(5), self.good(7)], calls)):
             _, usage = await services.structured_call(object(), 's', 'u')
         # 失败的尝试同样消耗 token，必须计入成本统计。
         self.assertEqual(usage['total_tokens'], 12)
@@ -803,7 +861,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         from app import services
         calls = []
         with patch.object(services, 'new_llm',
-                          lambda model=None: self.fake_llm([self.good(9)], calls)):
+                          lambda model=None, disable_thinking=False: self.fake_llm([self.good(9)], calls)):
             _, usage = await services.structured_call(object(), 's', 'u', attempts=1)
         self.assertEqual(usage, {'total_tokens': 9})
 

@@ -53,6 +53,7 @@ async def parse_request(state):
         '或索取可访问的网址链接时设为 true；只要求生成报告时为 false；'
         '若"部署"只是报告的研究内容（如"数据库的部署方式"），必须为 false。',
         payload,
+        disable_thinking=settings.llm_parse_disable_thinking,
     )
     data = plan.model_dump()
     data['mode'] = 'urls' if urls else 'topic'

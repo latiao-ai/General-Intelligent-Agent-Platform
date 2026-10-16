@@ -36,6 +36,7 @@ python --version             # Python 3.12.15
 | `TAVILY_API_KEY` | Tavily 搜索/提取密钥 |
 | `LLM_API_KEY` / `LLM_MODEL` / `LLM_BASE_URL` | 模型配置，需支持 tool calling |
 | `LLM_COMPOSE_MODEL` | 整理报告阶段单独用更快模型；留空沿用 `LLM_MODEL` |
+| `LLM_PARSE_DISABLE_THINKING` | 解析阶段关闭模型推理，实测约 2 倍提速（见下） |
 | `DEPLOY_ENABLED` | 部署总开关；`false` 时只生成本地 HTML |
 | `MCP_URL` / `MCP_BEARER_TOKEN` | 远端 MCP 部署服务地址与鉴权 |
 | `MCP_TOOL_NAME` | 部署工具名（当前远端为 `deploy_site`） |
@@ -318,6 +319,38 @@ python -m scripts.list_mcp_tools
 
 > 结构化输出偶发失败（快模型产出不符合 schema 的结构）会自动重试一次，
 > 失败尝试的 token 同样计入 `state.json` 的 usage。
+
+### 解析阶段为什么能关推理，整理阶段为什么不能
+
+实测结果（`deepseek-v4-1-flash`）：
+
+| 阶段 | 开推理 | 关推理 | 结论 |
+|---|---|---|---|
+| 解析需求 | 4.4s（多轮场景） | **2.3s** | ✅ 关掉，准确率不变（auto_deploy 判断 5/5） |
+| 整理报告 | 62s，结构化输出正常 | **失败** | ❌ 必须保留推理 |
+
+整理阶段关掉推理后，模型会生成 6000+ 个 output token，**但既没有 `tool_call` 也没有
+`content`**——无法产出合法的结构化报告，整条流程会失败。
+
+**耗时几乎全在推理 token 的生成上，与输入长度无关。** 实测把多轮历史从 536 字符砍到
+203 字符，耗时几乎没变；关掉推理则稳定减半。所以不要花力气去压缩提示词。
+
+可用参数也有讲究：
+
+| 参数 | 实际效果 |
+|---|---|
+| `extra_body={'thinking': {'type': 'disabled'}}` | ✅ 真正关闭（推理 token = 0） |
+| `reasoning_effort='none'` | ✅ 真正关闭 |
+| `reasoning_effort='low'` / `'minimal'` | ❌ **被网关忽略**（推理 token 不变） |
+
+### 但真正的瓶颈是网关抖动
+
+同一个请求、同样的 payload，实测出现过 **4.36s 和 104.96s** 两种结果。这不是提示词或
+参数能解决的——是网关侧的排队/卡顿。所以：
+
+- 解析阶段的 2 倍提速是**稳定收益**，但绝对值只省 2 秒左右
+- 总耗时（85%~90% 在整理报告）**不受解析优化影响**
+- 遇到离奇的慢，先怀疑网关，不要先去改提示词
 
 ### 网络提示
 
