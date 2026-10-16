@@ -74,6 +74,7 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px}
 
   <div class="card" id="stagesCard">
     <div class="hint">阶段耗时<span id="total">（尚未开始）</span></div>
+    <div class="hint" id="latency"></div>
     <table>
       <thead><tr><th style="width:38%">阶段</th><th style="width:22%">耗时(秒)</th><th>状态</th></tr></thead>
       <tbody id="stages"></tbody>
@@ -90,9 +91,8 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px}
 </div></div>
 
 <script>
-const S = { sessionId: localStorage.getItem('sessionId') || null,
-            taskId: null, artifactId: null, es: null, running: false, status: null,
-            stages: [], stageSeq: 0, skew: 0 };
+const S = { sessionId: null, taskId: null, artifactId: null, es: null,
+            running: false, status: null, stages: [], stageSeq: 0, skew: 0 };
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
@@ -152,19 +152,50 @@ function onStageEnd(ev) {
 }
 
 function updateTotal() {
-  const total = S.stages.reduce((sum, st) => sum + elapsedOf(st), 0);
+  // 只累加真实阶段；"收到指令→开始搜索"跨越了解析需求，算进去会重复计数。
+  const total = S.stages
+    .filter(st => st.stage !== 'instruction')
+    .reduce((sum, st) => sum + elapsedOf(st), 0);
   $('total').textContent = S.stages.length
     ? `（合计 ${total.toFixed(2)} 秒）` : '（尚未开始）';
 }
 
+// 「收到指令 → 开始搜索」单独放在表头那行：它跨越了解析需求，
+// 混在阶段表里会让人以为是一个独立的、需要相加的阶段。
+function renderLatency() {
+  const st = S.stages.find(item => item.stage === 'instruction');
+  $('latency').textContent = st
+    ? `从发出指令到开始搜索：${elapsedOf(st).toFixed(2)} 秒`
+      + (st.done ? '' : '（进行中…）')
+    : '';
+}
+
 function renderStages() {
-  $('stages').innerHTML = S.stages.map(st => `
+  const rows = S.stages.filter(st => st.stage !== 'instruction');
+  $('stages').innerHTML = rows.map(st => `
     <tr data-id="${st.id}">
       <td>${esc(st.label)}</td>
       <td class="sec">${elapsedOf(st).toFixed(2)}</td>
       <td>${st.done ? esc(st.status) : '<b>进行中…</b>'}</td>
     </tr>`).join('');
   updateTotal();
+  renderLatency();
+}
+
+// 兜底：任务进入终态时关掉所有还开着的阶段行。后端取消时也会补发 stage_end，
+// 这里再兜一层，避免那一行永远停在"进行中"、耗时一路涨下去。
+function closeOpenStages(status) {
+  const label = status === 'cancelled' ? '已中断'
+              : status === 'failed' ? '已失败' : '已结束';
+  let changed = false;
+  for (const st of S.stages) {
+    if (st.done) continue;
+    st.done = true;
+    st.seconds = elapsedOf(st);
+    st.status = label;
+    changed = true;
+  }
+  if (changed) renderStages();
 }
 
 // 只刷"进行中"那一格，100ms 一次 —— 这就是实时增长的部分。
@@ -173,10 +204,11 @@ setInterval(() => {
   for (const st of S.stages) {
     if (st.done) continue;
     ticking = true;
+    if (st.stage === 'instruction') continue;   // 渲染在表头那行
     const cell = document.querySelector(`#stages tr[data-id="${st.id}"] .sec`);
     if (cell) cell.textContent = elapsedOf(st).toFixed(2);
   }
-  if (ticking) updateTotal();
+  if (ticking) { updateTotal(); renderLatency(); }
 }, 100);
 
 function resetProcess() {
@@ -230,7 +262,6 @@ async function send() {
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     S.sessionId = data.session_id;
-    localStorage.setItem('sessionId', S.sessionId);
     S.taskId = data.task_id;
     S.status = null;
     openStream(S.taskId);
@@ -268,6 +299,7 @@ async function finish(status) {
   S.status = status;
   setRunning(false);
   if (S.es) { S.es.close(); S.es = null; }
+  closeOpenStages(status);
   if (!S.taskId) return;
   try {
     const res = await fetch(`/api/tasks/${S.taskId}`);
@@ -335,26 +367,21 @@ async function stop() {
 
 $('send').onclick = send;
 $('stop').onclick = stop;
-$('newSession').onclick = () => {
-  localStorage.removeItem('sessionId');
-  location.reload();
+// 不做任何持久化恢复：每次打开页面都是干净的新会话。
+// （会话与任务在服务端 SQLite 里仍然保留，需要时可经 API 查询。）
+$('newSession').onclick = async () => {
+  if (S.running) await interrupt();
+  $('messages').innerHTML = '';
+  $('result').innerHTML = '';
+  resetProcess();
+  setRunning(false);
+  S.sessionId = null;
+  S.taskId = null;
+  S.status = null;
 };
 $('msg').addEventListener('keydown', e => {
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
 });
-
-// 刷新页面后恢复本会话的历史对话（会话存在服务端 SQLite，不依赖浏览器缓存）
-async function restoreSession() {
-  if (!S.sessionId) return;
-  try {
-    const res = await fetch(`/api/sessions/${S.sessionId}/messages`);
-    if (!res.ok) return;
-    const data = await res.json();
-    (data.messages || []).forEach(m => addMessage(m.role, m.content));
-  } catch { /* 拉不到历史不影响开新对话 */ }
-}
-
-restoreSession();
 </script>
 </body>
 </html>

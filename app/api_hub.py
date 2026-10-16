@@ -46,6 +46,7 @@ class TaskRecord:
     state: dict | None = None
     started_at: float = field(default_factory=time.time)
     latency: float | None = None        # 收到指令 → 开始搜索 的耗时
+    open_stage: dict | None = None      # 当前未关闭的阶段 {'stage','at'}
     _subscribers: set = field(default_factory=set)
     _task: asyncio.Task | None = None
 
@@ -116,7 +117,9 @@ class Hub:
         self.tasks[record.task_id] = record
         # 先占位一条"收到指令"的开始事件，让它排在阶段表第一行；
         # 真正进入检索阶段时再补齐耗时。
-        record.publish(stage_start(INSTRUCTION_STAGE))
+        event = stage_start(INSTRUCTION_STAGE)
+        record.open_stage = {'stage': INSTRUCTION_STAGE, 'at': event['at']}
+        record.publish(event)
         record._task = asyncio.create_task(self._run(record, history))
         return record
 
@@ -128,14 +131,42 @@ class Hub:
 
         def close_instruction(status: str) -> None:
             """补齐"收到指令"的耗时。只补一次；中断/失败也要补，否则那一行会一直停在"进行中"。"""
-            if record.latency is None:
-                record.latency = time.time() - record.started_at
-                record.publish(stage_end(INSTRUCTION_STAGE, record.latency, status))
+            if record.latency is not None:
+                return
+            record.latency = time.time() - record.started_at
+            if record.open_stage and record.open_stage['stage'] == INSTRUCTION_STAGE:
+                # 必须清掉，否则 close_open_stage 会把它再关一次
+                record.open_stage = None
+            record.publish(stage_end(INSTRUCTION_STAGE, record.latency, status))
+
+        def track(event: dict) -> None:
+            kind = event.get('type')
+            if kind == 'stage_start':
+                record.open_stage = {'stage': event.get('stage'),
+                                     'at': event.get('at', time.time())}
+            elif kind == 'stage_end' and record.open_stage \
+                    and record.open_stage['stage'] == event.get('stage'):
+                record.open_stage = None
+
+        def close_open_stage(status: str) -> None:
+            """兜底关闭仍未结束的阶段。
+
+            任务被取消时，节点自己发的 stage_end 会丢：它写进 LangGraph 的流队列，
+            而 run_task 的消费循环此刻已经被取消，没人来取。因此必须由中枢直接补发，
+            否则前端那一行会永远停在"进行中"、耗时一路涨下去。
+            """
+            opened = record.open_stage
+            if not opened:
+                return
+            record.open_stage = None
+            record.publish(stage_end(opened['stage'],
+                                     time.time() - opened['at'], status))
 
         def relay(event: dict) -> None:
             if (event.get('type') == 'stage_start'
                     and event.get('stage') == 'discover_sources'):
                 close_instruction('解析完成')
+            track(event)
             record.publish(event)
 
         try:
@@ -145,6 +176,7 @@ class Hub:
             )
         except asyncio.CancelledError:
             close_instruction('已中断')
+            close_open_stage('已中断')
             detail = cancel_note(record.artifact_id)
             record.persist(status='cancelled')
             # 给会话补一条助手回复：否则下一轮上下文里会出现两条连续的用户消息，
@@ -154,12 +186,14 @@ class Hub:
             raise
         except Exception as exc:
             close_instruction('已失败')
+            close_open_stage('已失败')
             record.error = f'{type(exc).__name__}: {exc}'
             record.persist(status='failed', error=record.error)
             record.publish({'type': 'status', 'status': 'failed',
                             'detail': record.error})
         else:
             close_instruction('解析完成')
+            close_open_stage('已结束')
             record.state = state
             status = state.get('status', 'failed')
             reply = reply_text(state)

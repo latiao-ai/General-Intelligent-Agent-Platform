@@ -334,7 +334,8 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake(text, progress=None, on_event=None, history=None, on_start=None):
             on_event({'type': 'stage_start', 'stage': 'parse_request'})
-            on_event({'type': 'stage_end', 'stage': 'parse_request', 'seconds': 1.0})
+            on_event({'type': 'stage_end', 'stage': 'parse_request',
+                      'seconds': 1.0, 'status': 'planned'})
             # 这一条到达时，"收到指令"应当被补齐
             on_event({'type': 'stage_start', 'stage': 'discover_sources'})
             return {'task_id': 'a1', 'status': 'local_ready',
@@ -404,6 +405,75 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         contents = [m['content'] for m in captured['history']]
         self.assertEqual(contents[0], '第一轮要求')
         self.assertIn('（上一轮被用户中断）', contents)
+
+    async def test_cancel_closes_in_flight_stage(self):
+        """取消时必须兜底关闭未完成的阶段。
+
+        节点自己发的 stage_end 会丢：它写进 LangGraph 的流队列，而 run_task 的
+        消费循环此刻已被取消，没人来取。所以中枢必须直接补发，否则前端那一行
+        会永远停在"进行中"、耗时一路涨。
+        """
+        import app.api_hub as hub_module
+        hub = self.hub()
+
+        async def fake(text, progress=None, on_event=None, history=None, on_start=None):
+            on_event({'type': 'stage_start', 'stage': 'parse_request'})
+            on_event({'type': 'stage_end', 'stage': 'parse_request',
+                      'seconds': 1.0, 'status': 'planned'})
+            on_event({'type': 'stage_start', 'stage': 'discover_sources'})
+            on_event({'type': 'stage_start', 'stage': 'compose_report'})
+            await asyncio.sleep(30)          # 卡在整理报告
+            return {}
+
+        with patch.object(hub_module, 'run_task', fake):
+            record = hub.start('慢任务')
+            await asyncio.sleep(0.3)
+            hub.cancel(record.task_id)
+            with self.assertRaises(asyncio.CancelledError):
+                await record._task
+
+        ends = {e['stage']: e['status'] for e in self.events_of(record)
+                if e['type'] == 'stage_end'}
+        self.assertEqual(ends.get('compose_report'), '已中断')
+        self.assertIsNone(record.open_stage)
+
+    async def test_cancel_before_search_closes_instruction(self):
+        """在检索之前就被打断：合成阶段也要补上结束事件。"""
+        import app.api_hub as hub_module
+        hub = self.hub()
+
+        async def fake(text, progress=None, on_event=None, history=None, on_start=None):
+            on_event({'type': 'stage_start', 'stage': 'parse_request'})
+            await asyncio.sleep(30)
+            return {}
+
+        with patch.object(hub_module, 'run_task', fake):
+            record = hub.start('慢任务')
+            await asyncio.sleep(0.3)
+            hub.cancel(record.task_id)
+            with self.assertRaises(asyncio.CancelledError):
+                await record._task
+
+        ends = {e['stage']: e['status'] for e in self.events_of(record)
+                if e['type'] == 'stage_end'}
+        self.assertEqual(ends.get('instruction'), '已中断')
+        self.assertEqual(ends.get('parse_request'), '已中断')
+
+    async def test_failed_task_closes_in_flight_stage(self):
+        import app.api_hub as hub_module
+        hub = self.hub()
+
+        async def fake(text, progress=None, on_event=None, history=None, on_start=None):
+            on_event({'type': 'stage_start', 'stage': 'compose_report'})
+            raise RuntimeError('boom')
+
+        with patch.object(hub_module, 'run_task', fake):
+            record = hub.start('坏任务')
+            await asyncio.wait_for(record._task, timeout=10)
+        ends = {e['stage']: e['status'] for e in self.events_of(record)
+                if e['type'] == 'stage_end'}
+        self.assertEqual(ends.get('compose_report'), '已失败')
+        self.assertEqual(ends.get('instruction'), '已失败')
 
     async def test_cancel_done_task_is_noop(self):
         import app.api_hub as hub_module
