@@ -16,6 +16,9 @@ class Plan(BaseModel):
     # 是否需要联网检索。同样故意设为必填——带默认值会被模型省略、静默兜成 False，
     # 变成"该搜的没搜"。歧义时要求模型填 True（倾向检索）。
     need_research: bool
+    # 本轮用户透露的个人信息（姓名/电话/职业/偏好等），没有就留空。
+    # 这里允许默认值：'没有信息'是常态，不像 need_research 那样默认值会掩盖必要决策。
+    profile_updates: dict[str, str] = Field(default_factory=dict)
 
 class Paragraph(BaseModel):
     text: str = Field(min_length=1)

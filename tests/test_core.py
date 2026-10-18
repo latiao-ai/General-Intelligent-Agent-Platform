@@ -819,6 +819,109 @@ class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(captured['model'])
 
 
+class ProfileTests(unittest.TestCase):
+    """用户画像：Markdown 文件 + 原子写 + 版本守卫。"""
+
+    def setUp(self):
+        from app.config import settings
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig = settings.profile_path
+        # settings 是 frozen dataclass，用 object.__setattr__ 绕过冻结
+        object.__setattr__(settings, 'profile_path',
+                           Path(self._tmp.name) / 'USER.md')
+
+    def tearDown(self):
+        from app.config import settings
+        object.__setattr__(settings, 'profile_path', self._orig)
+        self._tmp.cleanup()
+
+    def test_merge_and_reload_roundtrip(self):
+        from app import profile
+        profile.merge({'姓名': '张三', '电话': '13800001111'})
+        self.assertEqual(profile.load()['姓名'], '张三')
+        self.assertEqual(profile.load()['电话'], '13800001111')
+        # 再次合并是增量，不丢旧字段
+        profile.merge({'职业': '后端工程师'})
+        self.assertEqual(len(profile.load()), 3)
+        # 文件确实落在磁盘上，且是人可读的 Markdown
+        text = Path(profile_file()).read_text(encoding='utf-8')
+        self.assertIn('# User Profile', text)
+        self.assertIn('姓名：张三', text)
+
+    def test_version_increments(self):
+        from app import profile
+        self.assertEqual(profile.version(), 0)
+        profile.merge({'a': 'b'})
+        self.assertEqual(profile.version(), 1)
+        profile.merge({'c': 'd'})
+        self.assertEqual(profile.version(), 2)
+
+    def test_block_and_with_profile(self):
+        from app import profile
+        profile.merge({'偏好': '简洁'})
+        self.assertIn('[用户画像]', profile.block())
+        self.assertIn('偏好：简洁', profile.block())
+        out = profile.with_profile('指令ABC')
+        self.assertTrue(out.startswith('指令ABC'))
+        self.assertIn('[用户画像]', out)
+        # 空画像时原样返回
+        profile.clear()
+        self.assertEqual(profile.with_profile('指令ABC'), '指令ABC')
+
+    def test_clear(self):
+        from app import profile
+        profile.merge({'x': 'y'})
+        profile.clear()
+        self.assertEqual(profile.load(), {})
+        self.assertEqual(profile.version(), 0)
+
+    def test_backup_kept_on_save(self):
+        from app import profile
+        from app.config import settings
+        profile.merge({'旧': '值'})
+        profile.merge({'新': '值'})
+        bak = settings.profile_path.parent / 'USER.md.bak'
+        self.assertTrue(bak.exists())
+        self.assertIn('旧：值', bak.read_text(encoding='utf-8'))
+
+
+def profile_file():
+    from app.config import settings
+    return str(settings.profile_path)
+
+
+class ProfileNodeTests(unittest.IsolatedAsyncioTestCase):
+    """parse_request 记住用户信息并发出提示。"""
+
+    async def test_parse_merges_profile_updates(self):
+        from app import nodes, profile
+        from app.config import settings
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as folder:
+            original = settings.profile_path
+            object.__setattr__(settings, 'profile_path',
+                               Path(folder) / 'USER.md')
+            try:
+                async def fake_call(schema, system, user, model=None, attempts=2,
+                                    disable_thinking=False, on_draft=None,
+                                    draft_interval=1.0):
+                    return Plan.model_validate({
+                        'topic': 't', 'auto_deploy': False,
+                        'need_research': True,
+                        'profile_updates': {'电话': '13900000000'}}), None
+                seen = []
+                with patch.object(nodes, 'structured_call', fake_call), \
+                     patch.object(nodes, 'urls_from_input', lambda text: []), \
+                     patch.object(nodes, 'emit', seen.append):
+                    await nodes.parse_request({'user_input': '我叫张三，电话13900000000',
+                                               'usage': []})
+                self.assertEqual(profile.load().get('电话'), '13900000000')
+                labels = [e.get('label') for e in seen]
+                self.assertIn('已记住', labels)
+            finally:
+                object.__setattr__(settings, 'profile_path', original)
+
+
 class RoutingTests(unittest.IsolatedAsyncioTestCase):
     """按 need_research 分流：不需要联网时直接回答，不搜索、不生成报告。"""
 

@@ -3,6 +3,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from app.config import settings
+from app import profile
 from app.schemas import Plan, Report
 from app.services import (
     structured_call, chat_reply, urls_from_input, clean_public_url,
@@ -43,8 +44,7 @@ async def parse_request(state):
             {'对话历史': history[-8:], '本轮要求': state['user_input']},
             ensure_ascii=False,
         )
-    plan, usage = await structured_call(
-        Plan,
+    system = (
         '你是研究任务规划器。只输出结构化需求；最多两个搜索查询。'
         '用户未提供 URL 时不要编造 URL。默认生成中文报告。'
         '若提供了对话历史，本轮要求可能是对上一轮的补充或修正，'
@@ -58,11 +58,23 @@ async def parse_request(state):
         '不需要——寒暄确认（"你好""在吗""谢谢"）、一般性知识问答'
         '（如"什么是 ACID"）、对上一轮产物的追问或修改；'
         '**拿不准时一律设为 true**，只有明显不需要联网才设为 false；'
-        '用户明确说"直接回答/不用搜"时设为 false，明确说"上网查/搜一下"时设为 true。',
+        '用户明确说"直接回答/不用搜"时设为 false，明确说"上网查/搜一下"时设为 true。'
+        'profile_updates：若用户透露了需要记住的个人信息'
+        '（姓名、电话、邮箱、职业、偏好、习惯等），以键值对填进去，键用中文'
+        '（如"电话"）；没有就留空 {}。只记用户明确说出的，不要推断、不要编造，'
+        '不要把对话中的例子当成用户自己的信息。'
+    )
+    plan, usage = await structured_call(
+        Plan,
+        profile.with_profile(system),
         payload,
         disable_thinking=settings.llm_parse_disable_thinking,
     )
     data = plan.model_dump()
+    updates = data.get('profile_updates') or {}
+    if updates:
+        profile.merge(updates)
+        emit(action('已记住', profile.describe(updates), '🧠'))
     data['mode'] = 'urls' if urls else 'topic'
     data['urls'] = urls
     data['queries'] = [q.strip() for q in data['queries'] if q.strip()][:settings.max_queries]
@@ -96,7 +108,7 @@ async def answer_directly(state):
     history = (state.get('history') or [])[-8:]
     messages = [{'role': m['role'], 'content': m['content']} for m in history]
     messages.append({'role': 'user', 'content': state['user_input']})
-    answer = await chat_reply(ANSWER_SYSTEM, messages,
+    answer = await chat_reply(profile.with_profile(ANSWER_SYSTEM), messages,
                               on_delta=lambda text: emit(answer_delta(text)))
     return {'answer': answer, 'status': 'answered'}
 
@@ -243,7 +255,8 @@ async def compose_report(state):
         '每一行的 cells 必须与 columns 一一对应、数量完全相同（第一个 cell 是维度名，之后是各列的值）。'
         '若无法保证每行 cells 与 columns 数量一致，就返回空 columns 和 rows。'
         '资料不足时明确写入 limitations；不得把抓取时间当发布日期；冲突资料保留差异。',
-        json.dumps({'需求': state['plan'], '资料': selected}, ensure_ascii=False),
+        json.dumps({'需求': state['plan'], '资料': selected,
+                    '用户画像': profile.load()}, ensure_ascii=False),
         model=settings.llm_compose_model,
         on_draft=on_draft,
     )

@@ -26,6 +26,8 @@ class Settings:
     artifact_dir: Path = PROJECT_ROOT / os.getenv('ARTIFACT_DIR', 'artifacts')
     # SQLite 持久化路径：会话、任务与事件日志。改这里也要同步 .gitignore。
     db_path: Path = PROJECT_ROOT / os.getenv('DB_PATH', 'agent.db')
+    # 用户画像文件（Markdown，人可读可改）。含电话等敏感信息，已在 .gitignore 排除。
+    profile_path: Path = PROJECT_ROOT / os.getenv('PROFILE_PATH', 'profile/USER.md')
     deploy_enabled: bool = os.getenv('DEPLOY_ENABLED', 'false').lower() == 'true'
 
 settings = Settings()
