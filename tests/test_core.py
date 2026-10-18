@@ -561,6 +561,23 @@ class ApiTests(unittest.TestCase):
         self.assertIn('"type": "end"', body)
         self.assertIn('data: ', body)
 
+    def test_keepalive_is_a_real_event_not_a_comment(self):
+        """心跳必须是 data 事件。
+
+        SSE 注释（": keepalive"）不会触发浏览器 onmessage，前端就无从判断连接
+        是否还活着：后端一被杀，那一行会永远"进行中"、耗时一直涨。
+        """
+        import inspect
+        import app.api as api_module
+
+        source = inspect.getsource(api_module.task_events)
+        self.assertIn("sse({'type': 'ping'})", source)
+        self.assertNotIn("': keepalive", source)
+        # ping 必须走标准 SSE 帧，浏览器 onmessage 才收得到。
+        frame = api_module.sse({'type': 'ping'})
+        self.assertTrue(frame.startswith('data: '))
+        self.assertTrue(frame.endswith('\n\n'))
+
     def test_session_messages_endpoint(self):
         import app.api_hub as hub_module
 

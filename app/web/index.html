@@ -128,7 +128,7 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
 <script>
 const S = { sessionId: null, taskId: null, artifactId: null, es: null,
             running: false, status: null, stages: [], stageSeq: 0, skew: 0,
-            turn: 0, streamBubble: null, sessions: [] };
+            turn: 0, streamBubble: null, sessions: [], lastEventAt: 0 };
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
@@ -284,6 +284,8 @@ function currentTurnEl() {
 }
 
 function startNewTurn() {
+  // 上一条还没收尾的阶段先关掉，否则它们的计时会一直涨下去。
+  closeOpenStages('已中断');
   S.turn += 1;
   S.streamBubble = null;
   $('result').innerHTML = '';
@@ -363,6 +365,7 @@ function updateTotal() {
 
 function closeOpenStages(status) {
   const label = status === 'cancelled' ? '已中断'
+              : status === 'interrupted' ? '连接已断开'
               : status === 'failed' ? '已失败' : '已结束';
   let changed = false;
   for (const st of S.stages) {
@@ -384,6 +387,11 @@ setInterval(() => {
     if (row) row.querySelector('.stage-sec').innerHTML = `<b>${elapsedOf(st).toFixed(2)}s</b>`;
   }
   if (ticking) updateTotal();
+  // 连接看门狗：服务端每 15s 发一次心跳（ping 事件）。超过 45s 一个事件都没收到，
+  // 说明后端已经不可达（进程被杀 / 连接断了）——立刻收尾，别让那一行永远"进行中"。
+  if (S.running && S.lastEventAt && Date.now() - S.lastEventAt > 45000) {
+    finish('interrupted');
+  }
 }, 100);
 
 function clearAll() {
@@ -395,6 +403,7 @@ function clearAll() {
   S.turn = 0;
   S.stageSeq = 0;
   S.skew = 0;
+  S.lastEventAt = 0;
   S.streamBubble = null;
 }
 
@@ -417,6 +426,8 @@ async function interrupt() {
   }
   if (S.es === stream) { S.es.close(); S.es = null; }
   S.running = false;
+  // 被中断的那一轮也要停表，否则旧轮那行会一直在跳。
+  closeOpenStages('已中断');
 }
 
 async function send() {
@@ -452,8 +463,11 @@ function openStream(taskId) {
   if (S.es) S.es.close();
   const es = new EventSource(`/api/tasks/${taskId}/events`);
   S.es = es;
+  S.lastEventAt = Date.now();
   es.onmessage = e => {
+    S.lastEventAt = Date.now();
     let ev; try { ev = JSON.parse(e.data); } catch { return; }
+    if (ev.type === 'ping') return;          // 心跳，只用来刷新 lastEventAt
     if (ev.type === 'task') { S.artifactId = ev.artifact_id; return; }
     if (ev.type === 'draft') { onDraft(ev); return; }
     if (ev.type === 'answer_delta') { onAnswerDelta(ev); return; }
@@ -548,9 +562,18 @@ function showDeployed(url, siteId) {
 
 async function stop() {
   if (!S.taskId || !S.running) return;
+  // 先停表：等后端确认的话，一个卡住的长任务会让那一行一直涨下去。
+  closeOpenStages('已中断');
   $('stop').disabled = true;
-  try { await fetch(`/api/tasks/${S.taskId}/cancel`, {method: 'POST'}); }
+  try {
+    await fetch(`/api/tasks/${S.taskId}/cancel`, {method: 'POST'});
+  } catch { /* 后端不可达也要让界面恢复 */ }
   finally { $('stop').disabled = false; }
+  // 后端迟迟不给结论（长任务卡住，或连接已断）时本地收尾，保证按钮能继续用。
+  const token = S.taskId;
+  setTimeout(() => {
+    if (S.running && S.taskId === token) finish('cancelled');
+  }, 3000);
 }
 
 $('send').onclick = send;

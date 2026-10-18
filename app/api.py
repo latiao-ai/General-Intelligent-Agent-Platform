@@ -90,7 +90,10 @@ async def task_events(task_id: str):
                     item = await asyncio.wait_for(queue.get(),
                                                   timeout=KEEPALIVE_SECONDS)
                 except asyncio.TimeoutError:
-                    yield ': keepalive\n\n'
+                    # 用真实事件而不是 SSE 注释（": keepalive"）做心跳：
+                    # 注释不会触发浏览器的 onmessage，前端就没法判断连接是否还活着，
+                    # 后端一死那一行就会永远停在"进行中"、耗时一路涨。
+                    yield sse({'type': 'ping'})
                     continue
                 if item is CLOSE:
                     yield sse({'type': 'end', 'status': record.status})
