@@ -25,7 +25,7 @@ from app.messages import cancel_note, reply_text
 from app.store import Store
 
 TERMINAL_STATUS = {'deployed', 'deploy_needs_check', 'local_ready', 'failed',
-                   'cancelled', 'interrupted'}
+                   'cancelled', 'interrupted', 'answered'}
 
 # 合成阶段：衡量"用户发出指令"到"真正开始搜索"之间的空档。
 INSTRUCTION_STAGE = 'instruction'
@@ -62,11 +62,11 @@ class TaskRecord:
     def publish(self, event: dict) -> None:
         """先落库再投递：库里是权威记录，内存只保证实时性。
 
-        例外是 draft（半成品报告）：它体积大（每份都是整份报告的快照）、
-        过程性强，落库会让 events 表膨胀几百 KB，因此只做实时投递。
-        序号传 None，SSE 端的去重逻辑会跳过它。
+        例外是 draft（半成品报告，每份是整份快照）与 answer_delta（增量文本，
+        一次可能上千片）：它们体积大或条数多，落库会让 events 表膨胀，
+        因此只做实时投递。序号传 None，SSE 端的去重逻辑会跳过它们。
         """
-        if event.get('type') == 'draft':
+        if event.get('type') in ('draft', 'answer_delta'):
             for queue in list(self._subscribers):
                 queue.put_nowait((None, event))
             return

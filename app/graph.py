@@ -10,7 +10,7 @@ from app import nodes
 NODE_NAMES = [
     'parse_request', 'discover_sources', 'fetch_pages',
     'compose_report', 'render_html', 'validate_artifact',
-    'deploy_report', 'finish_failed',
+    'deploy_report', 'finish_failed', 'answer_directly',
 ]
 
 
@@ -50,7 +50,12 @@ def build_graph():
     for name in NODE_NAMES:
         graph.add_node(name, instrument(name, getattr(nodes, name)))
     graph.add_edge(START, 'parse_request')
-    graph.add_edge('parse_request', 'discover_sources')
+    # 解析后分流：需要联网 → 研究链路；不需要 → 直接回答（省掉搜索与报告生成）
+    graph.add_conditional_edges('parse_request', nodes.route_intent, {
+        'discover_sources': 'discover_sources',
+        'answer_directly': 'answer_directly',
+    })
+    graph.add_edge('answer_directly', END)
     graph.add_edge('discover_sources', 'fetch_pages')
     graph.add_conditional_edges('fetch_pages', nodes.assess_coverage, {
         'discover_sources': 'discover_sources',

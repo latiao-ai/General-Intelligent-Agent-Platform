@@ -13,6 +13,9 @@ def reply_text(state: dict) -> str:
     deployment = state.get('deployment') or {}
     if deployment.get('public_url'):
         return f'报告已生成并部署完成，访问地址：{deployment["public_url"]}'
+    if status == 'answered':
+        # 直接回答：answer 本身就是给用户看的完整回执，不再包装
+        return state.get('answer') or '（模型没有返回内容）'
     if status == 'local_ready':
         return ('报告已生成，保存在本地。需要发布可以点「部署到服务器」，'
                 f'或直接说"部署到服务器"。任务 ID：{state.get("task_id")}')

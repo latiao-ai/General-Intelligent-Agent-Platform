@@ -5,12 +5,12 @@ from pathlib import Path
 from app.config import settings
 from app.schemas import Plan, Report
 from app.services import (
-    structured_call, urls_from_input, clean_public_url,
+    structured_call, chat_reply, urls_from_input, clean_public_url,
     search_query, extract_urls,
 )
 from app.rendering import render_report, save_json
 from app.mcp_adapter import deploy_html
-from app.events import action, draft, emit, outcome, thought
+from app.events import action, answer_delta, draft, emit, outcome, thought
 
 
 def error_entry(stage, exc):
@@ -51,7 +51,14 @@ async def parse_request(state):
         '要结合上文还原完整意图，并把 topic 更新为本轮真正要研究的内容。'
         'auto_deploy：用户要求把生成好的报告/页面/HTML 发布到服务器、部署上线、'
         '或索取可访问的网址链接时设为 true；只要求生成报告时为 false；'
-        '若"部署"只是报告的研究内容（如"数据库的部署方式"），必须为 false。',
+        '若"部署"只是报告的研究内容（如"数据库的部署方式"），必须为 false。'
+        'need_research 判断本轮是否需要联网检索：'
+        '需要——要求产出报告/整理/对比/调研，或依赖实时与外部事实'
+        '（"最新""今天""多少钱""版本号""新闻"），或用户给了 URL；'
+        '不需要——寒暄确认（"你好""在吗""谢谢"）、一般性知识问答'
+        '（如"什么是 ACID"）、对上一轮产物的追问或修改；'
+        '**拿不准时一律设为 true**，只有明显不需要联网才设为 false；'
+        '用户明确说"直接回答/不用搜"时设为 false，明确说"上网查/搜一下"时设为 true。',
         payload,
         disable_thinking=settings.llm_parse_disable_thinking,
     )
@@ -68,6 +75,40 @@ async def parse_request(state):
             'stage': 'parse', 'model_name': settings.llm_model, 'model': usage,
         }],
     }
+
+
+ANSWER_SYSTEM = (
+    '你是一个简洁、可靠的中文助手。直接回答用户的问题，不要编造事实。'
+    '本轮没有做任何联网检索，你只有自己已有的知识。'
+    '如果问题依赖最新或外部事实（版本号、价格、日期、新闻）而你不确定，'
+    '要明确说明"这需要联网核实"，并建议用户要求联网检索，不要猜具体数字。'
+    '回答保持简短，不要写成长篇报告。'
+)
+
+
+async def answer_directly(state):
+    """不检索、不生成报告：直接用模型回答（带多轮上下文）。
+
+    这条路对应"用户只是问个问题/打个招呼"的情况——省掉两次搜索、五篇抓取
+    和一整份报告生成（通常能省掉近百秒和相应费用）。
+    """
+    emit(action('直接回答', '本轮无需联网检索', '💬'))
+    history = (state.get('history') or [])[-8:]
+    messages = [{'role': m['role'], 'content': m['content']} for m in history]
+    messages.append({'role': 'user', 'content': state['user_input']})
+    answer = await chat_reply(ANSWER_SYSTEM, messages,
+                              on_delta=lambda text: emit(answer_delta(text)))
+    return {'answer': answer, 'status': 'answered'}
+
+
+def route_intent(state):
+    """解析后分流：需要联网就走研究链路，否则直接回答。
+
+    缺字段时**默认走检索**（`.get(..., True)`）——与"歧义时倾向 research"的策略一致：
+    该搜没搜只会让用户拿到没有来源的回答，而多搜一次最多是慢一点。
+    """
+    plan = state.get('plan') or {}
+    return 'discover_sources' if plan.get('need_research', True) else 'answer_directly'
 
 
 async def discover_sources(state):

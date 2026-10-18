@@ -13,6 +13,9 @@ class Plan(BaseModel):
     # 故意设为必填：带默认值时模型会直接省略该字段，被默认值静默兜成 False，
     # 导致"生成后部署到服务器"这类明确诉求永远识别不出来。
     auto_deploy: bool
+    # 是否需要联网检索。同样故意设为必填——带默认值会被模型省略、静默兜成 False，
+    # 变成"该搜的没搜"。歧义时要求模型填 True（倾向检索）。
+    need_research: bool
 
 class Paragraph(BaseModel):
     text: str = Field(min_length=1)
@@ -46,6 +49,8 @@ class AgentState(TypedDict, total=False):
     research_round: int
     searched: bool
     report: dict
+    # 直接回答（need_research=False）时的纯文本结果
+    answer: str
     artifact: dict
     validation: dict
     deployment: dict

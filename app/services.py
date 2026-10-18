@@ -135,7 +135,9 @@ async def structured_call(
             [schema], tool_choice=schema.__name__)
         accumulated = None
         buf = ''                 # 增量累积工具调用参数，避免每次重新拼接全部分片
-        last_emit = 0.0
+        # 用 None 而不是 0.0：monotonic() 是开机以来的秒数，开机不足一个
+        # draft_interval 时 "now - 0.0" 会一直小于阈值，草稿永远不触发。
+        last_emit = None
         last_fingerprint = None
         async for chunk in llm.astream(messages):
             accumulated = chunk if accumulated is None else accumulated + chunk
@@ -145,7 +147,7 @@ async def structured_call(
             if on_draft is None:
                 continue
             now = time.monotonic()
-            if now - last_emit < draft_interval:
+            if last_emit is not None and now - last_emit < draft_interval:
                 continue
             # 关键：无论这次解析成不成功都要推进节流时间戳。
             # 否则字段还没凑齐时会退化成"每个分片都重试一次"，
@@ -167,6 +169,25 @@ async def structured_call(
                 on_draft(parsed)
             return parsed, _combine_usage(usages)
     raise RuntimeError('模型结构化输出失败；检查 tool calling 支持及 schema')
+
+
+async def chat_reply(system: str, messages: list[dict], model: str | None = None,
+                     on_delta=None) -> str:
+    """纯文本对话：不检索、不结构化。on_delta 逐段回传增量文本，做打字机效果。
+
+    闲聊/一般性问答不需要推理，这里直接关掉思考——快且便宜，正是本路径的价值。
+    """
+    llm = new_llm(model, disable_thinking=True)
+    conversation = [('system', system)] + [
+        (m['role'], m['content']) for m in messages]
+    parts = []
+    async for chunk in llm.astream(conversation):
+        text = chunk.content
+        if isinstance(text, str) and text:
+            parts.append(text)
+            if on_delta:
+                on_delta(text)
+    return ''.join(parts).strip()
 
 
 def new_tavily():

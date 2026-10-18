@@ -17,6 +17,7 @@ STAGE_LABELS = {
     'validate_artifact': '校验产物',
     'deploy_report': '部署站点',
     'finish_failed': '提前终止',
+    'answer_directly': '直接回答',
     'manual_deploy': '手动部署',
     # 合成阶段：从服务端收到指令，到解析完成、真正开始搜索之间的空档。
     # 它跨越了 parse_request，因此与"解析需求"的耗时会有重叠，这是刻意的：
@@ -67,6 +68,15 @@ def draft(report: dict | None) -> dict:
     也不影响——最终报告本来就在 report.json / index.html 里。
     """
     return {'type': 'draft', 'report': report}
+
+
+def answer_delta(text: str) -> dict:
+    """直接回答时的增量文本（打字机效果）。
+
+    条数多（一次回答可能上千片），**不写入 SQLite**；最终答案随 status 事件的
+    detail 落库，重连时仍能看到完整回答。
+    """
+    return {'type': 'answer_delta', 'text': text}
 
 
 def stage_start(stage: str) -> dict:

@@ -107,7 +107,7 @@ details summary{cursor:pointer;color:var(--muted);font-size:13px}
 <script>
 const S = { sessionId: null, taskId: null, artifactId: null, es: null,
             running: false, status: null, stages: [], stageSeq: 0, skew: 0,
-            turn: 0 };
+            turn: 0, streamBubble: null };
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
@@ -119,6 +119,19 @@ function addMessage(role, text) {
   el.innerHTML = `<div class="bubble">${esc(text)}</div>`;
   $('messages').appendChild(el);
   el.scrollIntoView({block: 'end', behavior: 'smooth'});
+}
+
+// 直接回答问题时的增量文本（打字机效果）。后端用流式返回，这里边收边追加。
+function onAnswerDelta(ev) {
+  if (!S.streamBubble) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg assistant';
+    wrap.innerHTML = '<div class="bubble"></div>';
+    $('messages').appendChild(wrap);
+    S.streamBubble = wrap.querySelector('.bubble');
+  }
+  S.streamBubble.textContent += ev.text || '';
+  S.streamBubble.parentElement.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
 
 // 整理报告阶段是全程最长的静默期（占 85%~90%）。模型是流式生成工具调用参数的，
@@ -188,6 +201,7 @@ function currentTurnEl() {
 // 开始新一轮：追加一个轮次分隔头，保留此前所有过程与耗时记录。
 function startNewTurn() {
   S.turn += 1;
+  S.streamBubble = null;
   $('result').innerHTML = '';          // 结果区只反映当前任务，其余记录保留
   const turn = document.createElement('div');
   turn.className = 'turn';
@@ -313,6 +327,7 @@ function clearAll() {
   S.turn = 0;
   S.stageSeq = 0;
   S.skew = 0;
+  S.streamBubble = null;
 }
 
 function setRunning(on) {
@@ -376,11 +391,19 @@ function openStream(taskId) {
     let ev; try { ev = JSON.parse(e.data); } catch { return; }
     if (ev.type === 'task') { S.artifactId = ev.artifact_id; return; }
     if (ev.type === 'draft') { onDraft(ev); return; }
+    if (ev.type === 'answer_delta') { onAnswerDelta(ev); return; }
     if (ev.type === 'stage_start') { onStageStart(ev); return; }
     if (ev.type === 'stage_end') { onStageEnd(ev); return; }
     if (ev.type === 'result') { showDeployed(ev.public_url, ev.deployment_id); return; }
     if (ev.type === 'status') {
-      if (ev.detail) addMessage('assistant', ev.detail);
+      if (ev.detail) {
+        if (S.streamBubble) {        // 打字机已经渲染过，直接用最终文本覆盖
+          S.streamBubble.textContent = ev.detail;
+          S.streamBubble = null;
+        } else {
+          addMessage('assistant', ev.detail);
+        }
+      }
       finish(ev.status);
       return;
     }

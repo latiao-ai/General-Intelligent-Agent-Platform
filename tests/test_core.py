@@ -72,7 +72,8 @@ class GraphTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_sources_never_deploys(self):
         from app.graph import build_graph
         async def parse(state):
-            return {'plan': {'mode': 'topic', 'topic': 'test', 'queries': ['test'], 'urls': []}}
+            return {'plan': {'mode': 'topic', 'topic': 'test', 'queries': ['test'],
+                             'urls': [], 'need_research': True}}
         async def search(query):
             return {'results': [], 'usage': {'credits': 1}}
         with patch.object(nodes, 'parse_request', parse), \
@@ -101,9 +102,12 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
         # 必须是必填字段：带默认值时模型会省略该字段，被默认值静默兜成 False，
         # 导致"生成报告后部署到服务器"这类明确诉求永远识别不出来。
         self.assertTrue(Plan.model_fields['auto_deploy'].is_required())
+        # need_research 同理：带默认值会被模型省略，导致"该搜的没搜"
+        self.assertTrue(Plan.model_fields['need_research'].is_required())
         with self.assertRaises(ValidationError):
             Plan.model_validate({'topic': '对比数据库的部署方式'})
-        plan = Plan.model_validate({'topic': '对比数据库的部署方式', 'auto_deploy': False})
+        plan = Plan.model_validate({'topic': '对比数据库的部署方式', 'auto_deploy': False,
+                                 'need_research': True})
         self.assertFalse(plan.auto_deploy)
 
     async def test_skipped_when_not_requested(self):
@@ -725,7 +729,8 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
                             disable_thinking=False, on_draft=None,
                             draft_interval=1.0):
             captured['disable_thinking'] = disable_thinking
-            return Plan.model_validate({'topic': 't', 'auto_deploy': False}), None
+            return Plan.model_validate({'topic': 't', 'auto_deploy': False,
+                                 'need_research': True}), None
 
         with patch.object(nodes, 'structured_call', fake_call), \
              patch.object(nodes, 'urls_from_input', lambda text: []):
@@ -789,7 +794,8 @@ class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
         async def fake_call(schema, system, user, model=None, attempts=2,
                             disable_thinking=False, on_draft=None,
                             draft_interval=1.0):
-            return Plan.model_validate({'topic': 't', 'auto_deploy': False}), None
+            return Plan.model_validate({'topic': 't', 'auto_deploy': False,
+                                 'need_research': True}), None
 
         with patch.object(nodes, 'structured_call', fake_call), \
              patch.object(nodes, 'urls_from_input', lambda text: []):
@@ -804,12 +810,96 @@ class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
                             disable_thinking=False, on_draft=None,
                             draft_interval=1.0):
             captured['model'] = model
-            return Plan.model_validate({'topic': 't', 'auto_deploy': False}), None
+            return Plan.model_validate({'topic': 't', 'auto_deploy': False,
+                                 'need_research': True}), None
 
         with patch.object(nodes, 'structured_call', fake_call), \
              patch.object(nodes, 'urls_from_input', lambda text: []):
             await nodes.parse_request({'user_input': 't', 'usage': []})
         self.assertIsNone(captured['model'])
+
+
+class RoutingTests(unittest.IsolatedAsyncioTestCase):
+    """按 need_research 分流：不需要联网时直接回答，不搜索、不生成报告。"""
+
+    def test_route_intent(self):
+        from app import nodes
+        self.assertEqual(nodes.route_intent({'plan': {'need_research': True}}),
+                         'discover_sources')
+        self.assertEqual(nodes.route_intent({'plan': {'need_research': False}}),
+                         'answer_directly')
+
+    def test_route_intent_defaults_to_research(self):
+        # 缺字段时保守走检索：该搜没搜会让用户拿到没有来源的回答
+        from app import nodes
+        self.assertEqual(nodes.route_intent({'plan': {}}), 'discover_sources')
+        self.assertEqual(nodes.route_intent({}), 'discover_sources')
+
+    async def test_direct_answer_streams_deltas(self):
+        from app import nodes
+        pieces = ('你好', '，有什么', '可以帮你？')
+
+        async def fake_chat(system, messages, model=None, on_delta=None):
+            for piece in pieces:
+                if on_delta:
+                    on_delta(piece)
+            return ''.join(pieces)
+
+        seen = []
+        with patch.object(nodes, 'chat_reply', fake_chat), \
+             patch.object(nodes, 'emit', seen.append):
+            result = await nodes.answer_directly(
+                {'user_input': '你好', 'history': []})
+        self.assertEqual(result['status'], 'answered')
+        self.assertEqual(result['answer'], '你好，有什么可以帮你？')
+        deltas = [e['text'] for e in seen if e.get('type') == 'answer_delta']
+        self.assertEqual(''.join(deltas), '你好，有什么可以帮你？')
+
+    async def test_direct_answer_passes_history(self):
+        from app import nodes
+        captured = {}
+
+        async def fake_chat(system, messages, model=None, on_delta=None):
+            captured['messages'] = messages
+            return 'ok'
+
+        history = [{'role': 'user', 'content': '前一句'},
+                   {'role': 'assistant', 'content': '前一句的回答'}]
+        with patch.object(nodes, 'chat_reply', fake_chat), \
+             patch.object(nodes, 'emit', lambda e: None):
+            await nodes.answer_directly(
+                {'user_input': '接着问', 'history': history})
+        # 多轮上下文要带上，否则"接着问"这类指代没法理解
+        self.assertEqual([m['content'] for m in captured['messages']],
+                         ['前一句', '前一句的回答', '接着问'])
+
+    async def test_graph_routes_to_direct_answer_without_searching(self):
+        """need_research=False 时不应触发任何检索。"""
+        from app import nodes
+        from app.graph import build_graph
+        touched = {}
+
+        async def fake_parse(state):
+            return {'plan': {'mode': 'topic', 'topic': 't', 'queries': ['q'],
+                             'urls': [], 'need_research': False},
+                    'status': 'planned'}
+
+        async def fake_answer(state):
+            return {'answer': '你好！', 'status': 'answered'}
+
+        async def should_not_run(*a, **k):
+            touched['searched'] = True
+            return {}
+
+        with patch.object(nodes, 'parse_request', fake_parse), \
+             patch.object(nodes, 'answer_directly', fake_answer), \
+             patch.object(nodes, 'discover_sources', should_not_run):
+            result = await build_graph().ainvoke({
+                'task_id': 'x', 'user_input': '你好', 'documents': [],
+                'errors': [], 'usage': [], 'research_round': 0, 'searched': False})
+        self.assertEqual(result['status'], 'answered')
+        self.assertEqual(result['answer'], '你好！')
+        self.assertNotIn('searched', touched)
 
 
 class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
@@ -848,7 +938,8 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
     def good(self, tokens=7):
         return [self.FakeChunk(
             tool_calls=[{'name': 'Plan',
-                         'args': {'topic': 't', 'auto_deploy': False}}],
+                         'args': {'topic': 't', 'auto_deploy': False,
+                                  'need_research': True}}],
             usage={'total_tokens': tokens})]
 
     async def call(self, outcomes, calls=None, **kw):
@@ -894,10 +985,12 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         from app import services
         calls, drafts = [], []
         partial = self.FakeChunk(
-            tool_call_chunks=[{'args': '{"topic": "半成品", "auto_deploy": false}'}])
+            tool_call_chunks=[{'args':
+                '{"topic": "半成品", "auto_deploy": false, "need_research": true}'}])
         full = self.FakeChunk(
             tool_calls=[{'name': 'Plan',
-                         'args': {'topic': '完整', 'auto_deploy': False}}],
+                         'args': {'topic': '完整', 'auto_deploy': False,
+                                  'need_research': True}}],
             usage={'total_tokens': 3})
         with patch.object(services, 'new_llm',
                           lambda model=None, disable_thinking=False:
@@ -945,12 +1038,14 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         from app import services
         calls, drafts = [], []
         partial = self.FakeChunk(
-            tool_call_chunks=[{'args': '{"topic": "第一版的残留", "auto_deploy": false}'}])
+            tool_call_chunks=[{'args': '{"topic": "第一版的残留", "auto_deploy": false,'
+                                    ' "need_research": true}'}])
         bad = self.FakeChunk(tool_calls=[{'name': 'Plan', 'args': {'topic': ''}}],
                              tool_call_chunks=[{'args': '{"topic": "第一版的残留"}'}])
         good = self.FakeChunk(
             tool_calls=[{'name': 'Plan',
-                         'args': {'topic': '第二版', 'auto_deploy': False}}])
+                         'args': {'topic': '第二版', 'auto_deploy': False,
+                                  'need_research': True}}])
         with patch.object(services, 'new_llm',
                           lambda model=None, disable_thinking=False:
                           self.fake_llm([[partial, bad], [good]], calls)):
