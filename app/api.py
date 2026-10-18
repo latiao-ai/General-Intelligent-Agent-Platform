@@ -145,6 +145,12 @@ async def artifact(task_id: str):
     return FileResponse(path, media_type='text/html', filename='index.html')
 
 
+@app.get('/api/sessions')
+async def list_sessions():
+    """会话列表（侧边栏用）：按最近活跃排序，含标题与消息数。"""
+    return {'sessions': hub.list_sessions()}
+
+
 @app.get('/api/sessions/{session_id}/messages')
 async def session_messages(session_id: str):
     return {'session_id': session_id, 'messages': hub.history(session_id)}

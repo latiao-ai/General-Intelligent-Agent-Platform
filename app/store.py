@@ -107,6 +107,31 @@ class Store:
                 (session_id,)).fetchall()
         return [{'role': r['role'], 'content': r['content']} for r in rows]
 
+    def list_sessions(self, limit: int = 50) -> list[dict]:
+        """会话列表（按最近活跃排序），供前端侧边栏展示。
+
+        title 取该会话第一条用户消息（截断），没有就回退到「新会话」。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                'SELECT s.session_id, s.created_at, s.updated_at, '
+                '  (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.session_id) '
+                '    AS message_count, '
+                '  (SELECT content FROM messages m WHERE m.session_id=s.session_id '
+                '     AND m.role=\'user\' ORDER BY m.id LIMIT 1) AS first_message '
+                'FROM sessions s ORDER BY s.updated_at DESC LIMIT ?',
+                (limit,)).fetchall()
+        out = []
+        for r in rows:
+            first = (r['first_message'] or '').strip()
+            title = (first[:24] + '…') if len(first) > 24 else (first or '新会话')
+            out.append({'session_id': r['session_id'],
+                        'title': title,
+                        'message_count': r['message_count'],
+                        'created_at': r['created_at'],
+                        'updated_at': r['updated_at']})
+        return out
+
     # ---------- 任务 ----------
 
     def create_task(self, task_id: str, session_id: str, message: str) -> None:

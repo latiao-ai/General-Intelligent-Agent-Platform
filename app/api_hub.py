@@ -116,6 +116,9 @@ class Hub:
     def history(self, session_id: str) -> list:
         return self.store.messages(session_id)
 
+    def list_sessions(self, limit: int = 50) -> list[dict]:
+        return self.store.list_sessions(limit)
+
     def start(self, message: str, session_id: str | None = None) -> TaskRecord:
         session_id = session_id or uuid.uuid4().hex[:12]
         history = self.history(session_id)

@@ -8,13 +8,31 @@
 :root{--bg:#f5f6f8;--fg:#1b2430;--muted:#6b7684;--line:#e2e6eb;--accent:#165eb4;
       --user:#d9ecff;--card:#fff;--warn:#fff6df}
 *{box-sizing:border-box}
+html,body{height:100%}
 body{margin:0;background:var(--bg);color:var(--fg);
-     font:15px/1.7 system-ui,-apple-system,"PingFang SC",sans-serif}
-.wrap{max-width:860px;margin:0 auto;padding:20px 16px 140px}
-.head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
-.head button{flex:0 0 auto}
+     font:15px/1.7 system-ui,-apple-system,"PingFang SC",sans-serif;
+     display:flex;flex-direction:column;overflow:hidden}
+
+/* 左栏 + 主区 */
+.app{display:flex;flex:1;min-height:0}
+.sidebar{width:264px;flex:0 0 264px;background:var(--card);
+  border-right:1px solid var(--line);display:flex;flex-direction:column;
+  padding:14px 12px}
+.sidebar button.full{width:100%;margin-bottom:12px}
+.sidebar .side-label{color:var(--muted);font-size:12px;margin:4px 2px 8px}
+.session-list{flex:1;overflow-y:auto}
+.session-item{padding:9px 12px;border-radius:8px;cursor:pointer;margin-bottom:4px;
+  border:1px solid transparent}
+.session-item:hover{background:#f0f3f7}
+.session-item.active{background:var(--user);border-color:#bcd7f2}
+.session-item .t{font-size:14px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;line-height:1.4}
+.session-item .m{font-size:12px;color:var(--muted)}
+.content{flex:1;min-width:0;display:flex;flex-direction:column}
+.scroll{flex:1;overflow-y:auto;padding:20px 18px 12px}
+
 h1{font-size:20px;margin:0 0 4px}
-.sub{color:var(--muted);font-size:13px;margin-bottom:18px}
+.sub{color:var(--muted);font-size:13px;margin-bottom:16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;
       padding:14px 16px;margin-bottom:12px}
 .msg{display:flex;margin-bottom:10px}
@@ -24,7 +42,7 @@ h1{font-size:20px;margin:0 0 4px}
 .msg.user .bubble{background:var(--user)}
 .msg.assistant .bubble{background:var(--card);border:1px solid var(--line)}
 #process .row{display:flex;gap:8px;align-items:flex-start;padding:3px 0;
-              overflow-wrap:anywhere}
+               overflow-wrap:anywhere}
 #process .ico{flex:0 0 18px;text-align:center}
 .thought{color:#3b4757;font-style:normal}
 .detail{color:var(--muted)}
@@ -38,12 +56,10 @@ h1{font-size:20px;margin:0 0 4px}
   white-space:nowrap;flex:0 0 auto;min-width:72px;text-align:right;
   font-family:ui-monospace,monospace}
 #process .stage-row .stage-sec b{color:var(--fg);font-weight:600}
-/* 每轮一个分组：新一轮的记录追加在后面，不清空之前的 */
 #process .turn{margin-bottom:14px}
 #process .turn-head{display:flex;align-items:center;gap:8px;color:var(--muted);
   font-size:12px;margin:2px 0 6px;white-space:nowrap}
 #process .turn-head::after{content:"";flex:1;height:1px;background:var(--line)}
-/* 整理报告过程中的半成品预览 */
 #process .draft{background:#fafbfc;border:1px solid var(--line);
   border-left:3px solid var(--accent);border-radius:8px;padding:10px 12px;
   margin:6px 0;font-size:14px;max-height:340px;overflow:auto}
@@ -52,9 +68,10 @@ h1{font-size:20px;margin:0 0 4px}
 #process .draft-sum{color:#3b4757;margin-bottom:6px}
 #process .draft-sec{font-weight:600;margin:8px 0 2px}
 #process .draft-p{color:#3b4757;overflow-wrap:anywhere;margin:2px 0}
-.bar{position:fixed;left:0;right:0;bottom:0;background:var(--card);
-     border-top:1px solid var(--line);padding:12px 16px}
-.bar .inner{max-width:860px;margin:0 auto;display:flex;gap:8px}
+
+.bar{flex:0 0 auto;border-top:1px solid var(--line);background:var(--card);
+     padding:12px 16px}
+.bar .inner{max-width:920px;margin:0 auto;display:flex;gap:8px}
 textarea{flex:1;resize:none;height:46px;padding:11px 12px;border:1px solid var(--line);
          border-radius:9px;font:inherit;outline:none}
 textarea:focus{border-color:var(--accent)}
@@ -68,46 +85,50 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
       background:#eef1f5;color:#2a3442;text-decoration:none}
 .ok{background:#e8f6ec;border:1px solid #b7e0c4;padding:10px 14px;border-radius:9px;
     margin-top:8px;overflow-wrap:anywhere}
-table{border-collapse:collapse;width:100%;font-size:14px;margin-top:6px}
-th,td{border:1px solid var(--line);padding:6px 10px;text-align:left}
-th{background:#f0f3f7}
-details summary{cursor:pointer;color:var(--muted);font-size:13px}
 .err{color:#c0392b}
+
+@media(max-width:760px){
+  .sidebar{display:none}
+}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="head">
-    <div>
+<div class="app">
+  <aside class="sidebar">
+    <button id="newSession" class="ghost full">＋ 新建会话</button>
+    <div class="side-label">历史会话</div>
+    <div class="session-list" id="sessionList"></div>
+  </aside>
+  <main class="content">
+    <div class="scroll" id="scroll">
       <h1>网页研究与 HTML 报告</h1>
       <div class="sub">
         输入主题或链接，智能体会实时展示执行过程，每个阶段后面跟着它已用的时间（秒）。
         <b>运行中再发一条消息会自动打断当前任务</b>，带着上文改方向，不必先点停止。
       </div>
+
+      <div id="messages"></div>
+
+      <div class="card" id="processCard">
+        <div class="hint" id="processTitle">智能体执行过程（尚无动作）</div>
+        <div id="process"></div>
+      </div>
+
+      <div id="result"></div>
     </div>
-    <button id="newSession" class="ghost" style="height:34px">新对话</button>
-  </div>
 
-  <div id="messages"></div>
-
-  <div class="card" id="processCard">
-    <div class="hint" id="processTitle">智能体执行过程（尚无动作）</div>
-    <div id="process"></div>
-  </div>
-
-  <div id="result"></div>
+    <div class="bar"><div class="inner">
+      <textarea id="msg" placeholder="例如：整理 SQLite 的适用场景和限制，生成中文报告。生成后要发布就说「…然后部署到服务器」"></textarea>
+      <button id="stop" class="warn" style="display:none">停止</button>
+      <button id="send">发送</button>
+    </div></div>
+  </main>
 </div>
-
-<div class="bar"><div class="inner">
-  <textarea id="msg" placeholder="例如：整理 SQLite 的适用场景和限制，生成中文报告。生成后要发布就说「…然后部署到服务器」"></textarea>
-  <button id="stop" class="warn" style="display:none">停止</button>
-  <button id="send">发送</button>
-</div></div>
 
 <script>
 const S = { sessionId: null, taskId: null, artifactId: null, es: null,
             running: false, status: null, stages: [], stageSeq: 0, skew: 0,
-            turn: 0, streamBubble: null };
+            turn: 0, streamBubble: null, sessions: [] };
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
@@ -119,6 +140,72 @@ function addMessage(role, text) {
   el.innerHTML = `<div class="bubble">${esc(text)}</div>`;
   $('messages').appendChild(el);
   el.scrollIntoView({block: 'end', behavior: 'smooth'});
+}
+
+// ---------- 侧边栏：会话列表 ----------
+
+function fmtTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function renderSessionList() {
+  const box = $('sessionList');
+  box.innerHTML = '';
+  if (!S.sessions.length) {
+    box.innerHTML = '<div class="hint" style="padding:8px 4px">还没有历史会话</div>';
+    return;
+  }
+  for (const s of S.sessions) {
+    const item = document.createElement('div');
+    item.className = 'session-item' + (s.session_id === S.sessionId ? ' active' : '');
+    item.dataset.id = s.session_id;
+    item.innerHTML =
+      `<div class="t">${esc(s.title)}</div>` +
+      `<div class="m">${esc(s.message_count)} 条消息 · ${fmtTime(s.updated_at)}</div>`;
+    item.onclick = () => openSession(s.session_id);
+    box.appendChild(item);
+  }
+}
+
+async function loadSessions() {
+  try {
+    const res = await fetch('/api/sessions');
+    if (!res.ok) return;
+    const data = await res.json();
+    S.sessions = data.sessions || [];
+    renderSessionList();
+  } catch { /* 拉不到列表不阻塞主流程 */ }
+}
+
+async function openSession(id) {
+  if (S.running) await interrupt();
+  clearAll();
+  setRunning(false);
+  S.sessionId = id;
+  S.taskId = null;
+  S.status = null;
+  renderSessionList();          // 高亮当前会话
+  try {
+    const res = await fetch(`/api/sessions/${id}/messages`);
+    if (!res.ok) return;
+    const data = await res.json();
+    for (const m of (data.messages || [])) {
+      addMessage(m.role, m.content);
+    }
+  } catch { /* 读历史失败不影响 */ }
+}
+
+async function newSession() {
+  if (S.running) await interrupt();
+  clearAll();
+  setRunning(false);
+  S.sessionId = null;
+  S.taskId = null;
+  S.status = null;
+  renderSessionList();
 }
 
 // 直接回答问题时的增量文本（打字机效果）。后端用流式返回，这里边收边追加。
@@ -134,8 +221,8 @@ function onAnswerDelta(ev) {
   S.streamBubble.parentElement.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
 
-// 整理报告阶段是全程最长的静默期（占 85%~90%）。模型是流式生成工具调用参数的，
-// 后端边收边解析出"半成品报告"推过来，这里就地渲染，让用户看到报告在长出来。
+// 整理报告阶段是全程最长的静默期。模型流式生成工具参数，后端边收边解析出半成品报告，
+// 这里就地渲染，让用户看到报告在长出来。
 function renderDraft(report) {
   const parts = [];
   if (report.title) parts.push(`<div class="draft-title">${esc(report.title)}</div>`);
@@ -152,7 +239,7 @@ function renderDraft(report) {
 function onDraft(ev) {
   const turn = currentTurnEl();
   let box = turn.querySelector('.draft');
-  if (!ev.report) {                 // null = 清空（重试用，避免两次内容混在一起）
+  if (!ev.report) {                 // null = 清空（重试用）
     if (box) box.remove();
     return;
   }
@@ -166,7 +253,6 @@ function onDraft(ev) {
   box.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
 
-// 任务结束后把草稿的标题改成"报告内容"——它已经是最终内容了
 function sealDraft() {
   document.querySelectorAll('#process .draft-head').forEach(el => {
     el.textContent = '📝 报告内容';
@@ -187,7 +273,6 @@ function addEvent(ev) {
   row.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
 
-// 当前轮次的容器。新一轮只往后追加，不动历史记录（用户要求：不要覆盖之前的时间）。
 function currentTurnEl() {
   let el = $('process').lastElementChild;
   if (!el || !el.classList.contains('turn')) {
@@ -198,11 +283,10 @@ function currentTurnEl() {
   return el;
 }
 
-// 开始新一轮：追加一个轮次分隔头，保留此前所有过程与耗时记录。
 function startNewTurn() {
   S.turn += 1;
   S.streamBubble = null;
-  $('result').innerHTML = '';          // 结果区只反映当前任务，其余记录保留
+  $('result').innerHTML = '';
   const turn = document.createElement('div');
   turn.className = 'turn';
   const head = document.createElement('div');
@@ -217,16 +301,11 @@ function startNewTurn() {
 
 function elapsedOf(st) {
   if (st.done) return st.seconds;
-  // 用服务端给的开始时刻来算：事件经网络/轮询到达会晚几十到几百毫秒，
-  // 若按"本地收到时刻"计时会偏短。skew 用来校正本机与服务端的时钟差。
   return Math.max(0, (Date.now() / 1000 - S.skew) - st.at);
 }
 
 function onStageStart(ev) {
-  // 「收到指令 → 开始搜索」是跨阶段的时间跨度（≈ 解析需求 + 提交开销，实测只差
-  // 0.05 秒），在当前这种"逐步显示"的视图里和「解析需求」完全重复，因此不展示。
-  // 后端仍会记录它，需要时可用 /api/tasks/{id} 的 state.timings 查看。
-  if (ev.stage === 'instruction') return;
+  if (ev.stage === 'instruction') return;   // 与解析需求重复，不展示
   if (!S.stages.length) S.skew = Date.now() / 1000 - ev.at;
   const st = { id: ++S.stageSeq, stage: ev.stage, label: ev.label || ev.stage,
                at: ev.at, done: false, seconds: null, status: '', turn: S.turn };
@@ -235,7 +314,6 @@ function onStageStart(ev) {
 }
 
 function onStageEnd(ev) {
-  // 补搜会让同一个 stage 出现多次，所以从后往前关闭最后一个未完成项。
   for (let i = S.stages.length - 1; i >= 0; i--) {
     const st = S.stages[i];
     if (st.stage === ev.stage && !st.done) {
@@ -248,8 +326,6 @@ function onStageEnd(ev) {
   renderStages();
 }
 
-// 每个阶段开始时，在当前轮次里追加一行：「🔹 解析需求 · 进行中…  0.00s」
-// 时间直接跟在这一行后面，实时累加；阶段结束时定格。
 function appendStageRow(st) {
   const row = document.createElement('div');
   row.className = 'stage-row';
@@ -262,24 +338,20 @@ function appendStageRow(st) {
   row.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
 
-// 把已关闭阶段的耗时定格显示，并刷新进行中阶段的累计总耗时。
 function renderStages() {
   for (const st of S.stages) {
     const row = document.querySelector(`#process .stage-row[data-id="${st.id}"]`);
     if (!row) continue;
-    const sec = row.querySelector('.stage-sec');
-    const label = row.querySelector('.stage-text');
     if (st.done) {
-      sec.innerHTML = `${st.seconds.toFixed(2)}s`;
-      // 进行中提示保留为实际状态，如「已中断 / 解析完成」
-      label.innerHTML = `${esc(st.label)}<span class="detail"> · ${esc(st.status || '完成')}</span>`;
+      row.querySelector('.stage-sec').innerHTML = `${st.seconds.toFixed(2)}s`;
+      row.querySelector('.stage-text').innerHTML =
+        `${esc(st.label)}<span class="detail"> · ${esc(st.status || '完成')}</span>`;
     }
   }
   updateTotal();
 }
 
 function updateTotal() {
-  // 当前轮的合计（跨阶段的 instruction 已不展示，自然也不会重复计数）
   const turnTotal = S.stages
     .filter(st => st.turn === S.turn)
     .reduce((sum, st) => sum + elapsedOf(st), 0);
@@ -289,8 +361,6 @@ function updateTotal() {
     : '智能体执行过程';
 }
 
-// 兜底：任务进入终态时关掉所有还开着的阶段行。后端取消时也会补发 stage_end，
-// 这里再兜一层，避免那一行永远停在"进行中"、耗时一路涨下去。
 function closeOpenStages(status) {
   const label = status === 'cancelled' ? '已中断'
               : status === 'failed' ? '已失败' : '已结束';
@@ -305,7 +375,6 @@ function closeOpenStages(status) {
   if (changed) renderStages();
 }
 
-// 只刷"进行中"那一格的时间，100ms 一次 —— 这就是实时增长的部分。
 setInterval(() => {
   let ticking = false;
   for (const st of S.stages) {
@@ -317,7 +386,6 @@ setInterval(() => {
   if (ticking) updateTotal();
 }, 100);
 
-// 只有「新对话」才真正清空。日常的新一轮走 startNewTurn()，只追加不清空。
 function clearAll() {
   $('process').innerHTML = '';
   $('messages').innerHTML = '';
@@ -332,14 +400,11 @@ function clearAll() {
 
 function setRunning(on) {
   S.running = on;
-  // 运行中依然可以发送：发送会自动打断当前任务并开启新一轮，不必先点停止。
   $('send').disabled = false;
   $('send').textContent = on ? '打断并发送' : '发送';
   $('stop').style.display = on ? '' : 'none';
 }
 
-// 打断当前任务：取消它，并等它的结束提示经原事件流渲染出来后再继续，
-// 这样"上一轮被中断"的提示不会丢，也避免两条任务的日志混在一起。
 async function interrupt() {
   if (!S.taskId || !S.running) return;
   const stream = S.es;
@@ -358,12 +423,11 @@ async function send() {
   const text = $('msg').value.trim();
   if (!text) return;
   $('msg').value = '';
-  // 正在运行时直接打断改方向，不要求用户先点停止
   if (S.running) await interrupt();
   addMessage('user', text);
-  startNewTurn();                      // 追加新一轮，保留此前所有记录
+  startNewTurn();
   setRunning(true);
-  $('send').disabled = true;          // 提交期间短暂禁用，避免连点起两个任务
+  $('send').disabled = true;
   try {
     const res = await fetch('/api/tasks', {
       method: 'POST', headers: {'Content-Type': 'application/json'},
@@ -374,6 +438,7 @@ async function send() {
     S.sessionId = data.session_id;
     S.taskId = data.task_id;
     S.status = null;
+    loadSessions();            // 新会话或活跃时间变了，刷新侧边栏
     openStream(S.taskId);
   } catch (err) {
     addMessage('assistant', '提交失败：' + err.message);
@@ -397,7 +462,7 @@ function openStream(taskId) {
     if (ev.type === 'result') { showDeployed(ev.public_url, ev.deployment_id); return; }
     if (ev.type === 'status') {
       if (ev.detail) {
-        if (S.streamBubble) {        // 打字机已经渲染过，直接用最终文本覆盖
+        if (S.streamBubble) {
           S.streamBubble.textContent = ev.detail;
           S.streamBubble = null;
         } else {
@@ -410,7 +475,7 @@ function openStream(taskId) {
     if (ev.type === 'end') { finish(ev.status); return; }
     addEvent(ev);
   };
-  es.onerror = () => { /* 断线由浏览器自动重连；服务端在任务结束时会正常关闭 */ };
+  es.onerror = () => { /* 断线由浏览器自动重连 */ };
 }
 
 async function finish(status) {
@@ -420,6 +485,7 @@ async function finish(status) {
   if (S.es) { S.es.close(); S.es = null; }
   closeOpenStages(status);
   sealDraft();
+  loadSessions();            // 消息数、活跃时间变了，刷新侧边栏
   if (!S.taskId) return;
   try {
     const res = await fetch(`/api/tasks/${S.taskId}`);
@@ -487,19 +553,12 @@ async function stop() {
 
 $('send').onclick = send;
 $('stop').onclick = stop;
-// 不做任何持久化恢复：每次打开页面都是干净的新会话。
-// （会话与任务在服务端 SQLite 里仍然保留，需要时可经 API 查询。）
-$('newSession').onclick = async () => {
-  if (S.running) await interrupt();
-  clearAll();
-  setRunning(false);
-  S.sessionId = null;
-  S.taskId = null;
-  S.status = null;
-};
+$('newSession').onclick = newSession;
 $('msg').addEventListener('keydown', e => {
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
 });
+
+loadSessions();   // 页面加载时先拉会话列表
 </script>
 </body>
 </html>

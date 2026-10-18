@@ -176,6 +176,24 @@ class StoreTests(unittest.TestCase):
                          ['user', 'assistant'])
         self.assertEqual(len(store.messages('sess2')), 1)
 
+    def test_list_sessions_orders_by_recent_and_uses_first_user_message(self):
+        store = self.store()
+        store.append_message('s1', 'user', '帮我查一下 SQLite 的适用场景和限制以及和 Postgres 的区别')
+        store.append_message('s1', 'assistant', '好的')
+        store.append_message('s2', 'user', '你好')
+        sessions = store.list_sessions()
+        self.assertEqual([s['session_id'] for s in sessions], ['s2', 's1'])
+        by_id = {s['session_id']: s for s in sessions}
+        self.assertTrue(by_id['s1']['title'].startswith('帮我查一下'))
+        self.assertTrue(by_id['s1']['title'].endswith('…'))
+        self.assertEqual(len(by_id['s1']['title']), 25)   # 24 字 + 省略号
+        self.assertEqual(by_id['s1']['message_count'], 2)
+        self.assertEqual(by_id['s2']['title'], '你好')
+        # 只有助手消息（没有用户消息）时回退到「新会话」。
+        store2 = self.store()
+        store2.append_message('sess-empty', 'assistant', '请问有什么可以帮您？')
+        self.assertEqual(store2.list_sessions()[0]['title'], '新会话')
+
     def test_task_lifecycle_with_json_state(self):
         store = self.store()
         store.create_task('t1', 'sess1', '做点事')
