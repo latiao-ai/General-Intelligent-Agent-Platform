@@ -500,12 +500,14 @@ function renderResult(state) {
   box.innerHTML = '';
   const deployment = state.deployment || {};
 
-  if (state.artifact || S.artifactId) {
+  // 只有真正渲染出 HTML 的任务才有产物区（state.artifact 由 render_html 写入）。
+  // 直接回答（answered）的 state 里没有 artifact，不该出现「打开 / 下载 HTML」这种 404 链接。
+  if (state.artifact) {
     const card = document.createElement('div');
     card.className = 'card';
     card.innerHTML = '<b>报告产物</b><div class="actions"></div>';
     const actions = card.querySelector('.actions');
-    if (S.artifactId) {
+    if (S.taskId) {
       const a = document.createElement('a');
       a.className = 'btn';
       a.href = `/api/tasks/${S.taskId}/artifact`;
