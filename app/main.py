@@ -87,8 +87,11 @@ async def run_task(text: str, progress=None, on_event=None, history=None, on_sta
     except Exception as exc:
         state['status'] = 'failed'
         state['errors'].append({'stage': 'runtime', 'type': type(exc).__name__})
-        # 不打印原始 SDK 异常字符串；使用任务 ID 与错误类别定位。
-        raise RuntimeError(f'任务 {task_id} 失败：{type(exc).__name__}') from None
+        # 不打印原始 SDK 异常字符串（可能夹带密钥或内网地址），默认只用类型名定位。
+        # 但自写的、明确的提示（如单次尝试超时）会给异常挂 safe_message，这种可以透出。
+        hint = getattr(exc, 'safe_message', None)
+        detail = type(exc).__name__ + (f'（{hint}）' if hint else '')
+        raise RuntimeError(f'任务 {task_id} 失败：{detail}') from None
     finally:
         state['elapsed_seconds'] = round(time.perf_counter() - started, 2)
         save_json(folder / 'state.json', state)

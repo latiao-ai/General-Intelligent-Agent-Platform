@@ -21,8 +21,15 @@ class Settings:
     llm_base_url: str = os.getenv('LLM_BASE_URL', '')
     max_pages: int = min(5, max(1, int(os.getenv('MAX_PAGES', '5'))))
     max_queries: int = min(2, max(1, int(os.getenv('MAX_QUERIES', '2'))))
-    max_source_chars: int = max(500, int(os.getenv('MAX_SOURCE_CHARS', '10000')))
-    max_total_chars: int = max(1000, int(os.getenv('MAX_TOTAL_CHARS', '35000')))
+    # 单篇正文上限。必须和 max_total_chars 搭配看：总量 ÷ 单篇上限 = 能装下几个来源。
+    # 单篇设得和总量一样大时，第一个来源就把预算吃光，报告退化成单一来源。
+    max_source_chars: int = max(500, int(os.getenv('MAX_SOURCE_CHARS', '3000')))
+    # 送进整理报告阶段的总字符预算。它直接决定那次模型调用有多慢——输入越长，
+    # 产出结构化报告越久，超时与校验失败的概率也越高。
+    max_total_chars: int = max(1000, int(os.getenv('MAX_TOTAL_CHARS', '10000')))
+    # 单次模型调用的硬超时（秒）。整理报告一次尝试可能上百秒；没有上限时一旦卡住，
+    # 会一直耗到整个任务 300s 的预算。超时即失败、不重试（重试只会把耗时翻倍）。
+    llm_attempt_timeout: float = float(os.getenv('LLM_ATTEMPT_TIMEOUT', '180'))
     artifact_dir: Path = PROJECT_ROOT / os.getenv('ARTIFACT_DIR', 'artifacts')
     # SQLite 持久化路径：会话、任务与事件日志。改这里也要同步 .gitignore。
     db_path: Path = PROJECT_ROOT / os.getenv('DB_PATH', 'agent.db')

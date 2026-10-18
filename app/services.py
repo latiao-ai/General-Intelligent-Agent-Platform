@@ -1,3 +1,4 @@
+import asyncio
 import re
 import json
 import time
@@ -111,9 +112,22 @@ def _final_of(accumulated, schema):
     return None
 
 
+class AttemptTimeout(RuntimeError):
+    """单次模型调用超时：一次尝试没能在上限内返回完整结果。
+
+    safe_message 是显式标记：任务失败时 run_task 默认只透出异常类型名
+    （避免把 SDK 原文里的密钥/内网地址写进库），这一类自写提示可以透出。
+    """
+
+    def __init__(self, seconds: float) -> None:
+        super().__init__(f'模型调用超时：单次尝试超过 {seconds:.0f}s 仍未返回完整结果')
+        self.safe_message = f'模型单次尝试超时，上限 {seconds:.0f}s'
+
+
 async def structured_call(
     schema, system: str, user: str, model: str | None = None, attempts: int = 2,
     disable_thinking: bool = False, on_draft=None, draft_interval: float = 1.0,
+    attempt_timeout: float | None = None,
 ):
     """结构化调用，流式获取 + 解析失败时重试。
 
@@ -124,8 +138,15 @@ async def structured_call(
 
     on_draft(partial_or_None)：每次拿到新的半成品时回调；传 None 表示清空
     （重试时会先清空，避免两次尝试的内容混在一起）。
+    attempt_timeout：单次尝试的硬超时（秒），默认取 settings.llm_attempt_timeout；
+    传 0 或负数表示不限制。超时直接失败、不重试——一次尝试已经烧掉整个预算，
+    再试一次只会让耗时翻倍。
     返回 (Pydantic 对象, usage)，usage 为各次尝试的合计。
     """
+    timeout = (settings.llm_attempt_timeout
+               if attempt_timeout is None else attempt_timeout)
+    timeout = timeout if timeout and timeout > 0 else None
+
     usages = []
     messages = [('system', system), ('human', user)]
     for _ in range(max(1, attempts)):
@@ -139,30 +160,39 @@ async def structured_call(
         # draft_interval 时 "now - 0.0" 会一直小于阈值，草稿永远不触发。
         last_emit = None
         last_fingerprint = None
-        async for chunk in llm.astream(messages):
-            accumulated = chunk if accumulated is None else accumulated + chunk
-            for piece in (getattr(chunk, 'tool_call_chunks', None) or []):
-                if isinstance(piece, dict) and piece.get('args'):
-                    buf += piece['args']
-            if on_draft is None:
-                continue
-            now = time.monotonic()
-            if last_emit is not None and now - last_emit < draft_interval:
-                continue
-            # 关键：无论这次解析成不成功都要推进节流时间戳。
-            # 否则字段还没凑齐时会退化成"每个分片都重试一次"，
-            # 对不断增长的缓冲区反复做解析与校验，O(n²) 会把事件循环堵死。
-            last_emit = now
-            draft = _draft_of(buf, schema)
-            if draft is None:
-                continue
-            # 内容没变化就别重复推，省带宽也省前端重绘
-            fingerprint = len(draft.model_dump_json())
-            if fingerprint == last_fingerprint:
-                continue
-            last_fingerprint = fingerprint
-            on_draft(draft)
+        timed_out = False
+        try:
+            # asyncio.timeout(None) 表示不限制；外部取消（用户点停止）抛的是
+            # CancelledError，不会被这里翻译成超时。
+            async with asyncio.timeout(timeout):
+                async for chunk in llm.astream(messages):
+                    accumulated = chunk if accumulated is None else accumulated + chunk
+                    for piece in (getattr(chunk, 'tool_call_chunks', None) or []):
+                        if isinstance(piece, dict) and piece.get('args'):
+                            buf += piece['args']
+                    if on_draft is None:
+                        continue
+                    now = time.monotonic()
+                    if last_emit is not None and now - last_emit < draft_interval:
+                        continue
+                    # 关键：无论这次解析成不成功都要推进节流时间戳。
+                    # 否则字段还没凑齐时会退化成"每个分片都重试一次"，
+                    # 对不断增长的缓冲区反复做解析与校验，O(n²) 会把事件循环堵死。
+                    last_emit = now
+                    draft = _draft_of(buf, schema)
+                    if draft is None:
+                        continue
+                    # 内容没变化就别重复推，省带宽也省前端重绘
+                    fingerprint = len(draft.model_dump_json())
+                    if fingerprint == last_fingerprint:
+                        continue
+                    last_fingerprint = fingerprint
+                    on_draft(draft)
+        except TimeoutError:
+            timed_out = True
         usages.append(getattr(accumulated, 'usage_metadata', None))
+        if timed_out:
+            raise AttemptTimeout(timeout)
         parsed = _final_of(accumulated, schema)
         if parsed is not None:
             if on_draft:

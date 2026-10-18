@@ -1,4 +1,5 @@
 import os
+import json
 import time
 import base64
 import asyncio
@@ -795,6 +796,40 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
         # 但既无 content 也无 tool_call），所以这里必须是 False
         self.assertFalse(captured['disable_thinking'])
 
+    async def test_compose_keeps_multiple_sources_within_budget(self):
+        """单篇上限必须明显小于总量。
+
+        两者相等时第一个来源就把预算吃光，后面的来源 limit<=0 被 break 掉，
+        报告退化成单一来源——正好丢掉了交叉引用这个核心价值。
+        """
+        from app import nodes
+        from app.config import settings
+        captured = {}
+
+        async def fake_call(schema, system, user, model=None, attempts=2,
+                            disable_thinking=False, on_draft=None,
+                            draft_interval=1.0, attempt_timeout=None):
+            captured['payload'] = json.loads(user)
+            return Report.model_validate({
+                'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
+                'sections': [{'heading': 'h', 'paragraphs': [
+                    {'text': 'x', 'source_ids': ['s1']}]}]}), None
+
+        documents = [{'source_id': f's{i}', 'title': f't{i}', 'status': 'success',
+                      'url': f'https://example.com/{i}', 'raw_content': 'x' * 20000}
+                     for i in range(1, 5)]
+        state = {'documents': documents,
+                 'plan': {'mode': 'topic', 'topic': 't'}, 'usage': []}
+        with patch.object(nodes, 'structured_call', fake_call):
+            await nodes.compose_report(state)
+
+        selected = captured['payload']['资料']
+        total = sum(len(item['text']) for item in selected)
+        self.assertGreaterEqual(len(selected), 2, '至少要装下两个来源才能交叉引用')
+        self.assertLessEqual(total, settings.max_total_chars)
+        for item in selected:
+            self.assertLessEqual(len(item['text']), settings.max_source_chars)
+
 
 class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
     async def test_compose_passes_compose_model_and_records_it(self):
@@ -1118,6 +1153,61 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         _, calls = await self.call([self.good()], attempts=1)
         # tool_choice 必须钉死工具名，否则模型可能不调用工具
         self.assertEqual(calls[0], ('bind', 'Plan'))
+
+    async def test_attempt_timeout_fails_without_retry(self):
+        """单次尝试超时立刻失败，不再试第二次。
+
+        重试只会把等待时间翻倍，而超时通常意味着模型/网关本身慢，重试收益低。
+        """
+        from app import services
+        calls = []
+
+        class HangingLLM:
+            def bind_tools(self, tools, tool_choice=None):
+                calls.append(('bind', tool_choice))
+                return self
+
+            async def astream(self, messages):
+                await asyncio.sleep(30)      # 永远等不到分片
+                yield self.FakeChunk()
+
+        with patch.object(services, 'new_llm',
+                          lambda model=None, disable_thinking=False: HangingLLM()):
+            with self.assertRaises(services.AttemptTimeout):
+                await services.structured_call(
+                    Plan, 's', 'u', attempts=2, attempt_timeout=0.05)
+        self.assertEqual(len(calls), 1, '超时不应该重试')
+
+    async def test_attempt_timeout_zero_disables_the_limit(self):
+        """attempt_timeout<=0 表示不限制，走正常路径。"""
+        (parsed, _), calls = await self.call([self.good()], attempts=1,
+                                             attempt_timeout=0)
+        self.assertEqual(parsed.topic, 't')
+        self.assertEqual(len(calls), 1)
+
+    async def test_timeout_does_not_swallow_user_cancel(self):
+        """外部取消（用户点停止）必须继续抛 CancelledError，不能被当成超时。"""
+        from app import services
+
+        class BlockingLLM:
+            def bind_tools(self, tools, tool_choice=None):
+                return self
+
+            async def astream(self, messages):
+                await asyncio.sleep(30)
+                yield self.FakeChunk()
+
+        async def run():
+            await services.structured_call(
+                Plan, 's', 'u', attempts=1, attempt_timeout=30)
+
+        with patch.object(services, 'new_llm',
+                          lambda model=None, disable_thinking=False: BlockingLLM()):
+            task = asyncio.create_task(run())
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
 
     async def test_draft_callback_clears_then_streams_partials(self):
         from app import services
