@@ -176,6 +176,18 @@ class Store:
                 (session_id, limit)).fetchall()
         return [dict(r) for r in rows]
 
+    def session_tasks(self, session_id: str, limit: int = 50) -> list[dict]:
+        """会话里的任务，按时间**正序**——回放执行过程时要按发生顺序。
+
+        与 tasks_of 的区别只在排序方向：那个是给"最近任务"用的。
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                'SELECT task_id, message, status, created_at FROM tasks '
+                'WHERE session_id=? ORDER BY rowid ASC LIMIT ?',
+                (session_id, limit)).fetchall()
+        return [dict(r) for r in rows]
+
     # ---------- 事件日志 ----------
 
     def append_event(self, task_id: str, event: dict) -> int:

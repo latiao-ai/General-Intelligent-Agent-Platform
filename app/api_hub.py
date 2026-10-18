@@ -119,6 +119,23 @@ class Hub:
     def list_sessions(self, limit: int = 50) -> list[dict]:
         return self.store.list_sessions(limit)
 
+    def session_timeline(self, session_id: str) -> dict:
+        """一个会话的完整回放：聊天气泡 + 每轮的执行过程事件。
+
+        前端切换会话时用它重建"执行步骤"，否则那些步骤会随页面状态一起丢掉。
+        草稿（draft）与逐字增量（answer_delta）本来就不落库，这里自然没有。
+        """
+        turns = [{
+            'task_id': task['task_id'],
+            'message': task['message'],
+            'status': task['status'],
+            'created_at': task['created_at'],
+            'events': [event for _, event in self.store.events(task['task_id'])],
+        } for task in self.store.session_tasks(session_id)]
+        return {'session_id': session_id,
+                'messages': self.store.messages(session_id),
+                'turns': turns}
+
     def start(self, message: str, session_id: str | None = None) -> TaskRecord:
         session_id = session_id or uuid.uuid4().hex[:12]
         history = self.history(session_id)

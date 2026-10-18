@@ -157,3 +157,9 @@ async def list_sessions():
 @app.get('/api/sessions/{session_id}/messages')
 async def session_messages(session_id: str):
     return {'session_id': session_id, 'messages': hub.history(session_id)}
+
+
+@app.get('/api/sessions/{session_id}/timeline')
+async def session_timeline(session_id: str):
+    """会话回放：消息气泡 + 每轮执行过程事件，供切换会话时重建步骤面板。"""
+    return hub.session_timeline(session_id)

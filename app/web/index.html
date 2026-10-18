@@ -57,9 +57,19 @@ h1{font-size:20px;margin:0 0 4px}
   font-family:ui-monospace,monospace}
 #process .stage-row .stage-sec b{color:var(--fg);font-weight:600}
 #process .turn{margin-bottom:14px}
-#process .turn-head{display:flex;align-items:center;gap:8px;color:var(--muted);
-  font-size:12px;margin:2px 0 6px;white-space:nowrap}
-#process .turn-head::after{content:"";flex:1;height:1px;background:var(--line)}
+/* 每轮的执行步骤可折叠：完成后自动收起，点标题栏展开。 */
+#process .turn-head{display:flex;align-items:center;gap:7px;color:var(--muted);
+  font-size:12px;margin:2px 0 6px;white-space:nowrap;cursor:pointer;
+  user-select:none;border-radius:6px;padding:3px 5px}
+#process .turn-head:hover{background:#eef1f5;color:var(--fg)}
+#process .turn-head .caret{display:inline-block;width:11px;text-align:center;
+  font-size:10px;transition:transform .15s ease}
+#process .turn.collapsed .turn-head .caret{transform:rotate(-90deg)}
+#process .turn-head .turn-title{color:var(--fg)}
+#process .turn-head .turn-sum{margin-left:auto;font-variant-numeric:tabular-nums;
+  font-family:ui-monospace,monospace}
+#process .turn.collapsed .turn-body{display:none}
+#process .turn-body{overflow-wrap:anywhere}
 #process .draft{background:#fafbfc;border:1px solid var(--line);
   border-left:3px solid var(--accent);border-radius:8px;padding:10px 12px;
   margin:6px 0;font-size:14px;max-height:340px;overflow:auto}
@@ -189,13 +199,64 @@ async function openSession(id) {
   S.status = null;
   renderSessionList();          // 高亮当前会话
   try {
-    const res = await fetch(`/api/sessions/${id}/messages`);
+    const res = await fetch(`/api/sessions/${id}/timeline`);
     if (!res.ok) return;
     const data = await res.json();
     for (const m of (data.messages || [])) {
       addMessage(m.role, m.content);
     }
+    renderHistory(data.turns || []);
   } catch { /* 读历史失败不影响 */ }
+}
+
+// 把历史会话里每一轮的执行步骤重建出来（默认折叠）。
+// 事件不落库的部分（草稿、逐字回答）本来就没有，这里只还原可持久化的步骤。
+function renderHistory(turns) {
+  const box = $('process');
+  turns.forEach((task, index) => {
+    const turn = createTurn(index + 1);
+    box.appendChild(turn);
+    const body = turn.querySelector('.turn-body');
+    const open = new Map();
+    let total = 0;
+
+    for (const ev of (task.events || [])) {
+      if (ev.type === 'stage_start') {
+        if (ev.stage === 'instruction') continue;   // 与解析需求重复
+        const st = { id: ++S.stageSeq, stage: ev.stage,
+                     label: ev.label || ev.stage, done: false,
+                     seconds: null, status: '' };
+        const row = stageRowEl(st);
+        body.appendChild(row);
+        open.set(ev.stage, {st, row});
+      } else if (ev.type === 'stage_end') {
+        if (ev.stage === 'instruction') continue;
+        const hit = open.get(ev.stage);
+        if (!hit) continue;
+        hit.st.done = true;
+        hit.st.seconds = Number(ev.seconds) || 0;
+        hit.st.status = ev.status || '完成';
+        markStageDone(hit.row, hit.st);
+        total += hit.st.seconds;
+        open.delete(ev.stage);
+      } else if (ev.type === 'thought' || ev.type === 'action') {
+        body.appendChild(eventRowEl(ev));
+      }
+    }
+    // 没等到 stage_end 的（进程重启前被中断），标成未完成而不是留个空表。
+    for (const {st, row} of open.values()) {
+      row.querySelector('.stage-text').innerHTML =
+        `${esc(st.label)}<span class="detail"> · 未完成</span>`;
+      row.querySelector('.stage-sec').innerHTML = '—';
+    }
+    turn.classList.add('collapsed');
+    turn.querySelector('.turn-sum').textContent =
+      `${TURN_STATUS[task.status] || '已完成'} · ${total.toFixed(2)}s`;
+  });
+  S.turn = turns.length;                 // 新消息接着编号
+  $('processTitle').textContent = turns.length
+    ? `智能体执行过程 · 历史会话（共 ${turns.length} 轮，点标题展开）`
+    : '智能体执行过程（尚无动作）';
 }
 
 async function newSession() {
@@ -259,43 +320,89 @@ function sealDraft() {
   });
 }
 
-function addEvent(ev) {
+function eventRowEl(ev) {
   const row = document.createElement('div');
   row.className = 'row';
   if (ev.type === 'thought') {
     row.innerHTML = `<div class="ico">💭</div><div class="thought">${esc(ev.text)}</div>`;
-  } else if (ev.type === 'action') {
+  } else {
     const detail = ev.detail ? `<span class="detail">：${esc(ev.detail)}</span>` : '';
     row.innerHTML = `<div class="ico">${esc(ev.icon || '•')}</div>` +
                     `<div>${esc(ev.label)}${detail}</div>`;
-  } else { return; }
+  }
+  return row;
+}
+
+function addEvent(ev) {
+  if (ev.type !== 'thought' && ev.type !== 'action') return;
+  const row = eventRowEl(ev);
   currentTurnEl().appendChild(row);
   row.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
 
+// 一轮任务 = 可折叠的标题栏（倒三角 + 第 N 轮 + 结论/耗时）+ 内容区。
+function createTurn(n, live = false) {
+  const turn = document.createElement('div');
+  turn.className = 'turn';
+  turn.dataset.turn = n;
+  if (live) turn.dataset.live = '1';
+  const head = document.createElement('div');
+  head.className = 'turn-head';
+  head.innerHTML =
+    `<span class="caret">▾</span>` +
+    `<span class="turn-title">${esc(`第 ${n} 轮`)}</span>` +
+    `<span class="turn-sum"></span>`;
+  head.onclick = () => turn.classList.toggle('collapsed');
+  turn.appendChild(head);
+  const body = document.createElement('div');
+  body.className = 'turn-body';
+  turn.appendChild(body);
+  return turn;
+}
+
+// 返回"当前轮"的内容容器；需要整轮时用 closest('.turn')。
 function currentTurnEl() {
   let el = $('process').lastElementChild;
-  if (!el || !el.classList.contains('turn')) {
-    el = document.createElement('div');
-    el.className = 'turn';
+  if (!el || !el.classList.contains('turn') || el.dataset.live !== '1') {
+    el = createTurn(S.turn || 1, true);
     $('process').appendChild(el);
   }
-  return el;
+  return el.querySelector('.turn-body');
+}
+
+const TURN_STATUS = {answered: '已回答', cancelled: '已中断',
+                     interrupted: '已中断', failed: '已失败',
+                     deployed: '已部署', local_ready: '已完成',
+                     deploy_needs_check: '已完成'};
+
+function turnSeconds(n) {
+  return S.stages.filter(st => st.turn === n)
+                 .reduce((sum, st) => sum + elapsedOf(st), 0);
+}
+
+// 收尾时把这一轮折起来：步骤不再持续占用视线，要看再点开。
+function collapseLastTurn(status) {
+  const turn = $('process').lastElementChild;
+  if (!turn || !turn.classList.contains('turn')) return;
+  if (turn.dataset.live !== '1') return;      // 历史轮不动
+  // 已经收过的不再改：完成的那轮状态是"已回答/已完成"，后续开新轮不能覆盖成"已中断"。
+  if (turn.classList.contains('collapsed')) return;
+  const body = turn.querySelector('.turn-body');
+  if (!body || !body.children.length) { turn.remove(); return; }  // 空轮次不留痕
+  turn.classList.add('collapsed');
+  const n = Number(turn.dataset.turn);
+  turn.querySelector('.turn-sum').textContent =
+    `${TURN_STATUS[status] || '已完成'} · ${turnSeconds(n).toFixed(2)}s`;
 }
 
 function startNewTurn() {
   // 上一条还没收尾的阶段先关掉，否则它们的计时会一直涨下去。
   closeOpenStages('已中断');
+  collapseLastTurn('cancelled');       // 上一轮收起
   S.turn += 1;
   S.streamBubble = null;
   $('result').innerHTML = '';
-  const turn = document.createElement('div');
-  turn.className = 'turn';
-  const head = document.createElement('div');
-  head.className = 'turn-head';
-  head.textContent = `第 ${S.turn} 轮`;
-  turn.appendChild(head);
-  $('process').appendChild(turn);
+  $('process').appendChild(createTurn(S.turn, true));
   $('processTitle').textContent = '智能体执行过程';
 }
 
@@ -328,7 +435,7 @@ function onStageEnd(ev) {
   renderStages();
 }
 
-function appendStageRow(st) {
+function stageRowEl(st) {
   const row = document.createElement('div');
   row.className = 'stage-row';
   row.dataset.id = st.id;
@@ -336,19 +443,27 @@ function appendStageRow(st) {
     `<div class="stage-ico">🔹</div>` +
     `<div class="stage-text">${esc(st.label)}<span class="detail"> · 进行中…</span></div>` +
     `<div class="stage-sec"><b>0.00s</b></div>`;
+  return row;
+}
+
+function markStageDone(row, st) {
+  row.querySelector('.stage-sec').innerHTML =
+    `${Number(st.seconds).toFixed(2)}s`;
+  row.querySelector('.stage-text').innerHTML =
+    `${esc(st.label)}<span class="detail"> · ${esc(st.status || '完成')}</span>`;
+}
+
+function appendStageRow(st) {
+  const row = stageRowEl(st);
   currentTurnEl().appendChild(row);
   row.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
 
 function renderStages() {
   for (const st of S.stages) {
+    if (!st.done) continue;
     const row = document.querySelector(`#process .stage-row[data-id="${st.id}"]`);
-    if (!row) continue;
-    if (st.done) {
-      row.querySelector('.stage-sec').innerHTML = `${st.seconds.toFixed(2)}s`;
-      row.querySelector('.stage-text').innerHTML =
-        `${esc(st.label)}<span class="detail"> · ${esc(st.status || '完成')}</span>`;
-    }
+    if (row) markStageDone(row, st);
   }
   updateTotal();
 }
@@ -370,8 +485,10 @@ function closeOpenStages(status) {
   let changed = false;
   for (const st of S.stages) {
     if (st.done) continue;
-    st.done = true;
+    // 必须先量再标记：elapsedOf 见到 done 会直接返回 st.seconds（此刻还是 null），
+    // 顺序反了耗时就被写成 null，收起后显示成 0.00s。
     st.seconds = elapsedOf(st);
+    st.done = true;
     st.status = label;
     changed = true;
   }
@@ -499,6 +616,7 @@ async function finish(status) {
   if (S.es) { S.es.close(); S.es = null; }
   closeOpenStages(status);
   sealDraft();
+  collapseLastTurn(status);   // 跑完就收起步骤，需要时再点开
   loadSessions();            // 消息数、活跃时间变了，刷新侧边栏
   if (!S.taskId) return;
   try {

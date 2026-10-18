@@ -594,6 +594,57 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(messages[0]['role'], 'user')
         self.assertEqual(messages[0]['content'], '你好')
 
+    def test_session_timeline_replays_execution_steps(self):
+        """切换会话时要能重建执行过程：接口必须带回每轮持久化的事件。"""
+        import app.api_hub as hub_module
+
+        async def fake_run_task(text, progress=None, on_event=None,
+                                history=None, on_start=None):
+            if on_start:
+                on_start('a1')
+            if on_event:
+                on_event({'type': 'stage_start', 'stage': 'compose_report',
+                          'label': '整理报告', 'at': 10.0})
+                on_event({'type': 'action', 'icon': '🌐', 'label': '已搜索网页'})
+                on_event({'type': 'stage_end', 'stage': 'compose_report',
+                          'label': '整理报告', 'seconds': 2.5, 'status': '完成'})
+            return {'task_id': 'a1', 'status': 'local_ready',
+                    'deployment': {}, 'timings': []}
+
+        with patch.object(hub_module, 'run_task', fake_run_task):
+            created = self.client.post('/api/tasks', json={'message': '查一下'}).json()
+            record = self.api_module.hub.get(created['task_id'])
+            for _ in range(100):          # 后台任务跑完再取，事件才都落库
+                if record.done:
+                    break
+                time.sleep(0.02)
+        self.assertTrue(record.done, '假任务应当在超时前结束')
+
+        data = self.client.get(
+            f"/api/sessions/{created['session_id']}/timeline").json()
+        self.assertEqual(data['messages'][0]['content'], '查一下')
+        self.assertEqual(len(data['turns']), 1)
+        turn = data['turns'][0]
+        self.assertEqual(turn['status'], 'local_ready')
+        self.assertEqual(turn['message'], '查一下')
+        types = [(e['type'], e.get('stage')) for e in turn['events']]
+        self.assertIn(('stage_start', 'compose_report'), types)
+        self.assertIn(('stage_end', 'compose_report'), types)
+        ends = [e for e in turn['events'] if e['type'] == 'stage_end'
+                and e['stage'] == 'compose_report']
+        self.assertEqual(ends[0]['seconds'], 2.5)
+
+    def test_session_timeline_orders_turns_oldest_first(self):
+        """回放必须按发生顺序，否则步骤看起来是倒着走的。"""
+        from app.store import Store
+        store = Store(':memory:')
+        store.append_message('s1', 'user', '第一问')
+        store.create_task('t1', 's1', '第一问')
+        store.append_message('s1', 'user', '第二问')
+        store.create_task('t2', 's1', '第二问')
+        self.assertEqual([t['task_id'] for t in store.session_tasks('s1')],
+                         ['t1', 't2'])
+
 
 class McpPayloadTests(unittest.TestCase):
     """按工具真实 inputSchema 组装参数。"""
