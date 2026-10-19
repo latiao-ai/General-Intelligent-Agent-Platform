@@ -20,7 +20,10 @@ def reply_text(state: dict) -> str:
         return ('报告已生成，保存在本地。需要发布可以点「部署到服务器」，'
                 f'或直接说"部署到服务器"。任务 ID：{state.get("task_id")}')
     if status == 'failed':
-        return '资料不足或产物校验未通过，本次没有生成报告。可换个更具体的说法再试。'
+        reason = state.get('failure')
+        if reason:
+            return f'本次未完成：{reason}。可换个更具体的说法再试。'
+        return '本次没有产出可用结果。可换个更具体的说法再试。'
     if status == 'deploy_needs_check':
         return '报告已生成，但部署结果待确认，请核对服务端站点列表。'
     return f'任务结束，状态：{status}'
@@ -48,8 +51,9 @@ def cancel_note(artifact_id: str | None) -> str:
             state = json.loads(state_file.read_text(encoding='utf-8'))
         except (OSError, ValueError):
             state = {}
-    plan = state.get('plan') or {}
-    if settings.deploy_enabled and plan.get('auto_deploy'):
-        notes.append('注意：本次要求自动部署，停止时机可能落在部署阶段，'
+    steps = (state.get('plan') or {}).get('steps') or []
+    planned_deploy = any(step.get('tool') == 'deploy_site' for step in steps)
+    if settings.deploy_enabled and planned_deploy:
+        notes.append('注意：本轮计划包含部署，停止时机可能落在部署阶段，'
                      '服务端结果未知，建议核对站点列表。')
     return ' '.join(notes)

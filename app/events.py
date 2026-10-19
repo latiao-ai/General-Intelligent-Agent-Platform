@@ -9,20 +9,21 @@ from langgraph.config import get_stream_writer
 
 # 各阶段的中文名，CLI / Streamlit / API 三处共用。
 STAGE_LABELS = {
-    'parse_request': '解析需求',
-    'discover_sources': '检索来源',
+    # 编排本身
+    'plan': '规划',
+    'run_step': '执行步骤',
+    # 工具（与 app/tools.py 的 Tool.label 对应）
+    'web_search': '检索来源',
     'fetch_pages': '抓取正文',
     'compose_report': '整理报告',
     'render_html': '渲染 HTML',
-    'validate_artifact': '校验产物',
-    'deploy_report': '部署站点',
-    'finish_failed': '提前终止',
+    'deploy_site': '部署站点',
     'answer_directly': '直接回答',
     'manual_deploy': '手动部署',
-    # 合成阶段：从服务端收到指令，到解析完成、真正开始搜索之间的空档。
-    # 它跨越了 parse_request，因此与"解析需求"的耗时会有重叠，这是刻意的：
+    # 合成阶段：从服务端收到指令，到规划完成、真正开始调用工具之间的空档。
+    # 它跨越了 plan 阶段，因此与"规划"的耗时会有重叠，这是刻意的：
     # 用户关心的是"我发出去之后多久才真正开始干活"。
-    'instruction': '收到指令 → 开始搜索',
+    'instruction': '收到指令 → 开始执行',
 }
 
 
@@ -79,18 +80,22 @@ def answer_delta(text: str) -> dict:
     return {'type': 'answer_delta', 'text': text}
 
 
-def stage_start(stage: str) -> dict:
+def stage_start(stage: str, label: str | None = None) -> dict:
     """阶段开始。
 
     带 `at`（epoch 秒）是因为前端要按"现在 - 开始时刻"实时累加：
     事件到达前端可能被轮询或网络延迟几十到几百毫秒，
     用本地收到时刻计时会偏短，用服务端开始时刻才准。
+
+    label 可显式传入：MCP 工具是运行时发现的，中文名写不进 STAGE_LABELS。
     """
-    return {'type': 'stage_start', 'stage': stage, 'label': label_of(stage),
-            'at': time.time()}
+    return {'type': 'stage_start', 'stage': stage,
+            'label': label or label_of(stage), 'at': time.time()}
 
 
-def stage_end(stage: str, seconds: float, status: str = '') -> dict:
+def stage_end(stage: str, seconds: float, status: str = '',
+              label: str | None = None) -> dict:
     """阶段结束，带该阶段实际耗时。"""
-    return {'type': 'stage_end', 'stage': stage, 'label': label_of(stage),
+    return {'type': 'stage_end', 'stage': stage,
+            'label': label or label_of(stage),
             'seconds': round(seconds, 2), 'status': status, 'at': time.time()}

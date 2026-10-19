@@ -149,19 +149,32 @@ def result_url(payload) -> str:
     raise RuntimeError('工具返回的访问地址无效，请核对 MCP_RESULT_URL_FIELD 字段映射')
 
 
-async def deploy_html(artifact: dict):
-    tool_name = os.environ['MCP_TOOL_NAME']
-    # 先发现工具、按真实 inputSchema 组装参数；文件上传/服务端路径需另行改造。
+async def call_tool(tool_name: str, arguments: dict, artifact: dict | None = None):
+    """按真实 inputSchema 调用任意 MCP 工具。
+
+    供动态编排使用：模型自己挑工具、自己给业务参数，但它给不出文件字节，
+    所以当工具的 inputSchema 需要文件内容（files[{path,content}]）时，
+    由这里用当前产物 `artifact` 自动补上，模型给的参数优先级更高（可覆盖）。
+    返回解析后的 payload。
+    """
     async with asyncio.timeout(90):
         async with connect_session() as session:
             tools = await all_tools(session)
             tool = next((t for t in tools if t.name == tool_name), None)
             if tool is None:
-                raise RuntimeError('找不到配置的部署工具')
-            arguments = build_arguments(tool, artifact)
-            validate(instance=arguments, schema=tool.inputSchema)
-            result = await session.call_tool(tool_name, arguments=arguments)
-            payload = result_payload(result)
+                raise RuntimeError(f'MCP 工具 {tool_name} 不存在')
+            merged = dict(arguments or {})
+            if artifact is not None and payload_mode(tool) == 'files_base64':
+                merged = {**build_arguments(tool, artifact), **merged}
+            validate(instance=merged, schema=tool.inputSchema)
+            result = await session.call_tool(tool_name, arguments=merged)
+            return result_payload(result)
+
+
+async def deploy_html(artifact: dict):
+    tool_name = os.environ['MCP_TOOL_NAME']
+    # 先发现工具、按真实 inputSchema 组装参数；文件上传/服务端路径需另行改造。
+    payload = await call_tool(tool_name, {}, artifact=artifact)
     url = result_url(payload)
     site_id = payload.get('site_id') if isinstance(payload, dict) else None
     return {

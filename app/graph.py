@@ -6,12 +6,12 @@ from app.events import emit, stage_end, stage_start
 from app.schemas import AgentState
 from app import nodes
 
-# 节点清单（即实际执行顺序）；执行器计时与前端耗时表都以此为准。
-NODE_NAMES = [
-    'parse_request', 'discover_sources', 'fetch_pages',
-    'compose_report', 'render_html', 'validate_artifact',
-    'deploy_report', 'finish_failed', 'answer_directly',
-]
+# 节点清单；执行器计时与前端耗时表都以此为准。
+# run_step 会自我循环，每次只跑计划里的一步——故意**不**套 instrument，
+# 这样它想发的是按工具名区分的阶段（"检索来源"/"整理报告"…），而不是笼统的
+# "执行步骤"，前端耗时表才看得出来每一步干了什么。
+NODE_NAMES = ['plan', 'run_step']
+PLAIN_NODES = {'run_step'}
 
 
 def _status_of(result) -> str:
@@ -46,27 +46,20 @@ def instrument(name: str, fn):
 
 
 def build_graph():
+    """Planner-Executor：先规划，再逐步执行，直到计划走完。
+
+    唯一的环在 run_step 上——它每次只执行一步，所以"搜几次、要不要成稿、
+    要不要部署"由计划决定，而不是由图的固定边决定。
+    """
     graph = StateGraph(AgentState)
     for name in NODE_NAMES:
-        graph.add_node(name, instrument(name, getattr(nodes, name)))
-    graph.add_edge(START, 'parse_request')
-    # 解析后分流：需要联网 → 研究链路；不需要 → 直接回答（省掉搜索与报告生成）
-    graph.add_conditional_edges('parse_request', nodes.route_intent, {
-        'discover_sources': 'discover_sources',
-        'answer_directly': 'answer_directly',
+        node = getattr(nodes, name)
+        graph.add_node(name, node if name in PLAIN_NODES
+                       else instrument(name, node))
+    graph.add_edge(START, 'plan')
+    graph.add_edge('plan', 'run_step')
+    graph.add_conditional_edges('run_step', nodes.next_step, {
+        'run_step': 'run_step',
+        'end': END,
     })
-    graph.add_edge('answer_directly', END)
-    graph.add_edge('discover_sources', 'fetch_pages')
-    graph.add_conditional_edges('fetch_pages', nodes.assess_coverage, {
-        'discover_sources': 'discover_sources',
-        'compose_report': 'compose_report',
-        'finish_failed': 'finish_failed',
-    })
-    graph.add_edge('compose_report', 'render_html')
-    graph.add_edge('render_html', 'validate_artifact')
-    graph.add_conditional_edges('validate_artifact', nodes.route_validation, {
-        'deploy_report': 'deploy_report', 'finish_failed': 'finish_failed',
-    })
-    graph.add_edge('deploy_report', END)
-    graph.add_edge('finish_failed', END)
     return graph.compile()

@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 from pydantic import ValidationError
-from app.schemas import Plan, Report
+from app.schemas import ExecutionPlan, PlanStep, Report
 from app.services import clean_public_url
 from app.rendering import report_errors, render_report
 from app import mcp_adapter, nodes
@@ -59,105 +59,231 @@ class CoreTests(unittest.TestCase):
                 self.assertNotIn('<script>alert(1)</script>', html)
                 self.assertIn('&lt;script&gt;', html)
 
-    def test_research_bound(self):
-        state = {'documents': [], 'plan': {'mode': 'topic'}, 'research_round': 0}
-        self.assertEqual(nodes.assess_coverage(state), 'discover_sources')
-        state['research_round'] = 1
-        self.assertEqual(nodes.assess_coverage(state), 'finish_failed')
-        state['plan']['mode'] = 'urls'
-        state['research_round'] = 0
-        self.assertEqual(nodes.assess_coverage(state), 'finish_failed')
+    def test_source_budget_keeps_multiple_sources(self):
+        """总量预算不能只够装一个来源，否则报告退化成单一来源。"""
+        from app import tools as tool_module
+        from app.config import settings
+        docs = [{'source_id': f's{i}', 'title': f't{i}', 'status': 'success',
+                 'raw_content': 'x' * 20000} for i in range(1, 5)]
+        selected, truncated = tool_module._select_sources({'documents': docs})
+        self.assertGreaterEqual(len(selected), 2)
+        self.assertLessEqual(sum(len(s['text']) for s in selected),
+                             settings.max_total_chars)
+        self.assertTrue(truncated)
 
 
-class GraphTests(unittest.IsolatedAsyncioTestCase):
-    async def test_no_sources_never_deploys(self):
-        from app.graph import build_graph
-        async def parse(state):
-            return {'plan': {'mode': 'topic', 'topic': 'test', 'queries': ['test'],
-                             'urls': [], 'need_research': True}}
-        async def search(query):
-            return {'results': [], 'usage': {'credits': 1}}
-        with patch.object(nodes, 'parse_request', parse), \
-             patch.object(nodes, 'search_query', search), \
-             patch.object(nodes, 'deploy_report') as deploy:
-            result = await build_graph().ainvoke({
-                'task_id': 'testtask', 'user_input': 'test', 'documents': [],
-                'errors': [], 'usage': [], 'research_round': 0, 'searched': False,
-            })
-            self.assertEqual(result['status'], 'failed')
-            self.assertEqual(result['research_round'], 1)
-            deploy.assert_not_called()
+class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
+    """Planner-Executor：计划决定走哪条路，执行器逐步落实。"""
 
-FILES_SCHEMA = {
-    'properties': {
-        'files': {'type': 'array', 'items': {'properties': {'path': {}, 'content': {}}}}
-    }
-}
-TEXT_SCHEMA = {'properties': {'html': {'type': 'string'}}}
+    def test_next_step_follows_the_cursor(self):
+        from app import nodes
+        plan = {'steps': [{'tool': 'web_search'}, {'tool': 'render_html'}]}
+        self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 0}), 'run_step')
+        self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 1}), 'run_step')
+        self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 2}), 'end')
+        self.assertEqual(nodes.next_step({}), 'end')
+
+    def test_final_status_maps_internal_states(self):
+        from app import nodes
+        self.assertEqual(nodes.final_status({'answer': 'hi'}), 'answered')
+        self.assertEqual(nodes.final_status(
+            {'deployment': {'status': 'success'}}), 'deployed')
+        self.assertEqual(nodes.final_status({'deployment': {'status': 'pending'}}),
+                         'deploy_needs_check')
+        self.assertEqual(nodes.final_status({'artifact': {'html_path': 'x'}}),
+                         'local_ready')
+        self.assertEqual(nodes.final_status({}), 'failed')
+
+    def test_valid_steps_drops_unknown_tools_and_bad_args(self):
+        from app import nodes
+        from app import tools as tool_module
+        kept = nodes._valid_steps(
+            [{'tool': 'web_search', 'args': {'query': 'q'}},
+             {'tool': 'not_a_tool', 'args': {}},
+             {'tool': 'render_html', 'args': 'not-a-dict'}],
+            tool_module.BUILTIN_TOOLS)
+        self.assertEqual([s['tool'] for s in kept], ['web_search', 'render_html'])
+        self.assertEqual(kept[1]['args'], {})
+
+    def test_fallback_plan_respects_given_urls(self):
+        from app import nodes
+        from app import tools as tool_module
+        with_url = nodes.fallback_steps({'user_input': '看看 https://example.com/a'})
+        self.assertEqual(with_url[0]['tool'], 'fetch_pages')
+        self.assertEqual(with_url[0]['args']['urls'], ['https://example.com/a'])
+        without = nodes.fallback_steps({'user_input': '介绍一下 SQLite'})
+        self.assertEqual(without[0]['tool'], 'web_search')
+        # 兜底计划里的工具必须真实存在，否则整轮会被跳过
+        known = {t.name for t in tool_module.BUILTIN_TOOLS}
+        self.assertTrue({s['tool'] for s in without} <= known)
+
+    async def test_plan_asks_the_model_and_keeps_its_steps(self):
+        from app import nodes
+        from app import tools as tool_module
+        captured = {}
+
+        async def fake_catalog():
+            return tool_module.BUILTIN_TOOLS
+
+        async def fake_call(schema, system, user, **kw):
+            captured['user'] = user
+            return ExecutionPlan.model_validate({'steps': [
+                {'tool': 'web_search', 'args': {'query': 'sqlite'},
+                 'why': '需要外部资料'},
+                {'tool': 'render_html', 'args': {}, 'why': '产出 HTML'},
+            ], 'summary': '先搜再渲染'}), {'total_tokens': 3}
+
+        with patch.object(tool_module, 'catalog', fake_catalog), \
+                patch.object(nodes, 'structured_call', fake_call):
+            result = await nodes.plan({'user_input': '整理 SQLite 报告', 'usage': []})
+
+        tools_used = [s['tool'] for s in result['plan']['steps']]
+        self.assertEqual(tools_used, ['web_search', 'render_html'])
+        self.assertEqual(result['step_index'], 0)
+        self.assertEqual(result['usage'][-1]['stage'], 'plan')
+        # 工具清单必须真的进了提示词，否则模型只能瞎猜
+        self.assertIn('web_search', captured['user'])
+        self.assertIn('answer_directly', captured['user'])
+
+    async def test_plan_falls_back_when_the_model_fails(self):
+        from app import nodes
+        from app import tools as tool_module
+
+        async def fake_catalog():
+            return tool_module.BUILTIN_TOOLS
+
+        async def boom(*a, **k):
+            raise RuntimeError('模型不可用')
+
+        with patch.object(tool_module, 'catalog', fake_catalog), \
+                patch.object(nodes, 'structured_call', boom):
+            result = await nodes.plan({'user_input': '整理 SQLite 报告', 'usage': []})
+        # 规划失败不能让任务空手而归：要有可执行的兜底计划
+        self.assertGreaterEqual(len(result['plan']['steps']), 2)
+        self.assertEqual(result['plan']['steps'][0]['tool'], 'web_search')
+
+    async def test_plan_skips_the_model_for_small_talk(self):
+        from app import nodes
+        from app import tools as tool_module
+
+        async def forbidden(*a, **k):
+            raise AssertionError('寒暄不应调用模型')
+
+        async def fake_catalog():
+            raise AssertionError('寒暄不应去发现工具')
+
+        with patch.object(tool_module, 'catalog', fake_catalog), \
+                patch.object(nodes, 'structured_call', forbidden):
+            result = await nodes.plan({'user_input': '你好', 'usage': []})
+        self.assertEqual([s['tool'] for s in result['plan']['steps']],
+                         ['answer_directly'])
+        self.assertEqual(result.get('usage', []), [])   # 没调模型就没有用量
+
+    async def test_run_step_runs_exactly_one_tool_and_advances(self):
+        from app import nodes
+        from app import tools as tool_module
+        from app.tools import Tool
+        seen = []
+
+        async def runner(args, state):
+            seen.append(args)
+            return {'answer': '好的', 'status': 'answered'}
+
+        fake = Tool('answer_directly', '直接回答', 'd', {}, runner)
+        plan = {'steps': [{'tool': 'answer_directly', 'args': {'question': 'q'}}]}
+        with patch.dict(tool_module.BUILTIN_BY_NAME, {'answer_directly': fake}):
+            result = await nodes.run_step(
+                {'plan': plan, 'step_index': 0, 'user_input': 'q'})
+        self.assertEqual(seen, [{'question': 'q'}])
+        self.assertEqual(result['step_index'], 1)
+        self.assertEqual(result['step_label'], '直接回答')
+        # 最后一步要把内部状态归一成前端认识的终态
+        self.assertEqual(result['status'], 'answered')
+
+    async def test_run_step_aborts_remaining_steps_on_error(self):
+        from app import nodes
+        from app import tools as tool_module
+        from app.tools import Tool
+
+        async def boom(args, state):
+            raise tool_module.ToolError('搜不到正文')
+
+        fake = Tool('web_search', '检索来源', 'd', {}, boom)
+        plan = {'steps': [{'tool': 'web_search', 'args': {'query': 'q'}},
+                          {'tool': 'render_html', 'args': {}}]}
+        with patch.dict(tool_module.BUILTIN_BY_NAME, {'web_search': fake}):
+            result = await nodes.run_step(
+                {'plan': plan, 'step_index': 0, 'user_input': 'q'})
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['step_index'], len(plan['steps']))  # 剩余步骤被跳过
+        self.assertIn('搜不到正文', result['failure'])
+        self.assertEqual(result['errors'][0]['stage'], 'web_search')
+
+    async def test_run_step_skips_unknown_tool_without_failing(self):
+        from app import nodes
+        from app import tools as tool_module
+
+        async def no_mcp():
+            return []
+
+        plan = {'steps': [{'tool': 'mcp__gone', 'args': {}},
+                          {'tool': 'render_html', 'args': {}}]}
+        with patch.object(tool_module, 'mcp_tools', no_mcp):
+            result = await nodes.run_step(
+                {'plan': plan, 'step_index': 0, 'user_input': 'q'})
+        # 计划里点名的工具消失了（MCP 掉线）：跳过这一步继续，别让整轮失败
+        self.assertEqual(result['step_index'], 1)
+        self.assertNotEqual(result.get('status'), 'failed')
 
 
 class DeployGateTests(unittest.IsolatedAsyncioTestCase):
-    """部署只在用户明确要求且总开关打开时才自动执行。"""
+    """部署闸门：没有产物、或全局关闭时都不许部署。"""
 
-    def test_auto_deploy_must_be_explicit(self):
-        # 必须是必填字段：带默认值时模型会省略该字段，被默认值静默兜成 False，
-        # 导致"生成报告后部署到服务器"这类明确诉求永远识别不出来。
-        self.assertTrue(Plan.model_fields['auto_deploy'].is_required())
-        # need_research 同理：带默认值会被模型省略，导致"该搜的没搜"
-        self.assertTrue(Plan.model_fields['need_research'].is_required())
-        with self.assertRaises(ValidationError):
-            Plan.model_validate({'topic': '对比数据库的部署方式'})
-        plan = Plan.model_validate({'topic': '对比数据库的部署方式', 'auto_deploy': False,
-                                 'need_research': True})
-        self.assertFalse(plan.auto_deploy)
+    async def test_requires_an_artifact(self):
+        from app import tools as tool_module
+        with self.assertRaises(tool_module.ToolError):
+            await tool_module._deploy_site({}, {})
 
-    async def test_skipped_when_not_requested(self):
-        with patch.object(nodes, 'settings', SimpleNamespace(deploy_enabled=True)):
-            result = await nodes.deploy_report(
-                {'artifact': {}, 'plan': {'auto_deploy': False}})
-        self.assertEqual(result['status'], 'local_ready')
-        self.assertEqual(result['deployment'],
-                         {'status': 'skipped', 'reason': 'not_requested'})
+    async def test_requires_global_enable(self):
+        from app import tools as tool_module
+        with patch.object(tool_module, 'settings',
+                          SimpleNamespace(deploy_enabled=False)):
+            with self.assertRaises(tool_module.ToolError):
+                await tool_module._deploy_site({}, {'artifact': {'html_path': 'x'}})
 
-    async def test_skipped_when_globally_disabled(self):
-        with patch.object(nodes, 'settings', SimpleNamespace(deploy_enabled=False)):
-            result = await nodes.deploy_report(
-                {'artifact': {}, 'plan': {'auto_deploy': True}})
-        self.assertEqual(result['status'], 'local_ready')
-        self.assertEqual(result['deployment']['reason'], 'deploy_disabled')
-
-    async def test_runs_when_requested(self):
-        calls = []
-
-        async def fake_deploy(artifact):
-            calls.append(artifact)
-            return {'status': 'success', 'public_url': 'https://example.com/s/',
-                    'content_hash': 'h'}
-
+    async def test_deploys_and_marks_status(self):
+        from app import tools as tool_module
         with tempfile.TemporaryDirectory() as folder:
             html = Path(folder) / 'index.html'
             html.write_text('<html></html>', encoding='utf-8')
-            with patch.object(nodes, 'settings', SimpleNamespace(deploy_enabled=True)), \
-                 patch.object(nodes, 'deploy_html', fake_deploy):
-                result = await nodes.deploy_report({
-                    'artifact': {'html_path': str(html)}, 'plan': {'auto_deploy': True}})
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(result['status'], 'deployed')
-        self.assertEqual(result['deployment']['public_url'], 'https://example.com/s/')
+            artifact = {'html_path': str(html), 'sha256': 'abc'}
 
-    async def test_failure_marks_needs_check(self):
-        async def boom(artifact):
-            raise RuntimeError('连接中断')
+            async def fake_deploy(_artifact):
+                return {'status': 'success', 'public_url': 'https://x/1'}
 
+            with patch.object(tool_module, 'settings',
+                              SimpleNamespace(deploy_enabled=True)), \
+                    patch.object(tool_module.mcp_adapter, 'deploy_html', fake_deploy):
+                result = await tool_module._deploy_site({}, {'artifact': artifact})
+            self.assertEqual(result['status'], 'deployed')
+            saved = json.loads((Path(folder) / 'deployment.json').read_text('utf-8'))
+            self.assertEqual(saved['public_url'], 'https://x/1')
+
+    async def test_needs_check_when_tool_reports_otherwise(self):
+        from app import tools as tool_module
         with tempfile.TemporaryDirectory() as folder:
             html = Path(folder) / 'index.html'
             html.write_text('<html></html>', encoding='utf-8')
-            with patch.object(nodes, 'settings', SimpleNamespace(deploy_enabled=True)), \
-                 patch.object(nodes, 'deploy_html', boom):
-                result = await nodes.deploy_report({
-                    'artifact': {'html_path': str(html)}, 'plan': {'auto_deploy': True}})
-        self.assertEqual(result['status'], 'deploy_needs_check')
-        self.assertEqual(result['deployment']['status'], 'needs_check')
+
+            async def fake_deploy(_artifact):
+                return {'status': 'pending', 'public_url': 'https://x/2'}
+
+            with patch.object(tool_module, 'settings',
+                              SimpleNamespace(deploy_enabled=True)), \
+                    patch.object(tool_module.mcp_adapter, 'deploy_html', fake_deploy):
+                result = await tool_module._deploy_site(
+                    {}, {'artifact': {'html_path': str(html), 'sha256': 'a'}})
+            self.assertEqual(result['status'], 'deploy_needs_check')
 
 
 class StoreTests(unittest.TestCase):
@@ -351,16 +477,16 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(received)
 
     async def test_instruction_stage_is_first_and_closes_on_search(self):
-        """「收到指令 → 开始搜索」应排在阶段表第一行，并在检索开始时补齐耗时。"""
+        """「收到指令 → 开始执行」应排在阶段表第一行，并在真正开始干活时补齐耗时。"""
         import app.api_hub as hub_module
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None, on_start=None):
-            on_event({'type': 'stage_start', 'stage': 'parse_request'})
-            on_event({'type': 'stage_end', 'stage': 'parse_request',
+            on_event({'type': 'stage_start', 'stage': 'plan'})
+            on_event({'type': 'stage_end', 'stage': 'plan',
                       'seconds': 1.0, 'status': 'planned'})
             # 这一条到达时，"收到指令"应当被补齐
-            on_event({'type': 'stage_start', 'stage': 'discover_sources'})
+            on_event({'type': 'stage_start', 'stage': 'web_search'})
             return {'task_id': 'a1', 'status': 'local_ready',
                     'deployment': {}, 'timings': []}
 
@@ -371,13 +497,13 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         events = self.events_of(record)
         starts = [e for e in events if e['type'] == 'stage_start']
         self.assertEqual(starts[0]['stage'], 'instruction')
-        self.assertEqual(starts[0]['label'], '收到指令 → 开始搜索')
+        self.assertEqual(starts[0]['label'], '收到指令 → 开始执行')
         ends = [e for e in events
                 if e['type'] == 'stage_end' and e['stage'] == 'instruction']
         self.assertEqual(len(ends), 1)
-        self.assertEqual(ends[0]['status'], '解析完成')
+        self.assertEqual(ends[0]['status'], '规划完成')
         search_at = next(i for i, e in enumerate(events)
-                         if e['type'] == 'stage_start' and e['stage'] == 'discover_sources')
+                         if e['type'] == 'stage_start' and e['stage'] == 'web_search')
         self.assertLess(events.index(ends[0]), search_at)
         # 也要进持久化的 timings，state.json 与 CLI 汇总表才能看到
         self.assertEqual(record.state['timings'][0]['stage'], 'instruction')
@@ -440,8 +566,8 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None, on_start=None):
-            on_event({'type': 'stage_start', 'stage': 'parse_request'})
-            on_event({'type': 'stage_end', 'stage': 'parse_request',
+            on_event({'type': 'stage_start', 'stage': 'plan'})
+            on_event({'type': 'stage_end', 'stage': 'plan',
                       'seconds': 1.0, 'status': 'planned'})
             on_event({'type': 'stage_start', 'stage': 'discover_sources'})
             on_event({'type': 'stage_start', 'stage': 'compose_report'})
@@ -466,7 +592,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None, on_start=None):
-            on_event({'type': 'stage_start', 'stage': 'parse_request'})
+            on_event({'type': 'stage_start', 'stage': 'plan'})
             await asyncio.sleep(30)
             return {}
 
@@ -480,14 +606,17 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         ends = {e['stage']: e['status'] for e in self.events_of(record)
                 if e['type'] == 'stage_end'}
         self.assertEqual(ends.get('instruction'), '已中断')
-        self.assertEqual(ends.get('parse_request'), '已中断')
+        # 卡住的那一步（规划）也要被补上结束事件
+        self.assertEqual(ends.get('plan'), '已中断')
 
     async def test_failed_task_closes_in_flight_stage(self):
         import app.api_hub as hub_module
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None, on_start=None):
-            on_event({'type': 'stage_start', 'stage': 'compose_report'})
+            # 用规划阶段做"还没开始干活"的代表：它不在 FIRST_WORK_STAGES 里，
+            # 因此指令阶段仍是打开的，失败时应当由失败路径补上结束事件。
+            on_event({'type': 'stage_start', 'stage': 'plan'})
             raise RuntimeError('boom')
 
         with patch.object(hub_module, 'run_task', fake):
@@ -495,7 +624,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(record._task, timeout=10)
         ends = {e['stage']: e['status'] for e in self.events_of(record)
                 if e['type'] == 'stage_end'}
-        self.assertEqual(ends.get('compose_report'), '已失败')
+        self.assertEqual(ends.get('plan'), '已失败')
         self.assertEqual(ends.get('instruction'), '已失败')
 
     async def test_cancel_done_task_is_noop(self):
@@ -646,6 +775,14 @@ class ApiTests(unittest.TestCase):
                          ['t1', 't2'])
 
 
+FILES_SCHEMA = {
+    'properties': {
+        'files': {'type': 'array', 'items': {'properties': {'path': {}, 'content': {}}}}
+    }
+}
+TEXT_SCHEMA = {'properties': {'html': {'type': 'string'}}}
+
+
 class McpPayloadTests(unittest.TestCase):
     """按工具真实 inputSchema 组装参数。"""
 
@@ -721,7 +858,11 @@ class MessageTests(unittest.TestCase):
 
     def test_reply_for_failed_is_explainable(self):
         from app.messages import reply_text
-        self.assertIn('没有生成报告', reply_text({'status': 'failed'}))
+        self.assertIn('没有产出可用结果', reply_text({'status': 'failed'}))
+        # 有具体失败原因时要透出来，而不是只说"失败了"
+        with_reason = reply_text({'status': 'failed',
+                                  'failure': '检索来源失败：搜索失败'})
+        self.assertIn('检索来源失败', with_reason)
 
     def test_cancel_note_warns_when_already_deployed(self):
         import json
@@ -791,48 +932,54 @@ class ModelOverrideTests(unittest.TestCase):
 
 
 class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
-    """解析阶段关推理：实测约 2 倍提速，且不影响 auto_deploy 判断。"""
+    """推理开关：只有解析/规划阶段可以关，整理报告必须保留。"""
 
     def test_disable_thinking_sets_thinking_disabled(self):
-        from app.services import new_llm
-        llm = new_llm('m', disable_thinking=True)
-        # langchain 把它放进 model_kwargs / extra_body，两者都检查
-        body = getattr(llm, 'extra_body', None) or llm.model_kwargs.get('extra_body')
-        self.assertEqual(body, {'thinking': {'type': 'disabled'}})
+        import app.services as services
+        with patch.object(services, 'ChatOpenAI') as fake:
+            services.new_llm(disable_thinking=True)
+        kwargs = fake.call_args.kwargs
+        # 只有 thinking.disabled 能真正关掉推理（low/minimal 会被网关忽略）
+        self.assertEqual(kwargs['extra_body'], {'thinking': {'type': 'disabled'}})
 
     def test_default_keeps_thinking_enabled(self):
-        from app.services import new_llm
-        llm = new_llm('m')
-        body = getattr(llm, 'extra_body', None) or llm.model_kwargs.get('extra_body')
-        # 整理报告阶段依赖推理：默认不能带关闭参数，否则结构化输出会失败
-        self.assertIsNone(body)
+        import app.services as services
+        with patch.object(services, 'ChatOpenAI') as fake:
+            services.new_llm()
+        kwargs = fake.call_args.kwargs
+        self.assertNotIn('extra_body', kwargs)
+        self.assertNotIn('reasoning_effort', kwargs)
 
-    async def test_parse_passes_the_flag(self):
-        from app.config import settings
+    async def test_planner_passes_the_flag(self):
         from app import nodes
+        from app import tools as tool_module
         captured = {}
 
-        async def fake_call(schema, system, user, model=None, attempts=2,
-                            disable_thinking=False, on_draft=None,
-                            draft_interval=1.0):
-            captured['disable_thinking'] = disable_thinking
-            return Plan.model_validate({'topic': 't', 'auto_deploy': False,
-                                 'need_research': True}), None
+        async def fake_catalog():
+            return tool_module.BUILTIN_TOOLS
 
-        with patch.object(nodes, 'structured_call', fake_call), \
-             patch.object(nodes, 'urls_from_input', lambda text: []):
-            await nodes.parse_request({'user_input': 't', 'usage': []})
+        async def fake_call(schema, system, user, **kw):
+            captured.update(kw)
+            return ExecutionPlan.model_validate(
+                {'steps': [{'tool': 'answer_directly', 'args': {}}]}), None
+
+        with patch.object(tool_module, 'catalog', fake_catalog), \
+                patch.object(nodes, 'structured_call', fake_call):
+            await nodes.plan({'user_input': '介绍一下 SQLite', 'usage': []})
+        from app.config import settings
         self.assertEqual(captured['disable_thinking'],
                          settings.llm_parse_disable_thinking)
 
+
+class ComposeToolTests(unittest.IsolatedAsyncioTestCase):
+    """整理报告工具：模型选择、推理开关、来源预算。"""
+
     async def test_compose_never_disables_thinking(self):
-        from app import nodes
+        from app import tools as tool_module
         captured = {}
 
-        async def fake_call(schema, system, user, model=None, attempts=2,
-                            disable_thinking=False, on_draft=None,
-                            draft_interval=1.0):
-            captured['disable_thinking'] = disable_thinking
+        async def fake_call(schema, system, user, **kw):
+            captured.update(kw)
             return Report.model_validate({
                 'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
                 'sections': [{'heading': 'h', 'paragraphs': [
@@ -840,104 +987,40 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
 
         state = {'documents': [{'source_id': 's1', 'title': 't', 'status': 'success',
                                 'url': 'https://e.com/', 'raw_content': '正文'}],
-                 'plan': {'mode': 'topic', 'topic': 't'}, 'usage': []}
-        with patch.object(nodes, 'structured_call', fake_call):
-            await nodes.compose_report(state)
-        # 关掉推理会让整理阶段产不出合法的 tool_call（实测 output token 有、
-        # 但既无 content 也无 tool_call），所以这里必须是 False
-        self.assertFalse(captured['disable_thinking'])
-
-    async def test_compose_keeps_multiple_sources_within_budget(self):
-        """单篇上限必须明显小于总量。
-
-        两者相等时第一个来源就把预算吃光，后面的来源 limit<=0 被 break 掉，
-        报告退化成单一来源——正好丢掉了交叉引用这个核心价值。
-        """
-        from app import nodes
+                 'usage': []}
+        with patch.object(tool_module, 'structured_call', fake_call):
+            await tool_module._compose_report({}, state)
+        # 关掉推理会让整理阶段产不出合法的 tool_call，这里必须保持 False
+        self.assertFalse(captured.get('disable_thinking', False))
         from app.config import settings
-        captured = {}
-
-        async def fake_call(schema, system, user, model=None, attempts=2,
-                            disable_thinking=False, on_draft=None,
-                            draft_interval=1.0, attempt_timeout=None):
-            captured['payload'] = json.loads(user)
-            return Report.model_validate({
-                'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
-                'sections': [{'heading': 'h', 'paragraphs': [
-                    {'text': 'x', 'source_ids': ['s1']}]}]}), None
-
-        documents = [{'source_id': f's{i}', 'title': f't{i}', 'status': 'success',
-                      'url': f'https://example.com/{i}', 'raw_content': 'x' * 20000}
-                     for i in range(1, 5)]
-        state = {'documents': documents,
-                 'plan': {'mode': 'topic', 'topic': 't'}, 'usage': []}
-        with patch.object(nodes, 'structured_call', fake_call):
-            await nodes.compose_report(state)
-
-        selected = captured['payload']['资料']
-        total = sum(len(item['text']) for item in selected)
-        self.assertGreaterEqual(len(selected), 2, '至少要装下两个来源才能交叉引用')
-        self.assertLessEqual(total, settings.max_total_chars)
-        for item in selected:
-            self.assertLessEqual(len(item['text']), settings.max_source_chars)
-
-
-class ComposeModelTests(unittest.IsolatedAsyncioTestCase):
-    async def test_compose_passes_compose_model_and_records_it(self):
-        from app.config import settings
-        captured = {}
-
-        async def fake_call(schema, system, user, model=None, attempts=2,
-                            disable_thinking=False, on_draft=None,
-                            draft_interval=1.0):
-            captured['model'] = model
-            return Report.model_validate({
-                'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
-                'sections': [{'heading': 'h', 'paragraphs': [
-                    {'text': 'x', 'source_ids': ['s1']}]}],
-            }), {'total_tokens': 1}
-
-        state = {
-            'documents': [{'source_id': 's1', 'title': 't', 'status': 'success',
-                           'url': 'https://example.com/', 'raw_content': '正文内容'}],
-            'plan': {'mode': 'topic', 'topic': 't'}, 'usage': [],
-        }
-        with patch.object(nodes, 'structured_call', fake_call):
-            result = await nodes.compose_report(state)
         self.assertEqual(captured['model'], settings.llm_compose_model)
-        # usage 里要能看出这一阶段用的是哪个模型，便于排查耗时。
+
+    async def test_compose_records_model_name(self):
+        from app import tools as tool_module
+        from app.config import settings
+
+        async def fake_call(schema, system, user, **kw):
+            return Report.model_validate({
+                'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
+                'sections': [{'heading': 'h', 'paragraphs': [
+                    {'text': 'x', 'source_ids': ['s1']}]}]}), {'total_tokens': 1}
+
+        state = {'documents': [{'source_id': 's1', 'title': 't', 'status': 'success',
+                                'url': 'https://example.com/', 'raw_content': '正文'}],
+                 'usage': []}
+        with patch.object(tool_module, 'structured_call', fake_call):
+            result = await tool_module._compose_report({}, state)
         self.assertEqual(result['usage'][-1]['model_name'], settings.llm_compose_model)
 
-    async def test_parse_records_model_name(self):
-        """两个阶段的 usage 都要记模型名，才能从运行记录核查各步用的哪个模型。"""
-        from app.config import settings
+    async def test_compose_refuses_without_sources(self):
+        from app import tools as tool_module
+        with self.assertRaises(tool_module.ToolError):
+            await tool_module._compose_report({}, {'documents': [], 'usage': []})
 
-        async def fake_call(schema, system, user, model=None, attempts=2,
-                            disable_thinking=False, on_draft=None,
-                            draft_interval=1.0):
-            return Plan.model_validate({'topic': 't', 'auto_deploy': False,
-                                 'need_research': True}), None
-
-        with patch.object(nodes, 'structured_call', fake_call), \
-             patch.object(nodes, 'urls_from_input', lambda text: []):
-            result = await nodes.parse_request({'user_input': 't', 'usage': []})
-        self.assertEqual(result['usage'][-1]['model_name'], settings.llm_model)
-
-    async def test_parse_stage_keeps_main_model(self):
-        # 解析阶段不受影响，仍用主模型。
-        captured = {}
-
-        async def fake_call(schema, system, user, model=None, attempts=2,
-                            disable_thinking=False, on_draft=None,
-                            draft_interval=1.0):
-            captured['model'] = model
-            return Plan.model_validate({'topic': 't', 'auto_deploy': False,
-                                 'need_research': True}), None
-
-        with patch.object(nodes, 'structured_call', fake_call), \
-             patch.object(nodes, 'urls_from_input', lambda text: []):
-            await nodes.parse_request({'user_input': 't', 'usage': []})
-        self.assertIsNone(captured['model'])
+    async def test_render_requires_a_report(self):
+        from app import tools as tool_module
+        with self.assertRaises(tool_module.ToolError):
+            await tool_module._render_html({}, {'task_id': 'x', 'documents': []})
 
 
 class ProfileTests(unittest.TestCase):
@@ -1011,36 +1094,32 @@ def profile_file():
     return str(settings.profile_path)
 
 
-class ProfileNodeTests(unittest.IsolatedAsyncioTestCase):
-    """parse_request 记住用户信息并发出提示。"""
+class PlannerProfileTests(unittest.IsolatedAsyncioTestCase):
+    """规划器也会记用户信息：这条能力不能随重写丢掉。"""
 
-    async def test_parse_merges_profile_updates(self):
-        from app import nodes, profile
-        from app.config import settings
-        import tempfile as _tf
-        with _tf.TemporaryDirectory() as folder:
-            original = settings.profile_path
-            object.__setattr__(settings, 'profile_path',
-                               Path(folder) / 'USER.md')
-            try:
-                async def fake_call(schema, system, user, model=None, attempts=2,
-                                    disable_thinking=False, on_draft=None,
-                                    draft_interval=1.0):
-                    return Plan.model_validate({
-                        'topic': 't', 'auto_deploy': False,
-                        'need_research': True,
-                        'profile_updates': {'电话': '13900000000'}}), None
-                seen = []
-                with patch.object(nodes, 'structured_call', fake_call), \
-                     patch.object(nodes, 'urls_from_input', lambda text: []), \
-                     patch.object(nodes, 'emit', seen.append):
-                    await nodes.parse_request({'user_input': '我叫张三，电话13900000000',
-                                               'usage': []})
-                self.assertEqual(profile.load().get('电话'), '13900000000')
-                labels = [e.get('label') for e in seen]
-                self.assertIn('已记住', labels)
-            finally:
-                object.__setattr__(settings, 'profile_path', original)
+    async def test_plan_merges_profile_updates(self):
+        from app import nodes
+        from app import profile
+        from app import tools as tool_module
+
+        async def fake_catalog():
+            return tool_module.BUILTIN_TOOLS
+
+        async def fake_call(schema, system, user, **kw):
+            return ExecutionPlan.model_validate({
+                'steps': [{'tool': 'answer_directly', 'args': {'question': 'q'}}],
+                'profile_updates': {'电话': '13900000000'},
+            }), None
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'USER.md'
+            # settings 是 frozen dataclass，只能整体替换而不能改字段
+            with patch.object(profile, 'settings', SimpleNamespace(profile_path=path)):
+                with patch.object(tool_module, 'catalog', fake_catalog), \
+                        patch.object(nodes, 'structured_call', fake_call):
+                    await nodes.plan({'user_input': '我电话13900000000', 'usage': []})
+                self.assertTrue(path.exists(), '画像应被写入文件')
+                self.assertIn('13900000000', path.read_text(encoding='utf-8'))
 
 
 class SmallTalkFilterTests(unittest.IsolatedAsyncioTestCase):
@@ -1065,54 +1144,33 @@ class SmallTalkFilterTests(unittest.IsolatedAsyncioTestCase):
                      '谢谢你帮我写个报告']:
             self.assertFalse(is_small_talk(text), text)
 
-    async def test_parse_request_skips_the_model_for_small_talk(self):
+    async def test_link_is_never_treated_as_small_talk(self):
+        """带链接就必须走规划与检索，不能因为句子短就被当成寒暄。"""
         from app import nodes
-
-        async def forbidden(*args, **kwargs):
-            raise AssertionError('寒暄不应该调用模型')
-
-        with patch.object(nodes, 'structured_call', forbidden):
-            result = await nodes.parse_request({'user_input': '你好', 'usage': []})
-        self.assertEqual(result['status'], 'planned')
-        self.assertFalse(result['plan']['need_research'])
-        self.assertEqual(result['usage'], [])        # 没调模型就没有用量
-        self.assertEqual(nodes.route_intent(result), 'answer_directly')
-
-    async def test_link_is_never_small_talk(self):
-        """带链接就必须走检索，不能因为句子短就被当成寒暄。"""
-        from app import nodes
+        from app import tools as tool_module
         called = {}
+
+        async def fake_catalog():
+            return tool_module.BUILTIN_TOOLS
 
         async def fake_call(schema, system, user, **kw):
             called['hit'] = True
-            return Plan.model_validate({'topic': 't', 'auto_deploy': False,
-                                        'need_research': True}), None
+            return ExecutionPlan.model_validate({'steps': [
+                {'tool': 'fetch_pages', 'args': {'urls': ['https://example.com']}}]}), None
 
-        with patch.object(nodes, 'structured_call', fake_call):
-            result = await nodes.parse_request(
+        with patch.object(tool_module, 'catalog', fake_catalog), \
+                patch.object(nodes, 'structured_call', fake_call):
+            result = await nodes.plan(
                 {'user_input': 'hi https://example.com', 'usage': []})
-        self.assertTrue(called.get('hit'), '带 URL 时不能跳过模型')
-        self.assertTrue(result['plan']['need_research'])
+        self.assertTrue(called.get('hit'), '带 URL 时不能跳过规划')
+        self.assertEqual(result['plan']['steps'][0]['tool'], 'fetch_pages')
 
 
-class RoutingTests(unittest.IsolatedAsyncioTestCase):
-    """按 need_research 分流：不需要联网时直接回答，不搜索、不生成报告。"""
+class AnswerToolTests(unittest.IsolatedAsyncioTestCase):
+    """直接回答工具：流式增量 + 多轮上下文。"""
 
-    def test_route_intent(self):
-        from app import nodes
-        self.assertEqual(nodes.route_intent({'plan': {'need_research': True}}),
-                         'discover_sources')
-        self.assertEqual(nodes.route_intent({'plan': {'need_research': False}}),
-                         'answer_directly')
-
-    def test_route_intent_defaults_to_research(self):
-        # 缺字段时保守走检索：该搜没搜会让用户拿到没有来源的回答
-        from app import nodes
-        self.assertEqual(nodes.route_intent({'plan': {}}), 'discover_sources')
-        self.assertEqual(nodes.route_intent({}), 'discover_sources')
-
-    async def test_direct_answer_streams_deltas(self):
-        from app import nodes
+    async def test_streams_deltas(self):
+        from app import tools as tool_module
         pieces = ('你好', '，有什么', '可以帮你？')
 
         async def fake_chat(system, messages, model=None, on_delta=None):
@@ -1122,60 +1180,93 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             return ''.join(pieces)
 
         seen = []
-        with patch.object(nodes, 'chat_reply', fake_chat), \
-             patch.object(nodes, 'emit', seen.append):
-            result = await nodes.answer_directly(
-                {'user_input': '你好', 'history': []})
+        with patch.object(tool_module, 'chat_reply', fake_chat), \
+                patch.object(tool_module, 'emit', seen.append):
+            result = await tool_module._answer_directly(
+                {'question': '你好'}, {'user_input': '你好', 'history': []})
+        self.assertEqual(result['answer'], ''.join(pieces))
         self.assertEqual(result['status'], 'answered')
-        self.assertEqual(result['answer'], '你好，有什么可以帮你？')
-        deltas = [e['text'] for e in seen if e.get('type') == 'answer_delta']
-        self.assertEqual(''.join(deltas), '你好，有什么可以帮你？')
+        self.assertTrue(any(e.get('type') == 'answer_delta' for e in seen))
 
-    async def test_direct_answer_passes_history(self):
-        from app import nodes
+    async def test_passes_history(self):
+        from app import tools as tool_module
         captured = {}
 
         async def fake_chat(system, messages, model=None, on_delta=None):
             captured['messages'] = messages
             return 'ok'
 
-        history = [{'role': 'user', 'content': '前一句'},
-                   {'role': 'assistant', 'content': '前一句的回答'}]
-        with patch.object(nodes, 'chat_reply', fake_chat), \
-             patch.object(nodes, 'emit', lambda e: None):
-            await nodes.answer_directly(
-                {'user_input': '接着问', 'history': history})
-        # 多轮上下文要带上，否则"接着问"这类指代没法理解
-        self.assertEqual([m['content'] for m in captured['messages']],
-                         ['前一句', '前一句的回答', '接着问'])
+        history = [{'role': 'user', 'content': '上一问'},
+                   {'role': 'assistant', 'content': '上一答'}]
+        with patch.object(tool_module, 'chat_reply', fake_chat):
+            await tool_module._answer_directly(
+                {'question': '追问'}, {'user_input': '追问', 'history': history})
+        contents = [m['content'] for m in captured['messages']]
+        self.assertEqual(contents, ['上一问', '上一答', '追问'])
 
-    async def test_graph_routes_to_direct_answer_without_searching(self):
-        """need_research=False 时不应触发任何检索。"""
-        from app import nodes
+
+class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
+    """整图跑通：寒暄不检索，规划出来的步骤被逐步执行。"""
+
+    async def test_small_talk_answers_without_searching(self):
+        from app import tools as tool_module
         from app.graph import build_graph
-        touched = {}
+        from app.tools import Tool
+        touched = {'searched': False}
 
-        async def fake_parse(state):
-            return {'plan': {'mode': 'topic', 'topic': 't', 'queries': ['q'],
-                             'urls': [], 'need_research': False},
-                    'status': 'planned'}
-
-        async def fake_answer(state):
+        async def fake_answer(args, state):
             return {'answer': '你好！', 'status': 'answered'}
 
-        async def should_not_run(*a, **k):
+        async def fake_search(args, state):
             touched['searched'] = True
-            return {}
+            return {'documents': []}
 
-        with patch.object(nodes, 'parse_request', fake_parse), \
-             patch.object(nodes, 'answer_directly', fake_answer), \
-             patch.object(nodes, 'discover_sources', should_not_run):
+        table = dict(tool_module.BUILTIN_BY_NAME)
+        table['answer_directly'] = Tool('answer_directly', '直接回答', 'd', {}, fake_answer)
+        table['web_search'] = Tool('web_search', '检索来源', 'd', {}, fake_search)
+
+        async def fake_catalog():
+            return list(table.values())
+
+        with patch.dict(tool_module.BUILTIN_BY_NAME, table), \
+                patch.object(tool_module, 'catalog', fake_catalog):
             result = await build_graph().ainvoke({
                 'task_id': 'x', 'user_input': '你好', 'documents': [],
-                'errors': [], 'usage': [], 'research_round': 0, 'searched': False})
+                'errors': [], 'usage': [], 'step_index': 0, 'mcp_calls': []})
         self.assertEqual(result['status'], 'answered')
-        self.assertEqual(result['answer'], '你好！')
-        self.assertNotIn('searched', touched)
+        self.assertFalse(touched['searched'])
+
+    async def test_plan_steps_run_in_order(self):
+        from app import nodes
+        from app import tools as tool_module
+        from app.graph import build_graph
+        from app.tools import Tool
+        order = []
+
+        def make(name, label):
+            async def run(args, state):
+                order.append(name)
+                return {}
+            return Tool(name, label, 'd', {}, run)
+
+        table = {'web_search': make('web_search', '检索来源'),
+                 'render_html': make('render_html', '渲染 HTML')}
+
+        async def fake_catalog():
+            return list(table.values())
+
+        async def fake_plan(state):
+            return {'plan': {'steps': [{'tool': 'web_search', 'args': {}},
+                                       {'tool': 'render_html', 'args': {}}]},
+                    'step_index': 0, 'status': 'planned'}
+
+        with patch.dict(tool_module.BUILTIN_BY_NAME, table), \
+                patch.object(tool_module, 'catalog', fake_catalog), \
+                patch.object(nodes, 'plan', fake_plan):
+            await build_graph().ainvoke({
+                'task_id': 'x', 'user_input': 'q', 'documents': [],
+                'errors': [], 'usage': [], 'step_index': 0, 'mcp_calls': []})
+        self.assertEqual(order, ['web_search', 'render_html'])
 
 
 class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
@@ -1208,14 +1299,14 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
 
     def bad(self, tokens=5):
         # topic 为空过不了 Plan 的 min_length 校验
-        return [self.FakeChunk(tool_calls=[{'name': 'Plan', 'args': {'topic': ''}}],
+        return [self.FakeChunk(tool_calls=[{'name': 'ExecutionPlan', 'args': {'steps': []}}],
                                usage={'total_tokens': tokens})]
 
     def good(self, tokens=7):
         return [self.FakeChunk(
-            tool_calls=[{'name': 'Plan',
-                         'args': {'topic': 't', 'auto_deploy': False,
-                                  'need_research': True}}],
+            tool_calls=[{'name': 'ExecutionPlan',
+                         'args': {'steps': [{'tool': 'web_search',
+                                             'args': {'query': 't'}}]}}],
             usage={'total_tokens': tokens})]
 
     async def call(self, outcomes, calls=None, **kw):
@@ -1229,12 +1320,12 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(services, 'new_llm',
                           lambda model=None, disable_thinking=False:
                           self.fake_llm(outcomes, calls)):
-            result = await services.structured_call(Plan, 's', 'u', **kw)
+            result = await services.structured_call(ExecutionPlan, 's', 'u', **kw)
         return result, calls
 
     async def test_retries_once_then_succeeds(self):
         (parsed, _), calls = await self.call([self.bad(), self.good()])
-        self.assertEqual(parsed.topic, 't')
+        self.assertEqual(parsed.steps[0].tool, 'web_search')
         self.assertEqual(len(calls), 2)
 
     async def test_gives_up_after_max_attempts(self):
@@ -1255,7 +1346,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_name_is_forced(self):
         _, calls = await self.call([self.good()], attempts=1)
         # tool_choice 必须钉死工具名，否则模型可能不调用工具
-        self.assertEqual(calls[0], ('bind', 'Plan'))
+        self.assertEqual(calls[0], ('bind', 'ExecutionPlan'))
 
     async def test_attempt_timeout_fails_without_retry(self):
         """单次尝试超时立刻失败，不再试第二次。
@@ -1278,14 +1369,14 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
                           lambda model=None, disable_thinking=False: HangingLLM()):
             with self.assertRaises(services.AttemptTimeout):
                 await services.structured_call(
-                    Plan, 's', 'u', attempts=2, attempt_timeout=0.05)
+                    ExecutionPlan, 's', 'u', attempts=2, attempt_timeout=0.05)
         self.assertEqual(len(calls), 1, '超时不应该重试')
 
     async def test_attempt_timeout_zero_disables_the_limit(self):
         """attempt_timeout<=0 表示不限制，走正常路径。"""
         (parsed, _), calls = await self.call([self.good()], attempts=1,
                                              attempt_timeout=0)
-        self.assertEqual(parsed.topic, 't')
+        self.assertEqual(parsed.steps[0].tool, 'web_search')
         self.assertEqual(len(calls), 1)
 
     async def test_timeout_does_not_swallow_user_cancel(self):
@@ -1302,7 +1393,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
 
         async def run():
             await services.structured_call(
-                Plan, 's', 'u', attempts=1, attempt_timeout=30)
+                ExecutionPlan, 's', 'u', attempts=1, attempt_timeout=30)
 
         with patch.object(services, 'new_llm',
                           lambda model=None, disable_thinking=False: BlockingLLM()):
@@ -1317,24 +1408,26 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         calls, drafts = [], []
         partial = self.FakeChunk(
             tool_call_chunks=[{'args':
-                '{"topic": "半成品", "auto_deploy": false, "need_research": true}'}])
+                '{"steps": [{"tool": "web_search", "args": {"query": "半成品"}}]}'}])
         full = self.FakeChunk(
-            tool_calls=[{'name': 'Plan',
-                         'args': {'topic': '完整', 'auto_deploy': False,
-                                  'need_research': True}}],
+            tool_calls=[{'name': 'ExecutionPlan',
+                         'args': {'steps': [{'tool': 'web_search',
+                                             'args': {'query': '完整'}}]}}],
             usage={'total_tokens': 3})
         with patch.object(services, 'new_llm',
                           lambda model=None, disable_thinking=False:
                           self.fake_llm([[partial, full]], calls)):
             parsed, _ = await services.structured_call(
-                Plan, 's', 'u', attempts=1, on_draft=drafts.append, draft_interval=0)
-        self.assertEqual(parsed.topic, '完整')
+                ExecutionPlan, 's', 'u', attempts=1, on_draft=drafts.append, draft_interval=0)
+        self.assertEqual(parsed.steps[0].args['query'], '完整')
         # 首次回调必须是 None（清空）：重试时也一样，避免两次内容混在一起
         self.assertIsNone(drafts[0])
-        # 中途要能收到半成品（标题已到、其余还在生成）
-        self.assertTrue(any(d is not None and d.topic == '半成品' for d in drafts))
+        # 中途要能收到半成品（第一步已到、其余还在生成）
+        self.assertTrue(any(d is not None and d.steps
+                            and d.steps[0].args.get('query') == '半成品'
+                            for d in drafts))
         # 最终结果也要推一次，保证前端拿到完整版
-        self.assertEqual(drafts[-1].topic, '完整')
+        self.assertEqual(drafts[-1].steps[0].args['query'], '完整')
 
     async def test_throttle_advances_even_when_draft_unparsable(self):
         """解析失败也必须推进节流时间戳。
@@ -1360,7 +1453,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
                           self.fake_llm([unparsable], calls)):
             with self.assertRaises(RuntimeError):
                 await services.structured_call(
-                    Plan, 's', 'u', attempts=1, on_draft=drafts.append,
+                    ExecutionPlan, 's', 'u', attempts=1, on_draft=drafts.append,
                     draft_interval=3600)      # 节流窗口远大于测试时长
         # 40 个分片只允许解析一次（节流生效），而不是 40 次
         self.assertEqual(parsed_count['n'], 1)
@@ -1369,19 +1462,20 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         from app import services
         calls, drafts = [], []
         partial = self.FakeChunk(
-            tool_call_chunks=[{'args': '{"topic": "第一版的残留", "auto_deploy": false,'
-                                    ' "need_research": true}'}])
-        bad = self.FakeChunk(tool_calls=[{'name': 'Plan', 'args': {'topic': ''}}],
-                             tool_call_chunks=[{'args': '{"topic": "第一版的残留"}'}])
+            tool_call_chunks=[{'args': '{"steps": [{"tool": "web_search",'
+                                        ' "args": {"query": "第一版的残留"}}]}'}])
+        bad = self.FakeChunk(
+            tool_calls=[{'name': 'ExecutionPlan', 'args': {'steps': []}}],
+            tool_call_chunks=[{'args': '{"steps": [{"tool": "web_search"}]}'}])
         good = self.FakeChunk(
-            tool_calls=[{'name': 'Plan',
-                         'args': {'topic': '第二版', 'auto_deploy': False,
-                                  'need_research': True}}])
+            tool_calls=[{'name': 'ExecutionPlan',
+                         'args': {'steps': [{'tool': 'answer_directly',
+                                             'args': {'question': '第二版'}}]}}])
         with patch.object(services, 'new_llm',
                           lambda model=None, disable_thinking=False:
                           self.fake_llm([[partial, bad], [good]], calls)):
             await services.structured_call(
-                Plan, 's', 'u', on_draft=drafts.append, draft_interval=0)
+                ExecutionPlan, 's', 'u', on_draft=drafts.append, draft_interval=0)
         # 两次尝试各清空一次，第一次尝试的残留不会留在界面上
         self.assertEqual([d is None for d in drafts].count(True), 2)
 

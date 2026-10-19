@@ -191,10 +191,14 @@ class Hub:
             record.publish(stage_end(opened['stage'],
                                      time.time() - opened['at'], status))
 
+        # 这些阶段一出现，说明"规划已完成、开始真正干活"，可结算指令耗时。
+        FIRST_WORK_STAGES = {'web_search', 'fetch_pages', 'answer_directly',
+                             'compose_report', 'render_html', 'deploy_site'}
+
         def relay(event: dict) -> None:
             if (event.get('type') == 'stage_start'
-                    and event.get('stage') == 'discover_sources'):
-                close_instruction('解析完成')
+                    and event.get('stage') in FIRST_WORK_STAGES):
+                close_instruction('规划完成')
             track(event)
             record.publish(event)
 

@@ -52,8 +52,8 @@ async def run_task(text: str, progress=None, on_event=None, history=None, on_sta
         on_start(task_id)
     state = {
         'task_id': task_id, 'user_input': text,
-        'documents': [], 'errors': [], 'usage': [],
-        'research_round': 0, 'searched': False, 'status': 'created',
+        'documents': [], 'mcp_calls': [], 'errors': [], 'usage': [],
+        'step_index': 0, 'status': 'created',
         'timings': [], 'history': list(history or []),
     }
     started = time.perf_counter()
@@ -75,14 +75,18 @@ async def run_task(text: str, progress=None, on_event=None, history=None, on_sta
                         state.update(update)
                     # stream_mode='updates' 在该节点跑完后才产出事件，
                     # 所以相邻事件的时间差≈该节点耗时（含少量调度开销）。
+                    # run_step 会自我循环多次，用 step_label 记具体是哪一步，
+                    # 否则耗时表里会出现一排分不清的 "run_step"。
+                    label = (update.get('step_label')
+                             if isinstance(update, dict) else None) or name
                     state['timings'].append({
-                        'stage': name,
+                        'stage': label,
                         'seconds': round(now - marked, 2),
                         'status': state.get('status'),
                     })
                     marked = now
                     if progress:
-                        progress(name, state.get('status'), round(now - started, 2))
+                        progress(label, state.get('status'), round(now - started, 2))
                     save_json(folder / 'state.json', state)
     except Exception as exc:
         state['status'] = 'failed'
