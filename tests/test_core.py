@@ -72,6 +72,175 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(truncated)
 
 
+class SourceStoreTests(unittest.TestCase):
+    """P0：正文落盘，state 里只留元数据。"""
+
+    def test_text_roundtrip_and_metadata(self):
+        from app import sources
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(sources, 'settings',
+                              SimpleNamespace(artifact_dir=Path(folder))):
+                doc = sources.metadata('t1', 's1', url='https://a/1', title='甲',
+                                       snippet='摘要' * 300, text='正文' * 500)
+                self.assertEqual(doc['chars'], 1000)
+                self.assertEqual(doc['status'], 'success')
+                self.assertNotIn('raw_content', doc)      # 正文不进 state
+                self.assertLessEqual(len(doc['snippet']), 400)
+                self.assertEqual(len(sources.load_text(doc)), 1000)
+                self.assertTrue(sources.has_text(doc))
+
+    def test_missing_text_and_legacy_compat(self):
+        from app import sources
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(sources, 'settings',
+                              SimpleNamespace(artifact_dir=Path(folder))):
+                # 没有正文的登记项
+                doc = sources.metadata('t1', 's2', url='https://a/2', title='乙')
+                self.assertEqual(doc['chars'], 0)
+                self.assertFalse(sources.has_text(doc))
+                self.assertEqual(sources.load_text(doc), '')
+                # 旧数据里还带 raw_content 的也要能读
+                legacy = {'source_id': 's9', 'task_id': 't1', 'url': 'https://a/9',
+                          'title': '旧', 'raw_content': '旧正文', 'status': 'pending'}
+                self.assertEqual(sources.load_text(legacy), '旧正文')
+                self.assertTrue(sources.has_text(legacy))
+
+    def test_strip_text_drops_bodies(self):
+        from app import sources
+        docs = [{'source_id': 's1', 'raw_content': 'x' * 100, 'url': 'u'}]
+        self.assertNotIn('raw_content', sources.strip_text(docs)[0])
+
+
+class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
+    """P0：检索/成稿都走落盘正文，state 不再背几百 KB。"""
+
+    async def test_search_keeps_text_out_of_state(self):
+        from app import sources, tools as tool_module
+
+        async def fake_search(query):
+            return {'results': [{'url': 'https://example.com/a', 'title': '甲文',
+                                 'content': '摘要', 'raw_content': '正文' * 400}],
+                    'usage': {}}
+
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(sources, 'settings',
+                              SimpleNamespace(artifact_dir=Path(folder))), \
+                    patch.object(tool_module, 'search_query', fake_search), \
+                    patch.object(tool_module, 'emit', lambda e: None):
+                result = await tool_module._web_search(
+                    {'query': 'q'}, {'task_id': 't1', 'documents': [],
+                                     'errors': [], 'usage': []})
+        doc = result['documents'][0]
+        self.assertNotIn('raw_content', doc)
+        self.assertEqual(doc['chars'], 800)
+        self.assertEqual(doc['status'], 'success')
+        self.assertEqual(doc['task_id'], 't1')       # 正文在哪个任务目录下
+
+    def test_select_sources_reads_text_from_disk(self):
+        from app import sources, tools as tool_module
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(sources, 'settings',
+                              SimpleNamespace(artifact_dir=Path(folder))):
+                doc = sources.metadata('t1', 's1', url='https://a/1', title='甲',
+                                       text='一' * 5000)
+                selected, truncated = tool_module._select_sources(
+                    {}, [doc])
+        self.assertEqual(selected[0]['source_id'], 's1')
+        self.assertEqual(len(selected[0]['text']), 3000)   # max_source_chars
+        self.assertTrue(truncated)
+
+
+class ContextBuilderTests(unittest.TestCase):
+    """P1：按 token 预算装配上下文。"""
+
+    def test_estimate_tokens_prefers_conservative(self):
+        from app import context
+        self.assertGreater(context.estimate_tokens('中文' * 100), 100)
+        self.assertGreater(context.estimate_tokens('a' * 100), 0)
+        self.assertEqual(context.estimate_tokens(''), 0)
+
+    def test_select_trims_to_budget_but_keeps_one(self):
+        from app import context
+        history = [{'role': 'user', 'content': '很长的内容' * 800}
+                   for _ in range(30)]
+        picked = context.select(history, 'plan')
+        self.assertLess(len(picked), 30)
+        self.assertGreaterEqual(len(picked), 1)
+        # 只留一条也不会因为超预算就返回空
+        huge = [{'role': 'user', 'content': 'x' * 100000}]
+        self.assertEqual(len(context.select(huge, 'plan')), 1)
+
+    def test_memory_text_and_system_injection(self):
+        from app import context
+        memory = {'summary': '用户在减脂', 'facts': {'目标': '降到15%'}, 'upto': 12}
+        block = context.memory_text(memory)
+        self.assertIn('会话摘要', block)
+        self.assertIn('降到15%', block)
+        self.assertEqual(context.memory_text({}), '')
+        merged = context.system_with_memory('基础提示', memory)
+        self.assertTrue(merged.startswith('基础提示'))
+        self.assertIn('会话摘要', merged)
+        self.assertEqual(context.system_with_memory('基础提示', {}), '基础提示')
+
+
+class SessionMemoryTests(unittest.IsolatedAsyncioTestCase):
+    """P2：滚动摘要 + 关键事实。"""
+
+    def test_parse_and_render_facts(self):
+        from app import memory
+        self.assertEqual(memory.parse_facts('目标：减脂\n- 已否决: 节食\n\n'),
+                         {'目标': '减脂', '已否决': '节食'})
+        self.assertEqual(memory.render_facts({'目标': '减脂'}), '目标：减脂')
+
+    def test_needs_compaction_thresholds(self):
+        from app import memory
+        few = [{'content': '短'} for _ in range(3)]
+        self.assertFalse(memory.needs_compaction(few))
+        many = [{'content': '短'} for _ in range(memory.MAX_MESSAGES + 1)]
+        self.assertTrue(memory.needs_compaction(many))
+        fat = [{'content': '很长的内容' * 400} for _ in range(6)]
+        self.assertTrue(memory.needs_compaction(fat))
+
+    async def test_compact_folds_old_messages_into_summary(self):
+        from app import memory
+        from app.schemas import SessionMemory
+        from app.store import Store
+        store = Store(':memory:')
+        for i in range(memory.MAX_MESSAGES + 4):
+            store.append_message('s1', 'user' if i % 2 == 0 else 'assistant',
+                                 f'第{i}条消息')
+
+        async def fake_call(schema, system, user, **kw):
+            return SessionMemory(summary='压缩后的摘要', facts={'目标': '减脂'}), None
+
+        with patch.object(memory, 'structured_call', fake_call):
+            result = await memory.compact(store, 's1')
+        self.assertTrue(result['compacted'])
+        self.assertEqual(result['folded'], memory.MAX_MESSAGES + 4 - memory.KEEP_RECENT)
+        saved = store.memory('s1')
+        self.assertEqual(saved['summary'], '压缩后的摘要')
+        self.assertEqual(saved['facts'], {'目标': '减脂'})
+        # 未摘要部分只剩最近几条，不会越压越少
+        self.assertEqual(len(store.messages_after('s1', saved['upto'])),
+                         memory.KEEP_RECENT)
+
+    async def test_compact_failure_is_silent(self):
+        from app import memory
+        from app.store import Store
+        store = Store(':memory:')
+        for i in range(memory.MAX_MESSAGES + 4):
+            store.append_message('s1', 'user', f'第{i}条')
+
+        async def boom(*a, **k):
+            raise RuntimeError('模型不可用')
+
+        with patch.object(memory, 'structured_call', boom):
+            result = await memory.compact(store, 's1')
+        # 压缩是优化，失败不能把任务搞挂
+        self.assertFalse(result['compacted'])
+        self.assertEqual(store.memory('s1')['summary'], '')
+
+
 class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
     """Planner-Executor：计划决定走哪条路，执行器逐步落实。"""
 
@@ -428,7 +597,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
     def stub(captured=None, delay=0):
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
-                                prior=None):
+                                prior=None, memory=None):
             if captured is not None:
                 captured['history'] = history
             if on_start:
@@ -533,7 +702,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior=None):
+                       on_start=None, prior=None, memory=None):
             on_event({'type': 'stage_start', 'stage': 'plan'})
             on_event({'type': 'stage_end', 'stage': 'plan',
                       'seconds': 1.0, 'status': 'planned'})
@@ -618,7 +787,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior=None):
+                       on_start=None, prior=None, memory=None):
             on_event({'type': 'stage_start', 'stage': 'plan'})
             on_event({'type': 'stage_end', 'stage': 'plan',
                       'seconds': 1.0, 'status': 'planned'})
@@ -645,7 +814,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior=None):
+                       on_start=None, prior=None, memory=None):
             on_event({'type': 'stage_start', 'stage': 'plan'})
             await asyncio.sleep(30)
             return {}
@@ -668,7 +837,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior=None):
+                       on_start=None, prior=None, memory=None):
             # 用规划阶段做"还没开始干活"的代表：它不在 FIRST_WORK_STAGES 里，
             # 因此指令阶段仍是打开的，失败时应当由失败路径补上结束事件。
             on_event({'type': 'stage_start', 'stage': 'plan'})
@@ -689,7 +858,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         started = {'n': 0}
 
         async def slow(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior=None):
+                       on_start=None, prior=None, memory=None):
             started['n'] += 1
             await asyncio.sleep(30)
             return {}
@@ -784,7 +953,7 @@ class ApiTests(unittest.TestCase):
 
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
-                                prior=None):
+                                prior=None, memory=None):
             if on_start:
                 on_start('artifact9')
             if on_event:
@@ -829,7 +998,7 @@ class ApiTests(unittest.TestCase):
 
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
-                                prior=None):
+                                prior=None, memory=None):
             return {'task_id': 'a1', 'status': 'local_ready',
                     'deployment': {}, 'timings': []}
 
@@ -846,7 +1015,7 @@ class ApiTests(unittest.TestCase):
 
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
-                                prior=None):
+                                prior=None, memory=None):
             if on_start:
                 on_start('a1')
             if on_event:
@@ -913,6 +1082,26 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(
             self.client.put('/api/profile', json={'text': 'x' * 20001}).status_code,
             422)
+
+    def test_session_memory_endpoints(self):
+        """会话记忆要能在界面上读、改、清空。"""
+        hub = self.api_module.hub
+        hub.store.append_message('s1', 'user', '你好')
+
+        empty = self.client.get('/api/sessions/s1/memory').json()
+        self.assertEqual(empty['summary'], '')
+        self.assertEqual(empty['facts'], {})
+
+        saved = self.client.put('/api/sessions/s1/memory', json={
+            'summary': '用户在减脂', 'facts': '目标：降到15%\n已否决：节食'}).json()
+        self.assertEqual(saved['facts'], {'目标': '降到15%', '已否决': '节食'})
+
+        got = self.client.get('/api/sessions/s1/memory').json()
+        self.assertEqual(got['summary'], '用户在减脂')
+        self.assertIn('目标：降到15%', got['facts_text'])
+
+        self.client.delete('/api/sessions/s1/memory')
+        self.assertEqual(self.client.get('/api/sessions/s1/memory').json()['summary'], '')
 
     def test_session_timeline_orders_turns_oldest_first(self):
         """回放必须按发生顺序，否则步骤看起来是倒着走的。"""
@@ -1559,7 +1748,7 @@ class AnswerToolTests(unittest.IsolatedAsyncioTestCase):
             await tool_module._answer_directly(
                 {'question': '追问'}, {'user_input': '追问', 'history': history})
         contents = [m['content'] for m in captured['messages']]
-        self.assertEqual(contents, ['上一问', '上一答', '追问'])
+        self.assertEqual(contents, ['上一问', '上一答', '问题：追问'])
 
 
 class GraphShapeTests(unittest.IsolatedAsyncioTestCase):

@@ -13,7 +13,7 @@
 import json
 import time
 
-from app import profile
+from app import context, profile
 from app.config import settings
 from app.events import action, emit, stage_end, stage_start, thought
 from app.schemas import ExecutionPlan
@@ -139,7 +139,8 @@ async def plan(state):
     available, origin = tool_module.usable_documents(state)
     payload = json.dumps({
         '用户要求': question,
-        '对话历史': (state.get('history') or [])[-8:],
+        '对话历史': context.select(state.get('history'), purpose='plan'),
+        '会话记忆': context.memory_text(state.get('session_memory')),
         # 明确告诉模型手上还有多少料：否则它可能以为要重新检索，
         # 也可能反过来以为已有资料、结果空手去整理。
         '已有资料': (f'{len(available)} 个来源的正文' + (f'（{origin}）' if origin else '')

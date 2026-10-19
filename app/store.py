@@ -43,6 +43,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at  TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_session ON tasks(session_id);
+CREATE TABLE IF NOT EXISTS session_memory (
+    session_id TEXT PRIMARY KEY,
+    summary    TEXT NOT NULL DEFAULT '',
+    facts      TEXT NOT NULL DEFAULT '{}',
+    upto       INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
     task_id    TEXT NOT NULL,
     seq        INTEGER NOT NULL,
@@ -106,6 +113,46 @@ class Store:
                 'SELECT role, content FROM messages WHERE session_id=? ORDER BY id',
                 (session_id,)).fetchall()
         return [{'role': r['role'], 'content': r['content']} for r in rows]
+
+    def messages_after(self, session_id: str, after_id: int = 0) -> list[dict]:
+        """取 id 大于 after_id 的消息（带 id），供压缩与增量历史使用。"""
+        with self._lock:
+            rows = self._conn.execute(
+                'SELECT id, role, content FROM messages '
+                'WHERE session_id=? AND id>? ORDER BY id',
+                (session_id, after_id)).fetchall()
+        return [{'id': r['id'], 'role': r['role'], 'content': r['content']}
+                for r in rows]
+
+    def memory(self, session_id: str) -> dict:
+        """会话记忆；没有就是空摘要 + 空事实 + upto=0。"""
+        with self._lock:
+            row = self._conn.execute(
+                'SELECT summary, facts, upto FROM session_memory WHERE session_id=?',
+                (session_id,)).fetchone()
+        if row is None:
+            return {'summary': '', 'facts': {}, 'upto': 0}
+        return {'summary': row['summary'],
+                'facts': json.loads(row['facts'] or '{}'),
+                'upto': row['upto']}
+
+    def set_memory(self, session_id: str, *, summary: str, facts: dict,
+                   upto: int) -> None:
+        with self._lock:
+            self._conn.execute(
+                'INSERT INTO session_memory (session_id, summary, facts, upto, updated_at) '
+                'VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET '
+                'summary=excluded.summary, facts=excluded.facts, '
+                'upto=excluded.upto, updated_at=excluded.updated_at',
+                (session_id, summary or '',
+                 json.dumps(facts or {}, ensure_ascii=False), int(upto), now()))
+            self._conn.commit()
+
+    def clear_memory(self, session_id: str) -> None:
+        with self._lock:
+            self._conn.execute('DELETE FROM session_memory WHERE session_id=?',
+                               (session_id,))
+            self._conn.commit()
 
     def list_sessions(self, limit: int = 50) -> list[dict]:
         """会话列表（按最近活跃排序），供前端侧边栏展示。

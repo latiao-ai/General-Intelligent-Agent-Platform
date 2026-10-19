@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from app import profile
+from app import memory as memory_module, profile
 from app.api_hub import CLOSE, Hub
 from app.config import settings
 from app.main import deploy_task
@@ -35,6 +35,12 @@ hub = Hub()
 class ProfileRequest(BaseModel):
     # 画像就是一份 Markdown，直接收原文：手改、粘贴、整段重写都走同一条路。
     text: str = Field(default='', max_length=20000)
+
+
+class MemoryRequest(BaseModel):
+    summary: str = Field(default='', max_length=4000)
+    # 关键事实用「键：值」多行文本编辑，与画像保持同一种手感
+    facts: str = Field(default='', max_length=4000)
 
 
 class TaskRequest(BaseModel):
@@ -172,6 +178,32 @@ async def write_profile(payload: ProfileRequest):
 @app.delete('/api/profile')
 async def delete_profile():
     profile.clear()
+    return {'cleared': True}
+
+
+@app.get('/api/sessions/{session_id}/memory')
+async def read_memory(session_id: str):
+    """会话记忆：更早对话的压缩结果，可读可改。"""
+    state = hub.store.memory(session_id)
+    return {'summary': state['summary'], 'facts': state['facts'],
+            'facts_text': memory_module.render_facts(state['facts']),
+            'upto': state['upto']}
+
+
+@app.put('/api/sessions/{session_id}/memory')
+async def write_memory(session_id: str, payload: MemoryRequest):
+    """手动改写会话记忆（摘要 + 关键事实）。"""
+    facts = memory_module.parse_facts(payload.facts)
+    upto = hub.store.memory(session_id)['upto']
+    hub.store.set_memory(session_id, summary=payload.summary, facts=facts,
+                         upto=upto)
+    return {'summary': payload.summary, 'facts': facts, 'upto': upto}
+
+
+@app.delete('/api/sessions/{session_id}/memory')
+async def delete_memory(session_id: str):
+    """清空会话记忆，下轮会从原文重新开始累积。"""
+    hub.store.clear_memory(session_id)
     return {'cleared': True}
 
 

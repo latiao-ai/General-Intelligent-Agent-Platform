@@ -123,6 +123,7 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
   <aside class="sidebar">
     <button id="newSession" class="ghost full">＋ 新建会话</button>
     <button id="profileBtn" class="ghost full">🧠 我的画像</button>
+    <button id="memoryBtn" class="ghost full">🗂 会话记忆</button>
     <div class="side-label">历史会话</div>
     <div class="session-list" id="sessionList"></div>
   </aside>
@@ -149,6 +150,29 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
       <button id="send">发送</button>
     </div></div>
   </main>
+</div>
+
+<div class="modal" id="memoryModal" style="display:none">
+  <div class="modal-card">
+    <div class="modal-head">
+      <b>🗂 会话记忆</b>
+      <span class="hint" id="memoryMeta"></span>
+      <button class="ghost" id="memoryClose">关闭</button>
+    </div>
+    <div class="hint" style="margin:4px 0 8px">
+      更早的对话会被压成这里的摘要与关键事实，用来在长会话里不丢线索。
+      原文仍在数据库里，改这里只是改"给模型看的版本"。
+    </div>
+    <div class="side-label" style="margin:0 0 4px">摘要</div>
+    <textarea id="memorySummary" spellcheck="false" style="min-height:110px"></textarea>
+    <div class="side-label" style="margin:0 0 4px">关键事实（每行「键：值」）</div>
+    <textarea id="memoryFacts" spellcheck="false" style="min-height:90px"></textarea>
+    <div class="modal-actions">
+      <button class="warn" id="memoryClear">清空记忆</button>
+      <span class="hint" id="memoryStatus"></span>
+      <button id="memorySave">保存</button>
+    </div>
+  </div>
 </div>
 
 <div class="modal" id="profileModal" style="display:none">
@@ -758,6 +782,71 @@ async function clearProfile() {
   }
 }
 
+// ---------- 会话记忆 ----------
+
+async function loadMemoryForm() {
+  if (!S.sessionId) {
+    $('memoryMeta').textContent = '当前没有会话';
+    $('memorySummary').value = '';
+    $('memoryFacts').value = '';
+    return;
+  }
+  const res = await fetch(`/api/sessions/${S.sessionId}/memory`);
+  const data = await res.json();
+  $('memorySummary').value = data.summary || '';
+  $('memoryFacts').value = data.facts_text || '';
+  $('memoryMeta').textContent = data.upto
+    ? `已压缩前 ${data.upto} 条消息`
+    : '尚未压缩';
+}
+
+async function openMemory() {
+  $('memoryStatus').textContent = '';
+  $('memoryModal').style.display = 'flex';
+  try { await loadMemoryForm(); }
+  catch { $('memoryMeta').textContent = '读取失败'; }
+}
+
+function closeMemory() { $('memoryModal').style.display = 'none'; }
+
+async function saveMemory() {
+  if (!S.sessionId) { $('memoryStatus').textContent = '当前没有会话'; return; }
+  $('memoryStatus').textContent = '保存中…';
+  try {
+    const res = await fetch(`/api/sessions/${S.sessionId}/memory`, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({summary: $('memorySummary').value,
+                            facts: $('memoryFacts').value}),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+    await loadMemoryForm();
+    $('memoryStatus').textContent = `已保存 · ${Object.keys(data.facts || {}).length} 条事实`;
+  } catch (err) {
+    $('memoryStatus').textContent = '保存失败：' + err.message;
+  }
+}
+
+async function clearMemory() {
+  if (!S.sessionId) { $('memoryStatus').textContent = '当前没有会话'; return; }
+  if (!confirm('清空会话记忆？之后会从原文重新累积。')) return;
+  try {
+    await fetch(`/api/sessions/${S.sessionId}/memory`, {method: 'DELETE'});
+    await loadMemoryForm();
+    $('memoryStatus').textContent = '已清空';
+  } catch (err) {
+    $('memoryStatus').textContent = '清空失败：' + err.message;
+  }
+}
+
+$('memoryBtn').onclick = openMemory;
+$('memoryClose').onclick = closeMemory;
+$('memorySave').onclick = saveMemory;
+$('memoryClear').onclick = clearMemory;
+$('memoryModal').addEventListener('click', e => {
+  if (e.target === $('memoryModal')) closeMemory();
+});
+
 $('profileBtn').onclick = openProfile;
 $('profileClose').onclick = closeProfile;
 $('profileSave').onclick = saveProfile;
@@ -766,7 +855,9 @@ $('profileModal').addEventListener('click', e => {
   if (e.target === $('profileModal')) closeProfile();   // 点遮罩关闭
 });
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && $('profileModal').style.display !== 'none') closeProfile();
+  if (e.key !== 'Escape') return;
+  if ($('profileModal').style.display !== 'none') closeProfile();
+  if ($('memoryModal').style.display !== 'none') closeMemory();
 });
 
 $('send').onclick = send;

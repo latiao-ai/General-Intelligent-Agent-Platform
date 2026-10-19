@@ -20,6 +20,12 @@ class ExecutionPlan(BaseModel):
     # 本轮用户透露的个人信息，没有就留空。与旧版解析阶段的行为保持一致。
     profile_updates: dict[str, str] = Field(default_factory=dict)
 
+class SessionMemory(BaseModel):
+    """会话记忆：更早对话的压缩结果。人可读，也可被用户直接编辑。"""
+    summary: str = ''
+    facts: dict[str, str] = Field(default_factory=dict)
+
+
 class Paragraph(BaseModel):
     text: str = Field(min_length=1)
     source_ids: list[str] = Field(min_length=1)
@@ -76,3 +82,5 @@ class AgentState(TypedDict, total=False):
     elapsed_seconds: float
     # 多轮对话历史 [{'role','content'}]，供规划阶段理解指代型追加要求。
     history: list[dict]
+    # 更早对话的压缩结果 {'summary','facts','upto'}，由 context 装配时注入。
+    session_memory: dict

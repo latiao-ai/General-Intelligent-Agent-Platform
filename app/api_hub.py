@@ -19,9 +19,10 @@ import uuid
 from dataclasses import dataclass, field
 
 from app.config import settings
-from app.events import stage_end, stage_start
+from app.events import action, stage_end, stage_start
 from app.main import run_task
 from app.messages import cancel_note, reply_text
+from app import memory as memory_module
 from app.services import is_stop_command
 from app.store import Store
 
@@ -249,11 +250,26 @@ class Hub:
             track(event)
             record.publish(event)
 
+        # 先压缩更早的对话：成功则只把"未摘要"的部分当历史，避免摘要与原文重复。
+        memory = {}
+        try:
+            memory = await memory_module.compact(self.store, record.session_id)
+            if memory.get('compacted'):
+                record.publish(action(
+                    '已压缩上下文',
+                    f'合并 {memory["folded"]} 条较早对话为摘要', '📦'))
+                history = self.store.messages_after(
+                    record.session_id, memory.get('upto') or 0)
+                history = [{'role': m['role'], 'content': m['content']}
+                           for m in history]
+        except Exception:
+            memory = {}
+
         try:
             state = await run_task(
                 record.message, on_event=relay,
                 on_start=on_start, history=history,
-                prior=prior,
+                prior=prior, memory=memory,
             )
         except asyncio.CancelledError:
             close_instruction('已中断')

@@ -24,7 +24,7 @@ from app.schemas import Report
 from app.services import (
     chat_reply, clean_public_url, extract_urls, search_query, structured_call,
 )
-from app import mcp_adapter
+from app import context, mcp_adapter, sources
 
 
 class ToolError(RuntimeError):
@@ -75,17 +75,18 @@ async def _web_search(args: dict, state: dict) -> dict:
             continue
         if len(documents) >= settings.max_pages:
             break
-        document = {
-            'source_id': 's' + str(len(documents) + 1),
-            'url': url, 'title': item.get('title') or url,
-            'snippet': item.get('content', ''),
-            'raw_content': item.get('raw_content') or '',
-            'status': 'pending', 'fetched_at': None, 'error': None,
-        }
+        task_id = state.get('task_id') or 'task'
+        # 检索接口常常直接带回正文：落盘，记录里只留字数
+        document = sources.metadata(
+            task_id, 's' + str(len(documents) + 1),
+            url=url, title=item.get('title') or url,
+            snippet=item.get('content', ''),
+            text=item.get('raw_content') or '',
+        )
         documents.append(document)
         by_url[url] = document
         added += 1
-    with_content = sum(1 for d in documents if d.get('raw_content'))
+    with_content = sum(1 for d in documents if sources.has_text(d))
     emit(action('命中来源',
                 f'新增 {added} 个，累计 {len(documents)} 个（{with_content} 个自带正文）',
                 '📚'))
@@ -107,16 +108,13 @@ async def _fetch_pages(args: dict, state: dict) -> dict:
             continue
         if url in by_url or len(documents) >= settings.max_pages:
             continue
-        documents.append({
-            'source_id': 's' + str(len(documents) + 1),
-            'url': url, 'title': url, 'snippet': '',
-            'raw_content': '', 'status': 'pending',
-            'fetched_at': None, 'error': None,
-        })
+        documents.append(sources.metadata(
+            state.get('task_id') or 'task', 's' + str(len(documents) + 1),
+            url=url, title=url))
         by_url.add(url)
 
     missing = [d['url'] for d in documents
-               if not d.get('raw_content') and d['status'] == 'pending']
+               if not sources.has_text(d) and d.get('status') != 'failed']
     result_map = {}
     if missing:
         emit(action('提取正文', f'{len(missing)} 个链接', '📄'))
@@ -135,18 +133,19 @@ async def _fetch_pages(args: dict, state: dict) -> dict:
             errors.append({'stage': 'extract', 'type': 'URLExtractionFailed'})
 
     now = datetime.now(timezone.utc).isoformat()
+    task_id = state.get('task_id') or 'task'
     for d in documents:
-        if d['status'] == 'success':
+        if sources.has_text(d) and d.get('status') == 'success':
             continue
-        result = result_map.get(d['url'], {})
-        text = d.get('raw_content') or result.get('raw_content') or ''
+        text = sources.load_text(d) or (result_map.get(d['url'], {}) or {}).get('raw_content') or ''
         if isinstance(text, str) and text.strip():
-            d.update(raw_content=text, status='success', fetched_at=now, error=None)
+            chars = sources.save_text(task_id, d['source_id'], text)
+            d.update(chars=chars, status='success', fetched_at=now, error=None)
         else:
-            d.update(status='failed', error='未取得有效正文')
-    ok = [d for d in documents if d['status'] == 'success']
+            d.update(chars=0, status='failed', error='未取得有效正文')
+    ok = [d for d in documents if d.get('status') == 'success']
     if ok:
-        total_chars = sum(len(d.get('raw_content') or '') for d in ok)
+        total_chars = sum(sources.chars_of(d) for d in ok)
         emit(action('正文就绪', f'{len(ok)} 个来源，共 {total_chars} 字符', '✅'))
     else:
         emit(action('没有可用正文', f'{len(documents)} 个来源均未取到内容', '⚠️'))
@@ -173,16 +172,14 @@ COMPOSE_SYSTEM = (
 def _with_text(documents) -> list[dict]:
     """挑出真正能用的来源：已经拿到正文、且不是抓取失败的。
 
-    不能只看 status=='success'：检索接口常常直接带回正文，此时文档还是 pending
-    （只有 fetch_pages 会改写成 success）。只认 success 会让"搜索→作答/成稿"
-    这种少一步的计划误报"还没有可用正文"。这里按"有没有正文"判断，
-    并顺手把状态提升成 success，后续 render_html 才会把它们列进参考资料。
+    判定依据是**有没有正文**，不是 status：检索接口常常直接带回正文，此时
+    状态可能仍是 pending。只认 success 会让"搜索 → 作答/成稿"这种少一步的
+    计划误报"还没有可用正文"。命中时顺手把状态提升成 success，
+    后续 render_html 才会把它们列进参考资料。
     """
     usable = []
     for doc in documents or []:
-        if doc.get('status') == 'failed':
-            continue
-        if not (doc.get('raw_content') or '').strip():
+        if not sources.has_text(doc):
             continue
         if doc.get('status') != 'success':
             doc = dict(doc)
@@ -213,14 +210,17 @@ def _select_sources(state: dict, documents: list[dict] | None = None
     available = _with_text(documents)
     selected, remaining = [], settings.max_total_chars
     truncated = len(available) > settings.max_pages
-    for d in available[:settings.max_pages]:
+    for doc in available[:settings.max_pages]:
         limit = min(settings.max_source_chars, remaining)
         if limit <= 0:
             truncated = True
             break
-        text = (d.get('raw_content') or '')[:limit]
-        truncated = truncated or len(text) < len(d.get('raw_content') or '')
-        selected.append({'source_id': d['source_id'], 'title': d['title'], 'text': text})
+        # 正文不在 state 里，按需从 artifacts 读回来
+        full = sources.load_text(doc)
+        text = full[:limit]
+        truncated = truncated or len(text) < len(full)
+        selected.append({'source_id': doc['source_id'], 'title': doc['title'],
+                         'text': text})
         remaining -= len(text)
     return selected, truncated
 
@@ -245,6 +245,7 @@ async def _compose_report(args: dict, state: dict) -> dict:
                  'required_sections': args.get('required_sections') or []},
         '资料': selected,
         '用户画像': profile.load(),
+        '会话背景': context.memory_text(state.get('session_memory')),
     }, ensure_ascii=False)
     report, usage = await structured_call(
         Report, COMPOSE_SYSTEM, payload,
@@ -355,21 +356,21 @@ def tool_results_text(state: dict) -> str:
 
 
 async def _answer_directly(args: dict, state: dict) -> dict:
-    history = (state.get('history') or [])[-8:]
     question = str(args.get('question') or state.get('user_input') or '')
-    messages = [{'role': m['role'], 'content': m['content']} for m in history]
-    context = tool_results_text(state)
-    if context:
+    results = tool_results_text(state)
+    if results:
         system = ANSWER_USING_TOOL_RESULTS_SYSTEM
-        messages.append({'role': 'user',
-                         'content': f'问题：{question}\n\n工具返回的数据：\n{context}'})
+        prefix = f'工具返回的数据：\n{results}\n\n问题：{question}'
         emit(action('直接回答', '基于本轮工具返回的数据', '💬'))
     else:
         system = ANSWER_SYSTEM
-        messages.append({'role': 'user', 'content': question})
+        prefix = f'问题：{question}'
         emit(action('直接回答', '本轮无需联网检索', '💬'))
-    answer = await chat_reply(profile.with_profile(system), messages,
-                              on_delta=lambda text: emit(answer_delta(text)))
+    messages = context.chat_messages(state.get('history'), prefix,
+                                     purpose='answer')
+    answer = await chat_reply(
+        profile.with_profile(context.system_with_memory(system, state.get('session_memory'))),
+        messages, on_delta=lambda text: emit(answer_delta(text)))
     return {'answer': answer, 'status': 'answered'}
 
 
@@ -404,14 +405,18 @@ async def _answer_with_sources(args: dict, state: dict) -> dict:
                 '📝'))
     material = '\n\n'.join(
         f'[{item["source_id"]}] {item["title"]}\n{item["text"]}' for item in selected)
-    context = tool_results_text(state)
-    if context:
-        material = f'{context}\n\n{material}'
-    messages = [{'role': 'user',
-                 'content': f'问题：{question}\n\n资料：\n{material}'}]
+    results = tool_results_text(state)
+    if results:
+        material = f'{results}\n\n{material}'
+    # 多轮追问靠这里：此前这条路径完全不带历史，问"那第二种呢"就断了线索
+    messages = context.chat_messages(
+        state.get('history'), f'问题：{question}\n\n资料：\n{material}',
+        purpose='answer')
     body = await chat_reply(
-        profile.with_profile(ANSWER_WITH_SOURCES_SYSTEM), messages,
-        on_delta=lambda text: emit(answer_delta(text)))
+        profile.with_profile(
+            context.system_with_memory(ANSWER_WITH_SOURCES_SYSTEM,
+                                       state.get('session_memory'))),
+        messages, on_delta=lambda text: emit(answer_delta(text)))
 
     # 只列真正被引用的来源；一条都没引用时退回全部，免得"附来源"变成空话。
     cited = [item for item in selected
