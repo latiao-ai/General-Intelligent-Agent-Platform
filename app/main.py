@@ -31,7 +31,8 @@ async def deploy_task(task_id: str) -> dict:
     return result
 
 
-async def run_task(text: str, progress=None, on_event=None, history=None, on_start=None):
+async def run_task(text: str, progress=None, on_event=None, history=None,
+                  on_start=None, prior_artifact=None):
     """跑一次任务。
 
     progress(node, status, elapsed)  节点级进度
@@ -55,6 +56,8 @@ async def run_task(text: str, progress=None, on_event=None, history=None, on_sta
         'documents': [], 'mcp_calls': [], 'errors': [], 'usage': [],
         'step_index': 0, 'status': 'created',
         'timings': [], 'history': list(history or []),
+        # 上一轮的产物：让"部署到服务器"这类单独一句话也能落到具体的 HTML 上
+        'prior_artifact': prior_artifact or {},
     }
     started = time.perf_counter()
     marked = started

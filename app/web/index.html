@@ -114,7 +114,7 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
       <h1>网页研究与 HTML 报告</h1>
       <div class="sub">
         输入主题或链接，智能体会实时展示执行过程，每个阶段后面跟着它已用的时间（秒）。
-        <b>运行中再发一条消息会自动打断当前任务</b>，带着上文改方向，不必先点停止。
+        只有一个「发送」按钮：<b>运行中再发一条消息会自动打断当前任务</b>，带着上文改方向。
       </div>
 
       <div id="messages"></div>
@@ -128,8 +128,7 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
     </div>
 
     <div class="bar"><div class="inner">
-      <textarea id="msg" placeholder="例如：整理 SQLite 的适用场景和限制，生成中文报告。生成后要发布就说「…然后部署到服务器」"></textarea>
-      <button id="stop" class="warn" style="display:none">停止</button>
+      <textarea id="msg" placeholder="直接说你要什么，例如：整理 SQLite 的适用场景和限制，生成中文报告并部署到服务器"></textarea>
       <button id="send">发送</button>
     </div></div>
   </main>
@@ -524,11 +523,11 @@ function clearAll() {
   S.streamBubble = null;
 }
 
+// 只有一个按钮：跑着的时候再发一条就会自动打断上一轮，不做额外提示。
 function setRunning(on) {
   S.running = on;
   $('send').disabled = false;
-  $('send').textContent = on ? '打断并发送' : '发送';
-  $('stop').style.display = on ? '' : 'none';
+  $('send').textContent = '发送';
 }
 
 async function interrupt() {
@@ -647,24 +646,10 @@ function renderResult(state) {
       a.textContent = '打开 / 下载 HTML';
       actions.appendChild(a);
     }
-    if (deployment.status !== 'success') {
-      const btn = document.createElement('button');
-      btn.textContent = '部署到服务器';
-      btn.onclick = async () => {
-        btn.disabled = true; btn.textContent = '部署中…';
-        try {
-          const res = await fetch(`/api/tasks/${S.taskId}/deploy`, {method: 'POST'});
-          const data = await res.json();
-          if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
-          showDeployed(data.public_url, data.deployment_id);
-        } catch (err) {
-          btn.disabled = false; btn.textContent = '部署到服务器';
-          box.insertAdjacentHTML('beforeend',
-            `<div class="card err">部署失败：${esc(err.message)}</div>`);
-        }
-      };
-      actions.appendChild(btn);
-    }
+    const hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent = '想发布的说一句「部署到服务器」即可。';
+    card.appendChild(hint);
     box.appendChild(card);
   }
 
@@ -678,24 +663,7 @@ function showDeployed(url, siteId) {
     (siteId ? `<div class="hint">站点 ID：${esc(siteId)}</div>` : '') + '</div>');
 }
 
-async function stop() {
-  if (!S.taskId || !S.running) return;
-  // 先停表：等后端确认的话，一个卡住的长任务会让那一行一直涨下去。
-  closeOpenStages('已中断');
-  $('stop').disabled = true;
-  try {
-    await fetch(`/api/tasks/${S.taskId}/cancel`, {method: 'POST'});
-  } catch { /* 后端不可达也要让界面恢复 */ }
-  finally { $('stop').disabled = false; }
-  // 后端迟迟不给结论（长任务卡住，或连接已断）时本地收尾，保证按钮能继续用。
-  const token = S.taskId;
-  setTimeout(() => {
-    if (S.running && S.taskId === token) finish('cancelled');
-  }, 3000);
-}
-
 $('send').onclick = send;
-$('stop').onclick = stop;
 $('newSession').onclick = newSession;
 $('msg').addEventListener('keydown', e => {
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }

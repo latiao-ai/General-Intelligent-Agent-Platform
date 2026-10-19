@@ -136,9 +136,24 @@ class Hub:
                 'messages': self.store.messages(session_id),
                 'turns': turns}
 
+    def last_artifact(self, session_id: str) -> dict | None:
+        """会话里最近一次成功产出的 HTML。
+
+        界面上已经没有"部署"按钮了，用户会直接说"部署到服务器"。那一轮自己没有
+        render_html，得靠这个把上一轮的产物接过来，否则部署无从下手。
+        """
+        for row in self.store.tasks_of(session_id, limit=20):
+            data = self.store.task(row['task_id'])
+            state = (data or {}).get('state') or {}
+            artifact = state.get('artifact') if isinstance(state, dict) else None
+            if artifact:
+                return artifact
+        return None
+
     def start(self, message: str, session_id: str | None = None) -> TaskRecord:
         session_id = session_id or uuid.uuid4().hex[:12]
         history = self.history(session_id)
+        prior_artifact = self.last_artifact(session_id)
         self.store.append_message(session_id, 'user', message)
         record = TaskRecord(task_id=uuid.uuid4().hex[:12], session_id=session_id,
                             message=message, store=self.store)
@@ -149,10 +164,12 @@ class Hub:
         event = stage_start(INSTRUCTION_STAGE)
         record.open_stage = {'stage': INSTRUCTION_STAGE, 'at': event['at']}
         record.publish(event)
-        record._task = asyncio.create_task(self._run(record, history))
+        record._task = asyncio.create_task(
+            self._run(record, history, prior_artifact))
         return record
 
-    async def _run(self, record: TaskRecord, history: list) -> None:
+    async def _run(self, record: TaskRecord, history: list,
+                   prior_artifact: dict | None = None) -> None:
         def on_start(artifact_id: str) -> None:
             record.persist(artifact_id=artifact_id)
             record.publish({'type': 'task', 'task_id': record.task_id,
@@ -206,6 +223,7 @@ class Hub:
             state = await run_task(
                 record.message, on_event=relay,
                 on_start=on_start, history=history,
+                prior_artifact=prior_artifact,
             )
         except asyncio.CancelledError:
             close_instruction('已中断')

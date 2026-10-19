@@ -269,6 +269,27 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
             saved = json.loads((Path(folder) / 'deployment.json').read_text('utf-8'))
             self.assertEqual(saved['public_url'], 'https://x/1')
 
+    async def test_deploy_falls_back_to_prior_artifact(self):
+        """界面没有部署按钮了，用户单说一句"部署到服务器"也要能落到上一轮的产物上。"""
+        from app import tools as tool_module
+        with tempfile.TemporaryDirectory() as folder:
+            html = Path(folder) / 'index.html'
+            html.write_text('<html></html>', encoding='utf-8')
+            prior = {'html_path': str(html), 'sha256': 'p'}
+
+            async def fake_deploy(_artifact):
+                return {'status': 'success', 'public_url': 'https://x/9'}
+
+            seen = []
+            with patch.object(tool_module, 'settings',
+                              SimpleNamespace(deploy_enabled=True)), \
+                    patch.object(tool_module.mcp_adapter, 'deploy_html', fake_deploy), \
+                    patch.object(tool_module, 'emit', seen.append):
+                result = await tool_module._deploy_site({}, {'prior_artifact': prior})
+            self.assertEqual(result['status'], 'deployed')
+            # 必须明确告知复用了上一轮产物，避免误以为这轮重新生成过
+            self.assertTrue(any(e.get('label') == '复用上一轮产物' for e in seen))
+
     async def test_needs_check_when_tool_reports_otherwise(self):
         from app import tools as tool_module
         with tempfile.TemporaryDirectory() as folder:
@@ -377,7 +398,8 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def stub(captured=None, delay=0):
         async def fake_run_task(text, progress=None, on_event=None,
-                                history=None, on_start=None):
+                                history=None, on_start=None,
+                                prior_artifact=None):
             if captured is not None:
                 captured['history'] = history
             if on_start:
@@ -481,7 +503,8 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         import app.api_hub as hub_module
         hub = self.hub()
 
-        async def fake(text, progress=None, on_event=None, history=None, on_start=None):
+        async def fake(text, progress=None, on_event=None, history=None,
+                       on_start=None, prior_artifact=None):
             on_event({'type': 'stage_start', 'stage': 'plan'})
             on_event({'type': 'stage_end', 'stage': 'plan',
                       'seconds': 1.0, 'status': 'planned'})
@@ -565,7 +588,8 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         import app.api_hub as hub_module
         hub = self.hub()
 
-        async def fake(text, progress=None, on_event=None, history=None, on_start=None):
+        async def fake(text, progress=None, on_event=None, history=None,
+                       on_start=None, prior_artifact=None):
             on_event({'type': 'stage_start', 'stage': 'plan'})
             on_event({'type': 'stage_end', 'stage': 'plan',
                       'seconds': 1.0, 'status': 'planned'})
@@ -591,7 +615,8 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         import app.api_hub as hub_module
         hub = self.hub()
 
-        async def fake(text, progress=None, on_event=None, history=None, on_start=None):
+        async def fake(text, progress=None, on_event=None, history=None,
+                       on_start=None, prior_artifact=None):
             on_event({'type': 'stage_start', 'stage': 'plan'})
             await asyncio.sleep(30)
             return {}
@@ -613,7 +638,8 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         import app.api_hub as hub_module
         hub = self.hub()
 
-        async def fake(text, progress=None, on_event=None, history=None, on_start=None):
+        async def fake(text, progress=None, on_event=None, history=None,
+                       on_start=None, prior_artifact=None):
             # 用规划阶段做"还没开始干活"的代表：它不在 FIRST_WORK_STAGES 里，
             # 因此指令阶段仍是打开的，失败时应当由失败路径补上结束事件。
             on_event({'type': 'stage_start', 'stage': 'plan'})
@@ -626,6 +652,14 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
                 if e['type'] == 'stage_end'}
         self.assertEqual(ends.get('plan'), '已失败')
         self.assertEqual(ends.get('instruction'), '已失败')
+
+    async def test_last_artifact_carries_over(self):
+        hub = self.hub()
+        hub.store.create_task('t1', 'sess', '第一轮')
+        hub.store.update_task('t1', status='local_ready',
+                              state={'artifact': {'html_path': '/x/index.html'}})
+        self.assertEqual(hub.last_artifact('sess')['html_path'], '/x/index.html')
+        self.assertIsNone(hub.last_artifact('nope'))
 
     async def test_cancel_done_task_is_noop(self):
         import app.api_hub as hub_module
@@ -658,6 +692,10 @@ class ApiTests(unittest.TestCase):
         self.assertIn('阶段耗时', res.text)
         self.assertIn('stage_start', res.text)
         self.assertIn('setInterval', res.text)
+        # 只保留一个发送按钮：不再有"停止"和"打断并发送"
+        self.assertNotIn('id="stop"', res.text)
+        self.assertNotIn('打断并发送', res.text)
+        self.assertIn('id="send"', res.text)
 
     def test_unknown_task_returns_404(self):
         self.assertEqual(self.client.get('/api/tasks/nope').status_code, 404)
@@ -668,7 +706,8 @@ class ApiTests(unittest.TestCase):
         import app.api_hub as hub_module
 
         async def fake_run_task(text, progress=None, on_event=None,
-                                history=None, on_start=None):
+                                history=None, on_start=None,
+                                prior_artifact=None):
             if on_start:
                 on_start('artifact9')
             if on_event:
@@ -712,7 +751,8 @@ class ApiTests(unittest.TestCase):
         import app.api_hub as hub_module
 
         async def fake_run_task(text, progress=None, on_event=None,
-                                history=None, on_start=None):
+                                history=None, on_start=None,
+                                prior_artifact=None):
             return {'task_id': 'a1', 'status': 'local_ready',
                     'deployment': {}, 'timings': []}
 
@@ -728,7 +768,8 @@ class ApiTests(unittest.TestCase):
         import app.api_hub as hub_module
 
         async def fake_run_task(text, progress=None, on_event=None,
-                                history=None, on_start=None):
+                                history=None, on_start=None,
+                                prior_artifact=None):
             if on_start:
                 on_start('a1')
             if on_event:

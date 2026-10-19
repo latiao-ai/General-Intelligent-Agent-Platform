@@ -58,6 +58,9 @@ class AgentState(TypedDict, total=False):
     # 直接回答时的纯文本结果
     answer: str
     artifact: dict
+    # 同一会话里上一轮已生成的产物。用户单独说"部署到服务器"时，
+    # 这一轮自己没有 render_html，就用它作为部署对象。
+    prior_artifact: dict
     validation: dict
     deployment: dict
     # MCP 工具返回的原始结果（按调用顺序）

@@ -241,14 +241,18 @@ async def _render_html(args: dict, state: dict) -> dict:
 async def _deploy_site(args: dict, state: dict) -> dict:
     if not settings.deploy_enabled:
         raise ToolError('DEPLOY_ENABLED=false，部署已关闭')
+    artifact = state.get('artifact') or state.get('prior_artifact')
+    if not artifact:
+        raise ToolError('还没有 HTML 产物，请先生成报告再部署')
     if not state.get('artifact'):
-        raise ToolError('还没有 HTML 产物，请先调用 render_html')
+        # 本轮没有重新渲染，部署的是上一轮留下的产物——明确告知，别让人误以为重新生成过。
+        emit(action('复用上一轮产物', '本轮没有重新生成 HTML', '♻️'))
     emit(action('正在部署站点', '', '🚀'))
     try:
-        result = await mcp_adapter.deploy_html(state['artifact'])
+        result = await mcp_adapter.deploy_html(artifact)
     except Exception as exc:
         raise ToolError('部署失败，请核对 MCP 配置与服务端日志') from exc
-    save_json(Path(state['artifact']['html_path']).parent / 'deployment.json', result)
+    save_json(Path(artifact['html_path']).parent / 'deployment.json', result)
     emit(action('部署完成',
                 result.get('public_url') or '结果待确认',
                 '✅' if result.get('status') == 'success' else '⚠️'))
