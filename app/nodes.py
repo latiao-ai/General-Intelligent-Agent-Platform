@@ -169,6 +169,18 @@ async def plan(state):
     """产出执行计划；不执行任何工具。"""
     question = state['user_input']
 
+    # 续跑：沿用已保存的计划，不重新规划——重新规划会让"已完成步骤不可改写"
+    # 这条约束失效，也白白多花一次模型调用（文档 §7）。
+    resumed = state.get('resume_plan') or {}
+    if isinstance(resumed, dict) and resumed.get('steps'):
+        steps = resumed['steps']
+        emit(action('沿用已保存的计划', f'{len(steps)} 步', '↩️'))
+        emit(thought(describe_plan(steps, resumed.get('summary') or '续跑')))
+        return {'plan': {'steps': steps,
+                         'summary': resumed.get('summary') or '续跑'},
+                'step_index': int(resumed.get('step_index') or 0),
+                'status': 'planned'}
+
     # 明显的寒暄不必花一次模型调用去规划：直接给一步"直接回答"。
     # 这一步放在发现工具之前——否则为了判一句"你好"还要去探一次 MCP 服务端。
     if not urls_from_input(question) and is_small_talk(question):

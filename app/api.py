@@ -18,6 +18,7 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from app import memory as memory_module, profile
+from app.store import now
 from app.api_hub import CLOSE, Hub
 from app.config import settings
 from app.main import deploy_task
@@ -28,8 +29,11 @@ WEB_DIR = Path(__file__).resolve().parent / 'web'
 # 否则连接会被中间的代理/网关按空闲超时掐断。
 KEEPALIVE_SECONDS = 15
 
-app = FastAPI(title='网页研究与 HTML 报告 API', version='1.0')
+app = FastAPI(title='通用 Agent 执行中台 API', version='2.0')
 hub = Hub()
+# 启动即对账：进程重启后遗留的运行要按"已发出未回执=unknown"处理，
+# 不能简单当成中断（文档 §8.3）。
+RECOVERY = hub.reconcile()
 
 
 class ProfileRequest(BaseModel):
@@ -173,6 +177,50 @@ async def artifact(task_id: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail='产物不存在')
     return FileResponse(path, media_type='text/html', filename=path.name)
+
+
+@app.get('/api/runs/{run_id}')
+async def read_run(run_id: str):
+    """run 的状态、计划与步骤（文档 §13）。"""
+    run = hub.store.run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail='运行不存在')
+    plan = hub.store.plan(run_id) or {}
+    return {'run': run, 'plan': plan,
+            'steps': hub.store.steps_of(run_id),
+            'actions': [a for a in (hub.store.actions_of(run_id))]}
+
+
+@app.post('/api/runs/{run_id}/pause')
+async def pause_run(run_id: str):
+    if not hub.pause(run_id):
+        raise HTTPException(status_code=409, detail='该运行不在可暂停状态')
+    return {'paused': True}
+
+
+@app.post('/api/runs/{run_id}/resume')
+async def resume_run(run_id: str):
+    record = hub.resume(run_id)
+    if record is None:
+        raise HTTPException(status_code=409, detail='没有可续跑的计划')
+    return {'resumed': True, 'task_id': record.task_id}
+
+
+@app.post('/api/runs/{run_id}/cancel')
+async def cancel_run(run_id: str):
+    """取消：停止后续步骤，回执说明在途动作状态（文档 §8.4）。"""
+    run = hub.store.run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail='运行不存在')
+    hub.cancel(run['task_id'])
+    hub.store.update_run(run_id, status='cancelled',
+                         cancel_requested_at=now())
+    return {'cancelled': True}
+
+
+@app.get('/api/recovery')
+async def recovery_status():
+    return RECOVERY
 
 
 @app.get('/api/profile')

@@ -22,9 +22,10 @@ from app.config import settings
 from app.events import action, stage_end, stage_start
 from app.main import run_task
 from app.messages import cancel_note, reply_text
+from app import ledger as ledger_module
 from app import memory as memory_module
 from app.services import is_stop_command
-from app.store import Store
+from app.store import Store, now
 
 TERMINAL_STATUS = {'deployed', 'deploy_needs_check', 'local_ready', 'failed',
                    'cancelled', 'interrupted', 'answered'}
@@ -43,6 +44,7 @@ class TaskRecord:
     message: str
     store: Store
     status: str = 'running'
+    run_id: str = ''                    # 本次执行尝试的 ID（账本、续跑都挂在它上面）
     artifact_id: str | None = None      # run_task 内部的任务 ID，即产物目录名
     error: str | None = None
     state: dict | None = None
@@ -196,11 +198,18 @@ class Hub:
         event = stage_start(INSTRUCTION_STAGE)
         record.open_stage = {'stage': INSTRUCTION_STAGE, 'at': event['at']}
         record.publish(event)
+        # 建 run：task 是持续目标，run 是这一次执行尝试（文档 §3.1）。
+        # 账本挂在 run 上，重跑同样的 run_id 才能复用"已成功不重发"。
+        record.run_id = uuid.uuid4().hex[:12]
+        self.store.ensure_task_meta(record.task_id, session_id=session_id,
+                                    goal=message)
+        self.store.create_run(record.run_id, record.task_id, status='running')
         record._task = asyncio.create_task(self._run(record, history, prior))
         return record
 
     async def _run(self, record: TaskRecord, history: list,
-                   prior: dict | None = None) -> None:
+                   prior: dict | None = None,
+                   resume_plan: dict | None = None) -> None:
         def on_start(artifact_id: str) -> None:
             record.persist(artifact_id=artifact_id)
             record.publish({'type': 'task', 'task_id': record.task_id,
@@ -265,17 +274,22 @@ class Hub:
         except Exception:
             memory = {}
 
+        book = ledger_module.ActionLedger(self.store, record.run_id, 1)
         try:
             state = await run_task(
                 record.message, on_event=relay,
                 on_start=on_start, history=history,
                 prior=prior, memory=memory,
+                ledger=book, run_id=record.run_id,
+                resume_plan=resume_plan,
             )
         except asyncio.CancelledError:
             close_instruction('已中断')
             close_open_stage('已中断')
             detail = cancel_note(record.artifact_id)
             record.persist(status='cancelled')
+            self.store.update_run(record.run_id, status='cancelled',
+                                  cancel_requested_at=now())
             # 给会话补一条助手回复：否则下一轮上下文里会出现两条连续的用户消息，
             # 模型会看不出上一轮其实是被打断的。
             self.store.append_message(record.session_id, 'assistant', '（上一轮被用户中断）')
@@ -286,6 +300,8 @@ class Hub:
             close_open_stage('已失败')
             record.error = f'{type(exc).__name__}: {exc}'
             record.persist(status='failed', error=record.error)
+            self.store.update_run(record.run_id, status='failed',
+                                  error=record.error)
             record.publish({'type': 'status', 'status': 'failed',
                             'detail': record.error})
         else:
@@ -303,10 +319,64 @@ class Hub:
                     'status': '解析完成，开始搜索',
                 })
             record.persist(status=status, state=state)
+            self._finish_run(record, state, status)
             record.publish({'type': 'status', 'status': status, 'detail': reply})
         finally:
             # 无论成功、失败还是被取消，都要唤醒并释放所有订阅者。
             record.close()
+
+    # ---------- run 生命周期（文档 §7、§8.4） ----------
+
+    def _finish_run(self, record: TaskRecord, state: dict, status: str) -> None:
+        """把 run 收尾，并把计划与步骤落库，供续跑与界面查询。"""
+        run_status = {'answered': 'succeeded', 'local_ready': 'succeeded',
+                      'deployed': 'succeeded', 'failed': 'failed',
+                      'cancelled': 'cancelled'}.get(status, status)
+        plan = state.get('plan') or {}
+        steps = plan.get('steps') or []
+        if steps:
+            self.store.save_plan(record.run_id, 1, goal=record.message,
+                                 steps=steps, reason=plan.get('summary') or '')
+            self.store.save_steps(record.run_id, 1, steps)
+            for step in steps:
+                if step.get('step_outputs') is None and step.get('step_id'):
+                    self.store.update_step(record.run_id, 1, step['step_id'],
+                                           status='succeeded')
+        self.store.update_run(record.run_id, status=run_status,
+                              plan_version=1 if steps else 0)
+
+    def pause(self, run_id: str) -> bool:
+        """请求暂停：只停止派发新动作，在途动作尽量收结果（文档 §8.4）。"""
+        run = self.store.run(run_id)
+        if run is None or run['status'] not in {'running', 'queued'}:
+            return False
+        self.store.update_run(run_id, pause_requested=1)
+        return True
+
+    def resume(self, run_id: str) -> TaskRecord | None:
+        """续跑：沿用已存计划重跑，账本会把已成功的步骤直接复用。"""
+        run = self.store.run(run_id)
+        if run is None:
+            return None
+        record = self.tasks.get(run['task_id'])
+        if record is None:
+            return None
+        if record.live:
+            return record
+        plan = self.store.plan(run_id) or {}
+        steps = plan.get('steps') or []
+        if not steps:
+            return None
+        self.store.update_run(run_id, status='running', pause_requested=0)
+        record.run_id = run_id
+        record.status = 'running'
+        record._task = asyncio.create_task(
+            self._run(record, [], {}, resume_plan={'steps': steps}))
+        return record
+
+    def reconcile(self) -> dict:
+        """启动时对账遗留运行，返回统计（文档 §8.3）。"""
+        return self.store.reconcile_orphan_runs()
 
     def get(self, task_id: str) -> TaskRecord | None:
         """取任务。内存里没有再回库找——支持进程重启后继续查询与补发事件。"""

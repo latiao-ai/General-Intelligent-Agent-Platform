@@ -621,6 +621,13 @@ class Store:
                 (*updates.values(), now(), action_id))
             self._conn.commit()
 
+    def actions_of(self, run_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                'SELECT * FROM actions WHERE run_id=? ORDER BY created_at',
+                (run_id,)).fetchall()
+        return [_decode_action(dict(r)) for r in rows]
+
     def add_attempt(self, attempt_id: str, action_id: str) -> None:
         with self._lock:
             self._conn.execute(
@@ -730,6 +737,42 @@ class Store:
                 (now(),))
             self._conn.commit()
             return cur.rowcount
+
+    def reconcile_orphan_runs(self) -> dict:
+        """进程重启后对账遗留的 running run（文档 §8.3）。
+
+        不能简单地"一律标记中断"：已发出但没收到回执的调用必须保持 unknown，
+        要求核实，而不是假设它没执行过。这里做三件事：
+        1. in_flight 的 action → unknown（远端可能已经执行了）
+        2. 对应步骤 → unknown
+        3. run → reconciling，等人工或后续核实流程处理
+        """
+        with self._lock:
+            runs = self._conn.execute(
+                "SELECT run_id FROM runs WHERE status='running'").fetchall()
+            unknown_actions = 0
+            for row in runs:
+                run_id = row['run_id']
+                pending = self._conn.execute(
+                    "SELECT action_id, step_id FROM actions "
+                    "WHERE run_id=? AND status IN ('prepared','in_flight')",
+                    (run_id,)).fetchall()
+                for action in pending:
+                    self._conn.execute(
+                        "UPDATE actions SET status='unknown', updated_at=? "
+                        'WHERE action_id=?', (now(), action['action_id']))
+                    unknown_actions += 1
+                    self._conn.execute(
+                        "UPDATE steps SET status='unknown', error=? "
+                        'WHERE run_id=? AND step_id=?',
+                        ('进程重启时该调用结果未知，需核实', run_id,
+                         action['step_id']))
+                self._conn.execute(
+                    "UPDATE runs SET status='reconciling', lease_owner=NULL, "
+                    'lease_expires_at=NULL, updated_at=? WHERE run_id=?',
+                    (now(), run_id))
+            self._conn.commit()
+        return {'runs': len(runs), 'unknown_actions': unknown_actions}
 
     def close(self) -> None:
         with self._lock:

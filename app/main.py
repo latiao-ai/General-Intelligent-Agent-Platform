@@ -33,7 +33,8 @@ async def deploy_task(task_id: str) -> dict:
 
 
 async def run_task(text: str, progress=None, on_event=None, history=None,
-                  on_start=None, prior=None, memory=None, ledger=None):
+                  on_start=None, prior=None, memory=None, ledger=None,
+                  run_id=None, resume_plan=None):
     """跑一次任务。
 
     progress(node, status, elapsed)  节点级进度
@@ -55,6 +56,7 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     state = {
         'task_id': task_id, 'user_input': text,
         'documents': [], 'mcp_calls': [], 'errors': [], 'usage': [],
+        'run_id': run_id or '', 'resume_plan': resume_plan or {},
         'step_index': 0, 'status': 'created',
         'timings': [], 'history': list(history or []),
         # 更早对话的压缩结果；context 装配时注入 system 与规划 payload

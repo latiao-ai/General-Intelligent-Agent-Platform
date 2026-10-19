@@ -45,7 +45,31 @@ def instrument(name: str, fn):
     return wrapper
 
 
-def build_graph():
+def checkpointer():
+    """图的检查点后端（文档 §8.1）。
+
+    LangGraph 的检查点负责"图跑到哪了"，我们的 runs/steps/actions 账本负责
+    "外部调用到底发生过没有"。两者职责不同，缺了检查点也能靠账本续跑——
+    已成功的动作会直接复用回执。所以这里做成软依赖：
+    - 装了 langgraph-checkpoint-sqlite → 用它持久化
+    - 否则退回内存实现（进程内可用，重启即丢，不静默假装持久）
+    """
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver  # noqa: F401
+        import sqlite3
+
+        from app.config import settings
+        conn = sqlite3.connect(str(settings.db_path), check_same_thread=False)
+        return SqliteSaver(conn)
+    except Exception:
+        try:
+            from langgraph.checkpoint.memory import InMemorySaver
+            return InMemorySaver()
+        except Exception:
+            return None
+
+
+def build_graph(checkpointer_=None):
     """Planner-Executor：先规划，再逐步执行，直到计划走完。
 
     唯一的环在 run_step 上——它每次只执行一步，所以"搜几次、要不要成稿、
@@ -62,4 +86,4 @@ def build_graph():
         'run_step': 'run_step',
         'end': END,
     })
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer_)

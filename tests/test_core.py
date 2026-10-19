@@ -883,7 +883,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
     def stub(captured=None, delay=0):
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
-                                prior=None, memory=None):
+                                prior=None, memory=None, ledger=None, run_id=None, resume_plan=None):
             if captured is not None:
                 captured['history'] = history
             if on_start:
@@ -988,7 +988,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior=None, memory=None):
+                       on_start=None, prior=None, memory=None, ledger=None, run_id=None, resume_plan=None):
             on_event({'type': 'stage_start', 'stage': 'plan'})
             on_event({'type': 'stage_end', 'stage': 'plan',
                       'seconds': 1.0, 'status': 'planned'})
@@ -1073,7 +1073,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior=None, memory=None):
+                       on_start=None, prior=None, memory=None, ledger=None, run_id=None, resume_plan=None):
             on_event({'type': 'stage_start', 'stage': 'plan'})
             on_event({'type': 'stage_end', 'stage': 'plan',
                       'seconds': 1.0, 'status': 'planned'})
@@ -1100,7 +1100,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior=None, memory=None):
+                       on_start=None, prior=None, memory=None, ledger=None, run_id=None, resume_plan=None):
             on_event({'type': 'stage_start', 'stage': 'plan'})
             await asyncio.sleep(30)
             return {}
@@ -1123,7 +1123,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior=None, memory=None):
+                       on_start=None, prior=None, memory=None, ledger=None, run_id=None, resume_plan=None):
             # 用规划阶段做"还没开始干活"的代表：它不在 FIRST_WORK_STAGES 里，
             # 因此指令阶段仍是打开的，失败时应当由失败路径补上结束事件。
             on_event({'type': 'stage_start', 'stage': 'plan'})
@@ -1144,7 +1144,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         started = {'n': 0}
 
         async def slow(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior=None, memory=None):
+                       on_start=None, prior=None, memory=None, ledger=None, run_id=None, resume_plan=None):
             started['n'] += 1
             await asyncio.sleep(30)
             return {}
@@ -1198,6 +1198,93 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(hub.cancel(record.task_id))
 
 
+class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    """run 生命周期与断点续跑（文档 §7、§8）。"""
+
+    def hub(self):
+        from app.api_hub import Hub
+        from app.store import Store
+        return Hub(Store(':memory:'))
+
+    async def test_finishing_a_run_persists_plan_and_steps(self):
+        import app.api_hub as hub_module
+        hub = self.hub()
+        # 真实链路里 validate_plan 会给每步补 tool_key；这里按同一形状构造
+        plan = {'steps': [{'tool': 'web_search', 'step_id': 's1', 'args': {},
+                           'tool_key': 'local:web:search'},
+                          {'tool': 'render_html', 'step_id': 's2', 'args': {},
+                           'tool_key': 'local:reports:render'}],
+                'summary': '先搜后渲染'}
+
+        async def fake(text, progress=None, on_event=None, history=None,
+                       on_start=None, prior=None, memory=None, ledger=None,
+                       run_id=None, resume_plan=None):
+            return {'task_id': 'a1', 'status': 'local_ready', 'timings': [],
+                    'deployment': {}, 'plan': plan,
+                    'artifact': {'kind': 'sources', 'html_path': '/tmp/x.html'}}
+
+        with patch.object(hub_module, 'run_task', fake):
+            record = hub.start('做点事')
+            await asyncio.wait_for(record._task, timeout=10)
+
+        run = hub.store.run(record.run_id)
+        self.assertEqual(run['status'], 'succeeded')
+        saved = hub.store.plan(record.run_id)
+        self.assertEqual([s['step_id'] for s in saved['steps']], ['s1', 's2'])
+        self.assertEqual([s['tool_key'] for s in hub.store.steps_of(record.run_id)],
+                         ['local:web:search', 'local:reports:render'])
+
+    async def test_resume_reuses_saved_plan(self):
+        """续跑沿用已存计划，不重新规划（§7：已完成步骤不可改写）。"""
+        import app.api_hub as hub_module
+        hub = self.hub()
+        seen = {}
+
+        async def fake(text, progress=None, on_event=None, history=None,
+                       on_start=None, prior=None, memory=None, ledger=None,
+                       run_id=None, resume_plan=None):
+            seen['resume_plan'] = resume_plan
+            return {'task_id': 'a1', 'status': 'local_ready', 'timings': [],
+                    'deployment': {},
+                    'plan': {'steps': [{'tool': 'render_html', 'step_id': 's1',
+                                        'args': {}}], 'summary': 'x'}}
+
+        with patch.object(hub_module, 'run_task', fake):
+            record = hub.start('第一次')
+            await asyncio.wait_for(record._task, timeout=10)
+            resumed = hub.resume(record.run_id)
+            self.assertIsNotNone(resumed)
+            await asyncio.wait_for(resumed._task, timeout=10)
+        self.assertEqual([s['step_id'] for s in seen['resume_plan']['steps']],
+                         ['s1'])
+
+    async def test_reconcile_marks_inflight_actions_unknown(self):
+        """重启时不能说"一律中断"——已发出未回执的调用必须保持 unknown。"""
+        hub = self.hub()
+        hub.store.ensure_task_meta('t1', session_id='s1', goal='g')
+        hub.store.create_run('r1', 't1', status='running')
+        action = hub.store.create_action(
+            'a1', run_id='r1', plan_version=1, step_id='s1',
+            tool_key='mcp:publishing:deploy_site', args_hash='h',
+            idempotency_key='k1', effect='write')
+        hub.store.add_attempt('att1', action['action_id'])
+
+        stats = hub.reconcile()
+        self.assertEqual(stats['runs'], 1)
+        self.assertEqual(stats['unknown_actions'], 1)
+        self.assertEqual(hub.store.action('a1')['status'], 'unknown')
+        self.assertEqual(hub.store.run('r1')['status'], 'reconciling')
+
+    def test_pause_only_affects_active_runs(self):
+        hub = self.hub()
+        hub.store.ensure_task_meta('t1', session_id='s1', goal='g')
+        hub.store.create_run('r1', 't1', status='running')
+        self.assertTrue(hub.pause('r1'))
+        self.assertEqual(hub.store.run('r1')['pause_requested'], 1)
+        hub.store.update_run('r1', status='succeeded')
+        self.assertFalse(hub.pause('r1'))
+
+
 class ApiTests(unittest.TestCase):
     """HTTP 接口与 SSE 端点。"""
 
@@ -1239,7 +1326,7 @@ class ApiTests(unittest.TestCase):
 
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
-                                prior=None, memory=None):
+                                prior=None, memory=None, ledger=None, run_id=None, resume_plan=None):
             if on_start:
                 on_start('artifact9')
             if on_event:
@@ -1284,7 +1371,7 @@ class ApiTests(unittest.TestCase):
 
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
-                                prior=None, memory=None):
+                                prior=None, memory=None, ledger=None, run_id=None, resume_plan=None):
             return {'task_id': 'a1', 'status': 'local_ready',
                     'deployment': {}, 'timings': []}
 
@@ -1301,7 +1388,7 @@ class ApiTests(unittest.TestCase):
 
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
-                                prior=None, memory=None):
+                                prior=None, memory=None, ledger=None, run_id=None, resume_plan=None):
             if on_start:
                 on_start('a1')
             if on_event:
@@ -1380,7 +1467,7 @@ class ApiTests(unittest.TestCase):
             sources_html.write_text('<h1>资料页</h1>', encoding='utf-8')
 
             async def fake_run_task(text, progress=None, on_event=None, history=None,
-                                    on_start=None, prior=None, memory=None):
+                                    on_start=None, prior=None, memory=None, ledger=None, run_id=None, resume_plan=None):
                 return {'task_id': 'a1', 'status': 'local_ready', 'timings': [],
                         'deployment': {},
                         'artifact': {'kind': 'sources',
