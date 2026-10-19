@@ -1,0 +1,114 @@
+"""web 能力包：抓取资料。对应 DeepSeek 官方 Search / Fetch 两个接口。"""
+from datetime import datetime, timezone
+from app import search as search_backend, sources
+from app.services import clean_public_url
+from app.capabilities.base import ToolError, error_entry
+from app.events import action, emit
+from app.config import settings
+
+
+async def _web_search(args: dict, state: dict) -> dict:
+    query = str(args.get('query') or '').strip()
+    if not query:
+        raise ToolError('web_search 需要 query 参数')
+    documents = [dict(d) for d in state.get('documents', [])]
+    errors = list(state.get('errors', []))
+    usage = list(state.get('usage', []))
+    by_url = {d['url']: d for d in documents}
+    emit(action(f'已搜索网页（{search_backend.PROVIDER} 官方 API）', query, '🌐'))
+    try:
+        response = await search_backend.search(query)
+    except Exception as exc:
+        errors.append(error_entry('search', exc))
+        raise ToolError('搜索失败，检查 DEEPSEEK_API_KEY 与网络') from exc
+    usage.append({'stage': 'search', 'backend': response.get('usage')})
+    added = 0
+    for item in response.get('results', []):
+        try:
+            url = clean_public_url(item['url'])
+        except (KeyError, ValueError):
+            continue
+        if url in by_url:
+            continue
+        if len(documents) >= settings.max_pages:
+            break
+        task_id = state.get('task_id') or 'task'
+        # 检索接口常常直接带回正文：落盘，记录里只留字数
+        document = sources.metadata(
+            task_id, 's' + str(len(documents) + 1),
+            url=url, title=item.get('title') or url,
+            snippet=item.get('content', ''),
+            text=item.get('raw_content') or '',
+        )
+        # 官方 Search 会带回站点名/发布时间/排序分/权威度，资料页要用到，别丢
+        for key in ('site_name', 'date', 'score', 'authority'):
+            if item.get(key) is not None:
+                document[key] = item[key]
+        documents.append(document)
+        by_url[url] = document
+        added += 1
+    with_content = sum(1 for d in documents if sources.has_text(d))
+    emit(action('命中来源',
+                f'新增 {added} 个，累计 {len(documents)} 个（{with_content} 个自带正文）',
+                '📚'))
+    return {'documents': documents, 'errors': errors, 'usage': usage,
+            'status': 'searched'}
+
+
+async def _fetch_pages(args: dict, state: dict) -> dict:
+    documents = [dict(d) for d in state.get('documents', [])]
+    errors = list(state.get('errors', []))
+    usage = list(state.get('usage', []))
+    by_url = {d['url'] for d in documents}
+
+    # 用户直接给了链接（或计划里点名要抓）时，先登记成来源。
+    for raw in (args.get('urls') or []):
+        try:
+            url = clean_public_url(str(raw))
+        except ValueError:
+            continue
+        if url in by_url or len(documents) >= settings.max_pages:
+            continue
+        documents.append(sources.metadata(
+            state.get('task_id') or 'task', 's' + str(len(documents) + 1),
+            url=url, title=url))
+        by_url.add(url)
+
+    missing = [d['url'] for d in documents
+               if not sources.has_text(d) and d.get('status') != 'failed']
+    result_map = {}
+    if missing:
+        emit(action('提取正文', f'{len(missing)} 个链接', '📄'))
+        try:
+            response = await search_backend.fetch(missing)
+        except Exception as exc:
+            errors.append(error_entry('extract', exc))
+            raise ToolError('正文提取失败，检查代理或链接可达性') from exc
+        usage.append({'stage': 'extract', 'backend': response.get('usage')})
+        for result in response.get('results', []):
+            try:
+                result_map[clean_public_url(result['url'])] = result
+            except (KeyError, ValueError):
+                continue
+        for _failed in response.get('failed_results', []):
+            errors.append({'stage': 'extract', 'type': 'URLExtractionFailed'})
+
+    now = datetime.now(timezone.utc).isoformat()
+    task_id = state.get('task_id') or 'task'
+    for d in documents:
+        if sources.has_text(d) and d.get('status') == 'success':
+            continue
+        text = sources.load_text(d) or (result_map.get(d['url'], {}) or {}).get('raw_content') or ''
+        if isinstance(text, str) and text.strip():
+            chars = sources.save_text(task_id, d['source_id'], text)
+            d.update(chars=chars, status='success', fetched_at=now, error=None)
+        else:
+            d.update(chars=0, status='failed', error='未取得有效正文')
+    ok = [d for d in documents if d.get('status') == 'success']
+    if ok:
+        total_chars = sum(sources.chars_of(d) for d in ok)
+        emit(action('正文就绪', f'{len(ok)} 个来源，共 {total_chars} 字符', '✅'))
+    else:
+        emit(action('没有可用正文', f'{len(documents)} 个来源均未取到内容', '⚠️'))
+    return {'documents': documents, 'errors': errors,
+            'usage': usage, 'status': 'fetched'}
