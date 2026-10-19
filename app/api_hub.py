@@ -22,6 +22,7 @@ from app.config import settings
 from app.events import stage_end, stage_start
 from app.main import run_task
 from app.messages import cancel_note, reply_text
+from app.services import is_stop_command
 from app.store import Store
 
 TERMINAL_STATUS = {'deployed', 'deploy_needs_check', 'local_ready', 'failed',
@@ -150,8 +151,33 @@ class Hub:
                 return artifact
         return None
 
+    def stop_session(self, session_id: str, message: str) -> TaskRecord:
+        """把"暂停/停止"当成控制指令：掐掉在跑的任务，不启动新流程。
+
+        界面上已经没有停止按钮，用户就靠说一句停下。若不拦下来，这句话会被当成
+        普通任务送进规划器——想停反而跑起最重的一条链路。
+        """
+        running = [task for task in self.tasks.values()
+                   if task.session_id == session_id and task.live]
+        for task in running:
+            task._task.cancel()
+        self.store.append_message(session_id, 'user', message)
+        record = TaskRecord(task_id=uuid.uuid4().hex[:12], session_id=session_id,
+                            message=message, store=self.store)
+        self.store.create_task(record.task_id, session_id, message)
+        self.tasks[record.task_id] = record
+        detail = ('已停止当前任务，没有重新开始检索。' if running
+                  else '当前没有正在执行的任务。')
+        self.store.append_message(session_id, 'assistant', detail)
+        record.persist(status='cancelled', state={'status': 'cancelled'})
+        record.publish({'type': 'status', 'status': 'cancelled', 'detail': detail})
+        record.close()
+        return record
+
     def start(self, message: str, session_id: str | None = None) -> TaskRecord:
         session_id = session_id or uuid.uuid4().hex[:12]
+        if is_stop_command(message):
+            return self.stop_session(session_id, message)
         history = self.history(session_id)
         prior_artifact = self.last_artifact(session_id)
         self.store.append_message(session_id, 'user', message)

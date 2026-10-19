@@ -111,11 +111,23 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         with_url = nodes.fallback_steps({'user_input': '看看 https://example.com/a'})
         self.assertEqual(with_url[0]['tool'], 'fetch_pages')
         self.assertEqual(with_url[0]['args']['urls'], ['https://example.com/a'])
-        without = nodes.fallback_steps({'user_input': '介绍一下 SQLite'})
-        self.assertEqual(without[0]['tool'], 'web_search')
+        research = nodes.fallback_steps({'user_input': '整理一份 SQLite 调研报告'})
+        self.assertEqual(research[0]['tool'], 'web_search')
         # 兜底计划里的工具必须真实存在，否则整轮会被跳过
         known = {t.name for t in tool_module.BUILTIN_TOOLS}
-        self.assertTrue({s['tool'] for s in without} <= known)
+        self.assertTrue({s['tool'] for s in with_url} <= known)
+        self.assertTrue({s['tool'] for s in research} <= known)
+
+    def test_fallback_does_not_research_unrelated_input(self):
+        """兜底计划不能一律走检索。
+
+        早先这里无条件检索：用户发一句"暂停"，规划又恰好失败，就会去搜"暂停"
+        并出一份报告——比答得不好糟得多。
+        """
+        from app import nodes
+        for text in ['暂停', '你好', '介绍一下你自己', '现在是几点']:
+            steps = nodes.fallback_steps({'user_input': text})
+            self.assertEqual([s['tool'] for s in steps], ['answer_directly'], text)
 
     async def test_plan_asks_the_model_and_keeps_its_steps(self):
         from app import nodes
@@ -652,6 +664,41 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
                 if e['type'] == 'stage_end'}
         self.assertEqual(ends.get('plan'), '已失败')
         self.assertEqual(ends.get('instruction'), '已失败')
+
+    async def test_stop_command_cancels_instead_of_starting_a_task(self):
+        """说"暂停"要停流程，而不是拿"暂停"去检索。"""
+        import app.api_hub as hub_module
+        hub = self.hub()
+        started = {'n': 0}
+
+        async def slow(text, progress=None, on_event=None, history=None,
+                       on_start=None, prior_artifact=None):
+            started['n'] += 1
+            await asyncio.sleep(30)
+            return {}
+
+        with patch.object(hub_module, 'run_task', slow):
+            first = hub.start('整理一份 SQLite 报告')
+            await asyncio.sleep(0.2)
+            record = hub.start('暂停', first.session_id)
+            with self.assertRaises(asyncio.CancelledError):
+                await first._task
+
+        self.assertEqual(started['n'], 1, '暂停不应该再启动一次模型流程')
+        self.assertEqual(record.status, 'cancelled')
+        details = [e.get('detail') for e in self.events_of(record)
+                   if e.get('type') == 'status']
+        self.assertTrue(any('已停止当前任务' in (d or '') for d in details))
+
+    async def test_stop_command_with_nothing_running(self):
+        import app.api_hub as hub_module
+        hub = self.hub()
+        with patch.object(hub_module, 'run_task', self.stub()):
+            record = hub.start('暂停')
+        self.assertEqual(record.status, 'cancelled')
+        details = [e.get('detail') for e in self.events_of(record)
+                   if e.get('type') == 'status']
+        self.assertTrue(any('没有正在执行的任务' in (d or '') for d in details))
 
     async def test_last_artifact_carries_over(self):
         hub = self.hub()

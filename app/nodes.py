@@ -48,21 +48,31 @@ def _catalog_text(catalog) -> str:
     return '\n'.join(lines)
 
 
+# 出现这些词才认为"用户要的是一份研究报告"。
+RESEARCH_HINTS = ('报告', '整理', '调研', '研究', '对比', '比较', '分析', '综述',
+                  '总结', '梳理', '查一下', '查下', '搜一下', '搜索', '资料',
+                  '汇总', '评估', '盘点')
+
+
 def fallback_steps(state: dict) -> list[dict]:
     """规划失败、或模型给了不可用计划时的兜底。
 
-    保守但可用：有链接就抓链接，没有就先搜一次，然后成稿、渲染。
-    这条路保证"至少出一份报告"，不至于让任务空手而归。
+    要点是**别乱猜**：只有当输入明显是研究/报告诉求（含链接或研究类字眼）时才
+    退到检索链路；其余一律退到"直接回答"。早先这里无条件走检索，结果用户发一句
+    "暂停"也会被拿去搜一分钟——比答得不好糟得多。
     """
-    urls = urls_from_input(state.get('user_input') or '')
-    topic = state.get('user_input') or ''
+    text = state.get('user_input') or ''
+    urls = urls_from_input(text)
     if urls:
         first = {'tool': 'fetch_pages', 'args': {'urls': urls}, 'why': '用户直接给了链接'}
+    elif any(hint in text for hint in RESEARCH_HINTS):
+        first = {'tool': 'web_search', 'args': {'query': text}, 'why': '需要外部资料'}
     else:
-        first = {'tool': 'web_search', 'args': {'query': topic}, 'why': '需要外部资料'}
+        return [{'tool': 'answer_directly', 'args': {'question': text},
+                 'why': '不像研究请求，直接回答'}]
     return [first,
             {'tool': 'fetch_pages', 'args': {}, 'why': '补齐正文'},
-            {'tool': 'compose_report', 'args': {'topic': topic}, 'why': '整理成报告'},
+            {'tool': 'compose_report', 'args': {'topic': text}, 'why': '整理成报告'},
             {'tool': 'render_html', 'args': {}, 'why': '产出 HTML'}]
 
 
@@ -111,6 +121,7 @@ async def plan(state):
     }, ensure_ascii=False)
 
     usage = list(state.get('usage', []))
+    errors = list(state.get('errors', []))
     steps, summary, updates = None, '', {}
     try:
         execution, call_usage = await structured_call(
@@ -125,9 +136,14 @@ async def plan(state):
         updates = data.get('profile_updates') or {}
         usage.append({'stage': 'plan', 'model_name': settings.llm_model,
                       'model': call_usage})
-    except Exception:
+    except Exception as exc:
         # 规划失败不该让任务直接崩：退回一条保守的固定计划。
-        emit(action('规划失败', '回退到默认计划', '⚠️'))
+        # 把异常类别透出来——否则界面上只有一个"规划失败"，没法判断是网关超时
+        # 还是 schema 两次校验都没过。
+        hint = getattr(exc, 'safe_message', None) or type(exc).__name__
+        emit(action('规划失败', f'{hint}，改用默认计划', '⚠️'))
+        errors = list(state.get('errors', [])) + [
+            {'stage': 'plan', 'type': type(exc).__name__}]
         steps = None
     if not steps:
         steps = _valid_steps(fallback_steps(state), catalog)
@@ -137,8 +153,11 @@ async def plan(state):
         profile.merge(updates)
         emit(action('已记住', profile.describe(updates), '🧠'))
     emit(thought(describe_plan(steps, summary)))
-    return {'plan': {'steps': steps, 'summary': summary},
-            'step_index': 0, 'usage': usage, 'status': 'planned'}
+    result = {'plan': {'steps': steps, 'summary': summary},
+              'step_index': 0, 'usage': usage, 'status': 'planned'}
+    if errors:
+        result['errors'] = errors
+    return result
 
 
 def next_step(state) -> str:

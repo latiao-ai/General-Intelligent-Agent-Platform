@@ -91,6 +91,24 @@ def is_small_talk(text: str) -> bool:
     return True
 
 
+# 明确表示"停下"的说法。只做**整句完全匹配**，不做模糊包含：
+# "取消订单"这种是正常话题，不能被当成控制指令。
+_STOP_COMMANDS = {
+    '暂停', '暂停一下', '先暂停', '停止', '停一下', '停下', '先停一下', '先停',
+    '别搜了', '不要搜了', '不用搜了', '取消', '终止', '中断', '够了',
+    '停', 'stop', 'pause', 'cancel', 'abort',
+}
+
+
+def is_stop_command(text: str) -> bool:
+    """这句话是不是在叫停当前流程。
+
+    客户端一旦把它当普通任务发出去，就会被拿去检索/成稿——用户想停下，结果
+    反而启动了最重的一条链路。所以要在建任务之前拦下来。
+    """
+    return _NORMALIZE.sub('', text).lower() in _STOP_COMMANDS
+
+
 def new_llm(model: str | None = None, disable_thinking: bool = False):
     options = dict(
         model=model or settings.llm_model,
