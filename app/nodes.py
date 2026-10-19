@@ -81,24 +81,88 @@ def describe_plan(steps: list[dict], summary: str = '') -> str:
     return f'我的执行计划：{names}'
 
 
-def _valid_steps(raw_steps: list[dict], catalog) -> tuple[list[dict], list[str]]:
-    """校验计划：只保留工具真实存在的步骤，并回报被丢弃的工具名。
+def validate_plan(raw_steps: list[dict], catalog) -> tuple[list[dict], list[dict]]:
+    """校验计划，返回 (可执行步骤, 结构化错误)。
 
-    返回被丢弃的名字而不是静默过滤——计划引用了不存在的工具属于规划错误，
-    要让人看得见（文档 §6.3：不能丢掉未知工具就直接执行剩余步骤）。
+    文档 §6.3 要求校验工具存在与权限、引用合法、无环、参数类型合理、不超预算。
+    这里不去"丢坏的留好的"——计划是一个整体，被引用的一步坏了后面的都不可信，
+    所以错误要回给规划器修复，而不是静默拼一个残缺计划去执行。
     """
-    known = {tool.name for tool in catalog}
-    cleaned, dropped = [], []
-    for step in raw_steps:
-        name = str(step.get('tool') or '').strip()
+    known = {tool.name: tool for tool in catalog}
+    issues: list[dict] = []
+    steps: list[dict] = []
+    seen_ids: set[str] = set()
+
+    if len(raw_steps) > MAX_STEPS:
+        issues.append({'code': 'too_many_steps',
+                       'detail': f'最多 {MAX_STEPS} 步，收到 {len(raw_steps)} 步'})
+        raw_steps = raw_steps[:MAX_STEPS]
+
+    for index, raw in enumerate(raw_steps, 1):
+        name = str(raw.get('tool') or '').strip()
+        step_id = str(raw.get('step_id') or '').strip() or f's{index}'
         if name not in known:
-            dropped.append(name)
+            issues.append({'code': 'unknown_tool', 'step_id': step_id,
+                           'tool': name,
+                           'detail': f'工具 {name!r} 不在可用清单里'})
             continue
-        args = step.get('args')
-        cleaned.append({'tool': name,
-                        'args': args if isinstance(args, dict) else {},
-                        'why': str(step.get('why') or '')})
-    return cleaned[:MAX_STEPS], dropped
+        if step_id in seen_ids:
+            issues.append({'code': 'duplicate_step_id', 'step_id': step_id,
+                           'detail': '步骤 ID 重复'})
+            continue
+        seen_ids.add(step_id)
+        args = raw.get('args')
+        if args is not None and not isinstance(args, dict):
+            issues.append({'code': 'bad_args', 'step_id': step_id,
+                           'detail': 'args 必须是对象'})
+            args = {}
+        depends_on = [str(d) for d in (raw.get('depends_on') or [])]
+        for dep in depends_on:
+            if dep not in seen_ids:
+                # 只能依赖**前面**的步骤：指向后面或不存在都会让执行顺序失效
+                issues.append({'code': 'bad_dependency', 'step_id': step_id,
+                               'detail': f'依赖 {dep!r} 不是更早的步骤'})
+        steps.append({'tool': name, 'step_id': step_id,
+                      'args': dict(args or {}), 'depends_on': depends_on,
+                      'why': str(raw.get('why') or ''),
+                      'tool_key': known[name].tool_key,
+                      'effect': known[name].effect})
+    return steps, issues
+
+
+def _valid_steps(raw_steps: list[dict], catalog) -> tuple[list[dict], list[str]]:
+    """兼容旧调用点：返回 (步骤, 被丢弃的工具名)。"""
+    steps, issues = validate_plan(raw_steps, catalog)
+    dropped = [issue.get('tool') or issue['detail'] for issue in issues
+               if issue['code'] == 'unknown_tool']
+    return steps, dropped
+
+
+def resolve_inputs(step: dict, outputs: dict) -> dict:
+    """把步骤输入里的 ref 绑定解析成真实值（文档 §6.2）。
+
+    只认两种形态：literal 直传、ref 指向前序步骤输出里的某个指针。
+    不做表达式求值、不读任意文件路径。
+    """
+    args = dict(step.get('args') or {})
+    for key, value in list(args.items()):
+        if not isinstance(value, dict):
+            continue
+        if 'ref' in value and isinstance(value['ref'], dict):
+            ref = value['ref']
+            source = outputs.get(str(ref.get('step_id') or ''), {})
+            pointer = str(ref.get('pointer') or '').strip('/')
+            resolved = source
+            for part in filter(None, pointer.split('/')):
+                if isinstance(resolved, dict) and part in resolved:
+                    resolved = resolved[part]
+                else:
+                    resolved = None
+                    break
+            args[key] = resolved
+        elif 'literal' in value:
+            args[key] = value['literal']
+    return args
 
 
 async def plan(state):
@@ -133,21 +197,37 @@ async def plan(state):
     usage = list(state.get('usage', []))
     errors = list(state.get('errors', []))
     steps, summary, updates = None, '', {}
+    issues: list[dict] = []
     try:
-        execution, call_usage = await structured_call(
-            ExecutionPlan,
-            profile.with_profile(PLANNER_SYSTEM),
-            payload,
-            disable_thinking=settings.llm_parse_disable_thinking,
-        )
-        data = execution.model_dump()
-        steps, dropped = _valid_steps(data.get('steps') or [], catalog)
-        if dropped:
-            emit(action('计划引用了不存在的工具', '、'.join(dropped), '⚠️'))
-        summary = data.get('summary') or ''
-        updates = data.get('profile_updates') or {}
-        usage.append({'stage': 'plan', 'model_name': settings.llm_model,
-                      'model': call_usage})
+        # 最多两轮：第一次照常规划；若整体校验不通过，把结构化错误交回模型修复
+        for round_index in range(2):
+            execution, call_usage = await structured_call(
+                ExecutionPlan,
+                profile.with_profile(PLANNER_SYSTEM),
+                payload,
+                disable_thinking=settings.llm_parse_disable_thinking,
+            )
+            data = execution.model_dump()
+            steps, issues = validate_plan(data.get('steps') or [], catalog)
+            summary = data.get('summary') or ''
+            updates = data.get('profile_updates') or {}
+            usage.append({'stage': 'plan', 'model_name': settings.llm_model,
+                          'model': call_usage})
+            if not issues:
+                break
+            emit(action('计划校验未通过',
+                        '；'.join(f'{i["code"]}:{i["detail"]}' for i in issues)[:120],
+                        '⚠️'))
+            if round_index == 0:
+                # 把错误原文喂回去，让模型在同一份工具清单上修
+                payload = json.dumps({
+                    '用户要求': question,
+                    '上次计划': data.get('steps'),
+                    '校验错误': issues,
+                    '要求': '按校验错误修正计划；只能用清单里的工具；'
+                            'depends_on 只能指向更早的步骤。',
+                    '可用工具': _catalog_text(catalog),
+                }, ensure_ascii=False)
     except Exception as exc:
         # 规划失败不该让任务直接崩：退回一条保守的固定计划。
         # 把异常类别透出来——否则界面上只有一个"规划失败"，没法判断是网关超时
@@ -216,10 +296,21 @@ async def run_step(state):
             result['status'] = final_status(state)
         return result
 
+    step_id = step.get('step_id') or f's{index + 1}'
+    outputs = dict(state.get('step_outputs') or {})
+
+    # 依赖必须真的成功，否则这一步的输入就是不可信的（文档 §6.3）
+    for dep in step.get('depends_on') or []:
+        dep_status = (outputs.get(dep) or {}).get('__status__')
+        if dep_status != 'succeeded':
+            emit(action('依赖未完成', f'{tool.label} 依赖 {dep}（{dep_status or "缺失"}）', '⛔'))
+            return {'step_index': len(steps), 'step_label': tool.label,
+                    'status': 'failed',
+                    'failure': f'{tool.label}依赖的步骤 {dep} 没有成功完成'}
+
     emit(stage_start(name, tool.label))
     started = time.perf_counter()
-    args = dict(step.get('args') or {})
-    step_id = step.get('step_id') or f's{index + 1}'
+    args = resolve_inputs(step, outputs)
 
     # 账本：调用之前先落 prepared / in_flight，回来再改。崩溃窗口才有据可查。
     book = ledger_module.current_ledger()
@@ -255,8 +346,9 @@ async def run_step(state):
         errors = list(state.get('errors', [])) + [
             {'stage': name, 'type': type(exc).__name__}]
         # 出错就中止剩余步骤：后面的多半依赖这一步的产物。
+        outputs[step_id] = {'__status__': 'failed'}
         return {'step_index': len(steps), 'step_label': tool.label,
-                'errors': errors, 'status': 'failed',
+                'errors': errors, 'status': 'failed', 'step_outputs': outputs,
                 'failure': f'{tool.label}失败：{hint}'}
 
     updates = dict(updates)
@@ -264,6 +356,11 @@ async def run_step(state):
         book.succeed(action_id, attempt_id,
                      {k: v for k, v in updates.items()
                       if isinstance(v, (str, int, float, bool, dict, list))})
+    record = {k: v for k, v in updates.items()
+              if isinstance(v, (str, int, float, bool, dict, list))}
+    record['__status__'] = 'succeeded'
+    outputs[step_id] = record
+    updates['step_outputs'] = outputs
     updates['step_index'] = index + 1
     updates['step_label'] = tool.label
     emit(stage_end(name, time.perf_counter() - started,

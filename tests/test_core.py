@@ -637,6 +637,89 @@ class RunLeaseTests(unittest.TestCase):
         self.assertFalse(store.enqueue_job('j2', 'summary', 'sess:1'))
 
 
+class PlanContractTests(unittest.IsolatedAsyncioTestCase):
+    """计划合同：步骤 ID、依赖、输入绑定与结构化校验（文档 §6）。"""
+
+    def test_step_ids_assigned_and_dependencies_validated(self):
+        from app import nodes, tools as tm
+        steps, issues = nodes.validate_plan([
+            {'tool': 'web_search', 'args': {'query': 'x'}},
+            {'tool': 'render_html', 'depends_on': ['s1']},
+        ], tm.BUILTIN_TOOLS)
+        self.assertEqual([s['step_id'] for s in steps], ['s1', 's2'])
+        self.assertEqual(issues, [])
+        self.assertEqual(steps[0]['tool_key'], 'local:web:search')
+
+    def test_forward_or_missing_dependency_is_an_error(self):
+        from app import nodes, tools as tm
+        _, issues = nodes.validate_plan([
+            {'tool': 'web_search', 'args': {'query': 'x'}, 'step_id': 'a'},
+            {'tool': 'render_html', 'depends_on': ['b'], 'step_id': 'c'},
+        ], tm.BUILTIN_TOOLS)
+        self.assertIn('bad_dependency', [i['code'] for i in issues])
+
+    def test_duplicate_step_id_is_an_error(self):
+        from app import nodes, tools as tm
+        _, issues = nodes.validate_plan([
+            {'tool': 'web_search', 'args': {}, 'step_id': 'a'},
+            {'tool': 'render_html', 'step_id': 'a'},
+        ], tm.BUILTIN_TOOLS)
+        self.assertIn('duplicate_step_id', [i['code'] for i in issues])
+
+    def test_input_binding_resolves_previous_output(self):
+        from app import nodes
+        args = nodes.resolve_inputs(
+            {'args': {'artifact_id': {'ref': {'step_id': 's1',
+                                              'pointer': '/artifact/id'}},
+                      'title': {'literal': '活动页'},
+                      'plain': 'as-is'}},
+            {'s1': {'artifact': {'id': 'art_1'}}})
+        self.assertEqual(args, {'artifact_id': 'art_1', 'title': '活动页',
+                                'plain': 'as-is'})
+
+    def test_missing_binding_resolves_to_none(self):
+        from app import nodes
+        args = nodes.resolve_inputs(
+            {'args': {'x': {'ref': {'step_id': 'nope', 'pointer': '/a'}}}}, {})
+        self.assertIsNone(args['x'])
+
+    async def test_run_step_blocks_when_dependency_not_succeeded(self):
+        from app import nodes
+        from app import tools as tool_module
+        from app.tools import Tool
+
+        async def should_not_run(args, state):
+            raise AssertionError('依赖未完成时不应执行')
+
+        fake = Tool('render_html', '渲染 HTML', 'd', {}, should_not_run,
+                    tool_key='local:reports:render', effect='write')
+        plan = {'steps': [{'tool': 'render_html', 'step_id': 's2',
+                           'depends_on': ['s1'], 'args': {}}]}
+        with patch.dict(tool_module.BUILTIN_BY_NAME, {'render_html': fake}):
+            result = await nodes.run_step(
+                {'plan': plan, 'step_index': 0, 'user_input': 'q',
+                 'step_outputs': {'s1': {'__status__': 'failed'}}})
+        self.assertEqual(result['status'], 'failed')
+        self.assertIn('依赖', result['failure'])
+
+    async def test_run_step_records_output_for_downstream_binding(self):
+        from app import nodes
+        from app import tools as tool_module
+        from app.tools import Tool
+
+        async def run(args, state):
+            return {'artifact': {'id': 'art_9'}}
+
+        fake = Tool('render_html', '渲染 HTML', 'd', {}, run,
+                    tool_key='local:reports:render', effect='write')
+        plan = {'steps': [{'tool': 'render_html', 'step_id': 's1', 'args': {}}]}
+        with patch.dict(tool_module.BUILTIN_BY_NAME, {'render_html': fake}):
+            result = await nodes.run_step(
+                {'plan': plan, 'step_index': 0, 'user_input': 'q'})
+        self.assertEqual(result['step_outputs']['s1']['artifact']['id'], 'art_9')
+        self.assertEqual(result['step_outputs']['s1']['__status__'], 'succeeded')
+
+
 class DeployGateTests(unittest.IsolatedAsyncioTestCase):
     """部署闸门：没有产物、或全局关闭时都不许部署。"""
 

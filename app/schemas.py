@@ -1,12 +1,29 @@
-from typing import Literal
+from typing import Any, Literal
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 
+class InputBinding(BaseModel):
+    """步骤输入的一种绑定方式（文档 §6.2）。
+
+    只支持两种明确形态，**不解析任意表达式**：
+    - literal：字面量，直接作为参数值
+    - ref：引用前序步骤的输出，按受限 JSON Pointer 取值
+    """
+    literal: Any = None
+    ref: dict | None = None          # {'step_id': 's1', 'pointer': '/artifact_id'}
+
+
 class PlanStep(BaseModel):
-    """编排计划中的一步：调用哪个工具、传什么参数。"""
+    """编排计划中的一步。
+
+    step_id 可以省略（服务端按顺序补 s1、s2…）；depends_on 指向前序步骤，
+    执行前会校验引用合法且不构成环。
+    """
     tool: str = Field(min_length=1)
     args: dict = Field(default_factory=dict)
     why: str = ''
+    step_id: str = ''
+    depends_on: list[str] = Field(default_factory=list)
 
 
 class ExecutionPlan(BaseModel):
@@ -59,6 +76,8 @@ class AgentState(TypedDict, total=False):
     step_index: int
     # 上一步的中文名，执行器用它做耗时行的标签。
     step_label: str
+    # 已执行步骤的输出，按 step_id 索引，供后续步骤的 ref 绑定取值（文档 §6.2）
+    step_outputs: dict
     documents: list[dict]
     report: dict
     # 直接回答时的纯文本结果
