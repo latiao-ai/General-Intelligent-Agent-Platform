@@ -1398,6 +1398,39 @@ class AnswerToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'answered')
         self.assertTrue(any(e.get('type') == 'answer_delta' for e in seen))
 
+    async def test_tool_calls_record_their_arguments(self):
+        """参数必须记录下来。
+
+        list_sites 带 keyword 时只返回匹配项；不记参数就分不清"列表只有 1 个"
+        和"只匹配到 1 个"——这个坑导致过一条错误的"删除后剩余站点"汇报。
+        """
+        from app import tools as tool_module
+
+        async def fake_call(tool_name, arguments, artifact=None):
+            return {'deleted': tool_name}
+
+        state = {'usage': []}
+        with patch.object(tool_module.mcp_adapter, 'call_tool', fake_call), \
+                patch.object(tool_module, 'emit', lambda e: None):
+            runner = tool_module._make_mcp_runner('delete_site')
+            result = await runner({'site_id': 'y6XbM-lg'}, state)
+        call = result['mcp_calls'][0]
+        self.assertEqual(call['tool'], 'delete_site')
+        self.assertEqual(call['args'], {'site_id': 'y6XbM-lg'})
+        self.assertIn('deleted', call['payload'])
+
+    def test_tool_results_show_args_and_order(self):
+        from app import tools as tool_module
+        state = {'mcp_calls': [
+            {'tool': 'list_sites', 'args': {'keyword': 'y6XbM-lg'},
+             'payload': {'total': 1}},
+            {'tool': 'delete_site', 'args': {'site_id': 'y6XbM-lg'},
+             'payload': {'status': 'deleted'}}]}
+        text = tool_module.tool_results_text(state)
+        self.assertIn('keyword', text)
+        self.assertIn('第1次工具调用', text)
+        self.assertIn('第2次工具调用', text)
+
     async def test_uses_tool_results_from_earlier_steps(self):
         """"先调 MCP 取数据、再作答"：第二步必须看得见第一步的返回。
 
@@ -1420,6 +1453,8 @@ class AnswerToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"site_id": "a"', captured['content'])
         # 系统提示必须切换成"基于工具数据作答"，否则模型仍会说自己没能力
         self.assertIn('工具返回', captured['system'])
+        # 还要堵住"把过滤结果当全量"这个坑
+        self.assertIn('不是全量清单', captured['system'])
 
     async def test_without_tool_results_keeps_plain_prompt(self):
         from app import tools as tool_module

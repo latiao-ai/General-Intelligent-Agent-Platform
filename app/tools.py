@@ -303,6 +303,11 @@ ANSWER_USING_TOOL_RESULTS_SYSTEM = (
     '必须基于这些数据回答：该数就数、该列就列，直接给结论。'
     '不要说"我无法访问服务器/没有联网/你没提供给我"——数据就在下面。'
     '数据里确实没有的信息，就明确说那部分没有，不要编造。'
+    # 这条是真踩过的坑：list_sites 带 keyword 过滤时只返回匹配项，
+    # 模型把"过滤后 1 条"当成"服务器上只剩 1 个"，还把自己刚删掉的站点列成了幸存者。
+    '特别注意：如果某次调用带了过滤/搜索类参数（如 keyword），它的返回只是匹配结果，'
+    '不是全量清单。此时不要报"还剩几个"、也不要据此罗列剩余条目，'
+    '应当说明需要重新查询一次完整列表。只有不带过滤参数的调用结果，才代表全量。'
 )
 
 # 每个工具结果最多塞这么多字符，避免把上下文撑爆
@@ -317,14 +322,15 @@ def tool_results_text(state: dict) -> str:
     模型就会说"你没提供给我"——这个坑在 MCP 查询类问题上必现。
     """
     parts, used = [], 0
-    for call in state.get('mcp_calls') or []:
+    for index, call in enumerate(state.get('mcp_calls') or [], 1):
+        args = json.dumps(call.get('args') or {}, ensure_ascii=False)
         payload = json.dumps(call.get('payload'), ensure_ascii=False)
         room = min(_TOOL_RESULT_CHARS, _TOOL_RESULT_TOTAL - used)
         if room <= 0:
             break
         text = payload[:room]
         used += len(text)
-        parts.append(f'[工具 {call.get("tool")} 返回]\n{text}')
+        parts.append(f'[第{index}次工具调用] {call.get("tool")}  参数 {args}\n返回 {text}')
     return '\n\n'.join(parts)
 
 
@@ -484,8 +490,11 @@ def _make_mcp_runner(server_tool_name: str):
             raise ToolError(f'MCP 工具 {server_tool_name} 调用失败') from exc
         emit(action('MCP 工具返回', json.dumps(
             payload, ensure_ascii=False)[:120], '📦'))
+        # 参数必须一起记：过滤类工具（如 list_sites 的 keyword）传不传参数，
+        # 返回语义完全不同——不记下来就分不清"列表只有 1 个"和"只匹配到 1 个"。
         return {'mcp_calls': list(state.get('mcp_calls', [])) + [
-            {'tool': server_tool_name, 'payload': payload}]}
+            {'tool': server_tool_name, 'args': dict(args or {}),
+             'payload': payload}]}
     return run
 
 
