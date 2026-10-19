@@ -338,10 +338,15 @@ class Hub:
             self.store.save_plan(record.run_id, 1, goal=record.message,
                                  steps=steps, reason=plan.get('summary') or '')
             self.store.save_steps(record.run_id, 1, steps)
+            outputs = state.get('step_outputs') or {}
             for step in steps:
-                if step.get('step_outputs') is None and step.get('step_id'):
-                    self.store.update_step(record.run_id, 1, step['step_id'],
-                                           status='succeeded')
+                step_id = step.get('step_id')
+                if not step_id:
+                    continue
+                status = (outputs.get(step_id) or {}).get('__status__')
+                if status:
+                    self.store.update_step(record.run_id, 1, step_id,
+                                           status=status)
         self.store.update_run(record.run_id, status=run_status,
                               plan_version=1 if steps else 0)
         # outbox：业务事件与派生作业在同一处写入，消费者按 dedupe_key 幂等

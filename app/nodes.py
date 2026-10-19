@@ -330,6 +330,15 @@ async def run_step(state):
     if book is not None:
         prepared = book.begin(step_id=step_id, tool_key=tool.tool_key or name,
                               effect=tool.effect, args=args)
+        if prepared.get('blocked'):
+            # 之前已发出但没拿到确定回执：不能重发，也不能当成功
+            emit(action('该步骤结果未定',
+                        f'{tool.label}（{prepared["blocked"]}），需核实后再继续', '❓'))
+            outputs[step_id] = {'__status__': 'unknown'}
+            return {'step_index': len(steps), 'step_label': tool.label,
+                    'step_outputs': outputs, 'status': 'failed',
+                    'failure': f'{tool.label}的结果未确定（{prepared["blocked"]}），'
+                               f'为避免重复副作用已停止，请核实后重试'}
         if prepared.get('replay') is not None:
             # 这个动作之前已经成功：直接复用回执，不再调用远端
             emit(action('复用已有结果', f'{tool.label}（该动作此前已成功）', '♻️'))

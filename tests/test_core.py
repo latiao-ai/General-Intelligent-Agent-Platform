@@ -1438,17 +1438,50 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
         hub.store.ensure_task_meta('t1', session_id='s1', goal='g')
         hub.store.create_run('r1', 't1', status='running')
-        action = hub.store.create_action(
+        hub.store.create_action(
             'a1', run_id='r1', plan_version=1, step_id='s1',
             tool_key='mcp:publishing:deploy_site', args_hash='h',
             idempotency_key='k1', effect='write')
-        hub.store.add_attempt('att1', action['action_id'])
+        hub.store.update_action('a1', status='in_flight')
+        # 另一条只到 prepared（请求根本没发出去）：可以安全重试，不该标 unknown
+        hub.store.create_action(
+            'a2', run_id='r1', plan_version=1, step_id='s2',
+            tool_key='mcp:publishing:update_site', args_hash='h2',
+            idempotency_key='k2', effect='write')
 
         stats = hub.reconcile()
         self.assertEqual(stats['runs'], 1)
         self.assertEqual(stats['unknown_actions'], 1)
         self.assertEqual(hub.store.action('a1')['status'], 'unknown')
+        self.assertEqual(hub.store.action('a2')['status'], 'prepared')  # 可重试
         self.assertEqual(hub.store.run('r1')['status'], 'reconciling')
+
+    async def test_unknown_action_blocks_instead_of_resending(self):
+        """已发出但结果未定的动作，续跑时必须停下来而不是再发一次。"""
+        from app import nodes
+        from app import tools as tool_module
+        from app.ledger import ActionLedger, use_ledger
+        from app.store import Store
+        from app.tools import Tool
+
+        store = Store(':memory:')
+        book = ActionLedger(store, 'run1', 1)
+        first = book.begin(step_id='s1', tool_key='local:publishing:deploy',
+                           effect='write', args={})
+        attempt = book.in_flight(first['action_id'])
+        book.mark_unknown(first['action_id'], attempt, 'TimeoutError')
+
+        async def should_not_run(args, state):
+            raise AssertionError('结果未定的动作不能重发')
+
+        fake = Tool('deploy_site', '部署站点', 'd', {}, should_not_run,
+                    tool_key='local:publishing:deploy', effect='write')
+        plan = {'steps': [{'tool': 'deploy_site', 'step_id': 's1', 'args': {}}]}
+        with patch.dict(tool_module.BUILTIN_BY_NAME, {'deploy_site': fake}):
+            with use_ledger(book):
+                result = await nodes.run_step(
+                    {'plan': plan, 'step_index': 0, 'user_input': 'q'})
+        self.assertIn('结果未确定', result['failure'])
 
     def test_pause_only_affects_active_runs(self):
         hub = self.hub()

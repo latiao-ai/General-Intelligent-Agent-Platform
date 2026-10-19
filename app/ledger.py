@@ -82,10 +82,11 @@ class ActionLedger:
             if existing['status'] == 'succeeded':
                 return {'action_id': existing['action_id'],
                         'replay': existing['receipt']}
-            # prepared / in_flight / unknown：都不允许盲目重发
-            if existing['status'] == 'in_flight':
-                return {'action_id': existing['action_id'],
-                        'replay': None, 'unknown': True}
+            # 已发送但结果未定、或已判定未知：一律阻断，要求核实后再继续。
+            # 只有 prepared（根本没发出去）才可以安全重发（文档 §8.3 窗口一）。
+            if existing['status'] in {'in_flight', 'unknown'}:
+                return {'action_id': existing['action_id'], 'replay': None,
+                        'blocked': existing['status']}
             return {'action_id': existing['action_id'], 'replay': None}
 
         action_id = 'act_' + uuid.uuid4().hex[:16]

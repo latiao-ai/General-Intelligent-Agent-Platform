@@ -874,10 +874,11 @@ class Store:
             unknown_actions = 0
             for row in runs:
                 run_id = row['run_id']
+                # 只处理 in_flight：prepared 意味着请求根本没发出去，
+                # 可以直接重试；这一点文档 §8.3 的窗口一是分开处理的。
                 pending = self._conn.execute(
                     "SELECT action_id, step_id FROM actions "
-                    "WHERE run_id=? AND status IN ('prepared','in_flight')",
-                    (run_id,)).fetchall()
+                    "WHERE run_id=? AND status='in_flight'", (run_id,)).fetchall()
                 for action in pending:
                     self._conn.execute(
                         "UPDATE actions SET status='unknown', updated_at=? "
