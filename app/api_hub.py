@@ -347,6 +347,17 @@ class Hub:
                 if status:
                     self.store.update_step(record.run_id, 1, step_id,
                                            status=status)
+        artifact = state.get('artifact') or {}
+        if artifact.get('html_path'):
+            # 产物登记：把文件落成可授权的对象引用，而不是只有一条路径字符串
+            self.store.add_artifact(
+                artifact.get('artifact_id') or f'art_{record.run_id}',
+                run_id=record.run_id,
+                kind=artifact.get('kind') or 'report',
+                storage_key=artifact['html_path'],
+                mime='text/html',
+                size=int(artifact.get('size_bytes') or 0),
+                sha256=artifact.get('sha256') or '')
         self.store.update_run(record.run_id, status=run_status,
                               plan_version=1 if steps else 0)
         # outbox：业务事件与派生作业在同一处写入，消费者按 dedupe_key 幂等

@@ -228,6 +228,24 @@ async def cancel_run(run_id: str):
     return {'cancelled': True}
 
 
+@app.get('/api/artifacts/{artifact_id}')
+async def read_artifact(artifact_id: str,
+                        principal=Depends(policies.current_principal)):
+    """按引用读取产物元信息（文档 §13）。
+
+    文件内容仍走任务产物下载接口；这里给的是"这个东西是什么、多大、
+    哈希多少"的权威记录，便于界面与审计引用。
+    """
+    meta = hub.store.artifact(artifact_id)
+    if meta is None:
+        raise HTTPException(status_code=404, detail='产物不存在')
+    run = hub.store.run(meta['run_id']) or {}
+    policies.ensure_owner(
+        {'tenant_id': run.get('tenant_id', 'default'),
+         'owner_user_id': run.get('owner_user_id', 'default')}, principal, '产物')
+    return meta
+
+
 @app.get('/api/recovery')
 async def recovery_status():
     return RECOVERY
