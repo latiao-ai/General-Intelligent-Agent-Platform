@@ -743,6 +743,10 @@ class ApiTests(unittest.TestCase):
         self.assertNotIn('id="stop"', res.text)
         self.assertNotIn('打断并发送', res.text)
         self.assertIn('id="send"', res.text)
+        # 回车即发送；Shift+Enter 换行；中文输入法选词时不能误发
+        self.assertIn('isComposing', res.text)
+        self.assertIn('!e.shiftKey', res.text)
+        self.assertNotIn('(e.metaKey || e.ctrlKey)', res.text)
 
     def test_unknown_task_returns_404(self):
         self.assertEqual(self.client.get('/api/tasks/nope').status_code, 404)

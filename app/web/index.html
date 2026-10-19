@@ -128,7 +128,7 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
     </div>
 
     <div class="bar"><div class="inner">
-      <textarea id="msg" placeholder="直接说你要什么，例如：整理 SQLite 的适用场景和限制，生成中文报告并部署到服务器"></textarea>
+      <textarea id="msg" placeholder="直接说你要什么，例如：整理 SQLite 的适用场景和限制，生成中文报告并部署到服务器（Enter 发送，Shift+Enter 换行）"></textarea>
       <button id="send">发送</button>
     </div></div>
   </main>
@@ -665,8 +665,14 @@ function showDeployed(url, siteId) {
 
 $('send').onclick = send;
 $('newSession').onclick = newSession;
+// Enter 直接发送，Shift+Enter 换行。
+// isComposing 必须判：中文输入法用 Enter 选词时也会触发 keydown，
+// 不跳过就会把还没上屏的候选词发出去。
 $('msg').addEventListener('keydown', e => {
-  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); send(); }
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+    e.preventDefault();
+    send();
+  }
 });
 
 loadSessions();   // 页面加载时先拉会话列表
