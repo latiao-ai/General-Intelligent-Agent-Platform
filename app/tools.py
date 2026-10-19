@@ -10,6 +10,7 @@
 - 每个工具直接改传入的 state 并返回新增字段，同时自己 `emit` 过程事件——
   这样前端的执行过程面板和原来一样丰富。
 """
+import hashlib
 import json
 import time
 from dataclasses import dataclass
@@ -24,7 +25,7 @@ from app.schemas import Report
 from app.services import (
     chat_reply, clean_public_url, extract_urls, search_query, structured_call,
 )
-from app import context, mcp_adapter, sources
+from app import context, mcp_adapter, md, sources
 
 
 class ToolError(RuntimeError):
@@ -311,6 +312,96 @@ async def _deploy_site(args: dict, state: dict) -> dict:
                       else 'deploy_needs_check'}
 
 
+SOURCES_PAGE_CSS = """
+body{margin:0;background:#f5f6f8;color:#1b2430;
+     font:15px/1.75 system-ui,-apple-system,"PingFang SC",sans-serif}
+main{max-width:860px;margin:0 auto;padding:32px 20px 64px}
+h1{font-size:24px;margin:0 0 6px}
+.meta{color:#6b7684;font-size:13px;margin-bottom:22px}
+article{background:#fff;border:1px solid #e2e6eb;border-radius:10px;
+        padding:18px 22px;margin-bottom:18px}
+article h2{font-size:18px;margin:0 0 6px}
+.src{color:#6b7684;font-size:12px;margin-bottom:14px;
+     display:flex;gap:12px;flex-wrap:wrap}
+.src a{color:#165eb4;word-break:break-all}
+.body{overflow-wrap:anywhere}
+.body pre{background:#f6f8fa;border:1px solid #e2e6eb;border-radius:8px;
+          padding:10px 12px;overflow:auto;font-size:13px}
+.body code{font-family:ui-monospace,Menlo,monospace}
+.body blockquote{margin:10px 0;padding:6px 14px;border-left:3px solid #d6dde5;
+                 color:#3b4757;background:#fafbfc}
+.body img{max-width:100%}
+.body table{border-collapse:collapse}
+.tag{background:#eef1f5;border-radius:6px;padding:1px 7px;font-size:12px}
+"""
+
+MAX_PAGE_SOURCE_CHARS = 100_000
+
+
+def _sources_page(title: str, documents: list[dict]) -> str:
+    """把来源列表渲染成一份可独立打开的 HTML。
+
+    来源是任意网页，正文一律先转义再转标签（见 app/md.py）；
+    这里只负责拼装骨架与元信息。
+    """
+    cards = []
+    for doc in documents:
+        body = sources.load_text(doc)[:MAX_PAGE_SOURCE_CHARS]
+        rendered = md.to_html(body) if body.strip() else (
+            '<p>' + md.escape(doc.get('snippet') or '（这份来源没有正文）') + '</p>')
+        bits = [f'<a href="{md.escape(doc["url"])}" target="_blank" '
+                f'rel="noreferrer">{md.escape(doc["url"])}</a>']
+        if doc.get('site_name'):
+            bits.append(f'<span class="tag">{md.escape(str(doc["site_name"]))}</span>')
+        if doc.get('date'):
+            bits.append(f'<span class="tag">{md.escape(str(doc["date"]))}</span>')
+        if doc.get('chars'):
+            bits.append(f'<span class="tag">{doc["chars"]} 字符</span>')
+        cards.append(
+            f'<article><h2>{md.escape(doc.get("title") or doc["url"])}</h2>'
+            f'<div class="src">{"".join(bits)}</div>'
+            f'<div class="body">{rendered}</div></article>')
+    return f"""<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{md.escape(title)}</title><style>{SOURCES_PAGE_CSS}</style></head>
+<body><main>
+<h1>{md.escape(title)}</h1>
+<div class="meta">共 {len(documents)} 份来源 · 由智能体检索整理</div>
+{''.join(cards)}
+</main></body></html>"""
+
+
+async def _render_sources_html(args: dict, state: dict) -> dict:
+    """把已检索到的资料（JSON 元信息 + Markdown 正文）导出成一份 HTML。
+
+    与 compose_report 的区别：这一步**不调用模型**，只是把原始资料排版成网页。
+    用户说"把资料/搜索结果保存成网页/HTML"时用它。
+    """
+    documents, origin = usable_documents(state)
+    if not documents:
+        raise ToolError('还没有可用正文，请先调用 web_search 或 fetch_pages')
+    if origin:
+        emit(action('沿用上一轮的正文', f'{len(documents)} 个来源', '♻️'))
+    title = str(args.get('title') or state.get('user_input') or '检索资料')
+    task_id = state.get('task_id') or 'task'
+    folder = settings.artifact_dir / task_id
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / 'sources.html'
+    path.write_text(_sources_page(title, documents), encoding='utf-8')
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    artifact = {
+        'task_id': task_id, 'html_path': str(path.resolve()),
+        'sha256': digest, 'size_bytes': path.stat().st_size,
+        'kind': 'sources',
+    }
+    emit(action('已把资料导出为 HTML',
+                f'{len(documents)} 份来源 · {artifact["size_bytes"]} 字节', '📄'))
+    return {'artifact': artifact, 'sources_page': {'title': title,
+                                                   'count': len(documents)},
+            'status': 'rendered'}
+
+
 ANSWER_SYSTEM = (
     '你是一个简洁、可靠的中文助手。直接回答用户的问题，不要编造事实。'
     '本轮没有做任何联网检索，你只有自己已有的知识。'
@@ -447,6 +538,12 @@ BUILTIN_TOOLS = [
     Tool('render_html', '渲染 HTML',
          '把当前报告渲染成 HTML 产物并校验。必须在 compose_report 之后调用。',
          {'type': 'object', 'properties': {}}, _render_html),
+    Tool('render_sources_html', '资料转 HTML',
+         '把已检索到的原始资料（网页 JSON 元信息 + Markdown 正文）直接排版成一份 HTML，'
+         '不调用模型、不做摘要改写。用户说"把资料/搜索结果存成网页"时用它；'
+         '需要提炼总结成报告请用 compose_report。',
+         {'type': 'object', 'properties': {'title': {'type': 'string'}}},
+         _render_sources_html),
     Tool('deploy_site', '部署站点',
          '把当前 HTML 产物部署到服务器并返回访问地址。必须在 render_html 之后、'
          '且用户明确要求发布时调用。',

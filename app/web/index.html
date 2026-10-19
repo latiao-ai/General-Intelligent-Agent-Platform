@@ -706,7 +706,8 @@ function renderResult(state) {
   if (state.artifact) {
     const card = document.createElement('div');
     card.className = 'card';
-    card.innerHTML = '<b>报告产物</b><div class="actions"></div>';
+    const label = state.artifact.kind === 'sources' ? '资料页面' : '报告产物';
+    card.innerHTML = `<b>${label}</b><div class="actions"></div>`;
     const actions = card.querySelector('.actions');
     if (S.taskId) {
       const a = document.createElement('a');

@@ -19,6 +19,14 @@ class Settings:
     llm_parse_disable_thinking: bool = (
         os.getenv('LLM_PARSE_DISABLE_THINKING', 'false').lower() == 'true')
     llm_base_url: str = os.getenv('LLM_BASE_URL', '')
+    # 检索后端：tavily（默认，行为与之前一致）或 deepseek（官方 Search/Fetch API）
+    search_provider: str = os.getenv('SEARCH_PROVIDER', 'tavily')
+    # DeepSeek 官方接口用的 key。注意它与 LLM_BASE_URL 指向的网关账号不是一回事，
+    # api.deepseek.com 只认平台自己的 key。
+    deepseek_api_key: str = (os.getenv('DEEPSEEK_API_KEY', '').strip()
+                             or os.getenv('LLM_API_KEY', '').strip())
+    deepseek_base_url: str = os.getenv('DEEPSEEK_BASE_URL',
+                                       'https://api.deepseek.com').rstrip('/')
     max_pages: int = min(5, max(1, int(os.getenv('MAX_PAGES', '5'))))
     max_queries: int = min(2, max(1, int(os.getenv('MAX_QUERIES', '2'))))
     # 单篇正文上限。必须和 max_total_chars 搭配看：总量 ÷ 单篇上限 = 能装下几个来源。

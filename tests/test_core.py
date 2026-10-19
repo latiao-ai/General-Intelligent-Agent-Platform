@@ -150,6 +150,136 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(truncated)
 
 
+class MarkdownRenderTests(unittest.TestCase):
+    """资料转 HTML 的底座：Markdown 转换。"""
+
+    def test_basic_blocks(self):
+        from app import md
+        out = md.to_html('# 标题\n\n正文\n\n- a\n- b\n\n1. x\n2. y\n')
+        self.assertIn('<h1>标题</h1>', out)
+        self.assertIn('<p>正文</p>', out)
+        self.assertIn('<ul><li>a</li><li>b</li></ul>', out)
+        self.assertIn('<ol><li>x</li><li>y</li></ol>', out)
+
+    def test_inline_and_code_fence(self):
+        from app import md
+        out = md.to_html('**粗** 与 `code`\n\n```py\nprint(1)\n```')
+        self.assertIn('<strong>粗</strong>', out)
+        self.assertIn('<code>code</code>', out)
+        self.assertIn('language-py', out)
+        self.assertIn('print(1)', out)
+
+    def test_escapes_untrusted_html(self):
+        """来源是任意网页，正文必须先转义——否则我们等于在替它执行脚本。"""
+        from app import md
+        out = md.to_html('<script>alert(1)</script>\n\n[点我](javascript:alert(1))')
+        self.assertNotIn('<script>', out)
+        self.assertIn('&lt;script&gt;', out)
+        # javascript: 伪协议不该被拼成可点链接
+        self.assertNotIn('href="javascript', out)
+
+
+class SearchBackendTests(unittest.IsolatedAsyncioTestCase):
+    """检索后端可切换：默认 Tavily，DeepSeek 官方接口归一化成同一形状。"""
+
+    def test_default_provider_is_tavily(self):
+        from app import search
+        self.assertEqual(search.provider(), 'tavily')
+        self.assertTrue(search.provider_ready()[0])
+
+    async def test_deepseek_search_normalises_payload(self):
+        from app import search
+        captured = {}
+
+        class FakeResponse:
+            def raise_for_status(self): pass
+            def json(self):
+                return {'results': [{
+                    'url': 'https://example.com/a', 'title': '甲文',
+                    'snippet': '短摘要', 'summary': '长摘要',
+                    'content': '正文 markdown', 'site_name': '示例站',
+                    'date': '2026-01-01T00:00:00Z', 'rerank_score': 2.4,
+                    'authority': 3}]}
+
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def post(self, url, json=None, headers=None):
+                captured['url'] = url
+                captured['json'] = json
+                return FakeResponse()
+
+        with patch.object(search, 'httpx', SimpleNamespace(AsyncClient=FakeClient)), \
+                patch.object(search, 'settings',
+                             SimpleNamespace(search_provider='deepseek',
+                                             deepseek_api_key='sk-test',
+                                             deepseek_base_url='https://api.deepseek.com',
+                                             max_pages=4)):
+            data = await search.search('SQLite WAL')
+        self.assertTrue(captured['url'].endswith('/v1/tools/search'))
+        self.assertTrue(captured['json']['need_content'])   # 不开这个拿不到正文
+        self.assertEqual(captured['json']['count'], 4)
+        item = data['results'][0]
+        self.assertEqual(item['raw_content'], '正文 markdown')
+        self.assertEqual(item['content'], '短摘要')
+        self.assertEqual(item['site_name'], '示例站')
+
+    async def test_deepseek_fetch_collects_failures(self):
+        from app import search
+
+        class FakeResponse:
+            def __init__(self, ok): self.ok = ok
+            def raise_for_status(self):
+                if not self.ok: raise RuntimeError('boom')
+            def json(self): return {'title': 'T', 'content': '# 正文'}
+
+        class FakeClient:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def post(self, url, json=None, headers=None):
+                return FakeResponse(json['url'].endswith('/ok'))
+
+        with patch.object(search, 'httpx', SimpleNamespace(AsyncClient=FakeClient)), \
+                patch.object(search, 'settings',
+                             SimpleNamespace(search_provider='deepseek',
+                                             deepseek_api_key='sk-test',
+                                             deepseek_base_url='https://api.deepseek.com',
+                                             max_pages=4)):
+            data = await search.fetch(['https://a/ok', 'https://a/bad'])
+        self.assertEqual([r['url'] for r in data['results']], ['https://a/ok'])
+        self.assertEqual(len(data['failed_results']), 1)
+
+
+class SourcesHtmlToolTests(unittest.IsolatedAsyncioTestCase):
+    """资料转 HTML：不调模型，把原始资料直接排版成网页。"""
+
+    async def test_renders_page_from_disk_markdown(self):
+        from app import sources, tools as tool_module
+        with tempfile.TemporaryDirectory() as folder:
+            fake = SimpleNamespace(artifact_dir=Path(folder))
+            with patch.object(sources, 'settings', fake), \
+                    patch.object(tool_module, 'settings', fake), \
+                    patch.object(tool_module, 'emit', lambda e: None):
+                doc = sources.metadata('t1', 's1', url='https://a/1', title='甲文',
+                                       text='# 小标题\n\n正文内容')
+                result = await tool_module._render_sources_html(
+                    {'title': '我的资料'}, {'task_id': 't1', 'documents': [doc]})
+                html = Path(result['artifact']['html_path']).read_text('utf-8')
+        self.assertEqual(result['status'], 'rendered')
+        self.assertEqual(result['sources_page']['count'], 1)
+        self.assertEqual(result['artifact']['kind'], 'sources')
+        self.assertIn('我的资料', html)
+        self.assertIn('<h1>小标题</h1>', html)     # Markdown 被真正转换了
+        self.assertIn('https://a/1', html)
+
+    async def test_refuses_without_documents(self):
+        from app import tools as tool_module
+        with self.assertRaises(tool_module.ToolError):
+            await tool_module._render_sources_html({}, {'documents': []})
+
+
 class ContextBuilderTests(unittest.TestCase):
     """P1：按 token 预算装配上下文。"""
 

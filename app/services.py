@@ -281,27 +281,17 @@ async def chat_reply(system: str, messages: list[dict], model: str | None = None
     return ''.join(parts).strip()
 
 
-def new_tavily():
-    return AsyncTavilyClient(api_key=settings.tavily_key)
-
-
 async def search_query(query: str):
-    return await new_tavily().search(
-        query=query,
-        search_depth='basic',
-        max_results=settings.max_pages,
-        include_answer=False,
-        include_raw_content='markdown',
-        auto_parameters=False,
-        include_usage=True,
-        timeout=30,
-    )
+    """按当前配置的检索后端搜索。
+
+    具体走 Tavily 还是 DeepSeek 官方 API 由 `SEARCH_PROVIDER` 决定，
+    两种后端都归一化成同一形状，调用方无需关心（见 app/search.py）。
+    """
+    from app import search as backend
+    return await backend.search(query)
 
 
 async def extract_urls(urls: list[str]):
-    return await new_tavily().extract(
-        urls=urls,
-        extract_depth='basic',
-        format='markdown',
-        timeout=30,
-    )
+    """按当前配置的检索后端抓正文（Markdown）。"""
+    from app import search as backend
+    return await backend.fetch(urls)

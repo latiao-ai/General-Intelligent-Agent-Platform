@@ -74,6 +74,8 @@ class AgentState(TypedDict, total=False):
     deployment: dict
     # MCP 工具返回的原始结果（按调用顺序）
     mcp_calls: list[dict]
+    # 「资料转 HTML」产出的页面信息（标题/份数）
+    sources_page: dict
     errors: list[dict]
     usage: list[dict]
     status: str

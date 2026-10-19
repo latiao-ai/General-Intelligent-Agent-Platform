@@ -17,6 +17,7 @@ STAGE_LABELS = {
     'fetch_pages': '抓取正文',
     'compose_report': '整理报告',
     'render_html': '渲染 HTML',
+    'render_sources_html': '资料转 HTML',
     'deploy_site': '部署站点',
     'answer_with_sources': '联网作答',
     'answer_directly': '直接回答',
