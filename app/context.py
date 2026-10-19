@@ -87,6 +87,87 @@ def system_with_memory(system: str, memory: dict | None) -> str:
     return f'{system}\n\n{block}\n（以上是更早对话的压缩结果，只作背景，不要逐字复述。）'
 
 
+# 用途决定需要哪些材料（文档 §11）。不同用途给不同预算，不要一份预算打天下。
+PURPOSES = ('plan', 'replan', 'transform', 'final_answer', 'summarize',
+            'memory_extract')
+
+# 各用途的预算（token）。plan 只要判断意图；final_answer 要能答清楚；
+# transform/summarize 处理大块内容，预算最大。
+PURPOSE_BUDGETS = {
+    'plan': 1800,
+    'replan': 2200,
+    'final_answer': 3500,
+    'transform': 6000,
+    'summarize': 6000,
+    'memory_extract': 3000,
+}
+
+# 固定优先级：规则与权限 → 当前请求 → 状态与待核实 → 工具 → 证据 → 记忆 → 历史
+_PRIORITY = ('rules', 'request', 'state', 'tools', 'evidence', 'memory', 'history')
+
+
+def build(*, purpose: str = 'final_answer', rules: str = '', request: str = '',
+          state: str = '', tools: str = '', evidence: str = '',
+          history=None, memory: dict | None = None) -> dict:
+    """按用途装配模型输入，并返回**预算报告**（文档 §11）。
+
+    报告里写清每个板块用了多少、有没有被截断——"结果被截断却说成全量"是
+    文档点名要避免的失败模式，所以截断必须在报告里显式可见，交给调用方决定
+    是缩小候选、分页还是明确告知模型。
+
+    核心指令与最小 schema 已经超预算时**不做静默截断**：直接标记
+    `over_budget=True`，让上层选择缩小范围或暂停。
+    """
+    budget = PURPOSE_BUDGETS.get(purpose, PURPOSE_BUDGETS['final_answer'])
+    sections = {'rules': rules or '', 'request': request or '',
+                'state': state or '', 'tools': tools or '',
+                'evidence': evidence or ''}
+    report = {'purpose': purpose, 'budget': budget, 'sections': {},
+              'truncated': [], 'over_budget': False}
+
+    used = 0
+    for name in _PRIORITY:
+        if name in ('memory', 'history'):
+            continue
+        text = sections.pop(name, '')
+        cost = estimate_tokens(text)
+        report['sections'][name] = cost
+        used += cost
+
+    # 记忆与历史按剩余额度填充，从最老往前砍
+    memory_block = memory_text(memory)
+    memory_cost = estimate_tokens(memory_block)
+    report['sections']['memory'] = memory_cost
+    used += memory_cost
+
+    remaining = max(0, budget - used)
+    picked, spent = [], 0
+    for message in reversed(list(history or [])):
+        cost = estimate_tokens(message.get('content') or '')
+        if picked and spent + cost > remaining:
+            report['truncated'].append('history')
+            break
+        picked.append({'role': message.get('role') or 'user',
+                       'content': message.get('content') or ''})
+        spent += cost
+        if spent >= remaining:
+            break
+    picked.reverse()
+    # 只要还有历史没被装进去，就是截断过——哪怕原因是单条就吃满了预算
+    if len(picked) < len(list(history or [])) and 'history' not in report['truncated']:
+        report['truncated'].append('history')
+    report['sections']['history'] = spent
+    report['sections']['total'] = used + spent
+
+    if report['sections'].get('rules', 0) + report['sections'].get('tools', 0) > budget:
+        # 规则和工具 schema 已经撑爆预算：不能静默截断关键约束
+        report['over_budget'] = True
+
+    return {'purpose': purpose, 'messages': picked,
+            'memory_block': memory_block, 'sections': sections,
+            'report': report}
+
+
 def chat_messages(history, question: str, purpose: str = 'answer',
                   prefix: str = '') -> list[dict]:
     """给对话式调用准备的 messages：最近几轮原文 + 本轮问题。

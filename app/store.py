@@ -15,6 +15,7 @@ import json
 import sqlite3
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -172,6 +173,41 @@ CREATE TABLE IF NOT EXISTS session_summaries (
     generated_ver INTEGER NOT NULL DEFAULT 1,
     updated_at    TEXT NOT NULL
 );
+
+-- ---------- 长期记忆（文档 §12） ----------
+-- 作用域化：user / project / tenant 三级，单用户阶段全部落到 default。
+CREATE TABLE IF NOT EXISTS memories (
+    memory_id  TEXT PRIMARY KEY,
+    tenant_id  TEXT NOT NULL DEFAULT 'default',
+    scope_type TEXT NOT NULL,
+    scope_id   TEXT NOT NULL,
+    subject    TEXT NOT NULL,
+    predicate  TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'active',
+    version    INTEGER NOT NULL DEFAULT 1,
+    supersedes TEXT,
+    source     TEXT NOT NULL DEFAULT '',
+    valid_to   TEXT,
+    created_by TEXT NOT NULL DEFAULT 'default',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memories_scope ON memories(scope_type, scope_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memories_fact
+    ON memories(scope_type, scope_id, subject, predicate, version);
+
+-- 遗忘用墓碑：不能让旧后台任务从同一来源把已删事实再次生成
+CREATE TABLE IF NOT EXISTS memory_tombstones (
+    tombstone_id TEXT PRIMARY KEY,
+    scope_type   TEXT NOT NULL,
+    scope_id     TEXT NOT NULL,
+    fact_key     TEXT NOT NULL,
+    reason       TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tombstones_key
+    ON memory_tombstones(scope_type, scope_id, fact_key);
 
 -- ---------- 后台任务（文档 §9.2 outbox） ----------
 CREATE TABLE IF NOT EXISTS background_jobs (
@@ -669,6 +705,91 @@ class Store:
                 'SELECT * FROM artifacts WHERE artifact_id=?',
                 (artifact_id,)).fetchone()
         return dict(row) if row else None
+
+    # ---------- 长期记忆（文档 §12） ----------
+
+    def remember(self, *, scope_type: str, scope_id: str, subject: str,
+                 predicate: str, value: str, source: str = '',
+                 created_by: str = 'default',
+                 tenant_id: str = 'default') -> str | None:
+        """写入一条记忆。同键有旧值则升版本并替代旧值。
+
+        返回 None 表示这次写入被墓碑挡住（用户已明确忘记过这个事实）。
+        """
+        fact_key = f'{subject}|{predicate}'
+        with self._lock:
+            blocked = self._conn.execute(
+                'SELECT 1 FROM memory_tombstones WHERE scope_type=? AND '
+                'scope_id=? AND fact_key=?', (scope_type, scope_id, fact_key)
+            ).fetchone()
+            if blocked:
+                return None
+            current = self._conn.execute(
+                'SELECT memory_id, version FROM memories WHERE scope_type=? AND '
+                'scope_id=? AND subject=? AND predicate=? AND status=? '
+                'ORDER BY version DESC LIMIT 1',
+                (scope_type, scope_id, subject, predicate, 'active')).fetchone()
+            memory_id = 'mem_' + uuid.uuid4().hex[:12]
+            version = (current['version'] + 1) if current else 1
+            stamp = now()
+            self._conn.execute(
+                'INSERT INTO memories (memory_id, tenant_id, scope_type, scope_id, '
+                'subject, predicate, value, status, version, supersedes, source, '
+                'created_by, created_at, updated_at) '
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
+                (memory_id, tenant_id, scope_type, scope_id, subject, predicate,
+                 value, version, current['memory_id'] if current else None,
+                 source, created_by, stamp, stamp))
+            if current:
+                self._conn.execute(
+                    "UPDATE memories SET status='superseded', valid_to=?, "
+                    'updated_at=? WHERE memory_id=?',
+                    (stamp, stamp, current['memory_id']))
+            self._conn.commit()
+        return memory_id
+
+    def recall(self, scope_type: str, scope_id: str) -> list[dict]:
+        """读取该作用域下仍然有效的记忆（被替代/已失效的不返回）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                'SELECT * FROM memories WHERE scope_type=? AND scope_id=? '
+                "AND status='active' ORDER BY updated_at DESC",
+                (scope_type, scope_id)).fetchall()
+        return [dict(r) for r in rows]
+
+    def forget(self, *, scope_type: str, scope_id: str, subject: str,
+               predicate: str, reason: str = '') -> int:
+        """显式遗忘：写墓碑 + 把现有事实置为 forgotten。
+
+        墓碑的作用是阻止后台任务从同一来源再次生成这条事实——
+        只删不拦，下一次摘要又会把它捡回来。
+        """
+        fact_key = f'{subject}|{predicate}'
+        stamp = now()
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE memories SET status='forgotten', valid_to=?, updated_at=? "
+                'WHERE scope_type=? AND scope_id=? AND subject=? AND predicate=? '
+                "AND status='active'",
+                (stamp, stamp, scope_type, scope_id, subject, predicate))
+            changed = cur.rowcount
+            self._conn.execute(
+                'INSERT OR IGNORE INTO memory_tombstones '
+                '(tombstone_id, scope_type, scope_id, fact_key, reason, created_at) '
+                'VALUES (?, ?, ?, ?, ?, ?)',
+                ('tmb_' + uuid.uuid4().hex[:10], scope_type, scope_id, fact_key,
+                 reason, stamp))
+            self._conn.commit()
+        return changed
+
+    def is_forgotten(self, scope_type: str, scope_id: str, subject: str,
+                     predicate: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                'SELECT 1 FROM memory_tombstones WHERE scope_type=? AND '
+                'scope_id=? AND fact_key=?',
+                (scope_type, scope_id, f'{subject}|{predicate}')).fetchone()
+        return row is not None
 
     # ---------- 后台任务（outbox） ----------
 

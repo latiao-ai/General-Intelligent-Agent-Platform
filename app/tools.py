@@ -232,7 +232,10 @@ def _select_sources(state: dict, documents: list[dict] | None = None
         text = full[:limit]
         truncated = truncated or len(text) < len(full)
         selected.append({'source_id': doc['source_id'], 'title': doc['title'],
-                         'text': text})
+                         'text': text,
+                         # 截断必须显式可见：否则模型会把"前 3000 字"当全文
+                         'truncated': len(text) < len(full),
+                         'chars_full': len(full)})
         remaining -= len(text)
     return selected, truncated
 
@@ -514,6 +517,12 @@ async def _answer_with_sources(args: dict, state: dict) -> dict:
     messages = context.chat_messages(
         state.get('history'), f'问题：{question}\n\n资料：\n{material}',
         purpose='answer')
+    truncated_notes = [f'[{item["source_id"]}] 原文 {item["chars_full"]} 字，'
+                       f'仅取前 {len(item["text"])} 字'
+                       for item in selected if item.get('truncated')]
+    if truncated_notes:
+        material += ('\n\n[注意] 以下资料被截断，回答时不要把这些片段'
+                     '当成全文，必要时说明：\n' + '\n'.join(truncated_notes))
     body = await chat_reply(
         profile.with_profile(
             context.system_with_memory(ANSWER_WITH_SOURCES_SYSTEM,

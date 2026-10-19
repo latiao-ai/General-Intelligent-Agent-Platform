@@ -637,6 +637,79 @@ class RunLeaseTests(unittest.TestCase):
         self.assertFalse(store.enqueue_job('j2', 'summary', 'sess:1'))
 
 
+class ContextBudgetTests(unittest.TestCase):
+    """完整上下文预算与截断披露（文档 §11）。"""
+
+    def test_budget_report_lists_every_section(self):
+        from app import context
+        built = context.build(purpose='final_answer', rules='规则',
+                              request='问题', tools='工具', evidence='证据')
+        sections = built['report']['sections']
+        for key in ('rules', 'request', 'tools', 'evidence', 'memory', 'history'):
+            self.assertIn(key, sections)
+        self.assertEqual(built['report']['purpose'], 'final_answer')
+
+    def test_history_is_trimmed_and_flagged(self):
+        from app import context
+        history = [{'role': 'user', 'content': '很长的历史' * 500}
+                   for _ in range(8)]
+        built = context.build(purpose='plan', rules='x', history=history)
+        self.assertLess(len(built['messages']), 8)
+        self.assertIn('history', built['report']['truncated'])
+
+    def test_oversized_rules_are_reported_not_silently_cut(self):
+        """规则+工具 schema 已超预算时必须报出来，不能悄悄截断关键约束。"""
+        from app import context
+        built = context.build(purpose='plan', rules='约束' * 3000,
+                              tools='工具' * 3000)
+        self.assertTrue(built['report']['over_budget'])
+
+    def test_each_purpose_has_its_own_budget(self):
+        from app import context
+        self.assertGreater(context.PURPOSE_BUDGETS['transform'],
+                           context.PURPOSE_BUDGETS['plan'])
+        for purpose in context.PURPOSES:
+            self.assertIn(purpose, context.PURPOSE_BUDGETS)
+
+
+class MemoryScopeTests(unittest.TestCase):
+    """长期记忆：作用域、版本替代、遗忘墓碑（文档 §12）。"""
+
+    def store(self):
+        from app.store import Store
+        return Store(':memory:')
+
+    def test_value_update_supersedes_previous(self):
+        store = self.store()
+        store.remember(scope_type='user', scope_id='default', subject='偏好',
+                       predicate='回答', value='简洁')
+        store.remember(scope_type='user', scope_id='default', subject='偏好',
+                       predicate='回答', value='详细')
+        active = store.recall('user', 'default')
+        self.assertEqual([(m['value'], m['version']) for m in active],
+                         [('详细', 2)])
+
+    def test_scopes_do_not_leak(self):
+        store = self.store()
+        store.remember(scope_type='user', scope_id='u1', subject='偏好',
+                       predicate='回答', value='简洁')
+        self.assertEqual(store.recall('user', 'u2'), [])
+
+    def test_forget_blocks_regeneration_from_same_source(self):
+        """只删不拦没用：后台任务会把已删事实重新提取回来。"""
+        store = self.store()
+        store.remember(scope_type='user', scope_id='default', subject='电话',
+                       predicate='号码', value='139')
+        store.forget(scope_type='user', scope_id='default', subject='电话',
+                     predicate='号码')
+        self.assertEqual(store.recall('user', 'default'), [])
+        self.assertTrue(store.is_forgotten('user', 'default', '电话', '号码'))
+        # 墓碑生效：同一事实不能再被写回来
+        self.assertIsNone(store.remember(scope_type='user', scope_id='default',
+                                         subject='电话', predicate='号码',
+                                         value='139'))
+
+
 class PlanContractTests(unittest.IsolatedAsyncioTestCase):
     """计划合同：步骤 ID、依赖、输入绑定与结构化校验（文档 §6）。"""
 
