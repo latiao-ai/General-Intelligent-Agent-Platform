@@ -96,11 +96,3 @@ def metadata(task_id: str, source_id: str, *, url: str, title: str,
         'error': None,
     }
 
-
-def strip_text(documents) -> list[dict]:
-    """把可能残留的 raw_content 摘掉，保证 state 里不再出现正文。"""
-    cleaned = []
-    for doc in documents or []:
-        item = {k: v for k, v in doc.items() if k != 'raw_content'}
-        cleaned.append(item)
-    return cleaned

@@ -196,7 +196,7 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
 </div>
 
 <script>
-const S = { sessionId: null, taskId: null, artifactId: null, es: null,
+const S = { sessionId: null, taskId: null, es: null,
             running: false, status: null, stages: [], stageSeq: 0, skew: 0,
             turn: 0, streamBubble: null, sessions: [], lastEventAt: 0 };
 
@@ -653,7 +653,6 @@ function openStream(taskId) {
     S.lastEventAt = Date.now();
     let ev; try { ev = JSON.parse(e.data); } catch { return; }
     if (ev.type === 'ping') return;          // 心跳，只用来刷新 lastEventAt
-    if (ev.type === 'task') { S.artifactId = ev.artifact_id; return; }
     if (ev.type === 'draft') { onDraft(ev); return; }
     if (ev.type === 'answer_delta') { onAnswerDelta(ev); return; }
     if (ev.type === 'stage_start') { onStageStart(ev); return; }

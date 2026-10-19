@@ -64,8 +64,8 @@ async def _web_search(args: dict, state: dict) -> dict:
         response = await search_query(query)
     except Exception as exc:
         errors.append(error_entry('search', exc))
-        raise ToolError('搜索失败，检查代理或 TAVILY_API_KEY') from exc
-    usage.append({'stage': 'search', 'tavily': response.get('usage')})
+        raise ToolError('搜索失败，检查 DEEPSEEK_API_KEY 与网络') from exc
+    usage.append({'stage': 'search', 'backend': response.get('usage')})
     added = 0
     for item in response.get('results', []):
         try:
@@ -128,7 +128,7 @@ async def _fetch_pages(args: dict, state: dict) -> dict:
         except Exception as exc:
             errors.append(error_entry('extract', exc))
             raise ToolError('正文提取失败，检查代理或链接可达性') from exc
-        usage.append({'stage': 'extract', 'tavily': response.get('usage')})
+        usage.append({'stage': 'extract', 'backend': response.get('usage')})
         for result in response.get('results', []):
             try:
                 result_map[clean_public_url(result['url'])] = result

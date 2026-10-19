@@ -105,11 +105,6 @@ class SourceStoreTests(unittest.TestCase):
                 self.assertEqual(sources.load_text(legacy), '旧正文')
                 self.assertTrue(sources.has_text(legacy))
 
-    def test_strip_text_drops_bodies(self):
-        from app import sources
-        docs = [{'source_id': 's1', 'raw_content': 'x' * 100, 'url': 'u'}]
-        self.assertNotIn('raw_content', sources.strip_text(docs)[0])
-
 
 class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
     """P0：检索/成稿都走落盘正文，state 不再背几百 KB。"""
@@ -187,27 +182,22 @@ class MarkdownRenderTests(unittest.TestCase):
         self.assertNotIn('href="javascript', out)
 
 
+class RuntimeKeyCheckTests(unittest.TestCase):
+    """启动自检要提示缺哪个 key，而不是等到第一次检索才 401。"""
+
+    def test_missing_deepseek_key_is_reported(self):
+        from app import config as config_module
+        from app.config import Settings
+        fake = Settings()                       # 字段来自当前 .env
+        object.__setattr__(fake, 'deepseek_api_key', '')
+        with patch.object(config_module, 'settings', fake):
+            with self.assertRaises(RuntimeError) as ctx:
+                config_module.check_runtime_keys()
+        self.assertIn('DEEPSEEK_API_KEY', str(ctx.exception))
+
+
 class SearchBackendTests(unittest.IsolatedAsyncioTestCase):
-    """检索后端可切换：默认 Tavily，DeepSeek 官方接口归一化成同一形状。"""
-
-    def test_provider_switch_and_readiness(self):
-        """后端由 SEARCH_PROVIDER 决定；缺 key 时要能明确报出缺哪个。
-
-        断言不依赖当前 .env 的取值——本机可能已经切成 deepseek。
-        """
-        from app import search
-        with patch.object(search, 'settings', SimpleNamespace(
-                search_provider='tavily', tavily_key='tvly-x')):
-            self.assertEqual(search.provider(), 'tavily')
-            self.assertTrue(search.provider_ready()[0])
-        with patch.object(search, 'settings', SimpleNamespace(
-                search_provider='deepseek', deepseek_api_key='')):
-            ok, why = search.provider_ready()
-            self.assertFalse(ok)
-            self.assertIn('DEEPSEEK_API_KEY', why)
-        with patch.object(search, 'settings', SimpleNamespace(
-                search_provider='deepseek', deepseek_api_key='sk-x')):
-            self.assertTrue(search.provider_ready()[0])
+    """检索后端：DeepSeek 官方接口归一化成 tools 使用的形状。"""
 
     async def test_deepseek_search_normalises_payload(self):
         from app import search
@@ -234,8 +224,7 @@ class SearchBackendTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(search, 'httpx', SimpleNamespace(AsyncClient=FakeClient)), \
                 patch.object(search, 'settings',
-                             SimpleNamespace(search_provider='deepseek',
-                                             deepseek_api_key='sk-test',
+                             SimpleNamespace(deepseek_api_key='sk-test',
                                              deepseek_base_url='https://api.deepseek.com',
                                              max_pages=4)):
             data = await search.search('SQLite WAL')
@@ -265,8 +254,7 @@ class SearchBackendTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(search, 'httpx', SimpleNamespace(AsyncClient=FakeClient)), \
                 patch.object(search, 'settings',
-                             SimpleNamespace(search_provider='deepseek',
-                                             deepseek_api_key='sk-test',
+                             SimpleNamespace(deepseek_api_key='sk-test',
                                              deepseek_base_url='https://api.deepseek.com',
                                              max_pages=4)):
             data = await search.fetch(['https://a/ok', 'https://a/bad'])

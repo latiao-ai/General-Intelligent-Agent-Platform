@@ -20,7 +20,6 @@ import os
 import re
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 from app.config import settings
 

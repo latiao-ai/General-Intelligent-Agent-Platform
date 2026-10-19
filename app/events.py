@@ -58,10 +58,6 @@ def thought(text: str) -> dict:
     return {'type': 'thought', 'text': text}
 
 
-def outcome(**payload) -> dict:
-    """终态结果（部署地址、产物路径等）。"""
-    return {'type': 'result', **payload}
-
 
 def draft(report: dict | None) -> dict:
     """整理报告过程中的"半成品"报告，或 None 表示清空。
