@@ -549,6 +549,94 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(result.get('status'), 'failed')
 
 
+class ActionLedgerTests(unittest.IsolatedAsyncioTestCase):
+    """动作账本：已成功不重发、结果不确定不重试（文档 §8）。"""
+
+    def ledger(self, store):
+        from app.ledger import ActionLedger
+        return ActionLedger(store, 'run1', 1)
+
+    def test_succeeded_action_is_replayed_not_resent(self):
+        from app.store import Store
+        store = Store(':memory:')
+        book = self.ledger(store)
+        first = book.begin(step_id='s1', tool_key='local:publishing:deploy',
+                           effect='write', args={'a': 1})
+        self.assertIsNone(first['replay'])
+        attempt = book.in_flight(first['action_id'])
+        book.succeed(first['action_id'], attempt, {'public_url': 'https://x/1'})
+
+        # 同一个步骤、同样的参数再跑一次：必须直接复用回执
+        again = book.begin(step_id='s1', tool_key='local:publishing:deploy',
+                           effect='write', args={'a': 1})
+        self.assertEqual(again['action_id'], first['action_id'])
+        self.assertEqual(again['replay'], {'public_url': 'https://x/1'})
+        # 只该有一次真实尝试
+        self.assertEqual(len(store.attempts_of(first['action_id'])), 1)
+
+    def test_changed_args_is_a_different_action(self):
+        from app.store import Store
+        store = Store(':memory:')
+        book = self.ledger(store)
+        a = book.begin(step_id='s1', tool_key='t', effect='write', args={'a': 1})
+        b = book.begin(step_id='s1', tool_key='t', effect='write', args={'a': 2})
+        self.assertNotEqual(a['action_id'], b['action_id'])
+
+    def test_unknown_result_blocks_blind_retry(self):
+        """结果不确定时不能当成失败去重发，也不能当成功复用。"""
+        from app.store import Store
+        store = Store(':memory:')
+        book = self.ledger(store)
+        first = book.begin(step_id='s1', tool_key='mcp:publishing:deploy_site',
+                           effect='write', args={})
+        attempt = book.in_flight(first['action_id'])
+        book.mark_unknown(first['action_id'], attempt, 'TimeoutError')
+
+        again = book.begin(step_id='s1', tool_key='mcp:publishing:deploy_site',
+                           effect='write', args={})
+        self.assertIsNone(again['replay'])          # 没有可复用回执
+        self.assertEqual(store.action(first['action_id'])['status'], 'unknown')
+
+    def test_failure_records_error_type(self):
+        from app.store import Store
+        store = Store(':memory:')
+        book = self.ledger(store)
+        first = book.begin(step_id='s1', tool_key='t', effect='read', args={})
+        attempt = book.in_flight(first['action_id'])
+        book.fail(first['action_id'], attempt, 'ValueError')
+        self.assertEqual(store.action(first['action_id'])['status'], 'failed')
+        self.assertEqual(store.attempts_of(first['action_id'])[0]['error_type'],
+                         'ValueError')
+
+    def test_no_ledger_means_noop(self):
+        from app import ledger as ledger_module
+        self.assertIsNone(ledger_module.current_ledger())
+
+
+class RunLeaseTests(unittest.TestCase):
+    """租约与 fencing：两个 Worker 抢同一个 run，只有一个能领到。"""
+
+    def test_claim_is_exclusive_and_epoch_increments(self):
+        from app.store import Store
+        store = Store(':memory:')
+        store.create_run('run1', 'task1')
+        first = store.claim_run('w1', lease_seconds=30)
+        self.assertEqual(first['run_id'], 'run1')
+        self.assertEqual(first['lease_epoch'], 1)
+        self.assertIsNone(store.claim_run('w2'))          # 租约未过期，抢不到
+        # 租约过期后另一个 Worker 可以接手，代次递增
+        later = store.claim_run('w2', now_ts=10 ** 12)
+        self.assertEqual(later['lease_epoch'], 2)
+        # 旧 Worker 续租失败，不能再覆盖状态
+        self.assertFalse(store.renew_lease('run1', 'w1'))
+
+    def test_jobs_are_deduped(self):
+        from app.store import Store
+        store = Store(':memory:')
+        self.assertTrue(store.enqueue_job('j1', 'summary', 'sess:1'))
+        self.assertFalse(store.enqueue_job('j2', 'summary', 'sess:1'))
+
+
 class DeployGateTests(unittest.IsolatedAsyncioTestCase):
     """部署闸门：没有产物、或全局关闭时都不许部署。"""
 

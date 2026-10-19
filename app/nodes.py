@@ -13,7 +13,7 @@
 import json
 import time
 
-from app import context, profile
+from app import context, ledger as ledger_module, profile
 from app.config import settings
 from app.events import action, emit, stage_end, stage_start, thought
 from app.schemas import ExecutionPlan
@@ -218,12 +218,40 @@ async def run_step(state):
 
     emit(stage_start(name, tool.label))
     started = time.perf_counter()
+    args = dict(step.get('args') or {})
+    step_id = step.get('step_id') or f's{index + 1}'
+
+    # 账本：调用之前先落 prepared / in_flight，回来再改。崩溃窗口才有据可查。
+    book = ledger_module.current_ledger()
+    action_id, attempt_id, reused = None, None, False
+    if book is not None:
+        prepared = book.begin(step_id=step_id, tool_key=tool.tool_key or name,
+                              effect=tool.effect, args=args)
+        if prepared.get('replay') is not None:
+            # 这个动作之前已经成功：直接复用回执，不再调用远端
+            emit(action('复用已有结果', f'{tool.label}（该动作此前已成功）', '♻️'))
+            updates = dict(prepared['replay']) if isinstance(prepared['replay'], dict) else {}
+            reused = True
+        action_id = prepared['action_id']
+        if not reused:
+            attempt_id = book.in_flight(action_id)
+
     try:
-        updates = await tool.run(dict(step.get('args') or {}), state)
+        if not reused:
+            updates = await tool.run(args, state)
     except Exception as exc:
         emit(stage_end(name, time.perf_counter() - started, '失败', tool.label))
         hint = getattr(exc, 'safe_message', None) or type(exc).__name__
         emit(action(f'{tool.label}失败', hint, '⚠️'))
+        if book is not None and action_id:
+            # 超时/连接中断属于"结果不确定"，不能当失败去重试
+            uncertain = type(exc).__name__ in {'TimeoutError', 'AttemptTimeout',
+                                               'ConnectError', 'ReadTimeout'}
+            if uncertain:
+                book.mark_unknown(action_id, attempt_id, type(exc).__name__)
+                emit(action('结果不确定', '远端可能已执行，需要核实', '❓'))
+            else:
+                book.fail(action_id, attempt_id, type(exc).__name__)
         errors = list(state.get('errors', [])) + [
             {'stage': name, 'type': type(exc).__name__}]
         # 出错就中止剩余步骤：后面的多半依赖这一步的产物。
@@ -232,6 +260,10 @@ async def run_step(state):
                 'failure': f'{tool.label}失败：{hint}'}
 
     updates = dict(updates)
+    if book is not None and action and not reused:
+        book.succeed(action_id, attempt_id,
+                     {k: v for k, v in updates.items()
+                      if isinstance(v, (str, int, float, bool, dict, list))})
     updates['step_index'] = index + 1
     updates['step_label'] = tool.label
     emit(stage_end(name, time.perf_counter() - started,

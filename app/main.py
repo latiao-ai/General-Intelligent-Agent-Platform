@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from app.config import settings, check_runtime_keys
 from app.events import STAGE_LABELS  # noqa: F401  (对外仍从 app.main 可用)
+from app import ledger as ledger_module
 from app.graph import build_graph
 from app.mcp_adapter import deploy_html
 from app.rendering import save_json
@@ -32,7 +33,7 @@ async def deploy_task(task_id: str) -> dict:
 
 
 async def run_task(text: str, progress=None, on_event=None, history=None,
-                  on_start=None, prior=None, memory=None):
+                  on_start=None, prior=None, memory=None, ledger=None):
     """跑一次任务。
 
     progress(node, status, elapsed)  节点级进度
@@ -65,6 +66,7 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     }
     started = time.perf_counter()
     marked = started
+    ledger_token = ledger_module.bind(ledger)
     try:
         async with asyncio.timeout(300):
             async for mode, chunk in build_graph().astream(
@@ -104,6 +106,7 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         detail = type(exc).__name__ + (f'（{hint}）' if hint else '')
         raise RuntimeError(f'任务 {task_id} 失败：{detail}') from None
     finally:
+        ledger_module.unbind(ledger_token)
         state['elapsed_seconds'] = round(time.perf_counter() - started, 2)
         save_json(folder / 'state.json', state)
     return state
