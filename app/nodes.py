@@ -59,51 +59,19 @@ PLANNER_SYSTEM = (
 
 
 def _catalog_text(catalog) -> str:
-    lines = []
-    for tool in catalog:
-        schema = json.dumps(tool.args, ensure_ascii=False)
-        lines.append(f'- {tool.name}：{tool.description}\n  参数：{schema}')
-    return '\n'.join(lines)
-
-
-# 出现这些词才认为"用户要的是一份文档/报告"。
-REPORT_HINTS = ('报告', '文档', 'html', '网页', '页面', '白皮书', '综述',
-                '总结', '整理成', '生成一份', '写一份', '出一份')
-# 出现这些词说明"需要联网查一下"，但未必需要文档。
-RESEARCH_HINTS = REPORT_HINTS + ('整理', '调研', '研究', '对比', '比较', '分析',
-                                 '梳理', '查一下', '查下', '查询', '搜一下', '搜索',
-                                 '资料', '汇总', '评估', '盘点', '如何', '怎么', '怎样')
+    return '\n'.join(tool_module.describe_tool(tool) for tool in catalog)
 
 
 def fallback_steps(state: dict) -> list[dict]:
-    """规划失败、或模型给了不可用计划时的兜底。
+    """规划失败时的兜底：**不猜业务**。
 
-    要点是**别乱猜**：只有当输入明显是研究/报告诉求（含链接或研究类字眼）时才
-    退到检索链路；其余一律退到"直接回答"。早先这里无条件走检索，结果用户发一句
-    "暂停"也会被拿去搜一分钟——比答得不好糟得多。
+    这里以前会拼一条"检索 → 抓正文 → 成稿 → 渲染"的固定链路，等于把网页研究
+    业务写死进内核，而且用户只是想问句话也会被拉去跑一分钟检索。
+    中台不该替用户决定做什么——退化成一次直接作答，并明说规划失败。
     """
-    text = state.get('user_input') or ''
-    urls = urls_from_input(text)
-    wants_report = any(hint in text.lower() for hint in REPORT_HINTS)
-    needs_lookup = wants_report or any(hint in text for hint in RESEARCH_HINTS)
-
-    if urls:
-        first = {'tool': 'fetch_pages', 'args': {'urls': urls}, 'why': '用户直接给了链接'}
-    elif needs_lookup:
-        first = {'tool': 'web_search', 'args': {'query': text}, 'why': '需要外部资料'}
-    else:
-        return [{'tool': 'answer_directly', 'args': {'question': text},
-                 'why': '不像需要联网的问题，直接回答'}]
-
-    tail = ([{'tool': 'compose_report', 'args': {'topic': text}, 'why': '整理成报告'},
-             {'tool': 'render_html', 'args': {}, 'why': '产出 HTML'}]
-            if wants_report else
-            [{'tool': 'answer_with_sources', 'args': {'question': text},
-              'why': '在聊天里带来源作答'}])
-    steps = [first]
-    if first['tool'] != 'fetch_pages':      # 避免连着两步抓同一个东西
-        steps.append({'tool': 'fetch_pages', 'args': {}, 'why': '补齐正文'})
-    return steps + tail
+    return [{'tool': 'answer_directly',
+             'args': {'question': state.get('user_input') or ''},
+             'why': '规划失败，降级为直接作答'}]
 
 
 def describe_plan(steps: list[dict], summary: str = '') -> str:
@@ -113,19 +81,24 @@ def describe_plan(steps: list[dict], summary: str = '') -> str:
     return f'我的执行计划：{names}'
 
 
-def _valid_steps(raw_steps: list[dict], catalog) -> list[dict]:
-    """只保留工具真实存在的步骤，args 不是对象就退回空对象。"""
+def _valid_steps(raw_steps: list[dict], catalog) -> tuple[list[dict], list[str]]:
+    """校验计划：只保留工具真实存在的步骤，并回报被丢弃的工具名。
+
+    返回被丢弃的名字而不是静默过滤——计划引用了不存在的工具属于规划错误，
+    要让人看得见（文档 §6.3：不能丢掉未知工具就直接执行剩余步骤）。
+    """
     known = {tool.name for tool in catalog}
-    cleaned = []
+    cleaned, dropped = [], []
     for step in raw_steps:
         name = str(step.get('tool') or '').strip()
         if name not in known:
+            dropped.append(name)
             continue
         args = step.get('args')
         cleaned.append({'tool': name,
                         'args': args if isinstance(args, dict) else {},
                         'why': str(step.get('why') or '')})
-    return cleaned[:MAX_STEPS]
+    return cleaned[:MAX_STEPS], dropped
 
 
 async def plan(state):
@@ -168,7 +141,9 @@ async def plan(state):
             disable_thinking=settings.llm_parse_disable_thinking,
         )
         data = execution.model_dump()
-        steps = _valid_steps(data.get('steps') or [], catalog)
+        steps, dropped = _valid_steps(data.get('steps') or [], catalog)
+        if dropped:
+            emit(action('计划引用了不存在的工具', '、'.join(dropped), '⚠️'))
         summary = data.get('summary') or ''
         updates = data.get('profile_updates') or {}
         usage.append({'stage': 'plan', 'model_name': settings.llm_model,
@@ -183,8 +158,8 @@ async def plan(state):
             {'stage': 'plan', 'type': type(exc).__name__}]
         steps = None
     if not steps:
-        steps = _valid_steps(fallback_steps(state), catalog)
-        summary = summary or '默认计划'
+        steps, _ = _valid_steps(fallback_steps(state), catalog)
+        summary = summary or '降级计划'
 
     # 只播报真正新增/变化的事实：模型常把画像里已有的事实再抄一遍，
     # 若无条件播报，用户会看到"已记住"一条自己本轮根本没说过的话。

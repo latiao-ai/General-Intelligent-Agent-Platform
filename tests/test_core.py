@@ -403,52 +403,27 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
                          'local_ready')
         self.assertEqual(nodes.final_status({}), 'failed')
 
-    def test_valid_steps_drops_unknown_tools_and_bad_args(self):
+    def test_valid_steps_reports_unknown_tools(self):
+        """未知工具要**回报**而不是静默过滤——计划引用不存在的工具属于规划错误。"""
         from app import nodes
         from app import tools as tool_module
-        kept = nodes._valid_steps(
+        kept, dropped = nodes._valid_steps(
             [{'tool': 'web_search', 'args': {'query': 'q'}},
              {'tool': 'not_a_tool', 'args': {}},
              {'tool': 'render_html', 'args': 'not-a-dict'}],
             tool_module.BUILTIN_TOOLS)
         self.assertEqual([s['tool'] for s in kept], ['web_search', 'render_html'])
         self.assertEqual(kept[1]['args'], {})
+        self.assertEqual(dropped, ['not_a_tool'])
 
-    def test_fallback_plan_respects_given_urls(self):
-        from app import nodes
-        from app import tools as tool_module
-        with_url = nodes.fallback_steps({'user_input': '看看 https://example.com/a'})
-        self.assertEqual(with_url[0]['tool'], 'fetch_pages')
-        self.assertEqual(with_url[0]['args']['urls'], ['https://example.com/a'])
-        research = nodes.fallback_steps({'user_input': '整理一份 SQLite 调研报告'})
-        self.assertEqual(research[0]['tool'], 'web_search')
-        # 兜底计划里的工具必须真实存在，否则整轮会被跳过
-        known = {t.name for t in tool_module.BUILTIN_TOOLS}
-        self.assertTrue({s['tool'] for s in with_url} <= known)
-        self.assertTrue({s['tool'] for s in research} <= known)
+    def test_fallback_does_not_guess_business(self):
+        """兜底不能拼"检索→成稿→渲染"这种业务链路。
 
-    def test_fallback_ladder_matches_requested_output(self):
-        """兜底要分清"问个明白"和"要一份文档"，两者的收尾工具不同。"""
-        from app import nodes
-        ask = nodes.fallback_steps({'user_input': '查询如何降低体脂'})
-        self.assertEqual([s['tool'] for s in ask],
-                         ['web_search', 'fetch_pages', 'answer_with_sources'])
-        report = nodes.fallback_steps({'user_input': '生成一份降低体脂的 HTML 报告'})
-        self.assertEqual([s['tool'] for s in report],
-                         ['web_search', 'fetch_pages', 'compose_report', 'render_html'])
-        # 已经给了链接就别再重复抓一次
-        link = nodes.fallback_steps({'user_input': '看看 https://example.com/a 说了什么'})
-        self.assertEqual([s['tool'] for s in link],
-                         ['fetch_pages', 'answer_with_sources'])
-
-    def test_fallback_does_not_research_unrelated_input(self):
-        """兜底计划不能一律走检索。
-
-        早先这里无条件检索：用户发一句"暂停"，规划又恰好失败，就会去搜"暂停"
-        并出一份报告——比答得不好糟得多。
+        那等于把网页研究写死进内核，用户只是问句话也会被拉去跑检索。
+        中台里兜底只做一件事：别猜，降级成一次直接作答。
         """
         from app import nodes
-        for text in ['暂停', '你好', '介绍一下你自己', '现在是几点']:
+        for text in ('整理一份 SQLite 报告', '查询如何降低体脂', '你好', '暂停'):
             steps = nodes.fallback_steps({'user_input': text})
             self.assertEqual([s['tool'] for s in steps], ['answer_directly'], text)
 
@@ -496,9 +471,9 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(tool_module, 'catalog', fake_catalog), \
                 patch.object(nodes, 'structured_call', boom):
             result = await nodes.plan({'user_input': '整理 SQLite 报告', 'usage': []})
-        # 规划失败不能让任务空手而归：要有可执行的兜底计划
-        self.assertGreaterEqual(len(result['plan']['steps']), 2)
-        self.assertEqual(result['plan']['steps'][0]['tool'], 'web_search')
+        # 规划失败就如实降级，不替用户擅自拉起整条检索链路
+        self.assertEqual([s['tool'] for s in result['plan']['steps']],
+                         ['answer_directly'])
 
     async def test_plan_skips_the_model_for_small_talk(self):
         from app import nodes

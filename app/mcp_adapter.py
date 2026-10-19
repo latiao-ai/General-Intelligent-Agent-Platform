@@ -58,14 +58,60 @@ async def all_tools(session):
             return tools
 
 
+def _annotations(tool) -> dict:
+    """把 MCP annotations 摊平成普通 dict。
+
+    这几个标记决定了"能不能自动重试""要不要先确认"，是安全策略的输入，
+    只靠工具名字去猜（比如看到 delete 就认为危险）是不可靠的。
+    """
+    raw = getattr(tool, 'annotations', None)
+    if raw is None:
+        return {}
+    keys = ('title', 'readOnlyHint', 'destructiveHint',
+            'idempotentHint', 'openWorldHint')
+    out = {}
+    for key in keys:
+        value = getattr(raw, key, None)
+        if value is not None:
+            out[key] = value
+    return out
+
+
+def effect_type(tool) -> str:
+    """按 annotations 判定动作性质：read / destructive / write / unknown。
+
+    服务端没说就别猜（unknown）——文档要求"缺少行为信息时保持 unknown，
+    不根据名字猜测可重试性"。
+    """
+    notes = _annotations(tool)
+    if notes.get('destructiveHint') is True:
+        return 'destructive'
+    if notes.get('readOnlyHint') is True:
+        return 'read'
+    if notes.get('readOnlyHint') is False or notes.get('idempotentHint') is not None:
+        return 'write'
+    return 'unknown'
+
+
 async def list_server_tools():
+    """发现服务端工具，尽量把能力信息完整带回。
+
+    早先只保留 name 与 inputSchema，description/annotations 全被丢掉——
+    规划器只能靠工具名猜用途（`list_sites` 还猜得出来，`get_upload_instructions`
+    这类就完全看不出）。能力描述必须在规划前就到手。
+    """
     async with asyncio.timeout(30):
         async with connect_session() as session:
             tools = await all_tools(session)
-            return [
-                {'name': t.name, 'inputSchema': t.inputSchema}
-                for t in tools
-            ]
+            return [{
+                'name': t.name,
+                'title': getattr(t, 'title', None) or '',
+                'description': getattr(t, 'description', None) or '',
+                'inputSchema': t.inputSchema,
+                'outputSchema': getattr(t, 'outputSchema', None),
+                'annotations': _annotations(t),
+                'effect_type': effect_type(t),
+            } for t in tools]
 
 
 def result_payload(result):

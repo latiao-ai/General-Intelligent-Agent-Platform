@@ -13,7 +13,7 @@
 import hashlib
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -47,6 +47,13 @@ class Tool:
     description: str    # 给规划器看：这个工具干什么
     args: dict          # 参数 JSON Schema，给规划器看
     run: object         # async def run(args, state) -> dict（state 增量）
+    # 稳定身份：local:<能力包>:<动作> 或 mcp:<server_id>:<名称>。
+    # 模型只看 name，但记录、审计、幂等键都应挂在 tool_key 上。
+    tool_key: str = ''
+    # 动作性质：read / write / destructive / unknown。
+    # MCP 侧取自服务端 annotations，本地写死；没信息就是 unknown，不靠名字猜。
+    effect: str = 'unknown'
+    capability: str = ''
 
 
 # ---------- 内置工具 ----------
@@ -521,6 +528,16 @@ async def _answer_with_sources(args: dict, state: dict) -> dict:
     return {'answer': answer, 'status': 'answered'}
 
 
+def describe_tool(tool: Tool) -> str:
+    """工具在规划器眼里的样子：名称 + 动作性质 + 描述 + 参数。
+
+    动作性质必须一起给：规划器据此判断"这类操作要不要先向用户确认"，
+    只靠名字（比如看到 delete）去猜是不可靠的。
+    """
+    return (f'- {tool.name}［{tool.effect}］：{tool.description}\n'
+            f'  参数：{json.dumps(tool.args, ensure_ascii=False)}')
+
+
 BUILTIN_TOOLS = [
     Tool('web_search', '检索来源',
          '联网搜索，把命中的网页登记为来源（含摘要，部分自带正文）。需要外部/实时事实时先调它。',
@@ -565,6 +582,25 @@ BUILTIN_TOOLS = [
          _answer_directly),
 ]
 
+# 内置工具的身份与动作性质：tool_key 形如 local:<能力包>:<动作>，
+# capability 便于以后按业务拆文件，也便于界面分组。
+_LOCAL_META = {
+    'web_search': ('local:web:search', 'read', 'web'),
+    'fetch_pages': ('local:web:fetch', 'read', 'web'),
+    'compose_report': ('local:reports:compose', 'read', 'reports'),
+    'render_html': ('local:reports:render', 'write', 'reports'),
+    'render_sources_html': ('local:reports:render_sources', 'write', 'reports'),
+    'deploy_site': ('local:publishing:deploy', 'write', 'publishing'),
+    'answer_with_sources': ('local:answers:with_sources', 'read', 'answers'),
+    'answer_directly': ('local:answers:direct', 'read', 'answers'),
+}
+
+BUILTIN_TOOLS = [
+    replace(tool, tool_key=_LOCAL_META[tool.name][0],
+            effect=_LOCAL_META[tool.name][1], capability=_LOCAL_META[tool.name][2])
+    for tool in BUILTIN_TOOLS
+]
+
 BUILTIN_BY_NAME = {tool.name: tool for tool in BUILTIN_TOOLS}
 
 
@@ -605,13 +641,21 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
     for item in discovered:
         name = MCP_PREFIX + item['name']
         schema = item.get('inputSchema') or {'type': 'object', 'properties': {}}
+        # 用服务端给的真实描述，而不是拿工具名猜用途
+        title = item.get('title') or item['name']
+        detail = (item.get('description') or '').strip()
+        description = f'{title}（MCP 服务端工具 {item["name"]}）'
+        if detail:
+            description = f'{description}：{detail}'
         hint = MCP_HINTS.get(item['name'], '')
-        description = f'{item["name"]}（MCP 服务端提供的工具）'
         if hint:
             description = f'{description} {hint}'
         tools.append(Tool(
             name, f'MCP·{item["name"]}', description, schema,
             _make_mcp_runner(item['name']),
+            tool_key=f'mcp:{settings.mcp_server_id}:{item["name"]}',
+            effect=item.get('effect_type') or 'unknown',
+            capability='mcp',
         ))
     _MCP_CACHE.update(at=now, tools=tools)
     return tools

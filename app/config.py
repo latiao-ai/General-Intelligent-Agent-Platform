@@ -22,6 +22,9 @@ class Settings:
     # 账号**不是一回事**：api.deepseek.com 只认平台自己的 key，不做兜底回退，
     # 否则配错了只会在第一次检索时 401。
     deepseek_api_key: str = os.getenv('DEEPSEEK_API_KEY', '').strip()
+    # 接入的 MCP Server 标识；工具身份用它组成 mcp:<server_id>:<name>。
+    # 目前只接一个 Server，字段先留出来，多 Server 时按配置注册即可。
+    mcp_server_id: str = os.getenv('MCP_SERVER_ID', 'publishing')
     deepseek_base_url: str = os.getenv('DEEPSEEK_BASE_URL',
                                        'https://api.deepseek.com').rstrip('/')
     max_pages: int = min(5, max(1, int(os.getenv('MAX_PAGES', '5'))))
