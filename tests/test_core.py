@@ -1043,6 +1043,58 @@ class ProfileNodeTests(unittest.IsolatedAsyncioTestCase):
                 object.__setattr__(settings, 'profile_path', original)
 
 
+class SmallTalkFilterTests(unittest.IsolatedAsyncioTestCase):
+    """本地寒暄筛选：明显是寒暄就直接回答，省掉一次规划调用。"""
+
+    def test_recognises_plain_small_talk(self):
+        from app.services import is_small_talk
+        for text in ['你好', '您好！', '你好呀', '在吗', '谢谢', '好的谢谢',
+                     '嗯嗯', 'ok', 'OK!', 'hello', 'thanks', 'thank you',
+                     '早上好', '晚安', '再见', '好的，谢谢啦', '收到']:
+            self.assertTrue(is_small_talk(text), text)
+
+    def test_leaves_real_tasks_to_the_model(self):
+        from app.services import is_small_talk
+        # 误把任务当寒暄，会让该检索的请求变成闲聊；比多花一次调用糟得多，所以宁可漏判。
+        for text in ['帮我查一下 SQLite 的适用场景',
+                     '你好，帮我查一下 SQLite 的适用场景',
+                     '谢谢，请写一份报告',
+                     '什么是 ACID',
+                     'https://example.com',
+                     'higher', 'okr',
+                     '谢谢你帮我写个报告']:
+            self.assertFalse(is_small_talk(text), text)
+
+    async def test_parse_request_skips_the_model_for_small_talk(self):
+        from app import nodes
+
+        async def forbidden(*args, **kwargs):
+            raise AssertionError('寒暄不应该调用模型')
+
+        with patch.object(nodes, 'structured_call', forbidden):
+            result = await nodes.parse_request({'user_input': '你好', 'usage': []})
+        self.assertEqual(result['status'], 'planned')
+        self.assertFalse(result['plan']['need_research'])
+        self.assertEqual(result['usage'], [])        # 没调模型就没有用量
+        self.assertEqual(nodes.route_intent(result), 'answer_directly')
+
+    async def test_link_is_never_small_talk(self):
+        """带链接就必须走检索，不能因为句子短就被当成寒暄。"""
+        from app import nodes
+        called = {}
+
+        async def fake_call(schema, system, user, **kw):
+            called['hit'] = True
+            return Plan.model_validate({'topic': 't', 'auto_deploy': False,
+                                        'need_research': True}), None
+
+        with patch.object(nodes, 'structured_call', fake_call):
+            result = await nodes.parse_request(
+                {'user_input': 'hi https://example.com', 'usage': []})
+        self.assertTrue(called.get('hit'), '带 URL 时不能跳过模型')
+        self.assertTrue(result['plan']['need_research'])
+
+
 class RoutingTests(unittest.IsolatedAsyncioTestCase):
     """按 need_research 分流：不需要联网时直接回答，不搜索、不生成报告。"""
 

@@ -48,6 +48,49 @@ def urls_from_input(text: str) -> list[str]:
     return result[:settings.max_pages]
 
 
+# 只保留文字/数字：标点、空白、emoji 全部去掉，"你好！" 与 "谢谢~" 才判得出来。
+_NORMALIZE = re.compile(r'[^\w]+', re.UNICODE)
+
+# 能独立构成一整句寒暄/确认/致谢/告别的词。
+# 互为前缀的词必须长的在前（'thanks' 在 'thank' 前、'okay' 在 'ok' 前），
+# 否则短词会先把长词的开头吃掉。
+_SMALL_TALK_TOKENS = ('thankyou', '早上好', '中午好', '下午好', '晚上好',
+                      'hello', 'thanks', '哈喽', '在不在', '你好', '您好',
+                      '谢谢', '多谢', '感谢', '谢了', 'thank', 'thx',
+                      '好的', '收到', '明白', '知道', 'okay', '嗯嗯',
+                      '再见', '拜拜', 'bye', '早安', '晚安', '在吗', '在么',
+                      '哈哈', '嘿嘿', 'ok', '3q', '88', 'hi', 'hey',
+                      '嗯', '哦', '噢', '啦', '啊', '呀', '吧', '呢', '哈',
+                      '嘛', '喔', '了', '好')
+
+# 超过这个长度一律交给模型：长句里出现寒暄词（"谢谢，帮我查一下…"）不代表它是寒暄。
+_SMALL_TALK_MAX_CHARS = 12
+
+
+def is_small_talk(text: str) -> bool:
+    """是不是"纯寒暄/确认"，本地判、不花模型调用。
+
+    只在**极其保守**的前提下返回 True：整句能被已知寒暄词完全吃掉，且长度很短。
+    判不准就返回 False 走模型——误判成寒暄会让真正的任务被当成闲聊，代价远大于
+    多花一次调用，所以这里宁可漏判。
+    """
+    normalized = _NORMALIZE.sub('', text).lower()
+    if not normalized or len(normalized) > _SMALL_TALK_MAX_CHARS:
+        return False
+    rest = normalized
+    while rest:
+        for token in _SMALL_TALK_TOKENS:
+            if rest.startswith(token):
+                rest = rest[len(token):]
+                break
+            if rest.endswith(token):
+                rest = rest[:-len(token)]
+                break
+        else:
+            return False          # 剩下的不认识了，交给模型
+    return True
+
+
 def new_llm(model: str | None = None, disable_thinking: bool = False):
     options = dict(
         model=model or settings.llm_model,

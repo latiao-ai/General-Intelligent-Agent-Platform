@@ -7,7 +7,7 @@ from app import profile
 from app.schemas import Plan, Report
 from app.services import (
     structured_call, chat_reply, urls_from_input, clean_public_url,
-    search_query, extract_urls,
+    search_query, extract_urls, is_small_talk,
 )
 from app.rendering import render_report, save_json
 from app.mcp_adapter import deploy_html
@@ -36,6 +36,18 @@ def plan_statement(plan: dict) -> str:
 async def parse_request(state):
     urls = urls_from_input(state['user_input'])
     history = state.get('history') or []
+    if not urls and is_small_talk(state['user_input']):
+        # 本地筛选：明显的寒暄/确认不值得花一次模型调用去"规划"。
+        # 保守起见只认很干净的短句——带链接、偏长、或判不准的都照旧交给模型。
+        emit(action('跳过规划', '识别为寒暄，直接回答', '⚡'))
+        return {
+            'plan': {'mode': 'topic', 'topic': state['user_input'],
+                     'queries': [], 'urls': [], 'required_sections': [],
+                     'language': 'zh-CN', 'auto_deploy': False,
+                     'need_research': False, 'profile_updates': {}},
+            'status': 'planned',
+            'usage': state.get('usage', []),   # 没调模型，自然没有这一阶段的用量
+        }
     payload = state['user_input']
     if history:
         # 多轮：把上文一并交给模型，才能把「我只要第一部第三集」这类
