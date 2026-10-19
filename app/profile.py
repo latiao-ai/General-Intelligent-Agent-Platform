@@ -106,10 +106,28 @@ def merge(updates: dict) -> dict:
     return changed
 
 
-def clear() -> None:
+def raw() -> str:
+    """画像文件的原始文本，供界面展示与编辑。"""
     path = settings.profile_path
-    if path.exists():
-        path.unlink()
+    return path.read_text(encoding='utf-8') if path.exists() else ''
+
+
+def parse(text: str) -> dict:
+    """把编辑框里的 Markdown 解析成事实。界面保存时与 load 走同一套口径。"""
+    return _facts_of(text)
+
+
+def clear() -> None:
+    """清空画像。删之前先留一份 .bak——用户手一滑也能捞回来。"""
+    path = settings.profile_path
+    if not path.exists():
+        return
+    try:
+        (path.parent / (path.name + '.bak')).write_text(
+            path.read_text(encoding='utf-8'), encoding='utf-8')
+    except OSError:
+        pass
+    path.unlink()
 
 
 def block() -> str:

@@ -881,6 +881,39 @@ class ApiTests(unittest.TestCase):
                 and e['stage'] == 'compose_report']
         self.assertEqual(ends[0]['seconds'], 2.5)
 
+    def test_profile_can_be_read_and_rewritten(self):
+        """画像必须能在界面上改：读回原文、整体覆盖、清空留备份。"""
+        from app import profile
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'USER.md'
+            with patch.object(profile, 'settings',
+                              SimpleNamespace(profile_path=path)):
+                profile.merge({'身高': '173cm', '体重': '50kg'})
+
+                got = self.client.get('/api/profile').json()
+                self.assertEqual(got['facts'], {'身高': '173cm', '体重': '50kg'})
+                self.assertIn('身高', got['text'])
+
+                # 整体覆盖：改一条、加一条、删一条
+                res = self.client.put('/api/profile', json={'text':
+                    '身高：174cm\n饮食：低糖\n'})
+                self.assertEqual(res.status_code, 200)
+                self.assertEqual(res.json()['facts'],
+                                 {'身高': '174cm', '饮食': '低糖'})
+                self.assertEqual(profile.load(), {'身高': '174cm', '饮食': '低糖'})
+
+                # 清空要留 .bak，手滑也能捞回来
+                self.client.delete('/api/profile')
+                self.assertEqual(profile.load(), {})
+                backup = Path(str(path) + '.bak')
+                self.assertTrue(backup.exists())
+                self.assertIn('174cm', backup.read_text(encoding='utf-8'))
+
+    def test_profile_rejects_oversized_text(self):
+        self.assertEqual(
+            self.client.put('/api/profile', json={'text': 'x' * 20001}).status_code,
+            422)
+
     def test_session_timeline_orders_turns_oldest_first(self):
         """回放必须按发生顺序，否则步骤看起来是倒着走的。"""
         from app.store import Store

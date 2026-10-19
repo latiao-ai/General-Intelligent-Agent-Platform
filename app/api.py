@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from app import profile
 from app.api_hub import CLOSE, Hub
 from app.config import settings
 from app.main import deploy_task
@@ -29,6 +30,11 @@ KEEPALIVE_SECONDS = 15
 
 app = FastAPI(title='网页研究与 HTML 报告 API', version='1.0')
 hub = Hub()
+
+
+class ProfileRequest(BaseModel):
+    # 画像就是一份 Markdown，直接收原文：手改、粘贴、整段重写都走同一条路。
+    text: str = Field(default='', max_length=20000)
 
 
 class TaskRequest(BaseModel):
@@ -146,6 +152,27 @@ async def artifact(task_id: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail='产物不存在')
     return FileResponse(path, media_type='text/html', filename='index.html')
+
+
+@app.get('/api/profile')
+async def read_profile():
+    """当前的用户画像：原文 + 解析后的事实 + 版本号。"""
+    return {'text': profile.raw(), 'facts': profile.load(),
+            'version': profile.version()}
+
+
+@app.put('/api/profile')
+async def write_profile(payload: ProfileRequest):
+    """整体覆盖画像。只解析"键：值"行，头部元信息由服务端重写。"""
+    facts = profile.parse(payload.text)
+    version = profile.save(facts)
+    return {'version': version, 'facts': facts, 'count': len(facts)}
+
+
+@app.delete('/api/profile')
+async def delete_profile():
+    profile.clear()
+    return {'cleared': True}
 
 
 @app.get('/api/sessions')
