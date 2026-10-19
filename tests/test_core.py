@@ -1398,6 +1398,49 @@ class AnswerToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'answered')
         self.assertTrue(any(e.get('type') == 'answer_delta' for e in seen))
 
+    async def test_uses_tool_results_from_earlier_steps(self):
+        """"先调 MCP 取数据、再作答"：第二步必须看得见第一步的返回。
+
+        否则模型会如实回答"你没提供给我"——这个坑在查询服务器状态时必现。
+        """
+        from app import tools as tool_module
+        captured = {}
+
+        async def fake_chat(system, messages, model=None, on_delta=None):
+            captured['system'] = system
+            captured['content'] = messages[-1]['content']
+            return '已部署 3 个站点。'
+
+        state = {'user_input': '服务器上部署了几个站点', 'history': [],
+                 'mcp_calls': [{'tool': 'list_sites', 'payload': {
+                     'sites': [{'site_id': 'a'}, {'site_id': 'b'}, {'site_id': 'c'}]}}]}
+        with patch.object(tool_module, 'chat_reply', fake_chat):
+            await tool_module._answer_directly({'question': '几个站点'}, state)
+        self.assertIn('list_sites', captured['content'])
+        self.assertIn('"site_id": "a"', captured['content'])
+        # 系统提示必须切换成"基于工具数据作答"，否则模型仍会说自己没能力
+        self.assertIn('工具返回', captured['system'])
+
+    async def test_without_tool_results_keeps_plain_prompt(self):
+        from app import tools as tool_module
+        captured = {}
+
+        async def fake_chat(system, messages, model=None, on_delta=None):
+            captured['system'] = system
+            captured['content'] = messages[-1]['content']
+            return 'ok'
+
+        with patch.object(tool_module, 'chat_reply', fake_chat):
+            await tool_module._answer_directly(
+                {'question': '你好'}, {'user_input': '你好', 'history': []})
+        self.assertNotIn('工具返回的数据', captured['content'])
+
+    def test_tool_results_are_capped(self):
+        from app import tools as tool_module
+        huge = {'tool': 'list_sites', 'payload': {'sites': [{'x': 'y' * 5000}]}}
+        text = tool_module.tool_results_text({'mcp_calls': [huge]})
+        self.assertLessEqual(len(text), 4200)
+
     async def test_passes_history(self):
         from app import tools as tool_module
         captured = {}

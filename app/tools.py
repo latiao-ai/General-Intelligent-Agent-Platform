@@ -298,13 +298,51 @@ ANSWER_SYSTEM = (
 )
 
 
+ANSWER_USING_TOOL_RESULTS_SYSTEM = (
+    '你是一个简洁、可靠的中文助手。用户的问题下面已经附上了本轮工具返回的真实数据，'
+    '必须基于这些数据回答：该数就数、该列就列，直接给结论。'
+    '不要说"我无法访问服务器/没有联网/你没提供给我"——数据就在下面。'
+    '数据里确实没有的信息，就明确说那部分没有，不要编造。'
+)
+
+# 每个工具结果最多塞这么多字符，避免把上下文撑爆
+_TOOL_RESULT_CHARS = 4000
+_TOOL_RESULT_TOTAL = 8000
+
+
+def tool_results_text(state: dict) -> str:
+    """本轮已经调用过的工具返回，供后续作答步骤使用。
+
+    计划常是"先调工具取数据，再作答"两步；第二步若看不见第一步的返回，
+    模型就会说"你没提供给我"——这个坑在 MCP 查询类问题上必现。
+    """
+    parts, used = [], 0
+    for call in state.get('mcp_calls') or []:
+        payload = json.dumps(call.get('payload'), ensure_ascii=False)
+        room = min(_TOOL_RESULT_CHARS, _TOOL_RESULT_TOTAL - used)
+        if room <= 0:
+            break
+        text = payload[:room]
+        used += len(text)
+        parts.append(f'[工具 {call.get("tool")} 返回]\n{text}')
+    return '\n\n'.join(parts)
+
+
 async def _answer_directly(args: dict, state: dict) -> dict:
     history = (state.get('history') or [])[-8:]
     question = str(args.get('question') or state.get('user_input') or '')
     messages = [{'role': m['role'], 'content': m['content']} for m in history]
-    messages.append({'role': 'user', 'content': question})
-    emit(action('直接回答', '本轮无需联网检索', '💬'))
-    answer = await chat_reply(profile.with_profile(ANSWER_SYSTEM), messages,
+    context = tool_results_text(state)
+    if context:
+        system = ANSWER_USING_TOOL_RESULTS_SYSTEM
+        messages.append({'role': 'user',
+                         'content': f'问题：{question}\n\n工具返回的数据：\n{context}'})
+        emit(action('直接回答', '基于本轮工具返回的数据', '💬'))
+    else:
+        system = ANSWER_SYSTEM
+        messages.append({'role': 'user', 'content': question})
+        emit(action('直接回答', '本轮无需联网检索', '💬'))
+    answer = await chat_reply(profile.with_profile(system), messages,
                               on_delta=lambda text: emit(answer_delta(text)))
     return {'answer': answer, 'status': 'answered'}
 
@@ -340,6 +378,9 @@ async def _answer_with_sources(args: dict, state: dict) -> dict:
                 '📝'))
     material = '\n\n'.join(
         f'[{item["source_id"]}] {item["title"]}\n{item["text"]}' for item in selected)
+    context = tool_results_text(state)
+    if context:
+        material = f'{context}\n\n{material}'
     messages = [{'role': 'user',
                  'content': f'问题：{question}\n\n资料：\n{material}'}]
     body = await chat_reply(
@@ -385,7 +426,8 @@ BUILTIN_TOOLS = [
          {'type': 'object', 'properties': {'question': {'type': 'string'}}},
          _answer_with_sources),
     Tool('answer_directly', '直接回答',
-         '不联网、不出报告，直接用已有知识回答。寒暄、确认、一般性知识问答用它。'
+         '不检索、不出报告地作答。寒暄、确认、一般性知识问答用它；'
+         '也用于"先调工具取数据、再作答"计划里的收尾一步——它会看到前面工具的真实返回。'
          '若问题需要外部事实而你又没检索过，应该用 web_search 而不是它。',
          {'type': 'object', 'properties': {'question': {'type': 'string'}}},
          _answer_directly),
