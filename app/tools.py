@@ -170,16 +170,36 @@ COMPOSE_SYSTEM = (
 )
 
 
+def _with_text(documents) -> list[dict]:
+    """挑出真正能用的来源：已经拿到正文、且不是抓取失败的。
+
+    不能只看 status=='success'：检索接口常常直接带回正文，此时文档还是 pending
+    （只有 fetch_pages 会改写成 success）。只认 success 会让"搜索→作答/成稿"
+    这种少一步的计划误报"还没有可用正文"。这里按"有没有正文"判断，
+    并顺手把状态提升成 success，后续 render_html 才会把它们列进参考资料。
+    """
+    usable = []
+    for doc in documents or []:
+        if doc.get('status') == 'failed':
+            continue
+        if not (doc.get('raw_content') or '').strip():
+            continue
+        if doc.get('status') != 'success':
+            doc = dict(doc)
+            doc['status'] = 'success'
+        usable.append(doc)
+    return usable
+
+
 def usable_documents(state: dict) -> tuple[list[dict], str]:
     """本轮能用的正文来源，附带"来自哪里"的说明。
 
     本轮没检索、但用户说"把上面的内容整理成 HTML"时，退回上一轮已取得的正文。
     """
-    current = [d for d in state.get('documents', []) if d.get('status') == 'success']
+    current = _with_text(state.get('documents'))
     if current:
         return current, ''
-    prior = [d for d in (state.get('prior_documents') or [])
-             if d.get('status') == 'success']
+    prior = _with_text(state.get('prior_documents'))
     if prior:
         return prior, '上一轮检索到的正文'
     return [], ''
@@ -190,7 +210,7 @@ def _select_sources(state: dict, documents: list[dict] | None = None
     """按字符预算挑正文；返回 (入选片段, 是否发生截断)。"""
     if documents is None:
         documents = state.get('documents', [])
-    available = [d for d in documents if d['status'] == 'success']
+    available = _with_text(documents)
     selected, remaining = [], settings.max_total_chars
     truncated = len(available) > settings.max_pages
     for d in available[:settings.max_pages]:
@@ -208,7 +228,7 @@ def _select_sources(state: dict, documents: list[dict] | None = None
 async def _compose_report(args: dict, state: dict) -> dict:
     documents, origin = usable_documents(state)
     if not documents:
-        raise ToolError('还没有可用正文，请先调用 web_search 或 fetch_pages')
+        raise ToolError('还没有可用正文，请先调用 web_search，再用 fetch_pages 抓正文')
     if origin:
         emit(action('沿用上一轮的正文', f'{len(documents)} 个来源', '♻️'))
     selected, truncated = _select_sources(state, documents)
@@ -374,7 +394,7 @@ async def _answer_with_sources(args: dict, state: dict) -> dict:
     question = str(args.get('question') or state.get('user_input') or '')
     documents, origin = usable_documents(state)
     if not documents:
-        raise ToolError('还没有可用正文，请先调用 web_search 或 fetch_pages')
+        raise ToolError('还没有可用正文，请先调用 web_search，再用 fetch_pages 抓正文')
     if origin:
         emit(action('沿用上一轮的正文', f'{len(documents)} 个来源', '♻️'))
     selected, _ = _select_sources(state, documents)

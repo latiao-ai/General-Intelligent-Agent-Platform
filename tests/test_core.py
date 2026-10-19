@@ -1130,6 +1130,27 @@ class ComposeToolTests(unittest.IsolatedAsyncioTestCase):
             result = await tool_module._compose_report({}, state)
         self.assertEqual(result['usage'][-1]['model_name'], settings.llm_compose_model)
 
+    def test_search_supplied_bodies_count_as_usable(self):
+        """web_search 常直接带回正文，此时 status 仍是 pending。
+
+        只认 success 会让"搜索 → 作答/成稿"这种少一步的计划误报"还没有可用正文"
+        ——实测就因此让一轮查询整条失败（0.01s 就报错）。
+        """
+        from app import tools as tool_module
+        docs = [{'source_id': 's1', 'title': 't', 'url': 'https://a/1',
+                 'status': 'pending', 'raw_content': '检索时就带回来的正文'}]
+        usable, origin = tool_module.usable_documents({'documents': docs})
+        self.assertEqual(len(usable), 1)
+        # 用的时候要提升成 success，否则 render_html 不会把它列进参考资料
+        self.assertEqual(usable[0]['status'], 'success')
+        # 没有正文的不算
+        empty, _ = tool_module.usable_documents({'documents': [
+            {'source_id': 's2', 'status': 'pending', 'raw_content': ''}]})
+        self.assertEqual(empty, [])
+        failed, _ = tool_module.usable_documents({'documents': [
+            {'source_id': 's3', 'status': 'failed', 'raw_content': '正文'}]})
+        self.assertEqual(failed, [])
+
     async def test_compose_reuses_prior_documents(self):
         """"把上面的内容整理成 HTML"：本轮没检索，要能接住上一轮的正文。"""
         from app import tools as tool_module
