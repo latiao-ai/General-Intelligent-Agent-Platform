@@ -23,9 +23,9 @@ from app.events import action, answer_delta, draft, emit
 from app.rendering import render_report, save_json
 from app.schemas import Report
 from app.services import (
-    chat_reply, clean_public_url, extract_urls, search_query, structured_call,
+    chat_reply, clean_public_url, structured_call,
 )
-from app import context, mcp_adapter, md, sources
+from app import context, mcp_adapter, md, search as search_backend, sources
 
 
 class ToolError(RuntimeError):
@@ -61,7 +61,7 @@ async def _web_search(args: dict, state: dict) -> dict:
     by_url = {d['url']: d for d in documents}
     emit(action('已搜索网页', query, '🌐'))
     try:
-        response = await search_query(query)
+        response = await search_backend.search(query)
     except Exception as exc:
         errors.append(error_entry('search', exc))
         raise ToolError('搜索失败，检查 DEEPSEEK_API_KEY 与网络') from exc
@@ -124,7 +124,7 @@ async def _fetch_pages(args: dict, state: dict) -> dict:
     if missing:
         emit(action('提取正文', f'{len(missing)} 个链接', '📄'))
         try:
-            response = await extract_urls(missing)
+            response = await search_backend.fetch(missing)
         except Exception as exc:
             errors.append(error_entry('extract', exc))
             raise ToolError('正文提取失败，检查代理或链接可达性') from exc
@@ -571,6 +571,16 @@ BUILTIN_BY_NAME = {tool.name: tool for tool in BUILTIN_TOOLS}
 # ---------- MCP 动态工具 ----------
 
 MCP_PREFIX = 'mcp__'
+
+# 原始 MCP 工具仍全部暴露（保留最大能力），但重复/不可逆的那几个补一句说明，
+# 让模型优先走有保障的路径，而不是靠删功能来限制它。
+MCP_HINTS = {
+    'deploy_site': '与内置 deploy_site 等价。**优先用内置那个**——它负责把 HTML 组'
+                   '装成服务端要的 base64 文件内容，直接调原始工具容易传错格式。',
+    'delete_site': '⚠️ 不可逆。删除线上站点前必须先向用户复述将要删除的站点 ID 并确认。',
+    'update_site': '⚠️ 会改动线上站点内容，执行前先说明改什么。',
+    'list_sites': '不带 keyword 时返回全量站点；带了 keyword 只是筛选结果，不能当全量用。',
+}
 # 每次任务都去 discover 一次太慢（一次可能几十秒），进程内缓存一小段时间。
 _MCP_CACHE: dict = {'at': 0.0, 'tools': []}
 _MCP_TTL = 300.0
@@ -595,10 +605,12 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
     for item in discovered:
         name = MCP_PREFIX + item['name']
         schema = item.get('inputSchema') or {'type': 'object', 'properties': {}}
+        hint = MCP_HINTS.get(item['name'], '')
+        description = f'{item["name"]}（MCP 服务端提供的工具）'
+        if hint:
+            description = f'{description} {hint}'
         tools.append(Tool(
-            name, f'MCP·{item["name"]}',
-            f'{item["name"]}（MCP 服务端提供的工具）',
-            schema,
+            name, f'MCP·{item["name"]}', description, schema,
             _make_mcp_runner(item['name']),
         ))
     _MCP_CACHE.update(at=now, tools=tools)

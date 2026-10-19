@@ -280,16 +280,3 @@ async def chat_reply(system: str, messages: list[dict], model: str | None = None
     return ''.join(parts).strip()
 
 
-async def search_query(query: str):
-    """按当前配置的检索后端搜索。
-
-    后端固定在 DeepSeek 官方 Search API（见 app/search.py）。
-    """
-    from app import search as backend
-    return await backend.search(query)
-
-
-async def extract_urls(urls: list[str]):
-    """抓取正文（Markdown），走 DeepSeek 官方 Fetch API。"""
-    from app import search as backend
-    return await backend.fetch(urls)

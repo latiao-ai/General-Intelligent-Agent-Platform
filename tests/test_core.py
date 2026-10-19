@@ -120,7 +120,7 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as folder:
             with patch.object(sources, 'settings',
                               SimpleNamespace(artifact_dir=Path(folder))), \
-                    patch.object(tool_module, 'search_query', fake_search), \
+                    patch.object(tool_module.search_backend, 'search', fake_search), \
                     patch.object(tool_module, 'emit', lambda e: None):
                 result = await tool_module._web_search(
                     {'query': 'q'}, {'task_id': 't1', 'documents': [],
