@@ -1151,6 +1151,17 @@ class ComposeToolTests(unittest.IsolatedAsyncioTestCase):
         # 用到的来源必须写回 state，否则 render_html 解析不到 source_id
         self.assertEqual([d['source_id'] for d in result['documents']], ['s1'])
 
+    def test_compose_prompt_bounds_the_output_size(self):
+        """篇幅约束是整理阶段的主要耗时开关。
+
+        实测同一份输入的输出 token：不约束 14400（64.7s）→ 约束后 6084（28.6s）。
+        这条指令被删掉，整理阶段就会重新变慢并撞上单次超时。
+        """
+        from app import tools as tool_module
+        self.assertIn('章节 3~5 个', tool_module.COMPOSE_SYSTEM)
+        self.assertIn('不超过 120 字', tool_module.COMPOSE_SYSTEM)
+        self.assertIn('对比表最多 6 行', tool_module.COMPOSE_SYSTEM)
+
     async def test_compose_refuses_without_sources(self):
         from app import tools as tool_module
         with self.assertRaises(tool_module.ToolError):
