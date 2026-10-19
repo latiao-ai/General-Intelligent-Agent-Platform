@@ -1223,6 +1223,34 @@ class ApiTests(unittest.TestCase):
             self.client.put('/api/profile', json={'text': 'x' * 20001}).status_code,
             422)
 
+    def test_artifact_endpoint_serves_whatever_was_produced(self):
+        """产物可能是报告页也可能是资料页，接口不能把文件名写死成 index.html。
+
+        早先硬编码 index.html，"资料转 HTML" 产出的 sources.html 一律 404。
+        """
+        import app.api_hub as hub_module
+        with tempfile.TemporaryDirectory() as folder:
+            sources_html = Path(folder) / 'sources.html'
+            sources_html.write_text('<h1>资料页</h1>', encoding='utf-8')
+
+            async def fake_run_task(text, progress=None, on_event=None, history=None,
+                                    on_start=None, prior=None, memory=None):
+                return {'task_id': 'a1', 'status': 'local_ready', 'timings': [],
+                        'deployment': {},
+                        'artifact': {'kind': 'sources',
+                                     'html_path': str(sources_html)}}
+
+            with patch.object(hub_module, 'run_task', fake_run_task):
+                created = self.client.post('/api/tasks', json={'message': '存成网页'}).json()
+                record = self.api_module.hub.get(created['task_id'])
+                for _ in range(100):
+                    if record.done:
+                        break
+                    time.sleep(0.02)
+            res = self.client.get(f"/api/tasks/{created['task_id']}/artifact")
+        self.assertEqual(res.status_code, 200)
+        self.assertIn('资料页', res.text)
+
     def test_session_memory_endpoints(self):
         """会话记忆要能在界面上读、改、清空。"""
         hub = self.api_module.hub

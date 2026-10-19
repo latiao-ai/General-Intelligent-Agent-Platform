@@ -151,13 +151,25 @@ async def deploy(task_id: str):
 
 @app.get('/api/tasks/{task_id}/artifact')
 async def artifact(task_id: str):
+    """下载/预览任务产物。
+
+    文件路径以任务 state 里记的 `artifact.html_path` 为准——报告是 index.html，
+    "资料转 HTML" 产出的是 sources.html；早先这里写死 index.html，导致资料页 404。
+    """
     record = hub.get(task_id)
-    if record is None or not record.artifact_id:
+    if record is None:
         raise HTTPException(status_code=404, detail='产物不存在')
-    path = settings.artifact_dir / record.artifact_id / 'index.html'
+    recorded = ((record.state or {}).get('artifact') or {}).get('html_path')
+    if recorded:
+        path = Path(recorded)
+    elif record.artifact_id:
+        # 旧任务没有记录路径，按约定回退
+        path = settings.artifact_dir / record.artifact_id / 'index.html'
+    else:
+        raise HTTPException(status_code=404, detail='产物不存在')
     if not path.exists():
         raise HTTPException(status_code=404, detail='产物不存在')
-    return FileResponse(path, media_type='text/html', filename='index.html')
+    return FileResponse(path, media_type='text/html', filename=path.name)
 
 
 @app.get('/api/profile')

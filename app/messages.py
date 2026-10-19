@@ -17,8 +17,11 @@ def reply_text(state: dict) -> str:
         # 直接回答：answer 本身就是给用户看的完整回执，不再包装
         return state.get('answer') or '（模型没有返回内容）'
     if status == 'local_ready':
-        return ('报告已生成，保存在本地。需要发布可以点「部署到服务器」，'
-                f'或直接说"部署到服务器"。任务 ID：{state.get("task_id")}')
+        # 产出可能是报告，也可能是"资料原样转换"的页面，回执要说清楚是哪种
+        kind = (state.get('artifact') or {}).get('kind')
+        what = '资料页面' if kind == 'sources' else '报告'
+        return (f'{what}已生成，保存在本地。想发布就说一句「部署到服务器」。'
+                f'任务 ID：{state.get("task_id")}')
     if status == 'failed':
         reason = state.get('failure')
         if reason:
