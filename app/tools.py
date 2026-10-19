@@ -165,9 +165,27 @@ COMPOSE_SYSTEM = (
 )
 
 
-def _select_sources(state: dict) -> tuple[list[dict], bool]:
+def usable_documents(state: dict) -> tuple[list[dict], str]:
+    """本轮能用的正文来源，附带"来自哪里"的说明。
+
+    本轮没检索、但用户说"把上面的内容整理成 HTML"时，退回上一轮已取得的正文。
+    """
+    current = [d for d in state.get('documents', []) if d.get('status') == 'success']
+    if current:
+        return current, ''
+    prior = [d for d in (state.get('prior_documents') or [])
+             if d.get('status') == 'success']
+    if prior:
+        return prior, '上一轮检索到的正文'
+    return [], ''
+
+
+def _select_sources(state: dict, documents: list[dict] | None = None
+                    ) -> tuple[list[dict], bool]:
     """按字符预算挑正文；返回 (入选片段, 是否发生截断)。"""
-    available = [d for d in state.get('documents', []) if d['status'] == 'success']
+    if documents is None:
+        documents = state.get('documents', [])
+    available = [d for d in documents if d['status'] == 'success']
     selected, remaining = [], settings.max_total_chars
     truncated = len(available) > settings.max_pages
     for d in available[:settings.max_pages]:
@@ -183,9 +201,12 @@ def _select_sources(state: dict) -> tuple[list[dict], bool]:
 
 
 async def _compose_report(args: dict, state: dict) -> dict:
-    selected, truncated = _select_sources(state)
-    if not selected:
+    documents, origin = usable_documents(state)
+    if not documents:
         raise ToolError('还没有可用正文，请先调用 web_search 或 fetch_pages')
+    if origin:
+        emit(action('沿用上一轮的正文', f'{len(documents)} 个来源', '♻️'))
+    selected, truncated = _select_sources(state, documents)
 
     def on_draft(partial) -> None:
         emit(draft(partial.model_dump() if partial is not None else None))
@@ -214,6 +235,9 @@ async def _compose_report(args: dict, state: dict) -> dict:
         data['limitations'].append('部分正文因输入预算被截断或未送入模型，可能遗漏信息。')
     return {
         'report': data, 'status': 'composed',
+        # 把实际用到的来源写回 state：render_html 靠它解析 source_id 生成参考资料，
+        # 否则"沿用上一轮正文"生成的报告会引用不到任何来源。
+        'documents': documents,
         'usage': list(state.get('usage', [])) + [{
             'stage': 'compose', 'model_name': settings.llm_compose_model,
             'model': usage,
@@ -299,11 +323,13 @@ async def _answer_with_sources(args: dict, state: dict) -> dict:
     不想为了一份文档等上一分钟。
     """
     question = str(args.get('question') or state.get('user_input') or '')
-    selected, _ = _select_sources(state)
-    if not selected:
+    documents, origin = usable_documents(state)
+    if not documents:
         raise ToolError('还没有可用正文，请先调用 web_search 或 fetch_pages')
-    by_id = {d['source_id']: d for d in state.get('documents', [])
-             if d.get('source_id')}
+    if origin:
+        emit(action('沿用上一轮的正文', f'{len(documents)} 个来源', '♻️'))
+    selected, _ = _select_sources(state, documents)
+    by_id = {d['source_id']: d for d in documents if d.get('source_id')}
     emit(action('正在依据资料作答',
                 f'{len(selected)} 个来源 · {sum(len(s["text"]) for s in selected)} 字符',
                 '📝'))

@@ -28,6 +28,8 @@ PLANNER_SYSTEM = (
     '① 只能使用工具清单里出现过的名字，不要编造；args 必须符合该工具的参数 schema。'
     '② 需要外部或实时事实（最新、价格、版本、新闻）或用户要求调研时，先检索：'
     'web_search（用户已给 URL 就直接 fetch_pages），需要正文再用 fetch_pages 补抓。'
+    '但若「已有资料」里已经有正文，而用户只是要把这些内容整理/转换成文档或回答，'
+    '就不要再检索，直接进入收尾步骤——重复检索既慢又会引入无关来源。'
     '③ 检索完怎么收尾，取决于用户要的成果形态：'
     '只想"问个明白"（问怎么做/是什么/哪个好，但没有要文件）→ answer_with_sources，'
     '在聊天里带来源作答，不要为这种需求生成 HTML；'
@@ -128,9 +130,15 @@ async def plan(state):
                 'step_index': 0, 'status': 'planned'}
 
     catalog = await tool_module.catalog()
+    available, origin = tool_module.usable_documents(state)
     payload = json.dumps({
         '用户要求': question,
         '对话历史': (state.get('history') or [])[-8:],
+        # 明确告诉模型手上还有多少料：否则它可能以为要重新检索，
+        # 也可能反过来以为已有资料、结果空手去整理。
+        '已有资料': (f'{len(available)} 个来源的正文' + (f'（{origin}）' if origin else '')
+                     if available else '无'),
+        '上一轮已产出 HTML': bool(state.get('prior_artifact')),
         '可用工具': _catalog_text(catalog),
         '部署已开启': settings.deploy_enabled,
     }, ensure_ascii=False)

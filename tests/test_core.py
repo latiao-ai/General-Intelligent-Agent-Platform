@@ -171,6 +171,8 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('web_search', captured['user'])
         self.assertIn('answer_directly', captured['user'])
         self.assertIn('answer_with_sources', captured['user'])
+        # 必须告诉模型手上还有多少料，否则它会重复检索、或空手去整理
+        self.assertIn('已有资料', captured['user'])
 
     async def test_plan_falls_back_when_the_model_fails(self):
         from app import nodes
@@ -426,7 +428,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
     def stub(captured=None, delay=0):
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
-                                prior_artifact=None):
+                                prior=None):
             if captured is not None:
                 captured['history'] = history
             if on_start:
@@ -531,7 +533,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior_artifact=None):
+                       on_start=None, prior=None):
             on_event({'type': 'stage_start', 'stage': 'plan'})
             on_event({'type': 'stage_end', 'stage': 'plan',
                       'seconds': 1.0, 'status': 'planned'})
@@ -616,7 +618,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior_artifact=None):
+                       on_start=None, prior=None):
             on_event({'type': 'stage_start', 'stage': 'plan'})
             on_event({'type': 'stage_end', 'stage': 'plan',
                       'seconds': 1.0, 'status': 'planned'})
@@ -643,7 +645,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior_artifact=None):
+                       on_start=None, prior=None):
             on_event({'type': 'stage_start', 'stage': 'plan'})
             await asyncio.sleep(30)
             return {}
@@ -666,7 +668,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior_artifact=None):
+                       on_start=None, prior=None):
             # 用规划阶段做"还没开始干活"的代表：它不在 FIRST_WORK_STAGES 里，
             # 因此指令阶段仍是打开的，失败时应当由失败路径补上结束事件。
             on_event({'type': 'stage_start', 'stage': 'plan'})
@@ -687,7 +689,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         started = {'n': 0}
 
         async def slow(text, progress=None, on_event=None, history=None,
-                       on_start=None, prior_artifact=None):
+                       on_start=None, prior=None):
             started['n'] += 1
             await asyncio.sleep(30)
             return {}
@@ -715,13 +717,22 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
                    if e.get('type') == 'status']
         self.assertTrue(any('没有正在执行的任务' in (d or '') for d in details))
 
-    async def test_last_artifact_carries_over(self):
+    async def test_prior_context_carries_artifact_and_documents(self):
+        """多轮承接：产物和正文都要能从上一轮交过来。"""
         hub = self.hub()
         hub.store.create_task('t1', 'sess', '第一轮')
-        hub.store.update_task('t1', status='local_ready',
-                              state={'artifact': {'html_path': '/x/index.html'}})
-        self.assertEqual(hub.last_artifact('sess')['html_path'], '/x/index.html')
-        self.assertIsNone(hub.last_artifact('nope'))
+        hub.store.update_task('t1', status='local_ready', state={
+            'artifact': {'html_path': '/x/index.html'},
+            'documents': [{'source_id': 's1', 'url': 'https://a/1',
+                           'status': 'success'},
+                          {'source_id': 's2', 'url': 'https://b/2',
+                           'status': 'failed'}],
+        })
+        ctx = hub.prior_context('sess')
+        self.assertEqual(ctx['artifact']['html_path'], '/x/index.html')
+        # 只接成功的来源：报告要给它们生成参考资料，失败的没有正文
+        self.assertEqual([d['source_id'] for d in ctx['documents']], ['s1'])
+        self.assertEqual(hub.prior_context('nope'), {})
 
     async def test_cancel_done_task_is_noop(self):
         import app.api_hub as hub_module
@@ -773,7 +784,7 @@ class ApiTests(unittest.TestCase):
 
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
-                                prior_artifact=None):
+                                prior=None):
             if on_start:
                 on_start('artifact9')
             if on_event:
@@ -818,7 +829,7 @@ class ApiTests(unittest.TestCase):
 
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
-                                prior_artifact=None):
+                                prior=None):
             return {'task_id': 'a1', 'status': 'local_ready',
                     'deployment': {}, 'timings': []}
 
@@ -835,7 +846,7 @@ class ApiTests(unittest.TestCase):
 
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
-                                prior_artifact=None):
+                                prior=None):
             if on_start:
                 on_start('a1')
             if on_event:
@@ -1118,6 +1129,27 @@ class ComposeToolTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(tool_module, 'structured_call', fake_call):
             result = await tool_module._compose_report({}, state)
         self.assertEqual(result['usage'][-1]['model_name'], settings.llm_compose_model)
+
+    async def test_compose_reuses_prior_documents(self):
+        """"把上面的内容整理成 HTML"：本轮没检索，要能接住上一轮的正文。"""
+        from app import tools as tool_module
+        captured = {}
+
+        async def fake_call(schema, system, user, **kw):
+            captured['user'] = user
+            return Report.model_validate({
+                'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
+                'sections': [{'heading': 'h', 'paragraphs': [
+                    {'text': 'x', 'source_ids': ['s1']}]}]}), None
+
+        state = {'documents': [], 'usage': [], 'prior_documents': [
+            {'source_id': 's1', 'title': '甲文', 'url': 'https://a.example/1',
+             'status': 'success', 'raw_content': '上一轮的正文'}]}
+        with patch.object(tool_module, 'structured_call', fake_call):
+            result = await tool_module._compose_report({}, state)
+        self.assertIn('上一轮的正文', captured['user'])
+        # 用到的来源必须写回 state，否则 render_html 解析不到 source_id
+        self.assertEqual([d['source_id'] for d in result['documents']], ['s1'])
 
     async def test_compose_refuses_without_sources(self):
         from app import tools as tool_module

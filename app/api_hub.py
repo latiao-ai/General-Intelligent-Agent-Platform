@@ -137,19 +137,24 @@ class Hub:
                 'messages': self.store.messages(session_id),
                 'turns': turns}
 
-    def last_artifact(self, session_id: str) -> dict | None:
-        """会话里最近一次成功产出的 HTML。
+    def prior_context(self, session_id: str) -> dict:
+        """上一轮可以接过来用的东西：HTML 产物 + 已取得的正文。
 
-        界面上已经没有"部署"按钮了，用户会直接说"部署到服务器"。那一轮自己没有
-        render_html，得靠这个把上一轮的产物接过来，否则部署无从下手。
+        多轮里用户常说"把上面的内容整理成 HTML""部署到服务器"，这一轮自己不检索、
+        也不重新渲染，全靠上一轮留下的材料。只接正文来源（不含纯知识作答），
+        因为报告要引用来源，没有 URL 的来源没法在报告里成立。
         """
         for row in self.store.tasks_of(session_id, limit=20):
             data = self.store.task(row['task_id'])
             state = (data or {}).get('state') or {}
-            artifact = state.get('artifact') if isinstance(state, dict) else None
-            if artifact:
-                return artifact
-        return None
+            if not isinstance(state, dict):
+                continue
+            artifact = state.get('artifact') or None
+            documents = [d for d in (state.get('documents') or [])
+                         if d.get('status') == 'success']
+            if artifact or documents:
+                return {'artifact': artifact, 'documents': documents}
+        return {}
 
     def stop_session(self, session_id: str, message: str) -> TaskRecord:
         """把"暂停/停止"当成控制指令：掐掉在跑的任务，不启动新流程。
@@ -179,7 +184,7 @@ class Hub:
         if is_stop_command(message):
             return self.stop_session(session_id, message)
         history = self.history(session_id)
-        prior_artifact = self.last_artifact(session_id)
+        prior = self.prior_context(session_id)
         self.store.append_message(session_id, 'user', message)
         record = TaskRecord(task_id=uuid.uuid4().hex[:12], session_id=session_id,
                             message=message, store=self.store)
@@ -190,12 +195,11 @@ class Hub:
         event = stage_start(INSTRUCTION_STAGE)
         record.open_stage = {'stage': INSTRUCTION_STAGE, 'at': event['at']}
         record.publish(event)
-        record._task = asyncio.create_task(
-            self._run(record, history, prior_artifact))
+        record._task = asyncio.create_task(self._run(record, history, prior))
         return record
 
     async def _run(self, record: TaskRecord, history: list,
-                   prior_artifact: dict | None = None) -> None:
+                   prior: dict | None = None) -> None:
         def on_start(artifact_id: str) -> None:
             record.persist(artifact_id=artifact_id)
             record.publish({'type': 'task', 'task_id': record.task_id,
@@ -249,7 +253,7 @@ class Hub:
             state = await run_task(
                 record.message, on_event=relay,
                 on_start=on_start, history=history,
-                prior_artifact=prior_artifact,
+                prior=prior,
             )
         except asyncio.CancelledError:
             close_instruction('已中断')
