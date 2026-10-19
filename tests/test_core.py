@@ -1546,6 +1546,25 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(drain_jobs(hub, 'w1'), 0)
 
 
+class RepositoryContractTests(unittest.TestCase):
+    """仓储接口：换实现前先保证方法齐备（文档 §9.1）。"""
+
+    def test_sqlite_store_satisfies_repository_protocol(self):
+        from app.persistence import Repository, check_repository
+        from app.store import Store
+        store = Store(':memory:')
+        self.assertEqual(check_repository(store), [])
+        self.assertIsInstance(store, Repository)
+
+    def test_missing_methods_are_reported(self):
+        from app.persistence import check_repository
+
+        class Partial:
+            def append_message(self, *a, **k): ...
+
+        self.assertIn('claim_run', check_repository(Partial()))
+
+
 class PostgresMigrationTests(unittest.TestCase):
     """迁移脚本：DDL 翻译正确（**未在真实 PostgreSQL 上验证**）。"""
 

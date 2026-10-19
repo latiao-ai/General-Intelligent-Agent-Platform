@@ -44,8 +44,9 @@
 | 独立 Worker | ✅ | `scripts/run_worker.py` | 支持 `--once` / `--jobs-only`；SQLite 阶段限单 Worker |
 | SSE 游标 | ✅ | `Last-Event-ID` / `?after=` | 实测 `after=2` 正确跳发；事件帧带 `id:` 行 |
 | outbox 与后台任务 | ✅ | `background_jobs` + `dedupe_key` | `test_jobs_are_deduped`、Worker 消费 |
-| PostgreSQL 仓储与迁移 | ⚠️ | `scripts/migrate_to_postgres.py` | DDL 翻译有单测；**未在真实 PostgreSQL 上验证**，文件头列出已知差异 |
-| 先 SQLite 后 PG 的隔离 | ⬜ | — | SQL 仍在 `store.py` 内，文档要求的"仓储接口层"尚未抽出 |
+| 仓储接口层 | ✅ | `app/persistence.py`（Protocol） | `test_sqlite_store_satisfies_repository_protocol`；`check_repository` 能列出缺失方法 |
+| PostgreSQL 迁移 | ⚠️ | `scripts/migrate_to_postgres.py` | DDL 翻译有单测；**未在真实 PostgreSQL 上验证**，文件头列出已知差异 |
+| PostgresStore 实现 | ⬜ | — | 本机无 PG 实例，写一个跑不起来的实现只是制造"看起来支持了"的假象，故不写 |
 
 ## 阶段 D：上下文与长期记忆
 
@@ -92,4 +93,4 @@
 
 ## 测试
 
-`python -m unittest tests.test_core` → **168 个通过**。
+`python -m unittest tests.test_core` → **170 个通过**。
