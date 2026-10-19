@@ -84,6 +84,10 @@ async def _web_search(args: dict, state: dict) -> dict:
             snippet=item.get('content', ''),
             text=item.get('raw_content') or '',
         )
+        # 官方 Search 会带回站点名/发布时间/排序分/权威度，资料页要用到，别丢
+        for key in ('site_name', 'date', 'score', 'authority'):
+            if item.get(key) is not None:
+                document[key] = item[key]
         documents.append(document)
         by_url[url] = document
         added += 1

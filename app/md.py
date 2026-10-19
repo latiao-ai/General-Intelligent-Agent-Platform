@@ -20,8 +20,23 @@ _QUOTE = re.compile(r'^\s*>\s?(.*)$')
 _HR = re.compile(r'^\s*([-*_])\1{2,}\s*$')
 
 
-def _inline(text: str) -> str:
-    """行内语法。输入是**已转义**的文本，这里只插入标签。"""
+# Markdown 允许用反斜杠转义标点。DeepSeek 的 fetch 返回里大量出现这种转义
+# （如 `\# 1\. Overview`），不还原就会在页面上显示成一堆 `\#`。
+_ESCAPABLE = '\\`*_{}[]()#+-.!>'
+_PLACEHOLDER = '\ue000'          # 私有区字符，正文里不会出现
+
+
+def _inline(raw: str) -> str:
+    """行内语法。输入是**原始文本**，内部先保护转义、再 HTML 转义、最后插标签。"""
+    stash = []
+
+    def protect(match):
+        stash.append(match.group(1))
+        return f'{_PLACEHOLDER}{len(stash) - 1}{_PLACEHOLDER}'
+
+    protected = re.sub(rf'\\([{re.escape(_ESCAPABLE)}])', protect, raw)
+    text = html.escape(protected)
+
     # 行内代码优先，避免里面的 * _ 被当成强调
     parts = re.split(r'(`[^`]+`)', text)
 
@@ -39,7 +54,11 @@ def _inline(text: str) -> str:
             out.append(f'<code>{seg[1:-1]}</code>')
         else:
             out.append(rest(seg))
-    return ''.join(out)
+    merged = ''.join(out)
+    for index, char in enumerate(stash):
+        merged = merged.replace(f'{_PLACEHOLDER}{index}{_PLACEHOLDER}',
+                                html.escape(char))
+    return merged
 
 
 def to_html(text: str) -> str:
@@ -87,7 +106,7 @@ def to_html(text: str) -> str:
                     m = pattern.match(lines[i])
                     if not m:
                         break
-                    items.append(f'<li>{_inline(html.escape(m.group(1).strip()))}</li>')
+                    items.append(f'<li>{_inline(m.group(1).strip())}</li>')
                     i += 1
                 out.append(f'<{tag}>' + ''.join(items) + f'</{tag}>')
                 break
@@ -98,7 +117,7 @@ def to_html(text: str) -> str:
                     m = _QUOTE.match(lines[i])
                     if not m:
                         break
-                    block.append(_inline(html.escape(m.group(1).strip())))
+                    block.append(_inline(m.group(1).strip()))
                     i += 1
                 out.append('<blockquote>' + '<br>'.join(block) + '</blockquote>')
                 continue
@@ -109,7 +128,7 @@ def to_html(text: str) -> str:
                     and not _HEADING.match(lines[i]) and not _FENCE.match(lines[i]) \
                     and not _ULIST.match(lines[i]) and not _OLIST.match(lines[i]) \
                     and not _QUOTE.match(lines[i]) and not _HR.match(lines[i]):
-                para.append(_inline(html.escape(lines[i].strip())))
+                para.append(_inline(lines[i].strip()))
                 i += 1
             out.append('<p>' + '<br>'.join(para) + '</p>')
     return '\n'.join(out)

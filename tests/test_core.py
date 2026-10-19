@@ -169,6 +169,14 @@ class MarkdownRenderTests(unittest.TestCase):
         self.assertIn('language-py', out)
         self.assertIn('print(1)', out)
 
+    def test_handles_backslash_escapes(self):
+        """DeepSeek 的 fetch 返回大量反斜杠转义，必须还原成字面字符。"""
+        from app import md
+        out = md.to_html(r'\# 1\. Overview 与 \*字面星号\*')
+        self.assertIn('# 1. Overview', out)
+        self.assertIn('*字面星号*', out)
+        self.assertNotIn('\\#', out)
+
     def test_escapes_untrusted_html(self):
         """来源是任意网页，正文必须先转义——否则我们等于在替它执行脚本。"""
         from app import md
@@ -182,10 +190,24 @@ class MarkdownRenderTests(unittest.TestCase):
 class SearchBackendTests(unittest.IsolatedAsyncioTestCase):
     """检索后端可切换：默认 Tavily，DeepSeek 官方接口归一化成同一形状。"""
 
-    def test_default_provider_is_tavily(self):
+    def test_provider_switch_and_readiness(self):
+        """后端由 SEARCH_PROVIDER 决定；缺 key 时要能明确报出缺哪个。
+
+        断言不依赖当前 .env 的取值——本机可能已经切成 deepseek。
+        """
         from app import search
-        self.assertEqual(search.provider(), 'tavily')
-        self.assertTrue(search.provider_ready()[0])
+        with patch.object(search, 'settings', SimpleNamespace(
+                search_provider='tavily', tavily_key='tvly-x')):
+            self.assertEqual(search.provider(), 'tavily')
+            self.assertTrue(search.provider_ready()[0])
+        with patch.object(search, 'settings', SimpleNamespace(
+                search_provider='deepseek', deepseek_api_key='')):
+            ok, why = search.provider_ready()
+            self.assertFalse(ok)
+            self.assertIn('DEEPSEEK_API_KEY', why)
+        with patch.object(search, 'settings', SimpleNamespace(
+                search_provider='deepseek', deepseek_api_key='sk-x')):
+            self.assertTrue(search.provider_ready()[0])
 
     async def test_deepseek_search_normalises_payload(self):
         from app import search
