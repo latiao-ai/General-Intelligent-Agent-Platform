@@ -18,6 +18,7 @@ STAGE_LABELS = {
     'compose_report': '整理报告',
     'render_html': '渲染 HTML',
     'deploy_site': '部署站点',
+    'answer_with_sources': '联网作答',
     'answer_directly': '直接回答',
     'manual_deploy': '手动部署',
     # 合成阶段：从服务端收到指令，到规划完成、真正开始调用工具之间的空档。

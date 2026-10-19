@@ -41,6 +41,7 @@ h1{font-size:20px;margin:0 0 4px}
 .msg.user{justify-content:flex-end}
 .msg.user .bubble{background:var(--user)}
 .msg.assistant .bubble{background:var(--card);border:1px solid var(--line)}
+.msg.assistant .bubble a{color:var(--accent);word-break:break-all}
 #process .row{display:flex;gap:8px;align-items:flex-start;padding:3px 0;
                overflow-wrap:anywhere}
 #process .ico{flex:0 0 18px;text-align:center}
@@ -141,12 +142,20 @@ const S = { sessionId: null, taskId: null, artifactId: null, es: null,
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
-  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}));
+
+// 助手回答里常有来源链接（联网作答会附「参考来源」）。
+// 先整体转义、再把裸 URL 包成 <a>，这样既点得动又不会被注入 HTML。
+function linkify(text) {
+  return esc(text).replace(/(https?:\/\/[^\s<）)】」>"']+)/g,
+    url => `<a href="${url}" target="_blank" rel="noreferrer">${url}</a>`);
+}
 
 function addMessage(role, text) {
   const el = document.createElement('div');
   el.className = 'msg ' + role;
-  el.innerHTML = `<div class="bubble">${esc(text)}</div>`;
+  const body = role === 'assistant' ? linkify(text) : esc(text);
+  el.innerHTML = `<div class="bubble">${body}</div>`;
   $('messages').appendChild(el);
   el.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
@@ -593,7 +602,8 @@ function openStream(taskId) {
     if (ev.type === 'status') {
       if (ev.detail) {
         if (S.streamBubble) {
-          S.streamBubble.textContent = ev.detail;
+          // 流式时是纯文本（追加成本低），定稿再重绘一次，把来源变成可点链接
+          S.streamBubble.innerHTML = linkify(ev.detail);
           S.streamBubble = null;
         } else {
           addMessage('assistant', ev.detail);

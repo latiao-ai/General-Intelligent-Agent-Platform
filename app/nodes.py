@@ -26,14 +26,17 @@ PLANNER_SYSTEM = (
     '你是任务编排器。阅读用户要求与可用工具，输出一个**按顺序执行**的步骤计划。'
     '规则：'
     '① 只能使用工具清单里出现过的名字，不要编造；args 必须符合该工具的参数 schema。'
-    '② 需要外部或实时事实（最新、价格、版本、新闻）、要求调研/整理/对比/写报告时：'
-    '先 web_search（用户已给 URL 就直接 fetch_pages），再 fetch_pages 补正文，'
-    '然后 compose_report，最后 render_html。'
-    '③ 只有用户明确要求发布到服务器/要访问地址时，才在最后加 deploy_site；'
+    '② 需要外部或实时事实（最新、价格、版本、新闻）或用户要求调研时，先检索：'
+    'web_search（用户已给 URL 就直接 fetch_pages），需要正文再用 fetch_pages 补抓。'
+    '③ 检索完怎么收尾，取决于用户要的成果形态：'
+    '只想"问个明白"（问怎么做/是什么/哪个好，但没有要文件）→ answer_with_sources，'
+    '在聊天里带来源作答，不要为这种需求生成 HTML；'
+    '明确要报告/HTML/文档/页面 → compose_report → render_html。'
+    '④ 寒暄、确认、纯常识问答（如"什么是 ACID"）不需要检索：只用 answer_directly。'
+    '⑤ 只有用户明确要求发布到服务器/要访问地址时，才在最后加 deploy_site；'
     '若"部署"只是报告的研究主题（如"数据库的部署方式"），不要加。'
-    '④ 寒暄、确认、一般性知识问答（如"什么是 ACID"）只需 answer_directly 一步。'
-    '⑤ 最多 8 步；不要重复完全相同的调用；拿不准就少走一步，别硬凑。'
-    '⑥ 若提供了对话历史，本轮要求可能是对上一轮的补充或修正，要结合上文理解意图。'
+    '⑥ 最多 8 步；不要重复完全相同的调用；步数能少不多。'
+    '⑦ 若提供了对话历史，本轮要求可能是对上一轮的补充或修正，要结合上文理解意图。'
     'profile_updates：若用户透露了需要记住的个人信息（姓名、电话、邮箱、职业、'
     '偏好、习惯等），以键值对填进去，键用中文（如"电话"）；没有就留空 {}。'
     '只记用户明确说出的，不要推断、不要编造。'
@@ -48,10 +51,13 @@ def _catalog_text(catalog) -> str:
     return '\n'.join(lines)
 
 
-# 出现这些词才认为"用户要的是一份研究报告"。
-RESEARCH_HINTS = ('报告', '整理', '调研', '研究', '对比', '比较', '分析', '综述',
-                  '总结', '梳理', '查一下', '查下', '搜一下', '搜索', '资料',
-                  '汇总', '评估', '盘点')
+# 出现这些词才认为"用户要的是一份文档/报告"。
+REPORT_HINTS = ('报告', '文档', 'html', '网页', '页面', '白皮书', '综述',
+                '总结', '整理成', '生成一份', '写一份', '出一份')
+# 出现这些词说明"需要联网查一下"，但未必需要文档。
+RESEARCH_HINTS = REPORT_HINTS + ('整理', '调研', '研究', '对比', '比较', '分析',
+                                 '梳理', '查一下', '查下', '查询', '搜一下', '搜索',
+                                 '资料', '汇总', '评估', '盘点', '如何', '怎么', '怎样')
 
 
 def fallback_steps(state: dict) -> list[dict]:
@@ -63,17 +69,26 @@ def fallback_steps(state: dict) -> list[dict]:
     """
     text = state.get('user_input') or ''
     urls = urls_from_input(text)
+    wants_report = any(hint in text.lower() for hint in REPORT_HINTS)
+    needs_lookup = wants_report or any(hint in text for hint in RESEARCH_HINTS)
+
     if urls:
         first = {'tool': 'fetch_pages', 'args': {'urls': urls}, 'why': '用户直接给了链接'}
-    elif any(hint in text for hint in RESEARCH_HINTS):
+    elif needs_lookup:
         first = {'tool': 'web_search', 'args': {'query': text}, 'why': '需要外部资料'}
     else:
         return [{'tool': 'answer_directly', 'args': {'question': text},
-                 'why': '不像研究请求，直接回答'}]
-    return [first,
-            {'tool': 'fetch_pages', 'args': {}, 'why': '补齐正文'},
-            {'tool': 'compose_report', 'args': {'topic': text}, 'why': '整理成报告'},
-            {'tool': 'render_html', 'args': {}, 'why': '产出 HTML'}]
+                 'why': '不像需要联网的问题，直接回答'}]
+
+    tail = ([{'tool': 'compose_report', 'args': {'topic': text}, 'why': '整理成报告'},
+             {'tool': 'render_html', 'args': {}, 'why': '产出 HTML'}]
+            if wants_report else
+            [{'tool': 'answer_with_sources', 'args': {'question': text},
+              'why': '在聊天里带来源作答'}])
+    steps = [first]
+    if first['tool'] != 'fetch_pages':      # 避免连着两步抓同一个东西
+        steps.append({'tool': 'fetch_pages', 'args': {}, 'why': '补齐正文'})
+    return steps + tail
 
 
 def describe_plan(steps: list[dict], summary: str = '') -> str:

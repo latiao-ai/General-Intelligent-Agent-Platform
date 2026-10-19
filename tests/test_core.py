@@ -118,6 +118,20 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue({s['tool'] for s in with_url} <= known)
         self.assertTrue({s['tool'] for s in research} <= known)
 
+    def test_fallback_ladder_matches_requested_output(self):
+        """兜底要分清"问个明白"和"要一份文档"，两者的收尾工具不同。"""
+        from app import nodes
+        ask = nodes.fallback_steps({'user_input': '查询如何降低体脂'})
+        self.assertEqual([s['tool'] for s in ask],
+                         ['web_search', 'fetch_pages', 'answer_with_sources'])
+        report = nodes.fallback_steps({'user_input': '生成一份降低体脂的 HTML 报告'})
+        self.assertEqual([s['tool'] for s in report],
+                         ['web_search', 'fetch_pages', 'compose_report', 'render_html'])
+        # 已经给了链接就别再重复抓一次
+        link = nodes.fallback_steps({'user_input': '看看 https://example.com/a 说了什么'})
+        self.assertEqual([s['tool'] for s in link],
+                         ['fetch_pages', 'answer_with_sources'])
+
     def test_fallback_does_not_research_unrelated_input(self):
         """兜底计划不能一律走检索。
 
@@ -156,6 +170,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         # 工具清单必须真的进了提示词，否则模型只能瞎猜
         self.assertIn('web_search', captured['user'])
         self.assertIn('answer_directly', captured['user'])
+        self.assertIn('answer_with_sources', captured['user'])
 
     async def test_plan_falls_back_when_the_model_fails(self):
         from app import nodes
@@ -1256,6 +1271,66 @@ class SmallTalkFilterTests(unittest.IsolatedAsyncioTestCase):
                 {'user_input': 'hi https://example.com', 'usage': []})
         self.assertTrue(called.get('hit'), '带 URL 时不能跳过规划')
         self.assertEqual(result['plan']['steps'][0]['tool'], 'fetch_pages')
+
+
+class AnswerWithSourcesTests(unittest.IsolatedAsyncioTestCase):
+    """联网作答：基于正文回答并附来源，这是"直答"与"出报告"之间的那条路。"""
+
+    DOCS = [
+        {'source_id': 's1', 'title': '甲文', 'url': 'https://a.example/1',
+         'status': 'success', 'raw_content': '正文一'},
+        {'source_id': 's2', 'title': '乙文', 'url': 'https://b.example/2',
+         'status': 'success', 'raw_content': '正文二'},
+    ]
+
+    async def test_refuses_without_sources(self):
+        from app import tools as tool_module
+        with self.assertRaises(tool_module.ToolError):
+            await tool_module._answer_with_sources(
+                {'question': 'q'}, {'documents': [], 'usage': []})
+
+    async def test_lists_only_cited_sources(self):
+        from app import tools as tool_module
+
+        async def fake_chat(system, messages, model=None, on_delta=None):
+            return '结论一 [s1]。'
+
+        with patch.object(tool_module, 'chat_reply', fake_chat):
+            result = await tool_module._answer_with_sources(
+                {'question': '问题'}, {'documents': self.DOCS, 'usage': []})
+        self.assertEqual(result['status'], 'answered')
+        self.assertIn('参考来源', result['answer'])
+        self.assertIn('https://a.example/1', result['answer'])
+        # 没被引用的来源不该混进来
+        self.assertNotIn('https://b.example/2', result['answer'])
+
+    async def test_lists_all_when_model_cites_nothing(self):
+        from app import tools as tool_module
+
+        async def fake_chat(system, messages, model=None, on_delta=None):
+            return '一句没有任何标注的结论。'
+
+        with patch.object(tool_module, 'chat_reply', fake_chat):
+            result = await tool_module._answer_with_sources(
+                {'question': '问题'}, {'documents': self.DOCS, 'usage': []})
+        # 一条都没标注时退回全列，别让"附来源"变成空话
+        self.assertIn('https://a.example/1', result['answer'])
+        self.assertIn('https://b.example/2', result['answer'])
+
+    async def test_streams_answer_deltas(self):
+        from app import tools as tool_module
+        seen = []
+
+        async def fake_chat(system, messages, model=None, on_delta=None):
+            if on_delta:
+                on_delta('增量')
+            return '增量'
+
+        with patch.object(tool_module, 'chat_reply', fake_chat), \
+                patch.object(tool_module, 'emit', seen.append):
+            await tool_module._answer_with_sources(
+                {'question': '问题'}, {'documents': self.DOCS, 'usage': []})
+        self.assertTrue(any(e.get('type') == 'answer_delta' for e in seen))
 
 
 class AnswerToolTests(unittest.IsolatedAsyncioTestCase):

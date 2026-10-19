@@ -280,6 +280,49 @@ async def _answer_directly(args: dict, state: dict) -> dict:
     return {'answer': answer, 'status': 'answered'}
 
 
+ANSWER_WITH_SOURCES_SYSTEM = (
+    '你是一个严谨的中文研究助手。只依据给定资料回答用户问题，不得使用资料之外的事实。'
+    '关键结论后面用 [s1]、[s2] 这样的编号标注它来自哪条资料，可一句多条。'
+    '资料不足以回答的部分要明确说明；资料互相冲突时把差异讲出来，不要强行统一。'
+    '输出用自然的段落或短列表，不要写"根据资料"这类空话。'
+)
+
+
+def _source_line(doc: dict) -> str:
+    return f'[{doc["source_id"]}] {doc.get("title") or doc["url"]} — {doc["url"]}'
+
+
+async def _answer_with_sources(args: dict, state: dict) -> dict:
+    """联网检索后在聊天里作答，并附上来源。
+
+    这是"直接回答"和"出一份 HTML 报告"之间的那条路：用户只想问个明白、
+    不想为了一份文档等上一分钟。
+    """
+    question = str(args.get('question') or state.get('user_input') or '')
+    selected, _ = _select_sources(state)
+    if not selected:
+        raise ToolError('还没有可用正文，请先调用 web_search 或 fetch_pages')
+    by_id = {d['source_id']: d for d in state.get('documents', [])
+             if d.get('source_id')}
+    emit(action('正在依据资料作答',
+                f'{len(selected)} 个来源 · {sum(len(s["text"]) for s in selected)} 字符',
+                '📝'))
+    material = '\n\n'.join(
+        f'[{item["source_id"]}] {item["title"]}\n{item["text"]}' for item in selected)
+    messages = [{'role': 'user',
+                 'content': f'问题：{question}\n\n资料：\n{material}'}]
+    body = await chat_reply(
+        profile.with_profile(ANSWER_WITH_SOURCES_SYSTEM), messages,
+        on_delta=lambda text: emit(answer_delta(text)))
+
+    # 只列真正被引用的来源；一条都没引用时退回全部，免得"附来源"变成空话。
+    cited = [item for item in selected
+             if f'[{item["source_id"]}]' in body] or selected
+    lines = [_source_line(by_id.get(item['source_id'], item)) for item in cited]
+    answer = body.rstrip() + '\n\n参考来源：\n' + '\n'.join(f'- {line}' for line in lines)
+    return {'answer': answer, 'status': 'answered'}
+
+
 BUILTIN_TOOLS = [
     Tool('web_search', '检索来源',
          '联网搜索，把命中的网页登记为来源（含摘要，部分自带正文）。需要外部/实时事实时先调它。',
@@ -305,8 +348,14 @@ BUILTIN_TOOLS = [
          '把当前 HTML 产物部署到服务器并返回访问地址。必须在 render_html 之后、'
          '且用户明确要求发布时调用。',
          {'type': 'object', 'properties': {}}, _deploy_site),
+    Tool('answer_with_sources', '联网作答',
+         '基于已检索到的正文在聊天里回答问题，并附来源链接。用户想"问个明白"但没要'
+         '文档时用它；必须在 web_search / fetch_pages 之后调用。',
+         {'type': 'object', 'properties': {'question': {'type': 'string'}}},
+         _answer_with_sources),
     Tool('answer_directly', '直接回答',
-         '不联网、不出报告，直接用已有知识回答。寒暄、确认、一般性知识问答用它。',
+         '不联网、不出报告，直接用已有知识回答。寒暄、确认、一般性知识问答用它。'
+         '若问题需要外部事实而你又没检索过，应该用 web_search 而不是它。',
          {'type': 'object', 'properties': {'question': {'type': 'string'}}},
          _answer_directly),
 ]
