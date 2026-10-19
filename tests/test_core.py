@@ -1243,6 +1243,21 @@ class ProfileTests(unittest.TestCase):
         profile.clear()
         self.assertEqual(profile.with_profile('指令ABC'), '指令ABC')
 
+    def test_merge_reports_only_real_changes(self):
+        """merge 只返回变化量，调用方才能区分"学到新的"和"把已有的抄一遍"。"""
+        from app import profile
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'USER.md'
+            with patch.object(profile, 'settings', SimpleNamespace(profile_path=path)):
+                profile.merge({'身高': '173cm', '体重': '50kg'})
+                # 原样重复：什么都没变
+                self.assertEqual(profile.merge({'身高': '173cm'}), {})
+                # 一部分变化：只报变化的那部分
+                changed = profile.merge({'身高': '173cm', '体重': '52kg',
+                                         '新项': 'x'})
+                self.assertEqual(changed, {'体重': '52kg', '新项': 'x'})
+                self.assertEqual(profile.load()['身高'], '173cm')
+
     def test_clear(self):
         from app import profile
         profile.merge({'x': 'y'})

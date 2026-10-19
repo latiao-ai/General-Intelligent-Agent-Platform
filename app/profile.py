@@ -89,13 +89,21 @@ def save(facts: dict) -> int:
 
 
 def merge(updates: dict) -> dict:
-    """把新事实合并进画像，返回合并后的完整事实。空更新是 no-op。"""
+    """把新事实合并进画像，返回**真正发生变化**的那些条目。
+
+    只返回变化量，是为了让调用方能区分"学到了新东西"和"模型把已有事实又抄了一遍"。
+    后者曾导致每轮都弹一次「已记住」——用户明明没说过那些话，界面却像刚记住。
+    """
     if not updates:
-        return load()
+        return {}
     facts = load()
-    facts.update(updates)
+    changed = {key: value for key, value in updates.items()
+               if facts.get(key) != value}
+    if not changed:
+        return {}
+    facts.update(changed)
     save(facts)
-    return facts
+    return changed
 
 
 def clear() -> None:

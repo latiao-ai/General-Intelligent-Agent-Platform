@@ -43,8 +43,10 @@ PLANNER_SYSTEM = (
     '绝不能拿操作前的过滤结果或操作返回体去推断。'
     '⑦ 最多 8 步；不要重复完全相同的调用；步数能少不多。'
     '⑧ 若提供了对话历史，本轮要求可能是对上一轮的补充或修正，要结合上文理解意图。'
-    'profile_updates：若用户透露了需要记住的个人信息（姓名、电话、邮箱、职业、'
-    '偏好、习惯等），以键值对填进去，键用中文（如"电话"）；没有就留空 {}。'
+    'profile_updates：只填**本轮用户新说出、且画像里还没有（或已变化）**的个人信息'
+    '（姓名、电话、邮箱、职业、偏好、习惯等），键用中文（如"电话"）。'
+    '系统提示末端的「[用户画像]」段里已经出现过的事实，一律不要再填一遍——'
+    '重复上报会让界面误报"已记住"。没有新信息就留空 {}}。'
     '只记用户明确说出的，不要推断、不要编造。'
 )
 
@@ -176,9 +178,11 @@ async def plan(state):
         steps = _valid_steps(fallback_steps(state), catalog)
         summary = summary or '默认计划'
 
-    if updates:
-        profile.merge(updates)
-        emit(action('已记住', profile.describe(updates), '🧠'))
+    # 只播报真正新增/变化的事实：模型常把画像里已有的事实再抄一遍，
+    # 若无条件播报，用户会看到"已记住"一条自己本轮根本没说过的话。
+    changed = profile.merge(updates)
+    if changed:
+        emit(action('已记住', profile.describe(changed), '🧠'))
     emit(thought(describe_plan(steps, summary)))
     result = {'plan': {'steps': steps, 'summary': summary},
               'step_index': 0, 'usage': usage, 'status': 'planned'}
