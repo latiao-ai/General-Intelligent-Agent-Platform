@@ -55,7 +55,10 @@ def sse(event: dict) -> str:
 
 @app.get('/', response_class=HTMLResponse)
 async def index():
-    return (WEB_DIR / 'index.html').read_text(encoding='utf-8')
+    # 页面是内联 JS 的单文件，一旦被浏览器缓存就会出现"代码改了但界面还是旧的"，
+    # 排查时极易被误导。这里明确不缓存。
+    return HTMLResponse((WEB_DIR / 'index.html').read_text(encoding='utf-8'),
+                        headers={'Cache-Control': 'no-store, must-revalidate'})
 
 
 @app.post('/api/tasks')

@@ -59,7 +59,7 @@ async def _web_search(args: dict, state: dict) -> dict:
     errors = list(state.get('errors', []))
     usage = list(state.get('usage', []))
     by_url = {d['url']: d for d in documents}
-    emit(action('已搜索网页', query, '🌐'))
+    emit(action(f'已搜索网页（{search_backend.PROVIDER} 官方 API）', query, '🌐'))
     try:
         response = await search_backend.search(query)
     except Exception as exc:
