@@ -1285,6 +1285,71 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(hub.pause('r1'))
 
 
+class PolicyTests(unittest.TestCase):
+    """身份与权限缝：单用户恒通过，跨用户必须被挡住。"""
+
+    def test_same_owner_passes(self):
+        from app import policies
+        principal = policies.Principal(tenant_id='t1', user_id='u1')
+        resource = {'tenant_id': 't1', 'owner_user_id': 'u1'}
+        self.assertEqual(policies.ensure_owner(resource, principal, '运行'),
+                         resource)
+
+    def test_cross_tenant_is_hidden_as_not_found(self):
+        from app import policies
+        from fastapi import HTTPException
+        principal = policies.Principal(tenant_id='t1', user_id='u1')
+        other = {'tenant_id': 't2', 'owner_user_id': 'u1'}
+        with self.assertRaises(HTTPException) as ctx:
+            policies.ensure_owner(other, principal, '运行')
+        # 不泄漏"存在但无权"，统一按不存在处理
+        self.assertEqual(ctx.exception.status_code, 404)
+
+    def test_anonymous_default_principal_is_permissive(self):
+        from app import policies
+        principal = policies.Principal()
+        self.assertTrue(principal.anonymous)
+        resource = {'tenant_id': 'default', 'owner_user_id': 'default'}
+        self.assertEqual(policies.ensure_owner(resource, principal), resource)
+
+
+class WorkerTests(unittest.IsolatedAsyncioTestCase):
+    """独立 Worker：领取租约、消费 outbox。"""
+
+    def hub(self):
+        from app.api_hub import Hub
+        from app.store import Store
+        return Hub(Store(':memory:'))
+
+    async def test_worker_claims_and_reports_nothing_to_do(self):
+        from scripts.run_worker import run_once
+        hub = self.hub()
+        self.assertFalse(await run_once(hub, 'w1'))
+
+    def test_jobs_drain_is_idempotent(self):
+        from scripts.run_worker import drain_jobs
+        hub = self.hub()
+        hub.store.enqueue_job('j1', 'session_summary', 's1:r1',
+                              {'session_id': 's1'})
+        hub.store.enqueue_job('j2', 'session_summary', 's1:r1',
+                              {'session_id': 's1'})
+        done = drain_jobs(hub, 'w1')
+        self.assertEqual(done, 1)       # 去重键相同，只有一个作业
+        self.assertEqual(drain_jobs(hub, 'w1'), 0)
+
+
+class PostgresMigrationTests(unittest.TestCase):
+    """迁移脚本：DDL 翻译正确（**未在真实 PostgreSQL 上验证**）。"""
+
+    def test_ddl_translation(self):
+        from app.store import SCHEMA
+        from scripts.migrate_to_postgres import to_postgres_ddl
+        ddl = to_postgres_ddl(SCHEMA)
+        self.assertIn('BIGSERIAL PRIMARY KEY', ddl)
+        self.assertIn('DOUBLE PRECISION', ddl)
+        self.assertNotIn('AUTOINCREMENT', ddl)
+
+
 class ApiTests(unittest.TestCase):
     """HTTP 接口与 SSE 端点。"""
 

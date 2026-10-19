@@ -344,6 +344,11 @@ class Hub:
                                            status='succeeded')
         self.store.update_run(record.run_id, status=run_status,
                               plan_version=1 if steps else 0)
+        # outbox：业务事件与派生作业在同一处写入，消费者按 dedupe_key 幂等
+        self.store.enqueue_job(
+            uuid.uuid4().hex[:12], 'session_summary',
+            f"{record.session_id}:{record.run_id}",
+            {'session_id': record.session_id})
 
     def pause(self, run_id: str) -> bool:
         """请求暂停：只停止派发新动作，在途动作尽量收结果（文档 §8.4）。"""

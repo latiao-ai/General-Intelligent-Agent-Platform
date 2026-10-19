@@ -13,11 +13,11 @@ import asyncio
 import json
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from app import memory as memory_module, profile
+from app import memory as memory_module, policies, profile
 from app.store import now
 from app.api_hub import CLOSE, Hub
 from app.config import settings
@@ -88,19 +88,30 @@ async def cancel_task(task_id: str):
 
 
 @app.get('/api/tasks/{task_id}/events')
-async def task_events(task_id: str):
+async def task_events(task_id: str, request: Request,
+                      after: str | None = Query(default=None)):
     record = hub.get(task_id)
     if record is None:
         raise HTTPException(status_code=404, detail='任务不存在')
 
+    # 游标：优先用 Last-Event-ID 头，其次 ?after=，从最后确认的 seq 之后补发
+    cursor = request.headers.get('last-event-id') or after or '0'
+
     async def stream():
         queue, history = record.subscribe()
-        last_seq = 0
+        try:
+            last_seq = int(cursor)
+        except (TypeError, ValueError):
+            last_seq = 0
         try:
             # 先补发库里已有的事件：晚连上来、甚至服务重启后再连，都能看到完整过程。
             for seq, event in history:
-                last_seq = seq
-                yield sse(event)
+                if seq is not None and seq <= last_seq:
+                    continue          # 断线前已收到过的，不重复推
+                if seq is not None:
+                    last_seq = seq
+                # 带 id: 让标准 EventSource 记住 Last-Event-ID
+                yield (f'id: {last_seq}\n' if seq is not None else '') + sse(event)
             if record.done:
                 yield sse({'type': 'end', 'status': record.status})
                 return
@@ -124,7 +135,7 @@ async def task_events(task_id: str):
                         continue
                     last_seq = seq
                 # seq 为 None 的是不落库的过程事件（如 draft），始终透传
-                yield sse(event)
+                yield (f'id: {last_seq}\n' if seq is not None else '') + sse(event)
         finally:
             record.unsubscribe(queue)
 
@@ -180,11 +191,10 @@ async def artifact(task_id: str):
 
 
 @app.get('/api/runs/{run_id}')
-async def read_run(run_id: str):
+async def read_run(run_id: str,
+                    principal=Depends(policies.current_principal)):
     """run 的状态、计划与步骤（文档 §13）。"""
-    run = hub.store.run(run_id)
-    if run is None:
-        raise HTTPException(status_code=404, detail='运行不存在')
+    run = policies.ensure_owner(hub.store.run(run_id), principal, '运行')
     plan = hub.store.plan(run_id) or {}
     return {'run': run, 'plan': plan,
             'steps': hub.store.steps_of(run_id),
