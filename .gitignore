@@ -17,3 +17,5 @@ agent.db-shm
 profile/
 
 .conda-home/
+
+.conda-home/
