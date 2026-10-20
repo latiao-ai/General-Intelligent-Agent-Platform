@@ -264,9 +264,15 @@ user       我只要其中关于限制和不足的部分
 {"type":"action","icon":"🌐","label":"已搜索网页","detail":"SQLite 适用场景 应用场景"}
 {"type":"stage_end","stage":"render_sources_html","label":"资料转 HTML","seconds":0.02,"status":"rendered"}
 {"type":"result","public_url":"http://…/sites/xxx/"}              // 手动部署后
-{"type":"status","status":"local_ready","detail":"报告已生成…"}   // 终态，带助手回执
-{"type":"end","status":"local_ready"}
+{"type":"status","status":"local_ready","run_status":"succeeded",
+ "outcome":{"kind":"artifact","produced":[…],"effects":[…]},
+ "detail":"页面已生成…"}
+{"type":"end","status":"local_ready","run_status":"succeeded","outcome":{…}}
 ```
+
+`status` 是**展示标签**（`answered` / `local_ready` / `deployed` / `failed` …），
+给人和前端看；`run_status` 是状态机里的**通用**值（`succeeded` / `needs_reconcile`
+/ `failed` …）。判断流程用 `run_status`，别拿 `status` 做分支——理由见下一节。
 
 晚连上来的客户端会**先补发历史事件**再续推实时事件（订阅与快照在同一同步块内完成，
 不漏也不重）。整理/检索阶段可能静默较久，因此服务端每 15 秒发一次 `{"type":"ping"}` 心跳
@@ -398,7 +404,31 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
   工具名变成 `mcp__<server_id>__<tool>`；只有一个服务端时保持 `mcp__<tool>`，
   旧计划仍可用（`find_tool` 会按尾部唯一匹配回退）。
 
-## 4. 部署行为
+## 4. 状态、outcome 与展示标签
+
+三层分工（实现见 `app/outcome.py`）：
+
+| 层 | 存在哪 | 词汇 | 会不会随能力增长 |
+|---|---|---|---|
+| 状态机 | `tasks.status` / `runs.status` | 11 个通用值：`queued` `running` `reconciling` `waiting_input` `waiting_approval` `succeeded` `partially_succeeded` `needs_reconcile` `failed` `cancelled` `interrupted` | **不会**。接第 N 个 MCP Server 只让 `tool_key` 的行数变多 |
+| outcome | `state.outcome`（随任务持久化、随接口返回） | `{kind, produced[], effects[], answered, unverified}` | 会。它是数据，可以有无穷多种组合 |
+| 展示标签 | 接口字段 `status` / 前端文案表 | `answered` `local_ready` `deployed` `deploy_needs_check` `compensated` … | 会，而且随便加——它不进状态机、不写库 |
+
+规矩只有一条：**要加展示词就改 `app/outcome.py:label()` 和前端文案表，不要往
+`tasks.status` / `runs.status` 里加业务值。** `StatusVocabularyTests` 把这条钉住了
+（加一个业务终态会先让那组用例红）。
+
+历史数据用一次性的迁移脚本收口（幂等，可重复跑）：
+
+```bash
+python -m scripts.migrate_status_vocabulary            # 只报告
+python -m scripts.migrate_status_vocabulary --apply    # 写库
+```
+
+读取端也留了兜底：库里若还有旧的业务终态（比如从旧备份恢复），
+`outcome.normalize_status()` 会归一后再用，不会把 `local_ready` 当成一个新状态。
+
+## 5. 部署行为
 
 ```
 DEPLOY_ENABLED=false            → 清单里没有 deploy_site（连占位都没有）
@@ -425,7 +455,7 @@ python -m scripts.retry_deploy <task_id> --server-state-checked
 python -m scripts.list_mcp_tools
 ```
 
-## 5. 耗时统计
+## 6. 耗时统计
 
 每个节点的耗时写入 `state.json` 的 `timings` 与 `elapsed_seconds`（CLI 打印汇总表），
 节点包装层同时发出 `stage_start` / `stage_end` 事件供界面实时累加。
@@ -458,12 +488,21 @@ python -m scripts.list_mcp_tools
 代理/CONNECT 不可用时，**所有模型与检索调用**会报 `APIConnectionError` /
 `ConnectError`。DeepSeek 官方接口与 MCP 服务端都走网络，排查时先用 `curl` 直连确认。
 
-## 6. 测试
+## 7. 测试
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-覆盖：URL 安全校验、引用存在性、表格列数、HTML 自动转义、补搜上限、无来源禁止部署、
-部署意图门控、结构化输出重试、MCP 参数组装（base64）、阶段事件与实时计时、
-SQLite 存储与重启恢复、任务中枢、HTTP 接口与 SSE 事件流、助手回执文案。
+210 条用例（6 条真实 PostgreSQL 一致性用例需 `PG_TEST_DSN`）。
+
+覆盖：URL 安全校验、引用存在性、HTML 自动转义、无正文禁止导出、部署闸门与回执归一、
+结构化输出重试、MCP 参数组装（base64）、多服务端路由与失败隔离、阶段事件与实时计时、
+SQLite 存储与重启恢复、任务中枢、HTTP 接口与 SSE 事件流、助手回执文案、
+**状态机词汇封闭 / outcome 记录 / 展示标签派生 / 历史数据迁移**。
+
+```bash
+# 真实 PostgreSQL 一致性（DSN 必须指向一次性测试库）
+PG_TEST_DSN=postgresql://…/agent_platform_test \
+  python -m unittest tests.test_core.PostgresParityTests
+```

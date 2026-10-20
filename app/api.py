@@ -19,7 +19,8 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from app import idempotency, memory as memory_module, policies, profile
+from app import idempotency, memory as memory_module, outcome as outcome_module
+from app import policies, profile
 from app import tools as tool_module
 from app.api_hub import CLOSE, Hub
 from app.config import settings
@@ -185,8 +186,10 @@ async def create_task(payload: TaskRequest, request: Request,
 
 def _start_task(payload: TaskRequest, principal) -> dict:
     record = hub.start(payload.message, payload.session_id, principal)
+    # status 是展示标签（旧字段名不变），run_status 才是状态机里的通用状态
     return {'task_id': record.task_id, 'session_id': record.session_id,
-            'run_id': record.run_id, 'status': record.status}
+            'run_id': record.run_id,
+            **outcome_module.view(record.status, record.state or {})}
 
 
 @app.get('/api/tasks/{task_id}')
@@ -230,7 +233,8 @@ async def task_events(task_id: str, request: Request,
                 # 带 id: 让标准 EventSource 记住 Last-Event-ID
                 yield (f'id: {last_seq}\n' if seq is not None else '') + sse(event)
             if record.done:
-                yield sse({'type': 'end', 'status': record.status})
+                yield sse({'type': 'end',
+                           **outcome_module.view(record.status, record.state or {})})
                 return
             while True:
                 try:
@@ -243,7 +247,9 @@ async def task_events(task_id: str, request: Request,
                     yield sse({'type': 'ping'})
                     continue
                 if item is CLOSE:
-                    yield sse({'type': 'end', 'status': record.status})
+                    yield sse({'type': 'end', 'status': outcome_module.label(
+                        record.status, record.state or {}),
+                        'run_status': outcome_module.normalize_status(record.status)})
                     return
                 seq, event = item
                 if seq is not None:

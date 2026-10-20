@@ -454,16 +454,37 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 2}), 'end')
         self.assertEqual(nodes.next_step({}), 'end')
 
-    def test_final_status_maps_internal_states(self):
-        from app import nodes
-        self.assertEqual(nodes.final_status({'answer': 'hi'}), 'answered')
+    def test_final_status_is_generic_and_label_is_derived(self):
+        """状态机只存通用状态；answered / local_ready 是**派生**出来的展示标签。"""
+        from app import nodes, outcome
+        self.assertEqual(nodes.final_status({'answer': 'hi'}), 'succeeded')
         self.assertEqual(nodes.final_status(
-            {'deployment': {'status': 'success'}}), 'deployed')
+            {'deployment': {'status': 'success'}}), 'succeeded')
+        # 回执看不懂 ≠ 失败：写请求可能真的成功了
         self.assertEqual(nodes.final_status({'deployment': {'status': 'pending'}}),
-                         'deploy_needs_check')
+                         'needs_reconcile')
         self.assertEqual(nodes.final_status({'artifact': {'html_path': 'x'}}),
-                         'local_ready')
+                         'succeeded')
         self.assertEqual(nodes.final_status({}), 'failed')
+        self.assertEqual(nodes.final_status({'plan': {'kind': 'compensation'}}),
+                         'succeeded')
+        self.assertEqual(nodes.final_status(
+            {'plan': {'kind': 'compensation'}, 'failure': 'boom'}), 'failed')
+
+        self.assertEqual(outcome.label('succeeded', {'answer': 'hi'}), 'answered')
+        self.assertEqual(outcome.label('succeeded',
+                                       {'artifact': {'html_path': 'x'}}),
+                         'local_ready')
+        self.assertEqual(outcome.label('succeeded',
+                                       {'deployment': {'status': 'success'},
+                                        'artifact': {'html_path': 'x'}}),
+                         'deployed')
+        self.assertEqual(outcome.label('needs_reconcile',
+                                       {'deployment': {'status': 'pending'}}),
+                         'deploy_needs_check')
+        # 没有部署的未核实场景用通用词，别硬套部署的说法
+        self.assertEqual(outcome.label('needs_reconcile', {}), 'needs_reconcile')
+        self.assertEqual(outcome.label('failed', {}), 'failed')
 
     def test_valid_steps_reports_unknown_tools(self):
         """未知工具要**回报**而不是静默过滤——计划引用不存在的工具属于规划错误。"""
@@ -1007,7 +1028,7 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
                     patch_all_emits(seen.append):
                 result = await self.tool().run({}, {'artifact': artifact})
 
-            self.assertEqual(result['status'], 'deployed')
+            self.assertEqual(result['status'], 'deployed')   # 阶段小结，不是 run 终态
             self.assertEqual(result['deployment']['public_url'], 'https://x/1')
             self.assertEqual(result['deployment']['deployment_id'], 'site_7')
             self.assertEqual(result['deployment']['content_hash'], 'abc')
@@ -1034,7 +1055,7 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(tool_module.mcp_adapter, 'call_tool', fake_call), \
                     patch_all_emits(seen.append):
                 result = await self.tool().run({}, {'prior_artifact': prior})
-            self.assertEqual(result['status'], 'deployed')
+            self.assertEqual(result['status'], 'deployed')   # 阶段小结，不是 run 终态
             # 必须明确告知复用了上一轮产物，避免误以为这轮重新生成过
             self.assertTrue(any(e.get('label') == '复用上一轮产物' for e in seen))
 
@@ -1052,7 +1073,7 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
                     patch_all_emits(lambda e: None):
                 result = await self.tool().run(
                     {}, {'artifact': {'html_path': str(html), 'sha256': 'a'}})
-            self.assertEqual(result['status'], 'deploy_needs_check')
+            self.assertEqual(result['status'], 'unverified')
             self.assertEqual(result['deployment']['status'], 'needs_check')
             self.assertEqual(result['deployment']['public_url'], '')
 
@@ -1070,7 +1091,7 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deployment['status'], 'success')
         self.assertEqual(deployment['public_url'], payload['url'])
         self.assertEqual(deployment['deployment_id'], 'n6HRJXd8')
-        self.assertEqual(publishing_cap.status_of(deployment), 'deployed')
+        self.assertEqual(publishing_cap.marker_of(deployment), 'deployed')
 
     async def test_remote_failure_surfaces_as_tool_error(self):
         from app import tools as tool_module
@@ -1238,8 +1259,10 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
                           'detail': '测试'})
             if delay:
                 await asyncio.sleep(delay)
-            return {'task_id': 'artifact123', 'status': 'local_ready',
-                    'deployment': {'status': 'skipped'}, 'timings': []}
+            return {'task_id': 'artifact123', 'status': 'succeeded',
+                    'artifact': {'html_path': '/tmp/artifact123/sources.html',
+                                 'kind': 'sources'},
+                    'timings': []}
         return fake_run_task
 
     async def test_start_broadcasts_events_and_records_messages(self):
@@ -1248,7 +1271,9 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(hub_module, 'run_task', self.stub()):
             record = hub.start('测试需求')
             await asyncio.wait_for(record._task, timeout=10)
-        self.assertEqual(record.status, 'local_ready')
+        self.assertEqual(record.status, 'succeeded')            # 通用状态
+        self.assertEqual(record.summary()['status'], 'local_ready')  # 展示标签
+        self.assertEqual(record.summary()['run_status'], 'succeeded')
         self.assertEqual(record.artifact_id, 'artifact123')
         labels = [e.get('label') for e in self.events_of(record)]
         self.assertIn('已搜索网页', labels)
@@ -1256,7 +1281,8 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([m['role'] for m in hub.history(record.session_id)],
                          ['user', 'assistant'])
         # 状态也要落库，重启后才能查询。
-        self.assertEqual(hub.store.task(record.task_id)['status'], 'local_ready')
+        # 落库的是通用状态：状态机词汇不随业务能力增长
+        self.assertEqual(hub.store.task(record.task_id)['status'], 'succeeded')
 
     async def test_late_subscriber_still_gets_history(self):
         import app.api_hub as hub_module
@@ -1285,7 +1311,8 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
             second = Hub(Store(path))
             restored = second.get(record.task_id)
             self.assertIsNotNone(restored)
-            self.assertEqual(restored.status, 'local_ready')
+            self.assertEqual(restored.status, 'succeeded')
+            self.assertEqual(restored.summary()['status'], 'local_ready')
             self.assertFalse(restored.live)
             self.assertFalse(second.cancel(record.task_id))    # 重启后无法取消
             _, history = restored.subscribe()
@@ -1339,8 +1366,10 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
                       'seconds': 1.0, 'status': 'planned'})
             # 这一条到达时，"收到指令"应当被补齐
             on_event({'type': 'stage_start', 'stage': 'web_search'})
-            return {'task_id': 'a1', 'status': 'local_ready',
-                    'deployment': {}, 'timings': []}
+            return {'task_id': 'a1', 'status': 'succeeded',
+                    'artifact': {'html_path': '/tmp/a1/sources.html',
+                                 'kind': 'sources'},
+                    'timings': []}
 
         with patch.object(hub_module, 'run_task', fake):
             record = hub.start('测试')
@@ -1968,8 +1997,10 @@ class ApiTests(unittest.TestCase):
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
                                 prior=None, memory=None, ledger=None, run_id=None, resume_plan=None):
-            return {'task_id': 'a1', 'status': 'local_ready',
-                    'deployment': {}, 'timings': []}
+            return {'task_id': 'a1', 'status': 'succeeded',
+                    'artifact': {'html_path': '/tmp/a1/sources.html',
+                                 'kind': 'sources'},
+                    'timings': []}
 
         with patch.object(hub_module, 'run_task', fake_run_task):
             created = self.client.post('/api/tasks', json={'message': '你好'}).json()
@@ -1993,8 +2024,10 @@ class ApiTests(unittest.TestCase):
                 on_event({'type': 'action', 'icon': '🌐', 'label': '已搜索网页'})
                 on_event({'type': 'stage_end', 'stage': 'compose_report',
                           'label': '整理报告', 'seconds': 2.5, 'status': '完成'})
-            return {'task_id': 'a1', 'status': 'local_ready',
-                    'deployment': {}, 'timings': []}
+            return {'task_id': 'a1', 'status': 'succeeded',
+                    'artifact': {'html_path': '/tmp/a1/sources.html',
+                                 'kind': 'sources'},
+                    'timings': []}
 
         with patch.object(hub_module, 'run_task', fake_run_task):
             created = self.client.post('/api/tasks', json={'message': '查一下'}).json()
@@ -2010,6 +2043,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(data['messages'][0]['content'], '查一下')
         self.assertEqual(len(data['turns']), 1)
         turn = data['turns'][0]
+        # 库里存的是通用状态，回放时按 outcome 派生成展示标签
+        self.assertEqual(turn['run_status'], 'succeeded')
         self.assertEqual(turn['status'], 'local_ready')
         self.assertEqual(turn['message'], '查一下')
         types = [(e['type'], e.get('stage')) for e in turn['events']]
@@ -2189,8 +2224,9 @@ class MessageTests(unittest.TestCase):
 
     def test_reply_for_local_ready_mentions_deploy_option(self):
         from app.messages import reply_text
-        text = reply_text({'status': 'local_ready', 'task_id': 'abc',
-                           'deployment': {'status': 'skipped'}})
+        text = reply_text({'status': 'succeeded', 'task_id': 'abc',
+                           'artifact': {'html_path': '/tmp/a/index.html',
+                                        'kind': 'sources'}})
         self.assertIn('部署', text)
 
     def test_reply_for_failed_is_explainable(self):
@@ -2506,7 +2542,10 @@ class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
             result = await build_graph().ainvoke({
                 'task_id': 'x', 'user_input': '你好', 'documents': [],
                 'errors': [], 'usage': [], 'step_index': 0, 'mcp_calls': []})
-        self.assertEqual(result['status'], 'answered')
+        from app import outcome
+        self.assertEqual(result['status'], 'succeeded')     # 状态机里的通用值
+        self.assertEqual(outcome.label(result['status'], result), 'answered')
+        self.assertEqual(result['outcome']['kind'], 'answer')
         self.assertFalse(touched['searched'])
 
     async def test_plan_steps_run_in_order(self):
@@ -3329,8 +3368,11 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
                        on_start=None, prior=None, memory=None, ledger=None,
                        run_id=None, resume_plan=None):
             assert resume_plan['kind'] == 'compensation'
-            return {'task_id': 'a1', 'status': 'compensated', 'timings': [],
-                    'deployment': {}, 'compensations': [
+            # 真实 run_task 会把 resume_plan 落成 plan（含 kind），
+            # outcome 就是靠它认出"这是一次补偿"
+            return {'task_id': 'a1', 'status': 'succeeded', 'timings': [],
+                    'plan': {'kind': 'compensation', 'steps': []},
+                    'compensations': [
                         {'step_id': 's1', 'tool': 'undo_site',
                          'status': 'succeeded'}]}
 
@@ -3464,6 +3506,192 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(tool_module, 'mcp_tools', fake_tools):
             found = await tool_module.find_tool('mcp__list_sites')
         self.assertIs(found, legacy)
+
+
+class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
+    """状态机词汇封闭：业务结果进 outcome，展示词只出现在派生标签里。
+
+    这条约束是上一轮讨论的落点——"接 N 个 MCP Server 就要加 N 个状态值"
+    之所以不成立，全靠这里钉住：加一个业务终态会先让这组用例红。
+    """
+
+    def test_run_status_vocabulary_is_closed(self):
+        from app import outcome
+        # 冻结契约：要加状态值，就得连这份清单一起改，是有意识的决定
+        self.assertEqual(sorted(outcome.RUN_STATUSES), [
+            'cancelled', 'failed', 'interrupted', 'needs_reconcile',
+            'partially_succeeded', 'queued', 'reconciling', 'running',
+            'succeeded', 'waiting_approval', 'waiting_input'])
+        for word in ('answered', 'local_ready', 'deployed', 'deploy_needs_check',
+                     'compensated'):
+            self.assertNotIn(word, outcome.RUN_STATUSES, word)
+            # 这些词只允许作为"历史值"存在，不再参与状态机
+            self.assertIn(word, outcome.LEGACY_STATUS, word)
+
+    def test_label_is_the_only_place_with_display_words(self):
+        from app import outcome
+        cases = [
+            ('succeeded', {'answer': 'hi'}, 'answered'),
+            ('succeeded', {'artifact': {'html_path': '/x.html'}}, 'local_ready'),
+            ('succeeded', {'deployment': {'status': 'success'}}, 'deployed'),
+            ('succeeded', {'plan': {'kind': 'compensation'}}, 'compensated'),
+            ('needs_reconcile', {'deployment': {'status': 'pending'}},
+             'deploy_needs_check'),
+            # 没有部署的"未核实"不该硬套部署的说法
+            ('needs_reconcile', {}, 'needs_reconcile'),
+            ('failed', {}, 'failed'),
+            ('cancelled', {}, 'cancelled'),
+        ]
+        for status, state, expected in cases:
+            self.assertEqual(outcome.label(status, state), expected, status)
+
+    def test_legacy_business_status_normalizes(self):
+        from app import outcome
+        self.assertEqual(outcome.normalize_status('local_ready'), 'succeeded')
+        self.assertEqual(outcome.normalize_status('deploy_needs_check'),
+                         'needs_reconcile')
+        self.assertEqual(outcome.normalize_status('succeeded'), 'succeeded')
+        # 未知值不猜：原样交给上层，由 check_run_status 报错
+        self.assertEqual(outcome.normalize_status('ticket_created'),
+                         'ticket_created')
+
+    def test_out_of_vocabulary_status_is_loud_not_silent(self):
+        """以前 `RUN_STATUS_OF.get(status, status)` 会把业务词静默写进状态机。"""
+        from app import outcome
+        with self.assertLogs('app.outcome', level='ERROR'):
+            self.assertEqual(outcome.check_run_status('ticket_created'), 'failed')
+        self.assertEqual(outcome.check_run_status('succeeded'), 'succeeded')
+
+    def test_outcome_records_produced_and_effects(self):
+        from app import outcome
+        state = {
+            'artifact': {'html_path': '/x/sources.html', 'kind': 'sources',
+                         'sha256': 'abc', 'size_bytes': 10},
+            'deployment': {'status': 'pending'},
+            'plan': {'steps': [
+                {'tool': 'web_search', 'step_id': 's1',
+                 'tool_key': 'local:web:search', 'effect': 'read'},
+                {'tool': 'render_sources_html', 'step_id': 's2',
+                 'tool_key': 'local:export:sources_html', 'effect': 'write'},
+                {'tool': 'deploy_site', 'step_id': 's3',
+                 'tool_key': 'mcp:publishing:deploy_site', 'effect': 'write'},
+                {'tool': 'render_sources_html', 'step_id': 's4',
+                 'tool_key': 'local:export:sources_html', 'effect': 'write'},
+            ]},
+            'step_outputs': {
+                's1': {'__status__': 'succeeded'},
+                's2': {'__status__': 'succeeded',
+                       'artifact': {'html_path': '/x/sources.html'}},
+                's3': {'__status__': 'succeeded',
+                       'deployment': {'status': 'pending'}},
+                's4': {'__status__': 'failed'},
+            },
+        }
+        record = outcome.build(state)
+        self.assertEqual(record['kind'], 'deployment')
+        self.assertEqual([item['path'] for item in record['produced']],
+                         ['/x/sources.html'])
+        # 只记**成功**的有副作用调用：read 不算，失败那步也不算
+        self.assertEqual([item['tool_key'] for item in record['effects']],
+                         ['local:export:sources_html',
+                          'mcp:publishing:deploy_site'])
+        # render 落地成文件即视为已核实；部署回执看不懂 → 未核实
+        self.assertTrue(record['effects'][0]['verified'])
+        self.assertEqual(record['effects'][0]['target_ref'], '')
+        self.assertFalse(record['effects'][1]['verified'])
+        self.assertTrue(record['unverified'])
+        self.assertEqual(outcome.final_status(state), 'needs_reconcile')
+
+    async def test_tool_status_is_a_stage_marker_not_a_run_status(self):
+        """工具自报的 status 是阶段小结（searched/answered），不是 run 终态。"""
+        from app import nodes
+        from app import tools as tool_module
+        from app.tools import Tool
+
+        async def fake(args, state):
+            return {'answer': '你好', 'status': 'answered'}
+
+        tool = Tool('answer_directly', '直接回答', 'd', {}, fake,
+                    tool_key='local:answers:direct', effect='read')
+        plan = {'steps': [{'tool': 'answer_directly', 'step_id': 's1', 'args': {}}]}
+        with patch.dict(tool_module.BUILTIN_BY_NAME, {'answer_directly': tool}), \
+                patch_all_emits(lambda e: None):
+            result = await nodes.run_step({'plan': plan, 'step_index': 0,
+                                           'user_input': '你好'})
+        self.assertEqual(result['status'], 'succeeded')
+        self.assertEqual(result['outcome']['kind'], 'answer')
+        # 阶段小结仍留在这一步的输出与耗时行上，但没写进 run 终态
+        self.assertEqual(result['step_outputs']['s1']['status'], 'answered')
+
+    async def test_hub_never_persists_a_business_status(self):
+        """就算执行层交出旧词，落库的也必须是通用状态。"""
+        import app.api_hub as hub_module
+        from app.api_hub import Hub
+        from app.store import Store
+
+        async def fake_run_task(text, progress=None, on_event=None, history=None,
+                                on_start=None, prior=None, memory=None,
+                                ledger=None, run_id=None, resume_plan=None):
+            if on_start:
+                on_start('a1')
+            return {'task_id': 'a1', 'status': 'local_ready',   # 旧词
+                    'artifact': {'html_path': '/tmp/a1/sources.html',
+                                 'kind': 'sources'},
+                    'timings': []}
+
+        hub = Hub(Store(':memory:'))
+        with patch.object(hub_module, 'run_task', fake_run_task):
+            record = hub.start('存成网页')
+            await asyncio.wait_for(record._task, timeout=10)
+
+        self.assertEqual(record.status, 'succeeded')
+        self.assertEqual(hub.store.task(record.task_id)['status'], 'succeeded')
+        self.assertEqual(hub.store.run(record.run_id)['status'], 'succeeded')
+        # 展示标签仍然说得清"本地已生成"
+        self.assertEqual(record.summary()['status'], 'local_ready')
+        self.assertEqual(record.summary()['run_status'], 'succeeded')
+
+    def test_reply_for_needs_reconcile_shows_the_url_but_does_not_claim_success(self):
+        from app.messages import reply_text
+        text = reply_text({'status': 'needs_reconcile',
+                           'deployment': {'status': 'needs_check',
+                                          'public_url': 'http://x/1/'}})
+        self.assertIn('http://x/1/', text)
+        self.assertIn('确认', text)
+        self.assertNotIn('部署完成', text)
+
+    def test_migration_script_rewrites_legacy_rows(self):
+        """历史数据迁移：业务终态 → 通用状态，且可重复执行。"""
+        import importlib
+        from app.store import Store
+        from types import SimpleNamespace as NS
+        migrate = importlib.import_module('scripts.migrate_status_vocabulary')
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'legacy.db'
+            store = Store(path)
+            store.create_task('t1', 's1', '问个问题')
+            store.update_task('t1', status='answered')
+            store.create_task('t2', 's1', '存成网页')
+            store.update_task('t2', status='local_ready')
+            store.create_task('t3', 's1', '部署')
+            store.update_task('t3', status='deploy_needs_check')
+            store.create_run('r1', 't1', status='succeeded')
+            store.create_run('r2', 't2', status='succeeded')
+            store.create_run('r3', 't3', status='failed')      # 当年被折成失败
+            store.close()
+
+            with patch.object(migrate, 'settings',
+                              NS(database_url='', db_path=path)):
+                self.assertEqual(migrate.main(['--apply']), 0)
+
+            store = Store(path)
+            self.assertEqual(store.task('t1')['status'], 'succeeded')
+            self.assertEqual(store.task('t2')['status'], 'succeeded')
+            self.assertEqual(store.task('t3')['status'], 'needs_reconcile')
+            # 部署待确认不是失败：对应 run 要纠正回来
+            self.assertEqual(store.run('r3')['status'], 'needs_reconcile')
+            store.close()
 
 
 if __name__ == '__main__':

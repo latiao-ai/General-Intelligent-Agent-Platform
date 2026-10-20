@@ -25,6 +25,7 @@ from app.main import run_task
 from app.messages import cancel_note, reply_text
 from app import ledger as ledger_module
 from app import memory as memory_module
+from app import outcome as outcome_module
 from app import profile as profile_module
 from app.capabilities import publishing as publishing_capability
 from app.services import is_stop_command
@@ -32,28 +33,11 @@ from app.store import Store, now, open_store
 
 logger = logging.getLogger(__name__)
 
-# 终态词汇必须与 run 状态、前端认识的一整套对齐。少了 waiting_input /
-# waiting_approval / partially_succeeded，一旦出现"等人确认"，前端会把它当
-# "还在跑"一直转圈。
-TERMINAL_STATUS = {'deployed', 'deploy_needs_check', 'local_ready', 'failed',
-                   'cancelled', 'interrupted', 'answered', 'waiting_input',
-                   'waiting_approval', 'partially_succeeded', 'compensated'}
-
-# 内部状态 → run 状态。两套词汇必须在这里对上，别处不许各写一套。
-RUN_STATUS_OF = {
-    'answered': 'succeeded',
-    'local_ready': 'succeeded',
-    'deployed': 'succeeded',
-    'partially_succeeded': 'partially_succeeded',
-    'waiting_input': 'waiting_input',
-    'waiting_approval': 'waiting_approval',
-    'failed': 'failed',
-    'deploy_needs_check': 'failed',
-    'cancelled': 'cancelled',
-    'interrupted': 'cancelled',
-    # 补偿运行：业务上是一次"已撤销"的收尾，run 本身是成功的
-    'compensated': 'succeeded',
-}
+# 状态机词汇只有一套，在 app/outcome.py 里定义：run/task 层只存通用状态，
+# 界面看的 `answered` / `local_ready` / `deployed` 是**派生**出来的展示标签。
+# 以前这里有 TERMINAL_STATUS + RUN_STATUS_OF 两张手工表，收尾时
+# `RUN_STATUS_OF.get(status, status)` 兜底会把手写业务词静默写进 runs.status。
+TERMINAL_STATUS = outcome_module.TERMINAL_RUN_STATUSES
 
 # 合成阶段：衡量"用户发出指令"到"真正开始搜索"之间的空档。
 INSTRUCTION_STAGE = 'instruction'
@@ -133,9 +117,16 @@ class TaskRecord:
         self.store.update_task(self.task_id, **fields)
 
     def summary(self) -> dict:
+        """接口视图。
+
+        `status` 保持旧字段名与前端的词汇（展示标签），`run_status` 才是状态机
+        里的通用值，`outcome` 是本轮产出的结构化记录。判流程用 run_status，
+        给人看用 status——两者不要混用。
+        """
         return {
             'task_id': self.task_id, 'session_id': self.session_id,
-            'status': self.status, 'message': self.message, 'error': self.error,
+            **outcome_module.view(self.status, self.state or {}),
+            'message': self.message, 'error': self.error,
             'artifact_id': self.artifact_id, 'state': self.state,
         }
 
@@ -175,7 +166,10 @@ class Hub:
         turns = [{
             'task_id': task['task_id'],
             'message': task['message'],
-            'status': task['status'],
+            # 库里存的是通用状态，回放时按 outcome 派生展示标签
+            'status': outcome_module.label(task['status'],
+                                           task.get('state') or {}),
+            'run_status': outcome_module.normalize_status(task['status']),
             'created_at': task['created_at'],
             'events': [event for _, event in self.store.events(task['task_id'])],
         } for task in self.store.session_tasks(session_id)]
@@ -427,12 +421,12 @@ class Hub:
             self.store.update_run(record.run_id, status='failed',
                                   error=record.error)
             record.publish({'type': 'status', 'status': 'failed',
-                            'detail': record.error})
+                            'run_status': 'failed', 'detail': record.error})
         else:
             close_instruction('解析完成')
             close_open_stage('已结束')
             record.state = state
-            status = state.get('status', 'failed')
+            status = outcome_module.check_run_status(state.get('status') or 'failed')
             reply = reply_text(state)
             self.store.append_message(record.session_id, 'assistant', reply)
             if record.latency is not None:
@@ -444,7 +438,9 @@ class Hub:
                 })
             record.persist(status=status, state=state)
             self._finish_run(record, state, status)
-            record.publish({'type': 'status', 'status': status, 'detail': reply})
+            # 状态事件里 `status` 仍是展示标签（前端认这套），另带 run_status
+            record.publish({'type': 'status', **outcome_module.view(status, state),
+                            'detail': reply})
         finally:
             profile_module.reset(profile_token)
             if guard is not None:
@@ -465,13 +461,18 @@ class Hub:
     # ---------- run 生命周期（文档 §7、§8.4） ----------
 
     def _finish_run(self, record: TaskRecord, state: dict, status: str) -> None:
-        """把 run 收尾，并把计划与步骤落库，供续跑与界面查询。"""
-        run_status = RUN_STATUS_OF.get(status, status)
+        """把 run 收尾，并把计划与步骤落库，供续跑与界面查询。
+
+        `status` 必须是**通用**状态：run 层不认识 `local_ready` 这类展示词。
+        以前这里用 `RUN_STATUS_OF.get(status, status)` 折算，兜底会让新业务词
+        静默写进状态机；现在越界会被 `check_run_status` 记 error 并退化。
+        """
+        run_status = outcome_module.check_run_status(status)
         plan = state.get('plan') or {}
         steps = plan.get('steps') or []
         # waiting_input 的 run 不落计划：那份计划没过校验，存下来再续跑
         # 等于把坏计划喂回执行器。要恢复就重新规划。
-        if steps and status != 'waiting_input':
+        if steps and run_status != 'waiting_input':
             self.store.save_plan(record.run_id, 1, goal=record.message,
                                  steps=steps, reason=plan.get('summary') or '')
             self.store.save_steps(record.run_id, 1, steps)
@@ -480,10 +481,11 @@ class Hub:
                 step_id = step.get('step_id')
                 if not step_id:
                     continue
-                status = (outputs.get(step_id) or {}).get('__status__')
-                if status:
+                # 别用 status 这个名字：它会把整个 run 的状态覆盖成某一步的状态
+                step_status = (outputs.get(step_id) or {}).get('__status__')
+                if step_status:
                     self.store.update_step(record.run_id, 1, step_id,
-                                           status=status)
+                                           status=step_status)
         artifact = state.get('artifact') or {}
         if artifact.get('html_path'):
             # 产物登记：把文件落成可授权的对象引用，而不是只有一条路径字符串
@@ -496,14 +498,14 @@ class Hub:
                 size=int(artifact.get('size_bytes') or 0),
                 sha256=artifact.get('sha256') or '')
         fields = {'status': run_status,
-                  'plan_version': 1 if (steps and status != 'waiting_input') else 0}
+                  'plan_version': 1 if (steps and run_status != 'waiting_input') else 0}
         if (state.get('compensations')
                 and (plan.get('kind') or '') != 'compensation'):
             # 撤销是独立动作，必须有独立时间戳：只看 run 状态分不清
             # "失败"和"失败但已收回副作用"。
             # 补偿运行自己不再打这个标记——它本来就是撤销，标记属于被撤销的那条。
             fields['compensated_at'] = now()
-        if status == 'waiting_input':
+        if run_status == 'waiting_input':
             fields['error'] = (state.get('failure')
                                or '计划未通过校验，等待用户补充信息')
         self.store.update_run(record.run_id, **fields)
@@ -638,7 +640,8 @@ class Hub:
         if before.get('artifact') and not state.get('artifact'):
             state['artifact'] = before['artifact']
         record.persist(state=state)
-        return {'run_id': new_run_id, 'status': record.status,
+        return {'run_id': new_run_id,
+                **outcome_module.view(record.status, state),
                 'steps': state.get('compensations') or []}
 
     def reconcile(self, owner: str | None = None) -> dict:
@@ -662,7 +665,7 @@ class Hub:
                             message=data['message'], store=self.store,
                             tenant_id=meta.get('tenant_id') or 'default',
                             owner_user_id=meta.get('owner_user_id') or 'default')
-        record.status = data['status']
+        record.status = outcome_module.check_run_status(data['status'])
         record.artifact_id = data['artifact_id']
         record.error = data['error']
         record.state = data['state']

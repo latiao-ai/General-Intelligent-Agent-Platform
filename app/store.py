@@ -467,10 +467,16 @@ class Store:
         """
         with self._lock:
             rows = self._conn.execute(
-                'SELECT task_id, message, status, created_at FROM tasks '
+                'SELECT task_id, message, status, state, created_at FROM tasks '
                 'WHERE session_id=? ORDER BY rowid ASC LIMIT ?',
                 (session_id, limit)).fetchall()
-        return [dict(r) for r in rows]
+        # state 一起带上：回放时要用它把通用状态派生成展示标签（outcome.label）
+        out = []
+        for row in rows:
+            data = dict(row)
+            data['state'] = json.loads(data['state']) if data['state'] else None
+            out.append(data)
+        return out
 
     # ---------- 事件日志 ----------
 

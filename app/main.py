@@ -8,6 +8,7 @@ from pathlib import Path
 from app.config import settings, check_runtime_keys
 from app.events import STAGE_LABELS  # noqa: F401  (对外仍从 app.main 可用)
 from app import ledger as ledger_module
+from app import outcome as outcome_module
 from app.capabilities.publishing import deploy_once
 from app.graph import build_graph
 from app.files import save_json
@@ -110,6 +111,16 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     finally:
         ledger_module.unbind(ledger_token)
         state['elapsed_seconds'] = round(time.perf_counter() - started, 2)
+        # 终态与 outcome 在**一处**收口：
+        # - 图内部只写通用状态（succeeded / failed / waiting_input …）；
+        # - 中途退出（图没跑到收尾）留下的 planned/created 之类不是终态，
+        #   按"到底产出了什么"补一个；
+        # - outcome 是记录，展示标签由它在读取时派生（app/outcome.py）。
+        status = outcome_module.normalize_status(state.get('status'))
+        if status not in outcome_module.TERMINAL_RUN_STATUSES:
+            status = outcome_module.final_status(state)
+        state['status'] = outcome_module.check_run_status(status)
+        state['outcome'] = outcome_module.build(state)
         save_json(folder / 'state.json', state)
     return state
 
@@ -144,7 +155,7 @@ async def main():
     for line in format_timings(state.get('timings')):
         print(line)
     print('总耗时:', state.get('elapsed_seconds'), '秒')
-    if state['status'] in {'failed', 'deploy_needs_check'}:
+    if state['status'] in outcome_module.ATTENTION_RUN_STATUSES | {'failed'}:
         print('请查看对应任务的 state.json 和服务端日志。')
         raise SystemExit(1)
 

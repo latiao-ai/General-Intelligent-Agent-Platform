@@ -84,7 +84,20 @@ class AgentState(TypedDict, total=False):
     sources_page: dict
     errors: list[dict]
     usage: list[dict]
+    # 终态（**通用**状态：succeeded / failed / needs_reconcile …）。
+    # `answered` / `local_ready` 这类展示词由 app/outcome.py 派生，不入状态。
     status: str
+    # 本轮产出的结构化记录：{kind, produced[], effects[], answered, unverified}
+    outcome: dict
+    # 失败原因（给人看的一句话）；与 status 分开：状态是词汇，原因是文案
+    failure: str
+    # 已执行/已失败的回滚明细
+    compensations: list[dict]
+    # 账本发现有"结果未定"的动作时置位：禁止自动重放
+    needs_reconciliation: bool
+    # 续跑用：沿用已保存的计划，不重新规划
+    resume_plan: dict
+    run_id: str
     # 各节点耗时，由执行器写入（见 app/main.py）。
     timings: list[dict]
     elapsed_seconds: float

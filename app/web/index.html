@@ -438,6 +438,9 @@ function currentTurnEl() {
   return el.querySelector('.turn-body');
 }
 
+// 展示词汇：后端返回的 status 已经是派生出来的标签，通用状态也在其中
+// （succeeded/needs_reconcile 这类以后端 run_status 出现）。新增能力若要新的
+// 展示词，改这张表即可——状态机那边不需要加值。
 const TURN_STATUS = {answered: '已回答', cancelled: '已中断',
                      interrupted: '已中断', failed: '已失败',
                      deployed: '已部署', local_ready: '已完成',
@@ -447,7 +450,11 @@ const TURN_STATUS = {answered: '已回答', cancelled: '已中断',
                      waiting_approval: '待确认',
                      partially_succeeded: '部分完成',
                      // 补偿运行：副作用已收回，与"失败"不是一回事
-                     compensated: '已撤销'};
+                     compensated: '已撤销',
+                     // 通用状态（没有专门展示词时兜底）
+                     succeeded: '已完成', needs_reconcile: '待核实',
+                     queued: '排队中', running: '执行中',
+                     reconciling: '核对中'};
 
 function turnSeconds(n) {
   return S.stages.filter(st => st.turn === n)

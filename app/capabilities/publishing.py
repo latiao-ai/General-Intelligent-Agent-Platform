@@ -108,12 +108,14 @@ class DeployAdapter:
         emit(action('部署完成',
                     deployment.get('public_url') or '结果待确认',
                     '✅' if deployment.get('status') == 'success' else '⚠️'))
-        return {'deployment': deployment, 'status': status_of(deployment)}
+        # 这里返回的 `status` 只是**这一步的阶段小结**（执行器会把它从 run 状态
+        # 里摘出来，只用于耗时行），run 终态由 app/outcome.py 统一判定。
+        return {'deployment': deployment, 'status': marker_of(deployment)}
 
 
-def status_of(deployment: dict) -> str:
+def marker_of(deployment: dict) -> str:
     return 'deployed' if (deployment or {}).get('status') == 'success' \
-        else 'deploy_needs_check'
+        else 'unverified'
 
 
 def interpret_deploy(payload, artifact: dict, server=None) -> dict:

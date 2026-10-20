@@ -13,7 +13,7 @@
 import json
 import time
 
-from app import context, ledger as ledger_module, profile
+from app import context, ledger as ledger_module, outcome as outcome_module, profile
 from app.config import settings
 from app.events import action, emit, stage_end, stage_start, thought
 from app.schemas import ExecutionPlan
@@ -349,20 +349,12 @@ def next_step(state) -> str:
 
 
 def final_status(state: dict) -> str:
-    """把内部状态归一到前端认识的终态。"""
-    # 补偿运行没有产物也没有回答，"没产出"不等于失败：它成功就是成功。
-    if (state.get('plan') or {}).get('kind') == 'compensation':
-        return 'failed' if state.get('failure') else 'compensated'
-    if state.get('answer'):
-        return 'answered'
-    deployment = state.get('deployment') or {}
-    if deployment.get('status') == 'success':
-        return 'deployed'
-    if deployment:
-        return 'deploy_needs_check'
-    if state.get('artifact'):
-        return 'local_ready'
-    return 'failed'
+    """本轮收尾后的**通用**状态（`answered`/`local_ready` 这类展示词不在这一层）。
+
+    判定逻辑在 `app/outcome.py`：状态机词汇封闭、业务结果进 outcome、
+    展示标签由 `outcome.label()` 派生。
+    """
+    return outcome_module.final_status(state)
 
 
 async def _tool_by_name(name: str):
@@ -536,6 +528,10 @@ async def run_step(state):
                 'failure': f'{tool.label}失败：{hint}{note}'}
 
     updates = dict(updates)
+    # 工具返回的 `status` 是**阶段小结**（searched / fetched / rendered / deployed），
+    # 不是 run 终态。以前它直接落进 state['status']，于是任务状态里混进了业务词。
+    # 现在它只留在这一步的输出与耗时行上，run 终态由 outcome 统一判定。
+    marker = str(updates.pop('status', '') or '')
     if book is not None and action and not reused:
         book.succeed(action_id, attempt_id,
                      {k: v for k, v in updates.items()
@@ -543,14 +539,16 @@ async def run_step(state):
     record = {k: v for k, v in updates.items()
               if isinstance(v, (str, int, float, bool, dict, list))}
     record['__status__'] = 'succeeded'
+    if marker:
+        record['status'] = marker
     outputs[step_id] = record
     updates['step_outputs'] = outputs
     updates['step_index'] = index + 1
     updates['step_label'] = tool.label
-    emit(stage_end(name, time.perf_counter() - started,
-                   updates.get('status', ''), tool.label))
+    emit(stage_end(name, time.perf_counter() - started, marker, tool.label))
     if last:
         merged = dict(state)
         merged.update(updates)
         updates['status'] = final_status(merged)
+        updates['outcome'] = outcome_module.build(merged)
     return updates
