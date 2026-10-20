@@ -41,7 +41,8 @@ python --version             # Python 3.12.15
 | `MCP_URL` / `MCP_BEARER_TOKEN` | 远端 MCP 部署服务地址与鉴权 |
 | `MCP_TOOL_NAME` | 部署工具名（当前远端为 `deploy_site`） |
 | `MCP_EXTRA_ARGS` | 额外入参，如 `{"ttl":"7d"}` 控制站点有效期 |
-| `DB_PATH` | SQLite 持久化文件，默认 `agent.db` |
+| `DATABASE_URL` | 数据库连接串；填 `postgresql://…` 用 PostgreSQL，**留空回落 SQLite** |
+| `DB_PATH` | 仅 SQLite 模式下的文件名，默认 `agent.db` |
 | `PROFILE_PATH` | 用户画像文件，默认 `profile/USER.md`（见 3.1.2） |
 
 > 改了 `.env` 必须重启进程才生效。
@@ -76,7 +77,7 @@ python -m app.main '阅读 https://www.sqlite.org/whentouse.html ，整理适用
 | 实时推送 | 0.5 秒轮询 | 事件驱动，**到达即推** |
 | 计时刷新 | 0.5 秒一跳 | **100ms 平滑累加** |
 | 多客户端 | ❌ 单会话 | ✅ 可订阅同一任务 |
-| 状态持久化 | ❌ 纯内存 | ✅ SQLite |
+| 状态持久化 | ❌ 纯内存 | ✅ PostgreSQL（可回落 SQLite） |
 | 改代码生效 | 必须重启进程（模块不热重载） | `--reload` 自动 |
 
 ### 阶段耗时实时累加
@@ -165,14 +166,14 @@ user       我只要其中关于限制和不足的部分
 - 前端会等当前任务的结束提示经原事件流渲染出来后再开新一轮（最多 2 秒），
   这样「已停止…」这类副作用提示不会丢。
 
-会话消息在服务端存在 SQLite 里，但**前端不做自动恢复**：每次打开或刷新页面都是干净的新
+会话消息在服务端存在数据库里，但**前端不做自动恢复**：每次打开或刷新页面都是干净的新
 会话（否则重启服务后旧对话会自动冒出来）。需要清空当前对话时点「新对话」——运行中点击
 会先打断当前任务。历史任务仍保留在数据库里，可经 API 查询。
 
 ## 3.1.2 用户画像（跨会话记忆）
 
 借鉴 WorkBuddy 的「文件即记忆」：画像是一份**人可读、可手改、可 git diff 的 Markdown**，
-存在 `profile/USER.md`，不是 SQLite 里的 JSON。
+存在 `profile/USER.md`，不是数据库里的 JSON。
 
 ```
 # User Profile
@@ -266,42 +267,73 @@ curl -s -X POST localhost:8010/api/tasks -H 'Content-Type: application/json' \
 # → 模型还原为 topic「SQLite 的限制与不足」，查询「SQLite 限制 不足 缺点」
 ```
 
-## 3.3 SQLite 持久化
+## 3.3 数据持久化
 
-会话、任务状态与事件日志都落在 SQLite（默认 `agent.db`，用 `DB_PATH` 改路径），
-服务重启后不丢。
+会话、任务状态、计划步骤、动作账本与事件日志都落在数据库里，服务重启后不丢。
 
-| 表 | 内容 |
-|---|---|
-| `sessions` | 会话（多轮上下文的主体） |
-| `messages` | 会话消息，`parse_request` 靠它还原指代型要求 |
-| `tasks` | 任务状态、产物 ID、完整 `state`（含 timings） |
-| `events` | 每个任务的完整事件日志（带任务内自增 `seq`） |
+**默认后端是 PostgreSQL**：`.env` 里给 `DATABASE_URL` 一个连接串就走 PG；
+留空则退回本地 SQLite（`agent.db`，用 `DB_PATH` 改路径）。两者实现同一套仓储接口
+（`app/persistence.py` 的 `Repository`），业务代码不感知用的是哪个。
+
+```ini
+DATABASE_URL=postgresql://latiao@127.0.0.1:5432/agent_platform
+```
+
+从 SQLite 迁到 PG：
+
+```bash
+python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/agent_platform"
+```
+
+脚本会逐表搬数据并**校验行数一致**，完成后复位 `messages.id` 的序列。
+本地实测迁移了 21 会话 / 139 消息 / 71 任务 / 1069 事件，行数校验通过。
+
+### 表一览（16 张）
+
+| 分组 | 表 | 内容 |
+|---|---|---|
+| 会话 | `sessions` / `messages` | 多轮上下文的主体与消息 |
+| 记忆 | `session_memory` / `session_summaries` | 长会话滚动摘要与关键事实 |
+| 任务 | `tasks` / `tasks_meta` | 任务状态、产物 ID、完整 `state`（含 timings） |
+| 运行 | `runs` / `plans` / `steps` | 每次执行尝试、计划版本、步骤状态 |
+| 账本 | `actions` / `action_attempts` | 动作身份（幂等键）与每一次真实调用 |
+| 产物 | `artifacts` | 产物引用：kind / 路径 / 大小 / sha256 |
+| 记忆库 | `memories` / `memory_tombstones` | 作用域化长期记忆与遗忘墓碑 |
+| 后台 | `background_jobs` | outbox 派生的异步任务（带去重键） |
+| 事件 | `events` | 每个任务的完整事件日志（带任务内自增 `seq`） |
 
 ### 内存与磁盘的分工
 
 | | 存哪 | 为什么 |
 |---|---|---|
-| 事件日志 | **SQLite** | 权威记录，重启后仍能补发完整过程 |
-| 会话消息 | **SQLite** | 多轮上下文不能丢 |
-| 任务状态 | **SQLite** | 重启后仍可查历史任务 |
+| 事件日志 | **数据库** | 权威记录，重启后仍能补发完整过程 |
+| 会话消息 | **数据库** | 多轮上下文不能丢 |
+| 任务/运行状态 | **数据库** | 重启后仍可查历史，也是断点续跑的依据 |
+| 动作账本 | **数据库** | 判断"这次调用到底发生过没有"，崩溃恢复靠它 |
 | 订阅者队列 | 内存 | 连接级状态，不可能持久化 |
 | `asyncio.Task` | 内存 | 活着的进程状态，不可能持久化 |
 
-因此设计是**先落库再投递**：`publish()` 先把事件写入 SQLite 拿到序号，再推给内存订阅者。
+因此设计是**先落库再投递**：`publish()` 先把事件写入数据库拿到序号，再推给内存订阅者。
 正在跑的客户端拿到零延迟事件；晚连上来的、甚至服务重启后再连的，从库里补发——两者用
 `seq` 去重。
 
-### 孤儿任务恢复
+### 重启后的恢复
 
-服务启动时会把库里遗留的 `running` 任务标记为 `interrupted`。进程重启后不可能还有任务
-在跑；不处理的话前端会永远等一个不会结束的任务。
+启动时不会简单地把遗留的 `running` 一律标成中断，而是**按动作账本对账**：
+
+- 已经成功的动作 → 复用回执，不重复调用远端；
+- 已发出但没拿到回执（`in_flight`）→ 标记 `unknown`，要求核实，**绝不盲目重发**；
+- 从未发出的动作（`prepared`）→ 可以安全重试。
+
+运行状态置为 `reconciling`，可通过 `GET /api/recovery` 查看统计。
+详见 `docs/platform-acceptance.md`。
 
 ### 实现取舍
 
-用 Python 标准库 `sqlite3`，**没有引入新依赖**。WAL 模式（读不阻塞写），单连接 + 线程锁
-同步调用——SQLite 本地写入是亚毫秒级，demo 规模完全够用；真正高并发时应改为
-`asyncio.to_thread` 或换专门的数据库。
+- **PostgreSQL**：`psycopg` 3.x，单连接 + 线程锁串行化（与 SQLite 实现同构）。
+  本地单 Worker 够用；并发上来后应换连接池——这一步尚未做。
+- **SQLite**：标准库 `sqlite3`，WAL 模式，零新增依赖，适合单机快速起步。
+- 仓储接口见 `app/persistence.py`，`check_repository()` 可在换实现前校验方法齐备。
 
 ### 验证持久化
 
@@ -312,15 +344,27 @@ curl -X POST localhost:8010/api/tasks -H 'Content-Type: application/json' \
   -d '{"message":"整理 SQLite 的适用场景，生成中文报告"}'
 
 # 2) Ctrl+C 停服，再重新启动，然后：
-curl localhost:8010/api/tasks/<task_id>             # status 变为 interrupted
+curl localhost:8010/api/runs/<run_id>      # 状态与步骤都在
 curl -N localhost:8010/api/tasks/<task_id>/events   # 完整事件流从库里补发
+curl localhost:8010/api/recovery           # 重启对账统计
+```
+
+用 PostgreSQL 时可以直接核库：
+
+```bash
+psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
+  (SELECT count(*) FROM messages) 消息, (SELECT count(*) FROM runs) 运行;"
 ```
 
 ### 已知边界
 
-这仍是**单机单进程**的持久化：库文件在本机，多个服务副本各写各的会冲突。SQLite 解决的是
-"重启不丢"，**不是**"横向扩展"。要真正多副本，需要换 Postgres/MySQL 这类支持并发的
-数据库，并把事件广播换成消息总线（Redis Pub/Sub 等）。
+- **实时通知是进程内的**。事件先落库、再推给本进程的订阅者；别的实例写入的事件要靠
+  游标补发（`GET /api/tasks/{id}/events?after=<seq>` 或 `Last-Event-ID`）才能拿到，
+  跨实例实时推送需要消息总线。
+- **Worker 领取有竞争窗口**。`claim_run` 是"查一条 + 更新状态"两步，本地单连接加锁没
+  问题；多 Worker 跨进程并发时应改成 PostgreSQL 的 `SELECT … FOR UPDATE SKIP LOCKED`。
+- **PostgresStore 用单连接 + 线程锁**串行化，没有连接池。并发量上来后是瓶颈。
+- **SQLite 模式仍是单机单写**：多副本各写各的会冲突，只适合本地开发。
 
 ## 4. 部署行为
 
