@@ -1551,14 +1551,17 @@ PG_DSN = os.getenv('PG_TEST_DSN', '')
 
 @unittest.skipUnless(PG_DSN, '需要 PG_TEST_DSN 才跑真实 PostgreSQL 一致性测试')
 class PostgresParityTests(unittest.TestCase):
-    """在**真实 PostgreSQL** 上验证仓储实现（此前标注为未验证，现在补上）。
+    """在**真实 PostgreSQL** 上验证仓储实现。
 
-    每个用例开头清库，保证互不影响；只验关键读写路径，不重复 SQLite 的
-    全部用例。设置 PG_TEST_DSN 后运行。
+    ⚠️ 每个用例开头都会 TRUNCATE 全部业务表——**PG_TEST_DSN 必须指向一次性
+    测试库**（如 agent_platform_test），绝不能指向生产库。曾经因为拿生产库
+    跑这套用例，把刚迁好的数据清空过一次。
     """
 
     def setUp(self):
         from app.pg_store import PostgresStore
+        if 'test' not in PG_DSN:
+            raise unittest.SkipTest('PG_TEST_DSN 必须指向测试库（库名含 test）')
         self.store = PostgresStore(PG_DSN)
         tables = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
                   'action_attempts', 'actions', 'steps', 'plans', 'runs',

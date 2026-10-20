@@ -95,6 +95,7 @@
 
 ```
 python -m unittest tests.test_core                                  # 170 通过（SQLite）
-PG_TEST_DSN=postgresql://.../agent_platform python -m unittest \
+# PG_TEST_DSN 必须指向一次性测试库（库名需含 test），用例会 TRUNCATE 全部表
+PG_TEST_DSN=postgresql://.../agent_platform_test python -m unittest \
     tests.test_core.PostgresParityTests                             # 6 通过（真实 PG）
 ```
