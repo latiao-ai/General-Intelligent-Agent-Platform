@@ -1,10 +1,11 @@
 """工具注册表：把能力包提供的工具汇总成模型可选的清单。
 
-实现已经按业务拆到 app/capabilities/（web / reports / publishing / answers），
+实现已经按业务拆到 app/capabilities/（web / export / publishing / answers），
 这里只做三件事：
 
 1. 汇总内置工具并补上稳定身份（tool_key）与动作性质（effect）；
 2. 动态发现远端 MCP 工具，保留服务端给的完整能力描述与 annotations；
+   **部署工具也在这里注册**，它只是"带平台适配器的 MCP 工具"，不是另一条通道；
 3. 给规划器渲染工具清单。
 
 文件末尾保留一批名字别名（_web_search、_render_sources_html 等），让旧调用点和
@@ -22,12 +23,10 @@ from app.capabilities.base import (ToolError, error_entry, tool_results_text,
 from app.capabilities.web import _fetch_pages, _web_search
 from app.capabilities.answers import (_answer_directly, _answer_with_sources)
 from app.capabilities.export import (_render_sources_html, _sources_page)
-from app.capabilities.publishing import _deploy_site
 from app.capabilities import answers as answers_capability
 from app.capabilities import export as export_capability
 from app.capabilities import publishing as publishing_capability
 from app.capabilities import web as web_capability
-from app.capabilities import publishing as publishing_capability
 from app.config import settings
 
 # 旧代码里 image: tool_module.search_backend / chat_reply / emit 的引用保留
@@ -76,9 +75,12 @@ BUILTIN_TOOLS = [
           'required': ['query']},
          _web_search),
     Tool('fetch_pages', '抓取正文',
-         '抓取指定链接的正文；不传 urls 时为所有"还没有正文"的来源补抓。给了 URL 时优先用它。',
+         '读取**本轮用户输入里给出的 URL** 的正文（Markdown）。输入里没有 URL 就不要调用：'
+         '搜索结果自带的正文已经够用，不需要再逐条抓一遍。',
          {'type': 'object',
-          'properties': {'urls': {'type': 'array', 'items': {'type': 'string'}}}},
+          'properties': {'urls': {'type': 'array', 'minItems': 1,
+                                  'items': {'type': 'string'}}},
+          'required': ['urls']},
          _fetch_pages),
 
     Tool('render_sources_html', '资料转 HTML',
@@ -97,23 +99,20 @@ BUILTIN_TOOLS = [
          '对上一轮的追问都用它——不要为了保险先跑一次检索。',
          {'type': 'object', 'properties': {'question': {'type': 'string'}}},
          _answer_directly),
-    Tool('deploy_site', '部署站点',
-         '把当前 HTML 产物部署到服务器并返回访问地址。必须先有产物（如 render_sources_html 之后）、'
-         '且用户明确要求发布时调用。',
-         {'type': 'object', 'properties': {}}, _deploy_site),
-
-
 ]
+
 
 # 内置工具的身份与动作性质：tool_key 形如 local:<能力包>:<动作>，
 # capability 便于以后按业务拆文件，也便于界面分组。
+#
+# 注意：**部署不在这张表里**。部署工具来自 MCP 发现（见 mcp_tools），身份是
+# mcp:<server_id>:<tool>，这里只给"本地纯计算/纯回答"的工具发本地身份。
 _LOCAL_META = {
     'web_search': ('local:web:search', 'read', 'web'),
     'fetch_pages': ('local:web:fetch', 'read', 'web'),
     'render_sources_html': ('local:export:sources_html', 'write', 'export'),
     'answer_with_sources': ('local:answers:with_sources', 'read', 'answers'),
     'answer_directly': ('local:answers:direct', 'read', 'answers'),
-    'deploy_site': ('local:publishing:deploy', 'write', 'publishing'),
 }
 
 # 每个能力包自带一段"什么时候用我"的规划规则。工具注册时按 capability 取，
@@ -122,7 +121,8 @@ CAPABILITY_RULES = {
     'web': web_capability.PROMPT_RULES,
     'answers': answers_capability.PROMPT_RULES,
     'export': export_capability.PROMPT_RULES,
-    'publishing': publishing_capability.PROMPT_RULES,
+    # publishing 的规则挂在 MCP 发现出来的部署工具上（它由能力包适配），
+    # 所以这里不需要再登记一份。
 }
 
 # MCP 是"外来能力"，规则只能给通用纪律，不能替它编业务语义
@@ -150,8 +150,6 @@ MCP_PREFIX = mcp_servers.MCP_PREFIX
 # 原始 MCP 工具仍全部暴露（保留最大能力），但重复/不可逆的那几个补一句说明，
 # 让模型优先走有保障的路径，而不是靠删功能来限制它。
 MCP_HINTS = {
-    'deploy_site': '与内置 deploy_site 等价。**优先用内置那个**——它负责把 HTML 组'
-                   '装成服务端要的 base64 文件内容，直接调原始工具容易传错格式。',
     'delete_site': '⚠️ 不可逆。删除线上站点前必须先向用户复述将要删除的站点 ID 并确认。',
     'update_site': '⚠️ 会改动线上站点内容，执行前先说明改什么。',
     'list_sites': '不带 keyword 时返回全量站点；带了 keyword 只是筛选结果，不能当全量用。',
@@ -163,8 +161,10 @@ _MCP_TTL = 300.0
 
 
 def _signature() -> tuple:
-    return tuple((s.id, s.transport, s.url or s.stdio_command)
-                 for s in mcp_servers.servers())
+    # 部署开关也进签名：关掉部署后缓存里那个部署工具（或占位工具）必须立刻失效。
+    return (settings.deploy_enabled,
+            tuple((s.id, s.transport, s.url or s.stdio_command)
+                  for s in mcp_servers.servers()))
 
 
 async def _discover(server) -> tuple[list[dict], str]:
@@ -183,7 +183,9 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
     - 并发发现，单个服务端超时/掉线不影响其他服务端；
     - 多服务端时工具名带服务端前缀，避免同名工具互相覆盖；
     - 部署类工具需要文件内容，模型给不出 base64，执行时由 runner 用当前产物
-      自动填充——模型只需要给出其余业务参数。
+      自动填充——模型只需要给出其余业务参数；
+    - **部署工具也在这里注册**：它由服务端声明、身份是 `mcp:<server>:<tool>`，
+      只是多挂了一个由 publishing 能力包提供的适配器（闸门 + 回执归一）。
     """
     now = time.monotonic()
     signature = _signature()
@@ -203,6 +205,9 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
             errors[server.id] = error
             continue
         for item in items:
+            if publishing_capability.claims(server, item['name']):
+                tools.append(_deploy_tool(server, item))
+                continue
             name = mcp_servers.tool_name(server, item['name'], total)
             schema = item.get('inputSchema') or {'type': 'object', 'properties': {}}
             # 用服务端给的真实描述，而不是拿工具名猜用途
@@ -223,8 +228,69 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
                 prompt_rules=MCP_PROMPT_RULES,
                 server_id=server.id,
             ))
+    if settings.deploy_enabled and not _has_publishing(tools):
+        # 配置了部署工具，却没有从服务端发现到它（掉线、或服务端没声明这个工具）。
+        # 留一个占位工具，让"部署到服务器"得到一句明确报错，而不是被当成未知
+        # 工具静默跳过——那会变成"任务成功但什么都没发生"。
+        stub = _deploy_placeholder(errors)
+        if stub is not None:
+            tools.append(stub)
     _MCP_CACHE.update(at=now, tools=tools, errors=errors, signature=signature)
     return tools
+
+
+def _has_publishing(tools) -> bool:
+    return any(t.capability == publishing_capability.CAPABILITY for t in tools)
+
+
+def _deploy_tool(server, item: dict) -> Tool:
+    """把服务端的部署工具包装成平台认识的 `deploy_site`。
+
+    参数 schema 故意只暴露空对象：文件内容由平台从当前产物注入（模型写不出
+    base64），对外声明它只会引导模型编造一个 `files` 数组。
+    """
+    return Tool(
+        publishing_capability.TOOL_NAME,
+        publishing_capability.LABEL,
+        (f'{publishing_capability.DESCRIPTION}'
+         f'（MCP 服务端 {server.id} 的工具 {item["name"]}）'),
+        {'type': 'object', 'properties': {}},
+        _make_mcp_runner(item['name'], server,
+                         adapter=publishing_capability.adapter(server, item['name'])),
+        tool_key=f'mcp:{server.id}:{item["name"]}',
+        effect=item.get('effect_type') or 'unknown',
+        capability=publishing_capability.CAPABILITY,
+        prompt_rules=publishing_capability.PROMPT_RULES,
+        server_id=server.id,
+    )
+
+
+def _deploy_placeholder(errors: dict):
+    """部署工具当前不可用时的占位工具（身份仍然是那个 MCP 工具）。"""
+    for server in mcp_servers.servers():
+        name = publishing_capability.configured_tool(server)
+        if not name:
+            continue
+        reason = errors.get(server.id) or f'服务端 {server.id} 未提供该工具'
+        return _unavailable_deploy(server, name, reason)
+    return None
+
+
+def _unavailable_deploy(server, tool_name: str, reason: str) -> Tool:
+    async def run(args: dict, state: dict) -> dict:
+        raise ToolError(f'部署不可用：{reason}。请检查 MCP 配置与服务端状态后重试')
+
+    return Tool(
+        publishing_capability.TOOL_NAME, publishing_capability.LABEL,
+        f'{publishing_capability.DESCRIPTION}（当前不可用：{reason}）',
+        {'type': 'object', 'properties': {}}, run,
+        tool_key=f'mcp:{server.id}:{tool_name}',
+        # 服务端没回话，动作性质只能按配置的用途记 write，不假装是 read。
+        effect='write',
+        capability=publishing_capability.CAPABILITY,
+        prompt_rules=publishing_capability.PROMPT_RULES,
+        server_id=server.id,
+    )
 
 
 def mcp_status() -> dict:
@@ -234,9 +300,25 @@ def mcp_status() -> dict:
             'servers': mcp_servers.status()}
 
 
-def _make_mcp_runner(server_tool_name: str, server=None):
+def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
+    """所有远端工具共用的一条调用通道。
+
+    `adapter` 是可选的**平台侧适配器**（目前只有部署用）：它在调用前后各插一个
+    钩子，但传输、参数注入、`mcp_calls` 记录仍然走这里——这样"某个远端工具
+    需要平台额外解释回执"不会变成"某个远端工具有一条自己的调用通道"。
+    """
     async def run(args: dict, state: dict) -> dict:
         artifact = state.get('artifact')
+        if adapter is not None:
+            precheck = getattr(adapter, 'precheck', None)
+            if precheck is not None:
+                precheck(dict(args or {}), state)
+            pick = getattr(adapter, 'artifact', None)
+            if pick is not None:
+                artifact = pick(state)
+            before = getattr(adapter, 'before', None)
+            if before is not None:
+                before(dict(args or {}), state)
         label = (f'{server.id}·{server_tool_name}' if server is not None
                  else server_tool_name)
         emit(action('调用 MCP 工具', label, '🔧'))
@@ -257,29 +339,36 @@ def _make_mcp_runner(server_tool_name: str, server=None):
         # 参数必须一起记：过滤类工具（如 list_sites 的 keyword）传不传参数，
         # 返回语义完全不同——不记下来就分不清"列表只有 1 个"和"只匹配到 1 个"。
         # 服务端也要记：多服务端时同名工具的行为可能完全不同。
-        return {'mcp_calls': list(state.get('mcp_calls', [])) + [
+        updates = {'mcp_calls': list(state.get('mcp_calls', [])) + [
             {'tool': server_tool_name, 'args': dict(args or {}),
              'server': getattr(server, 'id', '') or '',
              'payload': payload}]}
+        interpret = getattr(adapter, 'interpret', None)
+        if interpret is not None:
+            updates.update(interpret(payload, dict(args or {}), state) or {})
+        return updates
     return run
 
 
 async def catalog() -> list[Tool]:
     """本轮可用的全部工具：内置 + MCP 发现。"""
     tools = list(BUILTIN_TOOLS)
-    if not settings.deploy_enabled:
-        # 关掉部署时干脆不给这个工具，免得计划里出现注定失败的一步。
-        tools = [t for t in tools if t.name != 'deploy_site']
     tools.extend(await mcp_tools())
+    if not settings.deploy_enabled:
+        # 关掉部署时连占位工具都不给，免得计划里出现注定失败的一步。
+        tools = [t for t in tools
+                 if t.capability != publishing_capability.CAPABILITY]
     return tools
 
 
 async def find_tool(name: str):
-    """按名字取工具：内置 → MCP 精确名 → 去掉服务端前缀后再匹配。
+    """按名字取工具：内置 → MCP 精确名 → 去掉服务端前缀后按**身份**再匹配。
 
     最后那步是为"续跑旧计划"服务的：工具名从 `mcp__delete_site` 变成了
-    `mcp__ops__delete_site` 之后，旧计划里的名字不该直接失效。只有唯一命中
-    才算数——两个服务端都有这个工具时不做猜测。
+    `mcp__ops__delete_site`、或者部署工具从 `mcp__deploy_site` 变成了平台的
+    `deploy_site`，旧计划里的名字都不该直接失效。匹配不了名字就退到 tool_key
+    的尾部——身份才是稳定的，名字只是对模型的展示形式。只有唯一命中才算数，
+    两个服务端都有这个工具时不做猜测。
     """
     tool = BUILTIN_BY_NAME.get(name)
     if tool is not None:
@@ -290,7 +379,8 @@ async def find_tool(name: str):
         return exact
     _, bare = mcp_servers.split_tool_name(name)
     matches = [t for t in tools if t.name == f'{MCP_PREFIX}{bare}'
-               or t.name.endswith(f'__{bare}')]
+               or t.name.endswith(f'__{bare}')
+               or t.tool_key.endswith(f':{bare}')]
     return matches[0] if len(matches) == 1 else None
 
 

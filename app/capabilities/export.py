@@ -17,7 +17,7 @@ from app.config import settings
 PROMPT_RULES = (
     '【导出网页】用户要"把资料/搜索结果原样存成网页"时用 render_sources_html：'
     '它不调用模型、不改写内容，只把 JSON 元信息与 Markdown 正文排版成 HTML。'
-    '必须在 web_search / fetch_pages 之后调用。'
+    '必须在取得正文的步骤（web_search 或 fetch_pages）之后调用。'
 )
 
 
@@ -90,7 +90,7 @@ async def _render_sources_html(args: dict, state: dict) -> dict:
     """
     documents, origin = usable_documents(state)
     if not documents:
-        raise ToolError('还没有可用正文，请先调用 web_search 或 fetch_pages')
+        raise ToolError('还没有可用正文：先用 web_search 检索取得正文')
     if origin:
         emit(action('沿用上一轮的正文', f'{len(documents)} 个来源', '♻️'))
     title = str(args.get('title') or state.get('user_input') or '检索资料')

@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from dataclasses import replace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from pydantic import ValidationError
 from app.schemas import ExecutionPlan, PlanStep
 from app.services import clean_public_url
@@ -116,10 +116,79 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
                 doc = sources.metadata('t1', 's1', url='https://example.com/a',
                                        title='甲', text='')
                 result = await tool_module._fetch_pages(
-                    {}, {'task_id': 't1', 'documents': [doc], 'errors': [],
+                    {'urls': ['https://example.com/a']},
+                    {'task_id': 't1', 'user_input': '阅读 https://example.com/a',
+                         'documents': [doc], 'errors': [],
                          'usage': []})
         self.assertEqual(result['documents'][0]['status'], 'success')
         self.assertGreater(result['documents'][0]['chars'], 0)
+
+    def test_fetch_pages_is_only_for_urls_in_the_user_input(self):
+        """调用时机只有一条：输入里有 URL。
+
+        "为没有正文的搜索结果补抓"是个不存在的场景（检索接口自带正文），
+        规则里留着它只会让规划器以为还有第二条路。
+        """
+        from app.capabilities import web as web_cap
+        from app import tools as tool_module
+        rules = web_cap.PROMPT_RULES
+        self.assertIn('用户输入里出现了 URL', rules)
+        self.assertNotIn('补抓', rules)
+        self.assertNotIn('补抓', tool_module.BUILTIN_BY_NAME['fetch_pages'].description)
+
+    async def test_fetch_requires_user_supplied_urls_before_network(self):
+        from app.capabilities import web as web_cap
+        from app.capabilities.base import ToolError
+
+        # 即使搜索已登记了缺正文的 URL，也不能省略参数或把它当用户链接抓取。
+        state = {'user_input': '查找王林的资料', 'documents': [
+            {'url': 'https://example.com/search-result', 'status': 'pending'}]}
+        with patch.object(web_cap.search_backend, 'fetch', new_callable=AsyncMock) as fetch:
+            for args in ({}, {'urls': []},
+                         {'urls': ['https://example.com/search-result']}):
+                with self.subTest(args=args), self.assertRaises(ToolError):
+                    await web_cap._fetch_pages(args, state)
+            fetch.assert_not_awaited()
+
+    async def test_fetch_only_updates_requested_user_url(self):
+        from app import sources
+        from app.capabilities import web as web_cap
+
+        target = 'https://example.com/user-page'
+        fetch = AsyncMock(return_value={
+            'results': [{'url': target, 'raw_content': '用户链接的正文'}],
+            'failed_results': [], 'usage': {}})
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(sources, 'settings',
+                              SimpleNamespace(artifact_dir=Path(folder))), \
+                    patch.object(web_cap.search_backend, 'fetch', fetch), \
+                    patch_all_emits(lambda e: None):
+                unrelated = sources.metadata('t1', 's1',
+                    url='https://example.com/search-result', title='搜索结果')
+                result = await web_cap._fetch_pages(
+                    {'urls': [target]}, {'task_id': 't1',
+                        'user_input': f'阅读 {target}', 'documents': [unrelated]})
+                fetch.assert_awaited_once_with([target])
+                self.assertEqual(result['documents'][0], unrelated)
+                self.assertFalse(sources.text_path('t1', 's1').exists())
+                self.assertEqual(sources.load_text(result['documents'][1]), '用户链接的正文')
+
+    async def test_fetch_reuses_existing_text_for_user_url(self):
+        from app import sources
+        from app.capabilities import web as web_cap
+
+        target = 'https://example.com/user-page'
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(sources, 'settings',
+                              SimpleNamespace(artifact_dir=Path(folder))), \
+                    patch.object(web_cap.search_backend, 'fetch', new_callable=AsyncMock) as fetch, \
+                    patch_all_emits(lambda e: None):
+                doc = sources.metadata('t1', 's1', url=target, title='已有正文', text='正文')
+                result = await web_cap._fetch_pages(
+                    {'urls': [target]}, {'task_id': 't1',
+                        'user_input': f'阅读 {target}', 'documents': [doc]})
+                fetch.assert_not_awaited()
+                self.assertEqual(result['documents'], [doc])
 
     def test_select_sources_reads_text_from_disk(self):
         from app import sources, tools as tool_module
@@ -700,10 +769,15 @@ class MemoryScopeTests(unittest.TestCase):
 class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
     """基础回答能力：简单问题不该被拖去检索（对应用户指出的流程）。"""
 
-    def test_registry_has_the_six_capabilities(self):
+    def test_registry_has_the_five_local_capabilities(self):
+        """本地的只剩"检索 / 读用户给的 URL / 转 HTML / 两种作答"。
+
+        部署不在里面：它由 MCP 发现得到（身份 mcp:<server>:<tool>），
+        见 `DeployGateTests`。本地身份只发给"纯计算/纯回答"的工具。
+        """
         from app import tools as tool_module
         self.assertEqual(sorted(tool_module.BUILTIN_BY_NAME),
-                         ['answer_directly', 'answer_with_sources', 'deploy_site',
+                         ['answer_directly', 'answer_with_sources',
                           'fetch_pages', 'render_sources_html', 'web_search'])
         keys = {name: tool.tool_key
                 for name, tool in tool_module.BUILTIN_BY_NAME.items()}
@@ -711,6 +785,8 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(keys['answer_directly'], 'local:answers:direct')
         self.assertEqual(keys['render_sources_html'],
                          'local:export:sources_html')
+        self.assertTrue(all(key.startswith('local:')
+                            for key in keys.values()))
 
     async def test_small_talk_skips_planning_but_still_answers(self):
         """闲聊不花规划调用，但**回答仍由模型给出**（不是固定文案）。"""
@@ -861,89 +937,203 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DeployGateTests(unittest.IsolatedAsyncioTestCase):
-    """部署闸门：没有产物、或全局关闭时都不许部署。"""
+    """部署：工具身份来自 MCP，闸门与回执归一份在能力包适配器里。
 
-    async def test_requires_an_artifact(self):
+    以前的 `deploy_site` 是内置工具、自己直连 MCP：清单里同时出现内置与
+    `mcp__deploy_site` 两份，账本记成 `local:publishing:deploy`（看不出依赖哪个
+    服务端），`mcp_calls` 里也没有它。现在它就是一个带适配器的 MCP 工具，
+    这组用例把这四条一起钉住。
+    """
+
+    @staticmethod
+    def server():
+        from app.integrations import mcp_servers
+        return mcp_servers.Server(id='publishing', url='https://a.example/mcp',
+                                  deploy_tool='deploy_site', default=True)
+
+    def tool(self, effect='write'):
         from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
-        with self.assertRaises(tool_module.ToolError):
-            await tool_module._deploy_site({}, {})
+        return tool_module._deploy_tool(
+            self.server(), {'name': 'deploy_site', 'effect_type': effect})
+
+    async def test_tool_takes_its_identity_from_mcp(self):
+        from app import tools as tool_module
+        tool = self.tool(effect='destructive')
+        self.assertEqual(tool.name, 'deploy_site')
+        self.assertEqual(tool.tool_key, 'mcp:publishing:deploy_site')
+        self.assertEqual(tool.effect, 'destructive')      # 用服务端的 annotations
+        self.assertEqual(tool.capability, 'publishing')
+        self.assertEqual(tool.server_id, 'publishing')
+        self.assertIn('【发布】', tool.prompt_rules)
+
+    async def test_requires_an_artifact_before_touching_the_server(self):
+        from app import tools as tool_module
+        call = AsyncMock()
+        with patch.object(tool_module.mcp_adapter, 'call_tool', call), \
+                patch_all_emits(lambda e: None):
+            with self.assertRaises(tool_module.ToolError) as ctx:
+                await self.tool().run({}, {})
+        self.assertIn('还没有 HTML 产物', ctx.exception.safe_message)
+        call.assert_not_awaited()
 
     async def test_requires_global_enable(self):
         from app import tools as tool_module
         from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
-        with patch.object(tool_module, 'settings',
-                          SimpleNamespace(deploy_enabled=False)):
-            with self.assertRaises(tool_module.ToolError):
-                await tool_module._deploy_site({}, {'artifact': {'html_path': 'x'}})
+        call = AsyncMock()
+        with patch.object(publishing_cap, 'settings',
+                          SimpleNamespace(deploy_enabled=False)), \
+                patch.object(tool_module.mcp_adapter, 'call_tool', call), \
+                patch_all_emits(lambda e: None):
+            with self.assertRaises(tool_module.ToolError) as ctx:
+                await self.tool().run({}, {'artifact': {'html_path': 'x'}})
+        self.assertIn('部署已关闭', ctx.exception.safe_message)
+        call.assert_not_awaited()
 
-    async def test_deploys_and_marks_status(self):
+    async def test_deploys_records_mcp_call_and_status(self):
         from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
         with tempfile.TemporaryDirectory() as folder:
             html = Path(folder) / 'index.html'
             html.write_text('<html></html>', encoding='utf-8')
             artifact = {'html_path': str(html), 'sha256': 'abc'}
 
-            async def fake_deploy(_artifact):
-                return {'status': 'success', 'public_url': 'https://x/1'}
+            async def fake_call(name, arguments, artifact=None, server=None):
+                self.assertEqual(name, 'deploy_site')
+                self.assertEqual(server.id, 'publishing')
+                return {'status': 'success', 'site_id': 'site_7',
+                        'url': 'https://x/1'}
 
-            with patch.object(tool_module, 'settings',
-                              SimpleNamespace(deploy_enabled=True)), \
-                    patch.object(publishing_cap.mcp_adapter, 'deploy_html', fake_deploy):
-                result = await tool_module._deploy_site({}, {'artifact': artifact})
+            seen = []
+            with patch.object(tool_module.mcp_adapter, 'call_tool', fake_call), \
+                    patch_all_emits(seen.append):
+                result = await self.tool().run({}, {'artifact': artifact})
+
             self.assertEqual(result['status'], 'deployed')
+            self.assertEqual(result['deployment']['public_url'], 'https://x/1')
+            self.assertEqual(result['deployment']['deployment_id'], 'site_7')
+            self.assertEqual(result['deployment']['content_hash'], 'abc')
+            # 和其它 MCP 工具一样留下调用记录（含服务端），否则审计查不到这条写操作
+            self.assertEqual(result['mcp_calls'][0]['tool'], 'deploy_site')
+            self.assertEqual(result['mcp_calls'][0]['server'], 'publishing')
             saved = json.loads((Path(folder) / 'deployment.json').read_text('utf-8'))
             self.assertEqual(saved['public_url'], 'https://x/1')
+            self.assertTrue(any(e.get('label') == '部署完成' for e in seen))
 
     async def test_deploy_falls_back_to_prior_artifact(self):
-        """界面没有部署按钮了，用户单说一句"部署到服务器"也要能落到上一轮的产物上。"""
+        """用户单说一句"部署到服务器"也要能落到上一轮的产物上。"""
         from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
         with tempfile.TemporaryDirectory() as folder:
             html = Path(folder) / 'index.html'
             html.write_text('<html></html>', encoding='utf-8')
             prior = {'html_path': str(html), 'sha256': 'p'}
 
-            async def fake_deploy(_artifact):
-                return {'status': 'success', 'public_url': 'https://x/9'}
+            async def fake_call(name, arguments, artifact=None, server=None):
+                self.assertEqual(artifact, prior)      # 注入的就是上一轮那份
+                return {'status': 'success', 'url': 'https://x/9'}
 
             seen = []
-            with patch.object(tool_module, 'settings',
-                              SimpleNamespace(deploy_enabled=True)), \
-                    patch.object(publishing_cap.mcp_adapter, 'deploy_html', fake_deploy), \
+            with patch.object(tool_module.mcp_adapter, 'call_tool', fake_call), \
                     patch_all_emits(seen.append):
-                result = await tool_module._deploy_site({}, {'prior_artifact': prior})
+                result = await self.tool().run({}, {'prior_artifact': prior})
             self.assertEqual(result['status'], 'deployed')
             # 必须明确告知复用了上一轮产物，避免误以为这轮重新生成过
             self.assertTrue(any(e.get('label') == '复用上一轮产物' for e in seen))
 
-    async def test_needs_check_when_tool_reports_otherwise(self):
+    async def test_unreadable_receipt_is_needs_check_not_failure(self):
+        """回执看不懂不等于失败：站点可能真的建出来了，不能说"没部署"。"""
         from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
         with tempfile.TemporaryDirectory() as folder:
             html = Path(folder) / 'index.html'
             html.write_text('<html></html>', encoding='utf-8')
 
-            async def fake_deploy(_artifact):
-                return {'status': 'pending', 'public_url': 'https://x/2'}
+            async def fake_call(name, arguments, artifact=None, server=None):
+                return {'status': 'pending'}           # 既没地址也没成功标记
 
-            with patch.object(tool_module, 'settings',
-                              SimpleNamespace(deploy_enabled=True)), \
-                    patch.object(publishing_cap.mcp_adapter, 'deploy_html', fake_deploy):
-                result = await tool_module._deploy_site(
+            with patch.object(tool_module.mcp_adapter, 'call_tool', fake_call), \
+                    patch_all_emits(lambda e: None):
+                result = await self.tool().run(
                     {}, {'artifact': {'html_path': str(html), 'sha256': 'a'}})
             self.assertEqual(result['status'], 'deploy_needs_check')
+            self.assertEqual(result['deployment']['status'], 'needs_check')
+            self.assertEqual(result['deployment']['public_url'], '')
+
+    async def test_live_server_payload_counts_as_success(self):
+        """线上服务端回的是 `status: deployed`，不是 success——不能判成待确认。"""
+        from app.capabilities import publishing as publishing_cap
+        payload = {'status': 'deployed', 'site_id': 'n6HRJXd8',
+                   'name': 'site-n6HRJXd8',
+                   'url': 'http://42.194.146.23:3456/sites/n6HRJXd8/'}
+        with tempfile.TemporaryDirectory() as folder:
+            html = Path(folder) / 'index.html'
+            html.write_text('<html></html>', encoding='utf-8')
+            deployment = publishing_cap.interpret_deploy(
+                payload, {'html_path': str(html), 'sha256': 'h'}, self.server())
+        self.assertEqual(deployment['status'], 'success')
+        self.assertEqual(deployment['public_url'], payload['url'])
+        self.assertEqual(deployment['deployment_id'], 'n6HRJXd8')
+        self.assertEqual(publishing_cap.status_of(deployment), 'deployed')
+
+    async def test_remote_failure_surfaces_as_tool_error(self):
+        from app import tools as tool_module
+
+        async def boom(name, arguments, artifact=None, server=None):
+            raise RuntimeError('502')
+
+        with patch.object(tool_module.mcp_adapter, 'call_tool', boom), \
+                patch_all_emits(lambda e: None):
+            with self.assertRaises(tool_module.ToolError) as ctx:
+                await self.tool().run({}, {'artifact': {'html_path': 'x',
+                                                       'sha256': 'a'}})
+        self.assertIn('deploy_site', ctx.exception.safe_message)
+
+    async def test_discovered_deploy_tool_is_the_only_deploy_entry(self):
+        """清单里只留一份部署工具：旧的内置那份已经没了，旧名字仍能解析。"""
+        from app import tools as tool_module
+        server = self.server()
+
+        async def fake_list(_server):
+            return [{'name': 'deploy_site', 'inputSchema': {'type': 'object'},
+                     'effect_type': 'write'},
+                    {'name': 'list_sites', 'inputSchema': {'type': 'object'},
+                     'effect_type': 'read'}]
+
+        with patch.object(tool_module.mcp_adapter, 'list_server_tools', fake_list), \
+                patch.object(tool_module.mcp_servers, 'servers', lambda: [server]), \
+                patch.object(tool_module, 'settings',
+                            SimpleNamespace(deploy_enabled=True)):
+            tool_module._MCP_CACHE.update(at=0.0, tools=[], signature=())
+            tools = await tool_module.mcp_tools(force=True)
+            self.assertEqual([t.name for t in tools],
+                             ['deploy_site', 'mcp__list_sites'])
+            deploy = tools[0]
+            self.assertEqual(deploy.tool_key, 'mcp:publishing:deploy_site')
+            # 新名字、旧名字都解析到同一个工具（旧计划续跑不会失效）
+            self.assertIs(await tool_module.find_tool('deploy_site'), deploy)
+            self.assertIs(await tool_module.find_tool('mcp__deploy_site'), deploy)
+            # DEPLOY_ENABLED=false：连占位都不给，计划里不会出现注定失败的一步
+            with patch.object(tool_module, 'settings',
+                              SimpleNamespace(deploy_enabled=False)):
+                tool_module._MCP_CACHE.update(at=0.0, tools=[], signature=())
+                off = await tool_module.catalog()
+        self.assertNotIn('deploy_site', [t.name for t in off])
+        self.assertIn('mcp__list_sites', [t.name for t in off])
+
+    async def test_placeholder_keeps_the_tool_visible_when_server_is_down(self):
+        """服务端掉线时留占位工具：报错要清楚，而不是当作未知工具静默跳过。"""
+        from app import tools as tool_module
+        from app.integrations import mcp_servers
+        server = self.server()
+        with patch.object(mcp_servers, 'servers', lambda: [server]), \
+                patch.object(mcp_servers, 'deploy_server', lambda: server):
+            tool = tool_module._deploy_placeholder(
+                {'publishing': 'RuntimeError: 502'})
+        self.assertIsNotNone(tool)
+        self.assertEqual(tool.name, 'deploy_site')
+        self.assertEqual(tool.tool_key, 'mcp:publishing:deploy_site')
+        with patch_all_emits(lambda e: None), \
+                self.assertRaises(tool_module.ToolError) as ctx:
+            await tool.run({}, {'artifact': {'html_path': 'x'}})
+        self.assertIn('部署不可用', ctx.exception.safe_message)
+        self.assertIn('502', ctx.exception.safe_message)
 
 
 class StoreTests(unittest.TestCase):
@@ -2754,12 +2944,17 @@ class KernelCorrectnessTests(unittest.IsolatedAsyncioTestCase):
     def test_planner_prompt_is_split_by_capability(self):
         """业务规则归能力包：没有部署工具时，提示词里就不该教怎么部署。"""
         from app import tools as tool_module
-        text = nodes.planner_system(tool_module.BUILTIN_TOOLS)
+        from app.integrations import mcp_servers
+        deploy = tool_module._deploy_tool(
+            mcp_servers.Server(id='publishing', url='https://a/mcp',
+                               deploy_tool='deploy_site', default=True),
+            {'name': 'deploy_site', 'effect_type': 'write'})
+        catalog = tool_module.BUILTIN_TOOLS + [deploy]
+        text = nodes.planner_system(catalog)
         for needle in ('联网检索', '导出网页', '发布'):
             self.assertIn(needle, text, needle)
         self.assertIn('step_id', text)
-        without = [tool for tool in tool_module.BUILTIN_TOOLS
-                   if tool.name != 'deploy_site']
+        without = [tool for tool in catalog if tool.name != 'deploy_site']
         self.assertNotIn('【发布】', nodes.planner_system(without))
 
 
@@ -3011,7 +3206,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
     def test_compensation_is_kept_and_bound_to_a_real_tool(self):
         from app import tools as tool_module
         steps, issues = nodes.validate_plan([
-            {'tool': 'deploy_site', 'step_id': 's1', 'args': {},
+            {'tool': 'web_search', 'step_id': 's1', 'args': {'query': 'q'},
              'compensate': {'tool': 'render_sources_html', 'args': {}}},
         ], tool_module.BUILTIN_TOOLS)
         self.assertEqual(issues, [])
@@ -3227,10 +3422,15 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
             discovered = await tool_module.mcp_tools(force=True)
 
         self.assertEqual(sorted(seen), ['ops', 'publishing'])
-        self.assertEqual([t.name for t in discovered],
+        # 掉线的 ops 一个工具都不贡献，publishing 的 list_sites 照常可用
+        mcp_only = [t for t in discovered if t.capability == 'mcp']
+        self.assertEqual([t.name for t in mcp_only],
                          ['mcp__publishing__list_sites'])
         self.assertIn('ops', tool_module.mcp_status()['errors'])
-        self.assertEqual(discovered[0].server_id, 'publishing')
+        self.assertEqual(mcp_only[0].server_id, 'publishing')
+        # 部署工具没发现到：不是消失，而是留占位（报错要说清楚）
+        deploy = [t for t in discovered if t.capability == 'publishing']
+        self.assertEqual([t.name for t in deploy], ['deploy_site'])
 
     async def test_runner_calls_the_server_it_belongs_to(self):
         from app import tools as tool_module

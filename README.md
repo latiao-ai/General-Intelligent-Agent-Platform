@@ -6,15 +6,21 @@
 
 当前能力面（有意保持最小）：
 
-| 工具 | 作用 | 来源 |
-|---|---|---|
-| `web_search` | 检索网页 | DeepSeek 官方 Search API |
-| `fetch_pages` | 抓取正文（Markdown） | DeepSeek 官方 Fetch API |
-| `render_sources_html` | 把资料原样排版成 HTML，不调用模型 | 本地能力包 |
-| `answer_directly` | 用模型自身知识直接回答，不检索 | 本地能力包 |
-| `answer_with_sources` | 基于已抓到的正文作答并附来源 | 本地能力包 |
-| `deploy_site` | 发布产物到服务器 | MCP 服务端 |
-| `mcp__*` | 服务端动态发现的工具（含查询/删除/更新站点） | MCP 服务端 |
+| 工具 | 作用 | 来源 | 身份（tool_key） |
+|---|---|---|---|
+| `web_search` | 检索网页 | DeepSeek 官方 Search API | `local:web:search` |
+| `fetch_pages` | 读取**本轮输入里给出的 URL** 正文（Markdown） | DeepSeek 官方 Fetch API | `local:web:fetch` |
+| `render_sources_html` | 把资料原样排版成 HTML，不调用模型 | 本地能力包 | `local:export:sources_html` |
+| `answer_directly` | 用模型自身知识直接回答，不检索 | 本地能力包 | `local:answers:direct` |
+| `answer_with_sources` | 基于已抓到的正文作答并附来源 | 本地能力包 | `local:answers:with_sources` |
+| `deploy_site` | 发布产物到服务器 | **MCP 服务端**（带平台适配器） | `mcp:<server>:<tool>` |
+| `mcp__*` | 服务端动态发现的工具（含查询/删除/更新站点） | MCP 服务端 | `mcp:<server>:<tool>` |
+
+只有前五个是"内置"工具：不需要外部服务、身份以 `local:` 开头。`deploy_site`
+**不是内置工具**——它就是服务端声明的那个部署工具，身份是 `mcp:<server>:<tool>`，
+和 `mcp__*` 走同一条调用通道（同一份账本记录、同样进 `mcp_calls`、同样的
+结果未定判定）。平台只为它多挂了一个适配器（调用前的开关/产物闸门 + 调用后的
+回执归一，见 `app/capabilities/publishing.py`）。
 
 > 结构化报告生成（compose/render 模板）已按需移除，内核仍保留通用的计划、
 > 账本、恢复等机制。
@@ -24,9 +30,14 @@
 | 情况 | 走哪条 |
 |---|---|
 | 闲聊、概念解释、原理、常识（模型自己有把握） | `answer_directly`（不检索） |
-| 需要外部事实，但只想在聊天里问个明白 | `web_search → fetch_pages → answer_with_sources` |
-| 要产出一个 HTML 文件 | `web_search → fetch_pages → render_sources_html` |
+| 需要外部事实，但只想在聊天里问个明白 | `web_search → answer_with_sources` |
+| 要产出一个 HTML 文件 | `web_search → render_sources_html` |
+| 本轮输入里给了 URL，要读这个网页 | `fetch_pages(urls=[用户给出的链接]) → answer_with_sources / render_sources_html` |
 | 还要发布上线 | 再加 `deploy_site` |
+
+`fetch_pages` 的调用时机只有一条：**用户输入里出现了 URL**。检索结果自带的正文
+就是本轮资料（官方 Search 用 `need_content=True` 拉正文），不需要再逐条抓一遍；
+输入里没有 URL 时它不该出现在计划里，硬传别的链接会被工具直接拒绝。
 
 "没有合适工具"不等于"直接编一个回答"：查实时数据但手里没对应工具时，
 应当说明无法确认或请用户提供数据，而不是拿不相关的工具硬凑。
@@ -390,13 +401,17 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
 ## 4. 部署行为
 
 ```
-DEPLOY_ENABLED=false            → 不部署（界面按钮置灰）
-DEPLOY_ENABLED=true + 用户要求  → 生成后自动部署
+DEPLOY_ENABLED=false            → 清单里没有 deploy_site（连占位都没有）
+DEPLOY_ENABLED=true + 用户要求  → 计划最后加一步 deploy_site
 DEPLOY_ENABLED=true + 未要求    → 停在本地产物，界面出现「部署到服务器」按钮
+DEPLOY_ENABLED=true + 服务端掉线 → 留占位工具，调用时报「部署不可用：<原因>」
 ```
 
-意图由模型判定（`Plan.auto_deploy`），**不使用关键词匹配**：
+意图由模型判定（能力包的【发布】规则），**不使用关键词匹配**：
 "对比数据库的部署方式"属于研究内容，不会被误判为要求部署。
+
+部署工具的身份是 `mcp:<server>:<tool>`，账本里因此能看出"这一轮依赖哪个服务端"；
+`DEPLOY_ENABLED=false` 时它整体不在清单里，没法绕过去调原始工具。
 
 只重试部署（不重新生成）：
 
@@ -420,8 +435,8 @@ python -m scripts.list_mcp_tools
 | 阶段 | 实测 | 说明 |
 |---|---|---|
 | 规划 | 2 ~ 4s | 唯一必有的模型调用 |
-| 检索来源（每次） | 0.5 ~ 0.7s | 官方 Search 已带正文，很少需要补抓 |
-| 抓取正文 | 0 ~ 3s | 多数情况正文已随检索返回，这一步常是空跑 |
+| 检索来源（每次） | 0.5 ~ 0.7s | 直接使用官方 Search 返回的正文，不补抓搜索结果 |
+| 抓取正文 | 0 ~ 3s | 只有输入里给了 URL 才有这一步 |
 | 资料转 HTML | 0.02s | 纯本地渲染，不调用模型 |
 | 部署 | 1 ~ 3s | MCP 往返 |
 

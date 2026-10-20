@@ -26,6 +26,7 @@ from app.messages import cancel_note, reply_text
 from app import ledger as ledger_module
 from app import memory as memory_module
 from app import profile as profile_module
+from app.capabilities import publishing as publishing_capability
 from app.services import is_stop_command
 from app.store import Store, now, open_store
 
@@ -370,8 +371,8 @@ class Hub:
                                      time.time() - opened['at'], status))
 
         # 这些阶段一出现，说明"规划已完成、开始真正干活"，可结算指令耗时。
-        FIRST_WORK_STAGES = {'web_search', 'fetch_pages',
-                             'render_sources_html', 'deploy_site'}
+        FIRST_WORK_STAGES = {'web_search', 'fetch_pages', 'render_sources_html',
+                             publishing_capability.TOOL_NAME}
 
         def relay(event: dict) -> None:
             if (event.get('type') == 'stage_start'
@@ -728,9 +729,8 @@ class Hub:
                                        run_id=run_id)
         if claimed is None:
             raise RuntimeError('无法领取部署运行，请稍后重试')
-        step = {'tool': 'deploy_site', 'step_id': 's1', 'args': {},
-                'depends_on': [], 'why': '用户点击部署',
-                'tool_key': 'local:publishing:deploy', 'effect': 'write'}
+        step = {'tool': publishing_capability.TOOL_NAME, 'step_id': 's1', 'args': {},
+                'depends_on': [], 'why': '用户点击部署'}
         keep_artifact_id = record.artifact_id
         record.run_id = run_id
         record.lease_owner = claimed.get('lease_owner')

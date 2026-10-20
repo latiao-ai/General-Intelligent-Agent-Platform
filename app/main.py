@@ -8,15 +8,17 @@ from pathlib import Path
 from app.config import settings, check_runtime_keys
 from app.events import STAGE_LABELS  # noqa: F401  (对外仍从 app.main 可用)
 from app import ledger as ledger_module
+from app.capabilities.publishing import deploy_once
 from app.graph import build_graph
-from app.integrations.mcp_adapter import deploy_html
 from app.files import save_json
 
 
 async def deploy_task(task_id: str) -> dict:
     """部署已经生成好的 HTML：不重新搜索、不调用模型。
 
-    供 Streamlit 部署按钮与 scripts.retry_deploy 共用。
+    只给 `scripts.retry_deploy` 这种"结果未定后人工重放一次"的补救场景用。
+    界面上的部署按钮走执行器（`Hub.deploy_artifact`），有账本、事件与取消语义；
+    这里刻意保持最小：校验开关与哈希，然后调一次部署工具。
     """
     if not settings.deploy_enabled:
         raise RuntimeError('DEPLOY_ENABLED=false，部署已关闭；请在 .env 打开后重启进程')
@@ -27,9 +29,7 @@ async def deploy_task(task_id: str) -> dict:
     actual = hashlib.sha256(Path(artifact['html_path']).read_bytes()).hexdigest()
     if actual != artifact['sha256']:
         raise ValueError('HTML 已修改，请重新生成 manifest 后再部署')
-    result = await deploy_html(artifact)
-    save_json(folder / 'deployment.json', result)
-    return result
+    return await deploy_once(artifact)
 
 
 async def run_task(text: str, progress=None, on_event=None, history=None,

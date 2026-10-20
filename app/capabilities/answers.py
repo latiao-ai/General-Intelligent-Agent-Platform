@@ -85,7 +85,7 @@ async def _answer_with_sources(args: dict, state: dict) -> dict:
     question = str(args.get('question') or state.get('user_input') or '')
     documents, origin = usable_documents(state)
     if not documents:
-        raise ToolError('还没有可用正文，请先调用 web_search，再用 fetch_pages 抓正文')
+        raise ToolError('还没有可用正文：先用 web_search 检索取得正文')
     if origin:
         emit(action('沿用上一轮的正文', f'{len(documents)} 个来源', '♻️'))
     selected, _ = _select_sources(state, documents)

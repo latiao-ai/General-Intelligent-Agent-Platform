@@ -109,7 +109,7 @@
 ## 测试
 
 ```
-python -m unittest tests.test_core                                  # 211 通过（SQLite）
+python -m unittest tests.test_core                                  # 201 通过（SQLite）
 # PG_TEST_DSN 必须指向一次性测试库（库名需含 test），用例会 TRUNCATE 全部表
 PG_TEST_DSN=postgresql://.../agent_platform_test python -m unittest \
     tests.test_core.PostgresParityTests                             # 6 通过（真实 PG）
@@ -149,7 +149,8 @@ PG_TEST_DSN=postgresql://.../agent_platform_test python -m unittest \
 |---|---|---|---|
 | P1-8 | `POST /api/tasks` 幂等键 | `Idempotency-Key` 头或 body `idempotency_key`；`request_keys` 表按 `主体+接口+键` 占位，同键同内容返回原响应（`idempotent_replay: true`），同键换内容 409，TTL 过期可复用；建任务失败会撤销占位 | `IdempotencyTests`、`ApiIdempotencyTests`（共 9 条） |
 | §8.4 | 补偿步骤 | 计划可给每步声明 `compensate`；步骤失败时逆序撤销已成功的写操作，补偿有自己的账本动作与事件；撤销失败 → `partially_succeeded`；手工撤销走 `POST /api/runs/{id}/compensate`（独立 run，原 run 记 `compensated_at`）；`ref` 绑定可把站点 ID 传给撤销工具 | `CompensationTests`（7 条） |
-| §5.4 | 多 MCP Server 路由 | `MCP_SERVERS` 配置多个服务端（transport/url/token/stdio），并发发现、失败隔离；工具名带服务端前缀并记录 `server_id`；`deploy_site` 类适配器工具由 `default` 服务端承接；旧计划里的 `mcp__<tool>` 可按尾部唯一匹配回退 | `McpRoutingTests`（6 条） |
+| §5.4 | 多 MCP Server 路由 | `MCP_SERVERS` 配置多个服务端（transport/url/token/stdio），并发发现、失败隔离；工具名带服务端前缀并记录 `server_id`；旧计划里的 `mcp__<tool>` 可按尾部唯一匹配、或按 `tool_key` 尾部回退 | `McpRoutingTests`（6 条） |
+| §5.4 | **部署工具不再是一条旁路** | `deploy_site` 就是 `default` 服务端声明的那个工具：身份 `mcp:<server>:<tool>`，走统一 MCP 通道（同一份账本、同样进 `mcp_calls`、同样的结果未定判定），平台只挂适配器（调用前的开关/产物闸门 + 调用后的回执归一）。清单里只有它一份，`mcp__deploy_site` 旧名仍能解析；服务端掉线时留占位工具明确报错；`DEPLOY_ENABLED=false` 时它整体不在清单里，没法绕过闸门调原始工具 | `DeployGateTests`（9 条） |
 
 设计取舍写在这里，避免以后被"看起来更简单"的做法改回去：
 

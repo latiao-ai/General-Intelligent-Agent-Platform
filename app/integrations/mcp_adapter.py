@@ -261,21 +261,3 @@ async def call_tool(tool_name: str, arguments: dict, artifact: dict | None = Non
             validate(instance=merged, schema=tool.inputSchema)
             result = await session.call_tool(tool_name, arguments=merged)
             return result_payload(result)
-
-
-async def deploy_html(artifact: dict, server=None):
-    """把 HTML 产物交给承接部署的服务端。"""
-    server = server or mcp_servers.deploy_server()
-    tool_name = (getattr(server, 'deploy_tool', '') if server is not None else '') \
-        or os.getenv('MCP_TOOL_NAME', '')
-    if not tool_name:
-        raise RuntimeError('未配置部署工具名（MCP_TOOL_NAME / deploy_tool）')
-    payload = await call_tool(tool_name, {}, artifact=artifact, server=server)
-    url = result_url(payload, server)
-    site_id = payload.get('site_id') if isinstance(payload, dict) else None
-    return {
-        'status': 'success',
-        'deployment_id': site_id,
-        'public_url': url,
-        'content_hash': artifact['sha256'],
-    }
