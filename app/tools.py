@@ -10,11 +10,13 @@
 文件末尾保留一批名字别名（_web_search、_compose_report 等），让旧调用点和
 既有测试在迁移期继续可用——文档 §14 要求的"过渡期薄兼容层"。
 """
+import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, replace
 
-from app import mcp_adapter
+from app import mcp_adapter, mcp_servers
 from app.capabilities.base import (ToolError, error_entry, tool_results_text,
                                    usable_documents, _select_sources, _with_text)
 from app.capabilities.web import _fetch_pages, _web_search
@@ -31,12 +33,15 @@ from app.capabilities.answers import (ANSWER_SYSTEM,
 from app.capabilities import web as web_capability
 from app.capabilities import answers as answers_capability
 from app.capabilities import reports as reports_capability
+from app.capabilities import publishing as publishing_capability
 from app.config import settings
 
 # 旧代码里 image: tool_module.search_backend / chat_reply / emit 的引用保留
 from app import search as search_backend
 from app.events import action, answer_delta, draft, emit
 from app.services import chat_reply
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -53,6 +58,12 @@ class Tool:
     # MCP 侧取自服务端 annotations，本地写死；没信息就是 unknown，不靠名字猜。
     effect: str = 'unknown'
     capability: str = ''
+    # 规划规则：由**能力包自带**，规划器提示词按候选工具所属能力拼接。
+    # 以前这些规则写死在 nodes.PLANNER_SYSTEM 里，新增一个工单/数据库能力
+    # 必须改内核提示词——跟"业务提示词归能力包"是反的（文档 §4）。
+    prompt_rules: str = ''
+    # 远端工具来自哪个服务端（本地工具为空）。多服务端时靠它做路由与排障。
+    server_id: str = ''
 
 
 def describe_tool(tool: Tool) -> str:
@@ -122,9 +133,27 @@ _LOCAL_META = {
     'answer_directly': ('local:answers:direct', 'read', 'answers'),
 }
 
+# 每个能力包自带一段"什么时候用我"的规划规则。工具注册时按 capability 取，
+# 规划器只拼接**本轮候选工具实际覆盖到的**能力——工具多起来时提示词不会膨胀。
+CAPABILITY_RULES = {
+    'web': web_capability.PROMPT_RULES,
+    'reports': reports_capability.PROMPT_RULES,
+    'publishing': publishing_capability.PROMPT_RULES,
+    'answers': answers_capability.PROMPT_RULES,
+}
+
+# MCP 是"外来能力"，规则只能给通用纪律，不能替它编业务语义
+MCP_PROMPT_RULES = (
+    '【MCP 工具】调用查询类 MCP 工具时，只有不带过滤参数（如 keyword）的结果才是'
+    '全量清单；删改类操作（delete_*/update_*）之后若要告诉用户"还剩什么/还剩几个"，'
+    '必须再加一步**不带过滤参数**的查询（如 mcp__list_sites 且参数为空），'
+    '绝不能拿操作前的过滤结果或操作返回体去推断。'
+)
+
 BUILTIN_TOOLS = [
     replace(tool, tool_key=_LOCAL_META[tool.name][0],
-            effect=_LOCAL_META[tool.name][1], capability=_LOCAL_META[tool.name][2])
+            effect=_LOCAL_META[tool.name][1], capability=_LOCAL_META[tool.name][2],
+            prompt_rules=CAPABILITY_RULES.get(_LOCAL_META[tool.name][2], ''))
     for tool in BUILTIN_TOOLS
 ]
 
@@ -133,7 +162,7 @@ BUILTIN_BY_NAME = {tool.name: tool for tool in BUILTIN_TOOLS}
 
 # ---------- MCP 动态工具 ----------
 
-MCP_PREFIX = 'mcp__'
+MCP_PREFIX = mcp_servers.MCP_PREFIX
 
 # 原始 MCP 工具仍全部暴露（保留最大能力），但重复/不可逆的那几个补一句说明，
 # 让模型优先走有保障的路径，而不是靠删功能来限制它。
@@ -145,64 +174,109 @@ MCP_HINTS = {
     'list_sites': '不带 keyword 时返回全量站点；带了 keyword 只是筛选结果，不能当全量用。',
 }
 # 每次任务都去 discover 一次太慢（一次可能几十秒），进程内缓存一小段时间。
-_MCP_CACHE: dict = {'at': 0.0, 'tools': []}
+# 缓存要跟"服务端配置签名"绑定：改了 MCP_SERVERS 立刻重新发现，不能等 TTL。
+_MCP_CACHE: dict = {'at': 0.0, 'tools': [], 'errors': {}, 'signature': ()}
 _MCP_TTL = 300.0
 
 
-async def mcp_tools(force: bool = False) -> list[Tool]:
-    """发现 MCP 服务端的工具，包装成可编排的 Tool。失败时返回空列表。
+def _signature() -> tuple:
+    return tuple((s.id, s.transport, s.url or s.stdio_command)
+                 for s in mcp_servers.servers())
 
-    部署类工具需要文件内容，模型给不出 base64，所以执行时由 `_run_mcp` 用当前
-    产物自动填充——模型只需要给出其余业务参数。
+
+async def _discover(server) -> tuple[list[dict], str]:
+    """发现单个服务端的工具。**失败只影响它自己**，不拖垮其他服务端。"""
+    try:
+        return await mcp_adapter.list_server_tools(server), ''
+    except Exception as exc:                       # noqa: BLE001
+        logger.warning('MCP 服务端 %s 工具发现失败：%s', server.id,
+                       type(exc).__name__, exc_info=True)
+        return [], f'{type(exc).__name__}: {str(exc)[:160]}'
+
+
+async def mcp_tools(force: bool = False) -> list[Tool]:
+    """发现所有 MCP 服务端的工具，包装成可编排的 Tool。
+
+    - 并发发现，单个服务端超时/掉线不影响其他服务端；
+    - 多服务端时工具名带服务端前缀，避免同名工具互相覆盖；
+    - 部署类工具需要文件内容，模型给不出 base64，执行时由 runner 用当前产物
+      自动填充——模型只需要给出其余业务参数。
     """
     now = time.monotonic()
-    if not force and _MCP_CACHE['tools'] and now - _MCP_CACHE['at'] < _MCP_TTL:
+    signature = _signature()
+    cached = (_MCP_CACHE['tools'] and _MCP_CACHE.get('signature') == signature
+              and now - _MCP_CACHE['at'] < _MCP_TTL)
+    if cached and not force:
         return _MCP_CACHE['tools']
-    try:
-        discovered = await mcp_adapter.list_server_tools()
-    except Exception:
-        # MCP 不可用不该拖垮整个任务：内置工具仍然能干活。
-        _MCP_CACHE.update(at=now, tools=[])
-        return []
-    tools = []
-    for item in discovered:
-        name = MCP_PREFIX + item['name']
-        schema = item.get('inputSchema') or {'type': 'object', 'properties': {}}
-        # 用服务端给的真实描述，而不是拿工具名猜用途
-        title = item.get('title') or item['name']
-        detail = (item.get('description') or '').strip()
-        description = f'{title}（MCP 服务端工具 {item["name"]}）'
-        if detail:
-            description = f'{description}：{detail}'
-        hint = MCP_HINTS.get(item['name'], '')
-        if hint:
-            description = f'{description} {hint}'
-        tools.append(Tool(
-            name, f'MCP·{item["name"]}', description, schema,
-            _make_mcp_runner(item['name']),
-            tool_key=f'mcp:{settings.mcp_server_id}:{item["name"]}',
-            effect=item.get('effect_type') or 'unknown',
-            capability='mcp',
-        ))
-    _MCP_CACHE.update(at=now, tools=tools)
+
+    servers = mcp_servers.servers()
+    discovered = await asyncio.gather(*(_discover(server) for server in servers)) \
+        if servers else []
+    total = len(servers)
+    tools: list[Tool] = []
+    errors: dict[str, str] = {}
+    for server, (items, error) in zip(servers, discovered):
+        if error:
+            errors[server.id] = error
+            continue
+        for item in items:
+            name = mcp_servers.tool_name(server, item['name'], total)
+            schema = item.get('inputSchema') or {'type': 'object', 'properties': {}}
+            # 用服务端给的真实描述，而不是拿工具名猜用途
+            title = item.get('title') or item['name']
+            detail = (item.get('description') or '').strip()
+            description = f'{title}（MCP 服务端 {server.id} 的工具 {item["name"]}）'
+            if detail:
+                description = f'{description}：{detail}'
+            hint = MCP_HINTS.get(item['name'], '')
+            if hint:
+                description = f'{description} {hint}'
+            tools.append(Tool(
+                name, f'MCP·{item["name"]}', description, schema,
+                _make_mcp_runner(item['name'], server),
+                tool_key=f'mcp:{server.id}:{item["name"]}',
+                effect=item.get('effect_type') or 'unknown',
+                capability='mcp',
+                prompt_rules=MCP_PROMPT_RULES,
+                server_id=server.id,
+            ))
+    _MCP_CACHE.update(at=now, tools=tools, errors=errors, signature=signature)
     return tools
 
 
-def _make_mcp_runner(server_tool_name: str):
+def mcp_status() -> dict:
+    """MCP 连接态势：给 /api/health 与排障用。"""
+    return {'tools': len(_MCP_CACHE['tools']),
+            'errors': dict(_MCP_CACHE.get('errors') or {}),
+            'servers': mcp_servers.status()}
+
+
+def _make_mcp_runner(server_tool_name: str, server=None):
     async def run(args: dict, state: dict) -> dict:
         artifact = state.get('artifact')
-        emit(action(f'调用 MCP 工具', server_tool_name, '🔧'))
+        label = (f'{server.id}·{server_tool_name}' if server is not None
+                 else server_tool_name)
+        emit(action('调用 MCP 工具', label, '🔧'))
         try:
-            payload = await mcp_adapter.call_tool(
-                server_tool_name, dict(args or {}), artifact=artifact)
+            # 不带 server 时保持旧调用形式：既兼容既有调用点，也让工具名自己
+            # 带前缀时能走路由（mcp_servers.split_tool_name）。
+            if server is None:
+                payload = await mcp_adapter.call_tool(
+                    server_tool_name, dict(args or {}), artifact=artifact)
+            else:
+                payload = await mcp_adapter.call_tool(
+                    server_tool_name, dict(args or {}), artifact=artifact,
+                    server=server)
         except Exception as exc:
             raise ToolError(f'MCP 工具 {server_tool_name} 调用失败') from exc
         emit(action('MCP 工具返回', json.dumps(
             payload, ensure_ascii=False)[:120], '📦'))
         # 参数必须一起记：过滤类工具（如 list_sites 的 keyword）传不传参数，
         # 返回语义完全不同——不记下来就分不清"列表只有 1 个"和"只匹配到 1 个"。
+        # 服务端也要记：多服务端时同名工具的行为可能完全不同。
         return {'mcp_calls': list(state.get('mcp_calls', [])) + [
             {'tool': server_tool_name, 'args': dict(args or {}),
+             'server': getattr(server, 'id', '') or '',
              'payload': payload}]}
     return run
 
@@ -215,3 +289,35 @@ async def catalog() -> list[Tool]:
         tools = [t for t in tools if t.name != 'deploy_site']
     tools.extend(await mcp_tools())
     return tools
+
+
+async def find_tool(name: str):
+    """按名字取工具：内置 → MCP 精确名 → 去掉服务端前缀后再匹配。
+
+    最后那步是为"续跑旧计划"服务的：工具名从 `mcp__delete_site` 变成了
+    `mcp__ops__delete_site` 之后，旧计划里的名字不该直接失效。只有唯一命中
+    才算数——两个服务端都有这个工具时不做猜测。
+    """
+    tool = BUILTIN_BY_NAME.get(name)
+    if tool is not None:
+        return tool
+    tools = await mcp_tools()
+    exact = next((t for t in tools if t.name == name), None)
+    if exact is not None:
+        return exact
+    _, bare = mcp_servers.split_tool_name(name)
+    matches = [t for t in tools if t.name == f'{MCP_PREFIX}{bare}'
+               or t.name.endswith(f'__{bare}')]
+    return matches[0] if len(matches) == 1 else None
+
+
+def planner_rules(catalog_tools) -> list[str]:
+    """按候选工具导出**去重后**的能力包规则块（顺序稳定，便于测试与 diff）。"""
+    blocks, seen = [], set()
+    for tool in catalog_tools:
+        rules = (tool.prompt_rules or '').strip()
+        if not rules or rules in seen:
+            continue
+        seen.add(rules)
+        blocks.append(rules)
+    return blocks

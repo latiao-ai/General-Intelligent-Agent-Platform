@@ -70,9 +70,9 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     marked = started
     ledger_token = ledger_module.bind(ledger)
     try:
-        async with asyncio.timeout(300):
+        async with asyncio.timeout(settings.task_timeout):
             async for mode, chunk in build_graph().astream(
-                state, config={'recursion_limit': 30},
+                state, config={'recursion_limit': settings.graph_recursion_limit},
                 stream_mode=['updates', 'custom'],
             ):
                 if mode == 'custom':

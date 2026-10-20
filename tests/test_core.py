@@ -7,6 +7,7 @@ import unittest
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from dataclasses import replace
 from unittest.mock import patch
 from pydantic import ValidationError
 from app.schemas import ExecutionPlan, PlanStep, Report
@@ -1534,16 +1535,16 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub()
         self.assertFalse(await run_once(hub, 'w1'))
 
-    def test_jobs_drain_is_idempotent(self):
+    async def test_jobs_drain_is_idempotent(self):
         from scripts.run_worker import drain_jobs
         hub = self.hub()
         hub.store.enqueue_job('j1', 'session_summary', 's1:r1',
                               {'session_id': 's1'})
         hub.store.enqueue_job('j2', 'session_summary', 's1:r1',
                               {'session_id': 's1'})
-        done = drain_jobs(hub, 'w1')
+        done = await drain_jobs(hub, 'w1')
         self.assertEqual(done, 1)       # 去重键相同，只有一个作业
-        self.assertEqual(drain_jobs(hub, 'w1'), 0)
+        self.assertEqual(await drain_jobs(hub, 'w1'), 0)
 
 
 PG_DSN = os.getenv('PG_TEST_DSN', '')
@@ -2943,6 +2944,727 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
                 ExecutionPlan, 's', 'u', on_draft=drafts.append, draft_interval=0)
         # 两次尝试各清空一次，第一次尝试的残留不会留在界面上
         self.assertEqual([d is None for d in drafts].count(True), 2)
+
+
+class ExecutionPathTests(unittest.IsolatedAsyncioTestCase):
+    """单一执行路径：就地执行也必须持有租约（评审 P0-1 / P0-5 / P0-6 / P0-7）。
+
+    这些用例守的是同一件事：**同一份计划不能被执行两次**。一旦破防，部署类
+    写操作会真的建出第二个站点，模型费用也会翻倍。
+    """
+
+    @staticmethod
+    def hub(store=None):
+        from app.api_hub import Hub
+        from app.store import Store
+        return Hub(store if store is not None else Store(':memory:'))
+
+    @staticmethod
+    def stub(delay=0.0, status='local_ready'):
+        async def fake_run_task(text, progress=None, on_event=None, history=None,
+                                on_start=None, prior=None, memory=None,
+                                ledger=None, run_id=None, resume_plan=None):
+            if delay:
+                await asyncio.sleep(delay)
+            return {'task_id': 'a1', 'status': status, 'timings': [],
+                    'deployment': {}}
+        return fake_run_task
+
+    async def test_inline_execution_holds_a_lease_so_worker_cannot_steal(self):
+        """API 就地执行也要占租约，否则 Worker 会把这条 running 当孤儿再跑一遍。"""
+        import app.api_hub as hub_module
+        hub = self.hub()
+        with patch.object(hub_module, 'run_task', self.stub(delay=0.2)):
+            record = hub.start('做点事')
+            run = hub.store.run(record.run_id)
+            self.assertEqual(run['status'], 'running')
+            self.assertTrue(run['lease_owner'], '就地执行也必须写 lease_owner')
+            self.assertIsNone(hub.store.claim_run('w-other'),
+                              '租约未过期时 Worker 不该领到同一个 run')
+            await asyncio.wait_for(record._task, timeout=5)
+        # 跑完要交还租约，否则这条 run 在过期前都无法被续跑
+        self.assertIsNone(hub.store.run(record.run_id)['lease_owner'])
+
+    async def test_reconcile_spares_runs_held_by_another_instance(self):
+        """第二个副本启动时不能替别人正在跑的 run 判死。"""
+        import app.api_hub as hub_module
+        first = self.hub()
+        with patch.object(hub_module, 'run_task', self.stub(delay=0.3)):
+            record = first.start('长任务')
+            second = self.hub(first.store)
+            stats = second.reconcile(owner='other-instance')
+            self.assertEqual(stats['runs'], 0)
+            self.assertEqual(first.store.run(record.run_id)['status'], 'running')
+            await asyncio.wait_for(record._task, timeout=5)
+
+    def test_reconcile_requeues_runs_without_inflight_actions(self):
+        """没有 in_flight 动作的遗留 run 应回到队列，而不是挂着等人核实。"""
+        hub = self.hub()
+        hub.store.ensure_task_meta('t1', session_id='s1', goal='g')
+        hub.store.create_run('r1', 't1', status='running')
+        stats = hub.reconcile()
+        self.assertEqual(stats['requeued'], 1)
+        self.assertEqual(hub.store.run('r1')['status'], 'queued')
+
+    def test_cross_process_cancel_writes_a_flag_and_is_honest(self):
+        """取消要真的送到执行者，且已经结束的运行不能假装取消成功。"""
+        hub = self.hub()
+        hub.store.ensure_task_meta('t1', session_id='s1', goal='g')
+        hub.store.create_run('r1', 't1', status='running')
+        self.assertTrue(hub.cancel_run('r1'))
+        self.assertIsNotNone(hub.store.run('r1')['cancel_requested_at'])
+        hub.store.update_run('r1', status='succeeded')
+        self.assertFalse(hub.cancel_run('r1'))
+
+    async def test_resume_works_after_restart(self):
+        """杀进程 → 新 Hub → 续跑：resume 必须回库，而不是只查内存。"""
+        import app.api_hub as hub_module
+        from app.store import Store
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'a.db'
+            first = self.hub(Store(path))
+            with patch.object(hub_module, 'run_task', self.stub()):
+                record = first.start('第一次')
+                await asyncio.wait_for(record._task, timeout=5)
+            # 模拟"计划已存、执行没跑完"
+            first.store.save_plan(
+                record.run_id, 1, goal='g',
+                steps=[{'tool': 'render_html', 'step_id': 's1', 'args': {},
+                        'tool_key': 'local:reports:render'}])
+            first.store.update_run(record.run_id, status='failed')
+            task_id, run_id = record.task_id, record.run_id
+            first.store.close()
+
+            second = self.hub(Store(path))
+            seen = {}
+
+            async def fake(text, progress=None, on_event=None, history=None,
+                           on_start=None, prior=None, memory=None, ledger=None,
+                           run_id=None, resume_plan=None):
+                seen['plan'] = resume_plan
+                seen['history'] = history
+                return {'task_id': 'a1', 'status': 'local_ready', 'timings': [],
+                        'deployment': {}}
+
+            with patch.object(hub_module, 'run_task', fake):
+                resumed = second.resume(run_id)
+                self.assertIsNotNone(resumed, '重启后必须还能续跑')
+                await asyncio.wait_for(resumed._task, timeout=5)
+            self.assertEqual([s['step_id'] for s in seen['plan']['steps']], ['s1'])
+            # 续跑要带上历史，否则续出来的结果接不上前文
+            self.assertTrue(any(m['content'] == '第一次'
+                                for m in (seen['history'] or [])))
+            self.assertEqual(second.store.task(task_id)['task_id'], task_id)
+
+
+class BackendJobTests(unittest.IsolatedAsyncioTestCase):
+    """后台作业：必须真的 await，失败要退避重排而不是一次终结。"""
+
+    def hub(self):
+        from app.api_hub import Hub
+        from app.store import Store
+        return Hub(Store(':memory:'))
+
+    async def test_failed_job_is_requeued_with_backoff(self):
+        from app import memory as memory_module
+        from scripts.run_worker import drain_jobs
+        hub = self.hub()
+        hub.store.enqueue_job('j1', 'session_summary', 's1:r1',
+                              {'session_id': 's1'})
+
+        async def boom(store, session_id):
+            raise RuntimeError('模型不可用')
+
+        with patch.object(memory_module, 'compact', boom):
+            self.assertEqual(await drain_jobs(hub, 'w1'), 0)
+        job = hub.store.job('j1')
+        self.assertEqual(job['status'], 'queued', '一次失败不能当终态')
+        self.assertEqual(job['last_error'], 'RuntimeError')
+        self.assertGreater(job['lease_expires_at'], time.time(), '应处于退避中')
+
+    async def test_summary_job_actually_compacts_memory(self):
+        """以前 asyncio.run() 在运行中的事件循环里必炸，摘要从来没成功过。"""
+        from app import memory as memory_module
+        from scripts.run_worker import drain_jobs
+        hub = self.hub()
+        for index in range(14):
+            hub.store.append_message('s1', 'user', f'第{index}条')
+        hub.store.enqueue_job('j1', 'session_summary', 's1:r1',
+                              {'session_id': 's1'})
+        seen = {}
+
+        async def fake_compact(store, session_id):
+            seen['session'] = session_id
+            return {'compacted': True, 'folded': 8}
+
+        with patch.object(memory_module, 'compact', fake_compact):
+            self.assertEqual(await drain_jobs(hub, 'w1'), 1)
+        self.assertEqual(seen['session'], 's1')
+        self.assertEqual(hub.store.job('j1')['status'], 'done')
+
+
+class KernelCorrectnessTests(unittest.IsolatedAsyncioTestCase):
+    """内核层：截断声明、坏计划、提示词分包（评审 P0-3 / P0-4 / 通用性）。"""
+
+    async def test_truncation_note_reaches_the_model(self):
+        """截断说明必须拼进**发给模型的正文**，否则模型把片段当全文。"""
+        from app import tools as tool_module
+        from app.capabilities import answers as answers_cap
+        from app.capabilities import base as base_cap
+        captured = {}
+
+        async def fake_chat(system, messages, model=None, on_delta=None):
+            captured['messages'] = messages
+            return '结论 [s1]'
+
+        docs = [{'source_id': 's1', 'title': '长文', 'url': 'https://a.example/1',
+                 'status': 'success', 'raw_content': '正' * 500}]
+        with patch.object(base_cap, 'settings', SimpleNamespace(
+                    max_total_chars=10000, max_source_chars=50, max_pages=3)), \
+                patch.object(answers_cap, 'chat_reply', fake_chat):
+            await tool_module._answer_with_sources(
+                {'question': 'q'}, {'documents': docs, 'usage': []})
+        body = captured['messages'][-1]['content']
+        self.assertIn('仅取前 50 字', body)
+        self.assertIn('不要把这些片段当成全文', body)
+
+    async def test_bad_plan_stops_instead_of_executing(self):
+        """两轮修不好就停：不能带着坏依赖去执行一份残缺计划。"""
+        from app import nodes
+        from app import tools as tool_module
+
+        async def fake_catalog():
+            return tool_module.BUILTIN_TOOLS
+
+        async def fake_call(schema, system, user, **kw):
+            return ExecutionPlan.model_validate({'steps': [
+                {'tool': 'not_a_tool', 'args': {}}]}), None
+
+        with patch.object(tool_module, 'catalog', fake_catalog), \
+                patch.object(nodes, 'structured_call', fake_call):
+            result = await nodes.plan({'user_input': '做点事', 'usage': []})
+        self.assertEqual(result['status'], 'waiting_input')
+        self.assertEqual(result['plan']['steps'], [])
+        self.assertIn('unknown_tool', result['failure'])
+        # 图必须直接收尾，不能因为"计划为空"又走进 run_step
+        self.assertEqual(nodes.next_step(result), 'end')
+        # 停下来的任务也要给用户一句人话
+        from app.messages import reply_text
+        self.assertIn('先停在这里', reply_text(result))
+
+    def test_planner_prompt_is_split_by_capability(self):
+        """业务规则归能力包：没有部署工具时，提示词里就不该教怎么部署。"""
+        from app import tools as tool_module
+        text = nodes.planner_system(tool_module.BUILTIN_TOOLS)
+        for needle in ('联网检索', '成稿', '作答', '发布'):
+            self.assertIn(needle, text, needle)
+        self.assertIn('step_id', text)
+        without = [tool for tool in tool_module.BUILTIN_TOOLS
+                   if tool.name != 'deploy_site']
+        self.assertNotIn('【发布】', nodes.planner_system(without))
+
+
+class ApiOwnershipTests(unittest.TestCase):
+    """接口归属校验：知道 session_id 不等于有权限（评审 P0-8）。"""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        import app.api as api_module
+        from app.api_hub import Hub
+        from app.store import Store
+        api_module.hub = Hub(Store(':memory:'))
+        self.api_module = api_module
+        self.client = TestClient(api_module.app)
+
+    def _create(self, message='你好'):
+        import app.api_hub as hub_module
+
+        async def fake(text, progress=None, on_event=None, history=None,
+                       on_start=None, prior=None, memory=None, ledger=None,
+                       run_id=None, resume_plan=None):
+            return {'task_id': 'a1', 'status': 'answered', 'timings': [],
+                    'deployment': {}, 'answer': '好的'}
+
+        with patch.object(hub_module, 'run_task', fake):
+            return self.client.post('/api/tasks', json={'message': message},
+                                    headers={'X-DSH-User': 'u1'}).json()
+
+    def test_other_user_cannot_read_a_session(self):
+        created = self._create()
+        session_id = created['session_id']
+        as_owner = self.client.get(f'/api/sessions/{session_id}/messages',
+                                   headers={'X-DSH-User': 'u1'})
+        self.assertEqual(as_owner.status_code, 200)
+        # 只把 ID 换成别人的身份：一律按"不存在"处理，不泄漏对象是否存在
+        for path in (f'/api/sessions/{session_id}/messages',
+                     f'/api/sessions/{session_id}/timeline',
+                     f'/api/sessions/{session_id}/memory',
+                     f"/api/tasks/{created['task_id']}",
+                     f"/api/tasks/{created['task_id']}/artifact"):
+            res = self.client.get(path, headers={'X-DSH-User': 'u2'})
+            self.assertEqual(res.status_code, 404, path)
+
+    def test_profile_is_scoped_per_user(self):
+        from app import profile
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'USER.md'
+            with patch.object(profile, 'settings',
+                              SimpleNamespace(profile_path=path)):
+                self.client.put('/api/profile', json={'text': '姓名：甲'},
+                                headers={'X-DSH-User': 'u1'})
+                self.client.put('/api/profile', json={'text': '姓名：乙'},
+                                headers={'X-DSH-User': 'u2'})
+                first = self.client.get('/api/profile',
+                                        headers={'X-DSH-User': 'u1'}).json()
+                second = self.client.get('/api/profile',
+                                         headers={'X-DSH-User': 'u2'}).json()
+                self.assertEqual(first['facts'], {'姓名': '甲'})
+                self.assertEqual(second['facts'], {'姓名': '乙'})
+                self.assertFalse(path.exists(), '默认用户不该被别人的画像覆盖')
+
+    def test_health_exposes_queue_state(self):
+        data = self.client.get('/api/health').json()
+        self.assertTrue(data['ok'])
+        for key in ('runs_queued', 'runs_running', 'actions_unknown',
+                    'jobs_queued'):
+            self.assertIn(key, data)
+
+
+class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
+    """创建任务幂等：客户端重试不能变成"两个任务、两次部署"。"""
+
+    def principal(self, user='u1'):
+        return SimpleNamespace(tenant_id='default', user_id=user)
+
+    def test_same_key_and_body_replays_the_same_task(self):
+        from app import idempotency
+        from app.store import Store
+        store = Store(':memory:')
+        body = {'message': '做个报告', 'session_id': None}
+        first = idempotency.reserve(store, principal=self.principal(),
+                                    endpoint='tasks.create', client_key='k1',
+                                    payload=body, ttl_seconds=3600)
+        self.assertFalse(first.replayed)
+        first.complete({'task_id': 't1', 'session_id': 's1', 'run_id': 'r1'},
+                       task_id='t1', session_id='s1', run_id='r1')
+
+        again = idempotency.reserve(store, principal=self.principal(),
+                                    endpoint='tasks.create', client_key='k1',
+                                    payload=body, ttl_seconds=3600)
+        self.assertTrue(again.replayed)
+        self.assertEqual(again.response['task_id'], 't1')
+
+    def test_same_key_with_different_body_conflicts(self):
+        from app import idempotency
+        from app.store import Store
+        store = Store(':memory:')
+        idempotency.reserve(store, principal=self.principal(),
+                            endpoint='tasks.create', client_key='k1',
+                            payload={'message': '甲'}, ttl_seconds=3600)
+        with self.assertRaises(idempotency.IdempotencyConflict):
+            idempotency.reserve(store, principal=self.principal(),
+                                endpoint='tasks.create', client_key='k1',
+                                payload={'message': '乙'}, ttl_seconds=3600)
+
+    def test_concurrent_duplicate_is_reported_as_in_flight(self):
+        """并发的重复请求只能有一个赢家；另一个不能顺手又建一个任务。"""
+        from app import idempotency
+        from app.store import Store
+        store = Store(':memory:')
+        idempotency.reserve(store, principal=self.principal(),
+                            endpoint='tasks.create', client_key='k1',
+                            payload={'message': '甲'}, ttl_seconds=3600)
+        with self.assertRaises(idempotency.IdempotencyInFlight):
+            idempotency.reserve(store, principal=self.principal(),
+                                endpoint='tasks.create', client_key='k1',
+                                payload={'message': '甲'}, ttl_seconds=3600)
+
+    def test_key_is_scoped_per_user(self):
+        """同一个键给不同用户用，不该互相顶掉。"""
+        from app import idempotency
+        from app.store import Store
+        store = Store(':memory:')
+        idempotency.reserve(store, principal=self.principal('u1'),
+                            endpoint='tasks.create', client_key='k1',
+                            payload={'message': '甲'}, ttl_seconds=3600)
+        other = idempotency.reserve(store, principal=self.principal('u2'),
+                                    endpoint='tasks.create', client_key='k1',
+                                    payload={'message': '乙'}, ttl_seconds=3600)
+        self.assertFalse(other.replayed)
+
+    def test_expired_key_can_be_reused(self):
+        from app.store import Store
+        store = Store(':memory:')
+        store.reserve_request_key('scope', client_key='k1', tenant_id='default',
+                                  owner_user_id='u1', endpoint='tasks.create',
+                                  fingerprint='old', expires_at=time.time() - 5)
+        row = store.reserve_request_key('scope', client_key='k1',
+                                        tenant_id='default', owner_user_id='u1',
+                                        endpoint='tasks.create',
+                                        fingerprint='new', expires_at=time.time() + 60)
+        self.assertEqual(row['fingerprint'], 'new')
+
+    def test_release_allows_retry_after_failure(self):
+        from app import idempotency
+        from app.store import Store
+        store = Store(':memory:')
+        reservation = idempotency.reserve(
+            store, principal=self.principal(), endpoint='tasks.create',
+            client_key='k1', payload={'message': '甲'}, ttl_seconds=3600)
+        reservation.release()
+        again = idempotency.reserve(
+            store, principal=self.principal(), endpoint='tasks.create',
+            client_key='k1', payload={'message': '甲'}, ttl_seconds=3600)
+        self.assertFalse(again.replayed, '失败后必须允许用同一个键重试')
+
+
+class ApiIdempotencyTests(unittest.TestCase):
+    """接口层：重试同一个键只建一个任务；换内容返回 409。"""
+
+    def setUp(self):
+        from fastapi.testclient import TestClient
+        import app.api as api_module
+        from app.api_hub import Hub
+        from app.store import Store
+        api_module.hub = Hub(Store(':memory:'))
+        self.api_module = api_module
+        self.client = TestClient(api_module.app)
+
+    def _post(self, message='做个报告', key='k1', user='u1'):
+        import app.api_hub as hub_module
+
+        async def fake(text, progress=None, on_event=None, history=None,
+                       on_start=None, prior=None, memory=None, ledger=None,
+                       run_id=None, resume_plan=None):
+            return {'task_id': 'a1', 'status': 'answered', 'timings': [],
+                    'deployment': {}, 'answer': '好的'}
+
+        headers = {'X-DSH-User': user}
+        if key:
+            headers['Idempotency-Key'] = key
+        with patch.object(hub_module, 'run_task', fake):
+            return self.client.post('/api/tasks', json={'message': message},
+                                    headers=headers)
+
+    def test_retry_with_same_key_returns_the_same_task(self):
+        first = self._post().json()
+        second = self._post().json()
+        self.assertEqual(first['task_id'], second['task_id'])
+        self.assertEqual(first['run_id'], second['run_id'])
+        self.assertTrue(second['idempotent_replay'])
+        tasks = self.api_module.hub.store.session_tasks(first['session_id'])
+        self.assertEqual(len(tasks), 1, '重试不能建出第二个任务')
+
+    def test_same_key_with_another_message_is_rejected(self):
+        self._post()
+        res = self._post(message='换个题目')
+        self.assertEqual(res.status_code, 409)
+        self.assertIn('幂等键', res.json()['detail'])
+
+    def test_without_key_each_request_creates_its_own_task(self):
+        first = self._post(key=None).json()
+        second = self._post(key=None).json()
+        self.assertNotEqual(first['task_id'], second['task_id'])
+
+
+class CompensationTests(unittest.IsolatedAsyncioTestCase):
+    """补偿步骤（文档 §8.4）：撤销是有副作用动作，要单独执行、单独记账。"""
+
+    @staticmethod
+    def _tools(calls):
+        from app import tools as tool_module
+
+        async def deploy(args, state):
+            calls.append(('deploy', dict(args)))
+            return {'deployment': {'site_id': 'site-1'}}
+
+        async def explode(args, state):
+            raise RuntimeError('第二步炸了')
+
+        async def undo(args, state):
+            calls.append(('undo', dict(args)))
+            return {}
+
+        return {
+            'deploy': tool_module.Tool(
+                'deploy', '部署', '', {}, deploy,
+                tool_key='local:publishing:deploy', effect='write'),
+            'explode': tool_module.Tool(
+                'explode', '会失败的步骤', '', {}, explode,
+                tool_key='local:x:boom', effect='write'),
+            'undo': tool_module.Tool(
+                'undo', '撤销部署', '', {}, undo,
+                tool_key='local:publishing:undo', effect='destructive'),
+        }
+
+    def test_unknown_compensation_is_a_warning_not_a_blocker(self):
+        """补偿工具写错不该把整份计划判死，但必须留痕。"""
+        from app import tools as tool_module
+        steps, issues = nodes.validate_plan([
+            {'tool': 'render_html', 'step_id': 's1', 'args': {},
+             'compensate': {'tool': 'ghost_tool', 'args': {}}},
+        ], tool_module.BUILTIN_TOOLS)
+        self.assertEqual([s['step_id'] for s in steps], ['s1'])
+        self.assertNotIn('compensate', steps[0])
+        self.assertEqual(issues[0]['code'], 'unknown_compensation')
+        self.assertEqual(issues[0]['severity'], 'warning')
+
+    def test_compensation_is_kept_and_bound_to_a_real_tool(self):
+        from app import tools as tool_module
+        steps, issues = nodes.validate_plan([
+            {'tool': 'deploy_site', 'step_id': 's1', 'args': {},
+             'compensate': {'tool': 'render_html', 'args': {}}},
+        ], tool_module.BUILTIN_TOOLS)
+        self.assertEqual(issues, [])
+        self.assertEqual(steps[0]['compensate']['tool_key'],
+                         'local:reports:render')
+
+    async def test_failure_rolls_back_succeeded_writes_in_reverse(self):
+        """前面成功、后面失败 → 逆序撤销已成功的写操作，并把明细写进状态。"""
+        from app import tools as tool_module
+        calls = []
+        tools = self._tools(calls)
+        plan = {'steps': [
+            {'tool': 'deploy', 'step_id': 's1', 'args': {},
+             'compensate': {'tool': 'undo', 'args': {
+                 'site_id': {'ref': {'step_id': 's1',
+                                     'pointer': '/deployment/site_id'}}}}},
+            {'tool': 'explode', 'step_id': 's2', 'args': {},
+             'depends_on': ['s1']},
+        ]}
+        state = {'plan': plan, 'step_index': 0, 'step_outputs': {},
+                 'user_input': '做个页面并发布'}
+
+        async def fake_find(name):
+            return tools.get(name)
+
+        with patch.object(tool_module, 'find_tool', fake_find), \
+                patch.object(nodes, 'emit', lambda event: None):
+            state.update(await nodes.run_step(state))
+            result = await nodes.run_step(state)
+
+        self.assertEqual(calls[0][0], 'deploy')
+        self.assertEqual(calls[1], ('undo', {'site_id': 'site-1'}),
+                         '补偿必须拿到部署返回的站点 ID')
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['compensations'][0]['status'], 'succeeded')
+        self.assertIn('已回滚 1 步', result['failure'])
+
+    async def test_failed_rollback_is_reported_as_partial(self):
+        """撤销失败不能只说"失败"：线上可能还留着一个站点。"""
+        from app import tools as tool_module
+        calls = []
+        tools = self._tools(calls)
+
+        async def broken_undo(args, state):
+            raise RuntimeError('删除站点被拒绝')
+
+        tools['undo'] = replace(tools['undo'], run=broken_undo)
+        plan = {'steps': [
+            {'tool': 'deploy', 'step_id': 's1', 'args': {},
+             'compensate': {'tool': 'undo', 'args': {}}},
+            {'tool': 'explode', 'step_id': 's2', 'args': {}},
+        ]}
+        state = {'plan': plan, 'step_index': 0, 'step_outputs': {},
+                 'user_input': 'x'}
+
+        async def fake_find(name):
+            return tools.get(name)
+
+        with patch.object(tool_module, 'find_tool', fake_find), \
+                patch.object(nodes, 'emit', lambda event: None):
+            state.update(await nodes.run_step(state))
+            result = await nodes.run_step(state)
+        self.assertEqual(result['status'], 'partially_succeeded')
+        self.assertIn('回滚失败', result['failure'])
+
+    async def test_unknown_action_is_not_compensated_blindly(self):
+        """结果未定的写操作不能自动去撤：那是基于猜测再发一次写请求。"""
+        from app import tools as tool_module
+        from app import ledger as ledger_module
+        from app.store import Store
+        calls = []
+        tools = self._tools(calls)
+        store = Store(':memory:')
+        book = ledger_module.ActionLedger(store, 'r1', 1)
+        prepared = book.begin(step_id='s2', tool_key='local:x:boom',
+                              effect='write', args={})
+        book.in_flight(prepared['action_id'])
+        store.update_action(prepared['action_id'], status='unknown')
+
+        plan = {'steps': [
+            {'tool': 'deploy', 'step_id': 's1', 'args': {},
+             'compensate': {'tool': 'undo', 'args': {}}},
+            {'tool': 'explode', 'step_id': 's2', 'args': {}},
+        ]}
+        state = {'plan': plan, 'step_index': 1,
+                 'step_outputs': {'s1': {'__status__': 'succeeded'}},
+                 'user_input': 'x'}
+
+        async def fake_find(name):
+            return tools.get(name)
+
+        with patch.object(tool_module, 'find_tool', fake_find), \
+                patch.object(nodes, 'emit', lambda event: None), \
+                ledger_module.use_ledger(book):
+            result = await nodes.run_step(state)
+        self.assertEqual(result['status'], 'failed')
+        self.assertTrue(result['needs_reconciliation'])
+        self.assertFalse([c for c in calls if c[0] == 'undo'],
+                         '结果未定时不能自动撤销')
+
+    async def test_manual_compensation_creates_its_own_run(self):
+        """手工补偿是一次独立运行，原运行只记 compensated_at。"""
+        import app.api_hub as hub_module
+        from app.api_hub import Hub
+        from app.store import Store
+        hub = Hub(Store(':memory:'))
+        hub.store.create_task('t1', 's1', '发布页面')
+        hub.store.ensure_task_meta('t1', session_id='s1', goal='发布页面')
+        hub.store.create_run('r1', 't1', status='succeeded')
+        step = {'tool': 'deploy_site', 'step_id': 's1', 'args': {},
+                'tool_key': 'local:publishing:deploy', 'effect': 'write',
+                'compensate': {'tool': 'undo_site', 'args': {'site_id': 'x'},
+                               'tool_key': 'local:publishing:undo',
+                               'effect': 'destructive'}}
+        hub.store.save_plan('r1', 1, goal='发布页面', steps=[step])
+        hub.store.save_steps('r1', 1, [step])
+        hub.store.update_step('r1', 1, 's1', status='succeeded')
+
+        async def fake(text, progress=None, on_event=None, history=None,
+                       on_start=None, prior=None, memory=None, ledger=None,
+                       run_id=None, resume_plan=None):
+            assert resume_plan['kind'] == 'compensation'
+            return {'task_id': 'a1', 'status': 'compensated', 'timings': [],
+                    'deployment': {}, 'compensations': [
+                        {'step_id': 's1', 'tool': 'undo_site',
+                         'status': 'succeeded'}]}
+
+        with patch.object(hub_module, 'run_task', fake):
+            result = await hub.compensate('r1')
+
+        self.assertIsNotNone(result)
+        self.assertNotEqual(result['run_id'], 'r1')
+        self.assertEqual(hub.store.run('r1')['compensated_at'] is not None, True)
+        self.assertEqual(result['status'], 'compensated')
+        # 再补一次要被拒绝：撤销两次可能误删重建的东西
+        with self.assertRaises(RuntimeError):
+            await hub.compensate('r1')
+
+    async def test_compensation_skips_steps_that_never_succeeded(self):
+        from app.api_hub import Hub
+        from app.store import Store
+        hub = Hub(Store(':memory:'))
+        hub.store.create_task('t1', 's1', 'g')
+        hub.store.ensure_task_meta('t1', session_id='s1', goal='g')
+        hub.store.create_run('r1', 't1', status='failed')
+        step = {'tool': 'deploy_site', 'step_id': 's1', 'args': {},
+                'compensate': {'tool': 'undo_site', 'args': {}}}
+        hub.store.save_plan('r1', 1, goal='g', steps=[step])
+        hub.store.save_steps('r1', 1, [step])
+        hub.store.update_step('r1', 1, 's1', status='failed')
+        self.assertEqual(hub.compensation_steps('r1'), [])
+
+
+class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
+    """多 MCP Server：工具命名、路由、失败隔离。"""
+
+    MULTI = json.dumps([
+        {'id': 'publishing', 'url': 'https://a.example/mcp',
+         'deploy_tool': 'deploy_site', 'default': True},
+        {'id': 'ops', 'url': 'https://b.example/mcp'},
+    ])
+
+    def test_single_server_keeps_legacy_tool_names(self):
+        from app import mcp_servers
+        with patch.dict(os.environ, {'MCP_SERVERS': '',
+                                     'MCP_URL': 'https://a.example/mcp'}, clear=False):
+            servers = mcp_servers.servers()
+            self.assertEqual(len(servers), 1)
+            self.assertEqual(mcp_servers.tool_name(servers[0], 'list_sites'),
+                             'mcp__list_sites')
+            self.assertTrue(mcp_servers.deploy_server().default)
+
+    def test_multiple_servers_qualify_tool_names(self):
+        from app import mcp_servers
+        with patch.dict(os.environ, {'MCP_SERVERS': self.MULTI,
+                                     'MCP_URL': ''}, clear=False):
+            servers = mcp_servers.servers()
+            self.assertEqual([s.id for s in servers], ['publishing', 'ops'])
+            self.assertEqual(mcp_servers.tool_name(servers[0], 'list_sites'),
+                             'mcp__publishing__list_sites')
+            self.assertEqual(mcp_servers.tool_name(servers[1], 'delete_site'),
+                             'mcp__ops__delete_site')
+            server, bare = mcp_servers.split_tool_name('mcp__ops__delete_site')
+            self.assertEqual((server.id, bare), ('ops', 'delete_site'))
+            self.assertEqual(mcp_servers.deploy_server().id, 'publishing')
+
+    def test_invalid_entries_are_skipped_not_fatal(self):
+        from app import mcp_servers
+        raw = json.dumps([
+            {'id': 'ok', 'url': 'https://a/mcp'},
+            {'id': '', 'url': 'https://b/mcp'},
+            {'id': 'no_url'},
+            {'id': 'bad__id', 'url': 'https://c/mcp'},
+        ])
+        with patch.dict(os.environ, {'MCP_SERVERS': raw, 'MCP_URL': ''},
+                        clear=False):
+            self.assertEqual([s.id for s in mcp_servers.servers()], ['ok'])
+
+    async def test_discovery_is_isolated_per_server(self):
+        from app import tools as tool_module
+        seen = []
+
+        async def fake_list(server):
+            seen.append(server.id)
+            if server.id == 'ops':
+                raise RuntimeError('ops 掉线')
+            return [{'name': 'list_sites', 'inputSchema': {'type': 'object'}}]
+
+        with patch.dict(os.environ, {'MCP_SERVERS': self.MULTI,
+                                     'MCP_URL': ''}, clear=False), \
+                patch.object(tool_module.mcp_adapter, 'list_server_tools', fake_list):
+            tool_module._MCP_CACHE.update(at=0.0, tools=[], signature=())
+            discovered = await tool_module.mcp_tools(force=True)
+
+        self.assertEqual(sorted(seen), ['ops', 'publishing'])
+        self.assertEqual([t.name for t in discovered],
+                         ['mcp__publishing__list_sites'])
+        self.assertIn('ops', tool_module.mcp_status()['errors'])
+        self.assertEqual(discovered[0].server_id, 'publishing')
+
+    async def test_runner_calls_the_server_it_belongs_to(self):
+        from app import tools as tool_module
+        from app import mcp_servers
+        with patch.dict(os.environ, {'MCP_SERVERS': self.MULTI,
+                                     'MCP_URL': ''}, clear=False):
+            target = mcp_servers.by_id('ops')
+        captured = {}
+
+        async def fake_call(name, arguments, artifact=None, server=None):
+            captured['name'] = name
+            captured['server'] = getattr(server, 'id', None)
+            return {'ok': True}
+
+        with patch.object(tool_module.mcp_adapter, 'call_tool', fake_call):
+            runner = tool_module._make_mcp_runner('delete_site', target)
+            result = await runner({'site_id': 'x'}, {})
+
+        self.assertEqual(captured, {'name': 'delete_site', 'server': 'ops'})
+        self.assertEqual(result['mcp_calls'][0]['server'], 'ops')
+
+    async def test_old_tool_name_resolves_after_prefix_change(self):
+        """旧计划里只有 mcp__<tool>，服务端变多后要能按尾部唯一匹配回去。"""
+        from app import tools as tool_module
+        legacy = tool_module.Tool('mcp__ops__list_sites', 'MCP·list_sites',
+                                  '', {}, None, tool_key='mcp:ops:list_sites')
+
+        async def fake_tools(force=False):
+            return [legacy]
+
+        with patch.object(tool_module, 'mcp_tools', fake_tools):
+            found = await tool_module.find_tool('mcp__list_sites')
+        self.assertIs(found, legacy)
 
 
 if __name__ == '__main__':

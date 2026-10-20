@@ -18,11 +18,17 @@
 | task / run 分离 | ✅ | `tasks_meta` / `runs` | `test_finishing_a_run_persists_plan_and_steps` |
 | 步骤 ID 与依赖 | ✅ | `PlanStep.step_id` / `depends_on` | `test_step_ids_assigned_and_dependencies_validated` 等 |
 | 输入绑定（literal / ref） | ✅ | `nodes.resolve_inputs` | 只认受限 JSON Pointer，不做表达式求值 |
-| 计划结构化校验 + 有限修复 | ✅ | `nodes.validate_plan` + `plan()` 两轮 | 未知工具/重复 ID/前向依赖都报错 |
+| 计划结构化校验 + 有限修复 | ✅ | `nodes.validate_plan` + `plan()` 两轮 | 未知工具/重复 ID/前向依赖都报错；**两轮仍有错误就停在 `waiting_input`，不执行残缺计划**（`test_bad_plan_stops_instead_of_executing`） |
 | 移除研究型兜底与静默跳过 | ✅ | `nodes.fallback_steps` | 兜底只降级为直接作答 |
-| 多 MCP Server 路由 | ⬜ | — | 当前配置仍是单 Server（`MCP_SERVER_ID`），接入第二个需要 Server 配置表 |
+| 业务提示词归能力包 | ✅ | `Tool.prompt_rules` + `nodes.planner_system` | 内核只留通用规则，检索/成稿/作答/发布四段规则各自随能力包走；无部署工具时提示词里不出现发布规则（`test_planner_prompt_is_split_by_capability`） |
+| 多 MCP Server 路由 | ✅ | `app/mcp_servers.py` + `mcp_adapter` 按 server 参数化 | `MCP_SERVERS` 配多个服务端；多服务端时工具名 `mcp__<id>__<tool>`、单服务端保持 `mcp__<tool>`；单服务端掉线不影响其他（`test_discovery_is_isolated_per_server`） |
 
 ## 阶段 B：可靠执行与恢复
+
+**唯一执行路径**：就地执行（API 进程）与 Worker 走同一条 `claim_run`，都要先占租约。
+`test_inline_execution_holds_a_lease_so_worker_cannot_steal` 守着这条——
+以前 API 用 `create_run(status='running')` 却不写租约，Worker 会把正在跑的 run
+当孤儿再领一次，同一任务执行两遍。
 
 | 文档要求 | 状态 | 实现位置 | 验证方式 |
 |---|---|---|---|
@@ -30,20 +36,28 @@
 | 崩溃窗口一（prepared 未发送） | ✅ | `reconcile_orphan_runs` 只处理 in_flight | `test_reconcile_marks_inflight_actions_unknown`（prepared 保持可重试） |
 | 崩溃窗口二（已发送未回执） | ✅ | `ledger.begin` 返回 blocked | `test_unknown_action_blocks_instead_of_resending` |
 | 崩溃窗口三（已成功未推进） | ✅ | 账本复用回执 | `test_succeeded_action_is_replayed_not_resent` |
-| 暂停 / 取消 / 恢复 | ✅ | `Hub.pause/cancel/resume`、`/api/runs/{id}/*` | `test_pause_only_affects_active_runs`、`test_resume_reuses_saved_plan` |
-| 断点续跑沿用已存计划 | ✅ | `plan()` 的 `resume_plan` 分支 | 续跑不重新规划，已成功动作不重发 |
+| 暂停 / 取消 / 恢复 | ✅ | `Hub.pause` / `cancel_run` / `resume`、`/api/runs/{id}/*` | 取消落 `cancel_requested_at` 由执行者轮询处置；已结束的运行返回 409 而不是假装成功（`test_cross_process_cancel_writes_a_flag_and_is_honest`） |
+| 断点续跑沿用已存计划 | ✅ | `plan()` 的 `resume_plan` 分支 + `Hub.resume` 回库 | 重启后仍可续跑，且带历史/上轮产物/记忆（`test_resume_works_after_restart`） |
+| 补偿步骤（§8.4） | ✅ | `PlanStep.compensate` + `nodes._run_compensations` + `POST /api/runs/{id}/compensate` | 失败时逆序撤销已成功的写操作并记账（`test_failure_rolls_back_succeeded_writes_in_reverse`）；撤销失败报 `partially_succeeded`；结果未定的动作**不自动撤销**（`test_unknown_action_is_not_compensated_blindly`）；手工补偿新建独立 run，原 run 记 `compensated_at` |
+| 取消与撤销分离 | ✅ | 取消只停后续步骤；撤销走独立补偿运行 | `Hub.compensate` 拒绝在运行中/已补偿的运行上执行 |
+| 启动对账不误伤在跑的 run | ✅ | `reconcile_orphan_runs(owner=...)`、lifespan | 只处理自己名下或租约已过期的运行；无 in_flight 动作时回到 `queued` 等 Worker 续跑（`test_reconcile_spares_runs_held_by_another_instance`） |
 | LangGraph 持久化检查点 | ⚠️ | `graph.checkpointer()` | **未安装 `langgraph-checkpoint-sqlite`**，当前退回 `InMemorySaver`；恢复能力由账本承担，不依赖检查点 |
-| 有限重新规划（replan 节点） | ⬜ | — | 当前用"校验失败回喂修复"两轮代替独立 replan 节点 |
+| 有限重新规划（replan 节点） | ⬜ | — | 当前用"校验失败回喂修复"两轮代替独立 replan 节点；修不好即停机等补充 |
 
 ## 阶段 C：多用户运行底座
 
 | 文档要求 | 状态 | 实现位置 | 验证方式 |
 |---|---|---|---|
 | 身份与对象权限缝 | ⚠️ | `app/policies.py` | 跨租户返回 404 有测试；**未接入真实认证**，请求头只当身份声明 |
-| 租约与 fencing | ✅ | `Store.claim_run`、`lease_epoch` | `test_claim_is_exclusive_and_epoch_increments` |
+| 对象权限覆盖全部接口 | ✅ | `app/api.py` 的 `_owned_task/_owned_session/_owned_run` | 任务/事件/产物/会话/记忆/画像全部按主体校验，`sessions` 与 `tasks_meta` 落 `owner_user_id`（`test_other_user_cannot_read_a_session`） |
+| 创建任务请求幂等 | ✅ | `request_keys` 表 + `app/idempotency.py` + `Idempotency-Key` 头 | 同键同内容只建一个任务（`test_retry_with_same_key_returns_the_same_task`）；同键换内容 409；键按 主体+接口 作用域化、按 TTL 过期 |
+| 画像按用户作用域 | ✅ | `profile.use()` + `users/<user>.md` | 两个用户的画像互不覆盖（`test_profile_is_scoped_per_user`） |
+| 租约与 fencing | ✅ | `Store.claim_run`（`UPDATE … RETURNING`）／`PgStore.claim_run`（`FOR UPDATE SKIP LOCKED`） | `test_claim_is_exclusive_and_epoch_increments`；就地执行也占租约 |
+| 执行期间续租 | ✅ | `Hub._guard` | 长任务不会因租约过期被另一个执行者接手 |
 | 独立 Worker | ✅ | `scripts/run_worker.py` | 支持 `--once` / `--jobs-only`；SQLite 阶段限单 Worker |
 | SSE 游标 | ✅ | `Last-Event-ID` / `?after=` | 实测 `after=2` 正确跳发；事件帧带 `id:` 行 |
-| outbox 与后台任务 | ✅ | `background_jobs` + `dedupe_key` | `test_jobs_are_deduped`、Worker 消费 |
+| 事件序号原子自增 | ✅ | `append_event` 单语句 `INSERT … RETURNING seq`（PG 冲突回滚重算） | 多写入者不会再算出同一个 seq（旧实现会撞主键或被 SSE 去重静默丢弃） |
+| outbox 与后台任务 | ✅ | `background_jobs` + `dedupe_key`，`drain_jobs` 为 async | `test_jobs_drain_is_idempotent`、`test_summary_job_actually_compacts_memory`、`test_failed_job_is_requeued_with_backoff` |
 | 仓储接口层 | ✅ | `app/persistence.py`（Protocol） | `test_sqlite_store_satisfies_repository_protocol`；`check_repository` 能列出缺失方法 |
 | PostgreSQL 迁移 | ✅ | `scripts/migrate_to_postgres.py` | 已在本地 PostgreSQL 18.6 实测：21 会话 / 139 消息 / 71 任务 / 1069 事件全部搬入，行数校验一致 |
 | PostgresStore 实现 | ✅ | `app/pg_store.py` | 满足同一 Repository 接口；`PostgresParityTests` 在真实 PG 上跑通 6 组关键读写 |
@@ -52,8 +66,8 @@
 
 | 文档要求 | 状态 | 实现位置 | 验证方式 |
 |---|---|---|---|
-| 按用途的完整预算 | ✅ | `context.build(purpose=...)` | 6 种用途各有预算与报告 |
-| 截断必须可见 | ✅ | `context.build` 报告 + `_select_sources` | `test_history_is_trimmed_and_flagged`；联网作答会写明"原文 X 字仅取前 Y" |
+| 按用途的完整预算 | ✅ | `context.build(purpose=...)` | `select()` / `chat_messages()` 都经由 `build()`，**生产路径就是这一套**；`BUDGETS` 由 `PURPOSE_BUDGETS` 派生，不再有两张表 |
+| 截断必须可见 | ✅ | `context.build` 报告 + `_select_sources` | `test_history_is_trimmed_and_flagged`；截断说明**先拼进正文再构造 messages**（`test_truncation_note_reaches_the_model`） |
 | 核心约束超预算不静默截断 | ✅ | `report['over_budget']` | `test_oversized_rules_are_reported_not_silently_cut` |
 | 产物引用按需读取 | ✅ | `artifacts` 表 + `GET /api/artifacts/{id}` | 实测产物登记（kind/size/sha256）并可按引用读取 |
 | 记忆作用域（user/project/tenant） | ✅ | `memories` 表 | `test_scopes_do_not_leak` |
@@ -87,15 +101,63 @@
    校验签名；生产必须替换为经过验证的认证依赖。
 3. **LangGraph 检查点持久化**：缺 `langgraph-checkpoint-sqlite`，当前是内存实现。
    图位置在进程重启后丢失，恢复依赖 `runs/steps/actions` 账本。
-4. **多 MCP Server 路由**：只有一个 Server 配置，同名工具跨 Server 的去重与
-   路由未实现。
-5. **补偿步骤（§8.4）**：取消不撤销已完成动作，撤销需要独立补偿步骤，未实现。
+4. **真实 MCP 服务端联调**：多 Server 的路由、命名、失败隔离都有用例覆盖，但
+   本环境没有第二个真实 MCP 服务端，`deploy_tool` / 参数形态仍按原服务端契约。
+5. **补偿的远端语义**：补偿依赖"存在对应的撤销工具"。服务端没有撤销工具时，
+   补偿只能是空（计划里留空），系统不会假装撤回过。
 
 ## 测试
 
 ```
-python -m unittest tests.test_core                                  # 170 通过（SQLite）
+python -m unittest tests.test_core                                  # 211 通过（SQLite）
 # PG_TEST_DSN 必须指向一次性测试库（库名需含 test），用例会 TRUNCATE 全部表
 PG_TEST_DSN=postgresql://.../agent_platform_test python -m unittest \
     tests.test_core.PostgresParityTests                             # 6 通过（真实 PG）
 ```
+
+## 本轮（2026-10-20 评审后）修复清单
+
+对应 `docs/platform-review-2026-10-20.md` 的批次 1 与部分批次 2：
+
+| 编号 | 问题 | 现在 |
+|---|---|---|
+| P0-1 | 双执行路径，Worker 会重跑 API 正在跑的任务 | 就地执行也走 `claim_run` 并写租约；`test_inline_execution_holds_a_lease_so_worker_cannot_steal` |
+| P0-2 | 后台摘要作业 100% 失败（`asyncio.run` 在运行中的循环里） | `drain_jobs` 改 async；失败按 attempts 退避重排，不再一次终结 |
+| P0-3 | 截断声明拼在 messages 之后，永远到不了模型 | 先拼 material 再建 messages |
+| P0-4 | 两轮修不好仍执行残缺计划 | 停在 `waiting_input`，把校验错误原文交给用户 |
+| P0-5 | `MAX(seq)+1` 与 `SELECT→UPDATE` 领取非原子 | `INSERT … RETURNING seq`；`UPDATE … RETURNING`（PG 加 `SKIP LOCKED`） |
+| P0-6 | 重启后 `resume` 必 409、`reconciling` 无人接手 | `resume` 回库 + 占租约 + 带上历史/产物/记忆；`reconciling` 可被领取 |
+| P0-7 | 导入即对账，误伤别的副本 | 对账移入 lifespan，只处理自己名下或租约过期的运行 |
+| P0-8 | 归属校验只覆盖一半接口 | 全部接口按主体校验；`sessions` 落 `owner_user_id`；画像按用户分文件 |
+| P1-1 | `context.build` 是死代码、两套预算表分叉 | `select`/`chat_messages` 都走 `build`；预算表合并 |
+| P1-2 | 部署按钮绕过执行链 | 部署变成"建 run + 一步计划"走执行器（账本/事件/取消都生效） |
+| P1-3 | 取消接口假装成功 | 返回 409；跨进程取消靠 `cancel_requested_at` |
+| P1-4 | 续跑丢上下文 | 续跑带 history / prior / memory |
+| P1-6 | 状态机两套词汇 | `TERMINAL_STATUS` 与 `RUN_STATUS_OF` 统一，补 waiting_* / partially_succeeded |
+| P1-7 | 预算只记不限、硬编码 | `MAX_STEPS` / `TASK_TIMEOUT` / `GRAPH_RECURSION_LIMIT` / `RUN_LEASE_SECONDS` 全部可配 |
+| P2-1 | 全仓没有 logging | `app/logging_setup.py`，hub/worker/api 关键路径打点 |
+| P2-3 | 没有 lifespan，连接从不收尾 | `FastAPI(lifespan=...)`，退出时 `hub.close()` |
+| 通用性 | 规划提示词写死网页业务 | `Tool.prompt_rules` 由能力包自带，规划器按候选工具拼接 |
+
+**仍未做**（批次 3）：retention/GC、metrics 看板、并行步骤、多租户真实认证。
+
+## 批次 2 补充（2026-10-20 第二轮）
+
+评审报告里标为"批次 2/3 剩余"的三项已经落地：
+
+| 编号 | 要求 | 现在 | 验证 |
+|---|---|---|---|
+| P1-8 | `POST /api/tasks` 幂等键 | `Idempotency-Key` 头或 body `idempotency_key`；`request_keys` 表按 `主体+接口+键` 占位，同键同内容返回原响应（`idempotent_replay: true`），同键换内容 409，TTL 过期可复用；建任务失败会撤销占位 | `IdempotencyTests`、`ApiIdempotencyTests`（共 9 条） |
+| §8.4 | 补偿步骤 | 计划可给每步声明 `compensate`；步骤失败时逆序撤销已成功的写操作，补偿有自己的账本动作与事件；撤销失败 → `partially_succeeded`；手工撤销走 `POST /api/runs/{id}/compensate`（独立 run，原 run 记 `compensated_at`）；`ref` 绑定可把站点 ID 传给撤销工具 | `CompensationTests`（7 条） |
+| §5.4 | 多 MCP Server 路由 | `MCP_SERVERS` 配置多个服务端（transport/url/token/stdio），并发发现、失败隔离；工具名带服务端前缀并记录 `server_id`；`deploy_site` 类适配器工具由 `default` 服务端承接；旧计划里的 `mcp__<tool>` 可按尾部唯一匹配回退 | `McpRoutingTests`（6 条） |
+
+设计取舍写在这里，避免以后被"看起来更简单"的做法改回去：
+
+- **补偿不做成"把 run 标成已撤销"**。撤销本身是有副作用的调用，必须有独立
+  账本动作和事件流；标一个状态字段等于假装撤销过。
+- **结果未定（unknown）的动作不自动补偿**。那等于基于猜测再发一次写请求；
+  应保持 unknown，等人核实后再走手工补偿。
+- **单服务端不强制改成带前缀的名字**。多服务端才加前缀，是为了让已保存的
+  计划继续可用；`find_tool` 仍保留"去前缀后唯一匹配"的回退。
+- **幂等只覆盖创建任务**。事件追加、部署、补偿都不收幂等键：它们已经有
+  更精确的机制（事件序号、账本 action、`compensated_at`）。

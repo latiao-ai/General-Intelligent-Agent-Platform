@@ -22,11 +22,23 @@ def reply_text(state: dict) -> str:
         what = '资料页面' if kind == 'sources' else '报告'
         return (f'{what}已生成，保存在本地。想发布就说一句「部署到服务器」。'
                 f'任务 ID：{state.get("task_id")}')
+    if status == 'compensated':
+        done = [c for c in (state.get('compensations') or [])
+                if c.get('status') == 'succeeded']
+        return f'已撤销此前完成的 {len(done)} 个有副作用的步骤。'
+    if status == 'partially_succeeded':
+        # 不能只说"部分完成"：用户要知道哪些副作用没收回来
+        reason = state.get('failure') or '部分动作未能撤销'
+        return f'本次执行只完成了一部分：{reason}'
     if status == 'failed':
         reason = state.get('failure')
         if reason:
             return f'本次未完成：{reason}。可换个更具体的说法再试。'
         return '本次没有产出可用结果。可换个更具体的说法再试。'
+    if status in ('waiting_input', 'waiting_approval'):
+        # 计划没过校验就停下来等人补信息——不能说"任务结束"了事
+        reason = state.get('failure') or '需要补充信息后才能继续'
+        return f'先停在这里：{reason}'
     if status == 'deploy_needs_check':
         return '报告已生成，但部署结果待确认，请核对服务端站点列表。'
     return f'任务结束，状态：{status}'

@@ -20,42 +20,43 @@ from app.schemas import ExecutionPlan
 from app.services import is_small_talk, structured_call, urls_from_input
 from app import tools as tool_module
 
-MAX_STEPS = 8
+# 步数上限从配置读：预算不该写死在内核常量里（文档 §7）
+MAX_STEPS = settings.max_steps
 
 PLANNER_SYSTEM = (
     '你是任务编排器。阅读用户要求与可用工具，输出一个**按顺序执行**的步骤计划。'
     '规则：'
     '① 只能使用工具清单里出现过的名字，不要编造；args 必须符合该工具的参数 schema。'
-    '② 需要外部或实时事实（最新、价格、版本、新闻）或用户要求调研时，先检索：'
-    'web_search（用户已给 URL 就直接 fetch_pages），需要正文再用 fetch_pages 补抓。'
-    '但若「已有资料」里已经有正文，而用户只是要把这些内容整理/转换成文档或回答，'
-    '就不要再检索，直接进入收尾步骤——重复检索既慢又会引入无关来源。'
-    '③ 检索完怎么收尾，取决于用户要的成果形态：'
-    '只想"问个明白"（问怎么做/是什么/哪个好，但没有要文件）→ answer_with_sources，'
-    '在聊天里带来源作答，不要为这种需求生成 HTML；'
-    '明确要报告/HTML/文档/页面 → compose_report → render_html。'
-    '④ "把资料/搜索结果存成网页"（要的是原始资料本身，不要提炼）→ render_sources_html；'
-    '要的是**整理后的报告**才用 compose_report → render_html。两者别混。'
-    '⑤ **名词解释、原理、常识、做法建议**这类问题，如果你自己有把握，就直接用'
-    'answer_directly 作答，不要为了保险去检索——把"XX 是什么/为什么/怎么用"都变成'
-    '一次联网搜索既慢又没必要。只有下列情况才必须检索：'
-    '涉及具体数字/价格/日期/版本/排名、明确要"最新/现在/今年"、提到你不确定的新名词'
-    '或圈内事件、或者用户明说要查资料。拿不准时先直接答，并在回答里说明"未联网核实"。'
-    '寒暄、确认一律 answer_directly。'
-    '⑥ 只有用户明确要求发布到服务器/要访问地址时，才在最后加 deploy_site；'
-    '若"部署"只是报告的研究主题（如"数据库的部署方式"），不要加。'
-    '⑦ 调用查询类 MCP 工具时，只有不带过滤参数（如 keyword）的结果才是全量清单；'
-    '删改类操作（delete_*/update_*）之后若要告诉用户"还剩什么/还剩几个"，'
-    '必须再加一步**不带过滤参数**的查询（如 mcp__list_sites 且参数为空），'
-    '绝不能拿操作前的过滤结果或操作返回体去推断。'
-    '⑧ 最多 8 步；不要重复完全相同的调用；步数能少不多。'
-    '⑨ 若提供了对话历史，本轮要求可能是对上一轮的补充或修正，要结合上文理解意图。'
+    '② 每个步骤给 step_id；depends_on 只能指向**更早**的步骤，不要成环。'
+    '③ 最多 {max_steps} 步；不要重复完全相同的调用；步数能少不多。'
+    '④ 若提供了对话历史，本轮要求可能是对上一轮的补充或修正，要结合上文理解意图。'
+    '⑤ 有副作用（write/destructive）的步骤只在用户明确要求时出现，不要顺带执行。'
+    '⑥ 有副作用的步骤，若工具清单里有对应的**撤销**工具（例如 deploy_site 对应'
+    'delete_site），在 compensate 里写 {"tool": 撤销工具名, "args": {...}}：'
+    '它会在后续步骤失败时被逆序执行，用来收回已发生的副作用。args 里的值同样'
+    '可以用 ref 指向前序输出（比如站点 ID）。清单里没有撤销工具就留空，不要编造。'
+    '⑦ 工具清单里的每条规则都来自对应能力包，按它说的选工具，别混用形态相近的。'
     'profile_updates：只填**本轮用户新说出、且画像里还没有（或已变化）**的个人信息'
     '（姓名、电话、邮箱、职业、偏好、习惯等），键用中文（如"电话"）。'
     '系统提示末端的「[用户画像]」段里已经出现过的事实，一律不要再填一遍——'
     '重复上报会让界面误报"已记住"。没有新信息就留空 {}}。'
     '只记用户明确说出的，不要推断、不要编造。'
 )
+
+
+def planner_system(catalog) -> str:
+    """规划器 system = 通用规则 + **候选工具所属能力包**的规则。
+
+    通用部分只讲"计划本身怎么算合法"（工具名、依赖、步数、画像增量）；
+    "什么时候该检索、什么时候该成稿、什么时候能部署"这些业务判断由能力包
+    自带（`Tool.prompt_rules`）。新增一个能力只要在包里写规则并注册工具，
+    内核提示词一个字都不用改——这才是"通用中台"。
+    """
+    body = PLANNER_SYSTEM.replace('{max_steps}', str(MAX_STEPS))
+    blocks = tool_module.planner_rules(catalog)
+    if blocks:
+        body = f'{body}\n[能力包规则]\n' + '\n'.join(blocks)
+    return body
 
 
 def _catalog_text(catalog) -> str:
@@ -122,12 +123,48 @@ def validate_plan(raw_steps: list[dict], catalog) -> tuple[list[dict], list[dict
                 # 只能依赖**前面**的步骤：指向后面或不存在都会让执行顺序失效
                 issues.append({'code': 'bad_dependency', 'step_id': step_id,
                                'detail': f'依赖 {dep!r} 不是更早的步骤'})
-        steps.append({'tool': name, 'step_id': step_id,
-                      'args': dict(args or {}), 'depends_on': depends_on,
-                      'why': str(raw.get('why') or ''),
-                      'tool_key': known[name].tool_key,
-                      'effect': known[name].effect})
+        compensate = _validate_compensation(raw.get('compensate'), step_id,
+                                            name, known, issues)
+        step = {'tool': name, 'step_id': step_id,
+                'args': dict(args or {}), 'depends_on': depends_on,
+                'why': str(raw.get('why') or ''),
+                'tool_key': known[name].tool_key,
+                'effect': known[name].effect}
+        if compensate:
+            step['compensate'] = compensate
+        steps.append(step)
     return steps, issues
+
+
+def _validate_compensation(raw, step_id: str, tool_name: str, known: dict,
+                           issues: list[dict]) -> dict | None:
+    """校验补偿动作。**不可用就丢掉，但不阻断整份计划。**
+
+    补偿是一道安全网，不是主流程：模型偶尔会写一个不存在的撤销工具。为此把
+    整份计划判死（等用户补信息）比"少一道安全网"更糟，所以这里记 warning。
+    """
+    if not raw:
+        return None
+    if not isinstance(raw, dict) or not str(raw.get('tool') or '').strip():
+        issues.append({'code': 'bad_compensation', 'step_id': step_id,
+                       'severity': 'warning',
+                       'detail': 'compensate 必须是 {tool, args}'})
+        return None
+    name = str(raw['tool']).strip()
+    if name not in known:
+        issues.append({'code': 'unknown_compensation', 'step_id': step_id,
+                       'severity': 'warning',
+                       'detail': f'补偿工具 {name!r} 不在可用清单里，已忽略'})
+        return None
+    if name == tool_name:
+        issues.append({'code': 'self_compensation', 'step_id': step_id,
+                       'severity': 'warning',
+                       'detail': '补偿动作不能是这一步自己，已忽略'})
+        return None
+    args = raw.get('args')
+    return {'tool': name, 'args': dict(args) if isinstance(args, dict) else {},
+            'tool_key': known[name].tool_key,
+            'effect': known[name].effect}
 
 
 def _valid_steps(raw_steps: list[dict], catalog) -> tuple[list[dict], list[str]]:
@@ -176,8 +213,11 @@ async def plan(state):
         steps = resumed['steps']
         emit(action('沿用已保存的计划', f'{len(steps)} 步', '↩️'))
         emit(thought(describe_plan(steps, resumed.get('summary') or '续跑')))
-        return {'plan': {'steps': steps,
-                         'summary': resumed.get('summary') or '续跑'},
+        plan = {'steps': steps, 'summary': resumed.get('summary') or '续跑'}
+        if resumed.get('kind'):
+            # kind=compensation 的计划走的是同一套执行器，但终态与回执不同
+            plan['kind'] = resumed['kind']
+        return {'plan': plan,
                 'step_index': int(resumed.get('step_index') or 0),
                 'status': 'planned'}
 
@@ -210,32 +250,39 @@ async def plan(state):
     errors = list(state.get('errors', []))
     steps, summary, updates = None, '', {}
     issues: list[dict] = []
+    blocking: list[dict] = []
+    model_answered = False          # 模型是否真的给出过一份计划（哪怕是坏的）
     try:
         # 最多两轮：第一次照常规划；若整体校验不通过，把结构化错误交回模型修复
         for round_index in range(2):
             execution, call_usage = await structured_call(
                 ExecutionPlan,
-                profile.with_profile(PLANNER_SYSTEM),
+                profile.with_profile(planner_system(catalog)),
                 payload,
                 disable_thinking=settings.llm_parse_disable_thinking,
             )
             data = execution.model_dump()
-            steps, issues = validate_plan(data.get('steps') or [], catalog)
+            raw_steps = data.get('steps') or []
+            model_answered = model_answered or bool(raw_steps)
+            steps, issues = validate_plan(raw_steps, catalog)
+            # 只有 blocking 级别的错误才值得再花一次模型调用去修；
+            # 补偿工具写错这类 warning 已经丢弃该字段，不需要为它卡住计划。
+            blocking = [i for i in issues if i.get('severity') != 'warning']
             summary = data.get('summary') or ''
             updates = data.get('profile_updates') or {}
             usage.append({'stage': 'plan', 'model_name': settings.llm_model,
                           'model': call_usage})
-            if not issues:
+            if not blocking:
                 break
             emit(action('计划校验未通过',
-                        '；'.join(f'{i["code"]}:{i["detail"]}' for i in issues)[:120],
+                        '；'.join(f'{i["code"]}:{i["detail"]}' for i in blocking)[:120],
                         '⚠️'))
             if round_index == 0:
                 # 把错误原文喂回去，让模型在同一份工具清单上修
                 payload = json.dumps({
                     '用户要求': question,
                     '上次计划': data.get('steps'),
-                    '校验错误': issues,
+                    '校验错误': blocking,
                     '要求': '按校验错误修正计划；只能用清单里的工具；'
                             'depends_on 只能指向更早的步骤。',
                     '可用工具': _catalog_text(catalog),
@@ -249,9 +296,34 @@ async def plan(state):
         errors = list(state.get('errors', [])) + [
             {'stage': 'plan', 'type': type(exc).__name__}]
         steps = None
+        issues = []
+
+    # 两轮修复后仍有结构化错误：**停下来**，不带着坏计划执行。
+    #
+    # 以前这里只判 `if not steps`，而 validate_plan 返回的是"过滤后"的合法步骤
+    # ——通常非空，于是带着坏依赖一路跑下去，被丢掉步骤的 step_id 仍可能被后面
+    # 的 ref 引用，resolve_inputs 解析成 None 直接喂给工具（文档 §6.3 明确禁止）。
+    if model_answered and blocking:
+        detail = '；'.join(f'{item["code"]}:{item["detail"]}'
+                          for item in blocking)[:300]
+        emit(action('计划无法通过校验', detail, '⛔'))
+        emit(thought(f'这份计划修了两轮仍有问题，先停下来确认：{detail}'))
+        return {'plan': {'steps': [], 'summary': summary or '计划未通过校验'},
+                'step_index': 0, 'usage': usage, 'status': 'waiting_input',
+                'failure': f'计划没有通过校验（{detail}）。'
+                           f'可以补充更具体的要求，或明确要用的工具再试。',
+                'errors': errors}
+
     if not steps:
         steps, _ = _valid_steps(fallback_steps(state), catalog)
         summary = summary or '降级计划'
+
+    # warning 级问题不阻断执行，但必须留痕：否则"补偿被静默丢掉"没人知道。
+    warnings = [item for item in issues if item.get('severity') == 'warning']
+    if warnings:
+        emit(action('计划有可忽略的问题',
+                    '；'.join(f'{i["code"]}:{i["detail"]}' for i in warnings)[:160],
+                    '⚠️'))
 
     # 只播报真正新增/变化的事实：模型常把画像里已有的事实再抄一遍，
     # 若无条件播报，用户会看到"已记住"一条自己本轮根本没说过的话。
@@ -259,7 +331,8 @@ async def plan(state):
     if changed:
         emit(action('已记住', profile.describe(changed), '🧠'))
     emit(thought(describe_plan(steps, summary)))
-    result = {'plan': {'steps': steps, 'summary': summary},
+    result = {'plan': {'steps': steps, 'summary': summary,
+                       **({'warnings': warnings} if warnings else {})},
               'step_index': 0, 'usage': usage, 'status': 'planned'}
     if errors:
         result['errors'] = errors
@@ -274,6 +347,9 @@ def next_step(state) -> str:
 
 def final_status(state: dict) -> str:
     """把内部状态归一到前端认识的终态。"""
+    # 补偿运行没有产物也没有回答，"没产出"不等于失败：它成功就是成功。
+    if (state.get('plan') or {}).get('kind') == 'compensation':
+        return 'failed' if state.get('failure') else 'compensated'
     if state.get('answer'):
         return 'answered'
     deployment = state.get('deployment') or {}
@@ -286,6 +362,77 @@ def final_status(state: dict) -> str:
     return 'failed'
 
 
+async def _tool_by_name(name: str):
+    """按名字取工具：先内置，再 MCP 动态清单（含旧名回退）。"""
+    return await tool_module.find_tool(name)
+
+
+async def _run_compensations(state: dict, steps: list[dict], outputs: dict,
+                             book) -> list[dict]:
+    """逆序执行已成功步骤声明的补偿动作（文档 §8.4）。
+
+    只补偿**已经成功**的步骤：失败/跳过的步骤没有可撤销的副作用；结果未定
+    （unknown）的步骤更不能自动去撤——那等于基于猜测再发一次写操作，正是
+    账本要避免的事。
+    """
+    results: list[dict] = []
+    for step in reversed(steps):
+        comp = step.get('compensate') or {}
+        if not comp.get('tool'):
+            continue
+        if (outputs.get(step.get('step_id')) or {}).get('__status__') != 'succeeded':
+            continue
+        name = comp['tool']
+        step_id = f'undo:{step["step_id"]}'
+        tool = await _tool_by_name(name)
+        if tool is None:
+            results.append({'step_id': step['step_id'], 'tool': name,
+                            'status': 'failed',
+                            'error': '补偿工具当前不可用（MCP 可能已掉线）'})
+            emit(action('补偿无法执行', f'{name} 不可用', '⚠️'))
+            continue
+        args = resolve_inputs({'args': comp.get('args') or {}}, outputs)
+        emit(stage_start(step_id, f'回滚·{tool.label}'))
+        started = time.perf_counter()
+        action_id, attempt_id = None, None
+        if book is not None:
+            prepared = book.begin(step_id=step_id, tool_key=tool.tool_key or name,
+                                  effect=tool.effect, args=args,
+                                  authorized_by='compensation')
+            if prepared.get('replay') is not None:
+                # 已经撤过一次：再撤一次可能报错，也可能误删新建的东西
+                results.append({'step_id': step['step_id'], 'tool': name,
+                                'status': 'skipped', 'error': '该补偿此前已执行过'})
+                emit(stage_end(step_id, 0, '已执行过', tool.label))
+                continue
+            if prepared.get('blocked'):
+                results.append({'step_id': step['step_id'], 'tool': name,
+                                'status': 'failed',
+                                'error': f'上次补偿结果未定（{prepared["blocked"]}）'})
+                emit(stage_end(step_id, 0, '结果未定', tool.label))
+                continue
+            action_id = prepared['action_id']
+            attempt_id = book.in_flight(action_id)
+        try:
+            await tool.run(args, state)
+        except Exception as exc:                      # noqa: BLE001
+            hint = getattr(exc, 'safe_message', None) or type(exc).__name__
+            if book is not None and action_id:
+                book.fail(action_id, attempt_id, type(exc).__name__)
+            results.append({'step_id': step['step_id'], 'tool': name,
+                            'status': 'failed', 'error': hint})
+            emit(stage_end(step_id, time.perf_counter() - started, '失败', tool.label))
+            emit(action('回滚失败', f'{tool.label}：{hint}', '⚠️'))
+            continue
+        if book is not None and action_id:
+            book.succeed(action_id, attempt_id, {'compensated': step['step_id']})
+        results.append({'step_id': step['step_id'], 'tool': name,
+                        'status': 'succeeded'})
+        emit(stage_end(step_id, time.perf_counter() - started, '已回滚', tool.label))
+        emit(action('已回滚一步', tool.label, '↩️'))
+    return results
+
+
 async def run_step(state):
     """执行计划中的一步。每次只走一步，便于逐步计时与取消。"""
     steps = (state.get('plan') or {}).get('steps') or []
@@ -295,9 +442,7 @@ async def run_step(state):
 
     step = steps[index]
     name = step['tool']
-    tool = tool_module.BUILTIN_BY_NAME.get(name)
-    if tool is None:
-        tool = {t.name: t for t in await tool_module.mcp_tools()}.get(name)
+    tool = await _tool_by_name(name)
     last = index + 1 >= len(steps)
 
     if tool is None:
@@ -337,6 +482,7 @@ async def run_step(state):
             outputs[step_id] = {'__status__': 'unknown'}
             return {'step_index': len(steps), 'step_label': tool.label,
                     'step_outputs': outputs, 'status': 'failed',
+                    'needs_reconciliation': True,
                     'failure': f'{tool.label}的结果未确定（{prepared["blocked"]}），'
                                f'为避免重复副作用已停止，请核实后重试'}
         if prepared.get('replay') is not None:
@@ -368,9 +514,23 @@ async def run_step(state):
             {'stage': name, 'type': type(exc).__name__}]
         # 出错就中止剩余步骤：后面的多半依赖这一步的产物。
         outputs[step_id] = {'__status__': 'failed'}
+        # 已经发生的写操作要收回来（文档 §8.4）。只回滚声明了 compensate 且
+        # 确实成功的步骤，逆序执行——先做的后撤。
+        compensations = await _run_compensations(state, steps[:index + 1],
+                                                 outputs, book)
+        failed_undo = [r for r in compensations if r['status'] == 'failed']
+        note = ''
+        if compensations:
+            note = f'；已回滚 {len(compensations) - len(failed_undo)} 步'
+            if failed_undo:
+                note += (f'，{len(failed_undo)} 步回滚失败'
+                         f'（{failed_undo[0]["tool"]}：{failed_undo[0].get("error")}）')
         return {'step_index': len(steps), 'step_label': tool.label,
-                'errors': errors, 'status': 'failed', 'step_outputs': outputs,
-                'failure': f'{tool.label}失败：{hint}'}
+                'errors': errors, 'step_outputs': outputs,
+                'compensations': compensations,
+                # 有副作用没撤干净时不能只说"失败"：线下可能留着一个站点。
+                'status': 'partially_succeeded' if failed_undo else 'failed',
+                'failure': f'{tool.label}失败：{hint}{note}'}
 
     updates = dict(updates)
     if book is not None and action and not reused:

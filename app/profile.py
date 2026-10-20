@@ -16,15 +16,54 @@
     电话：138xxxx
     偏好：回答简洁、多用表格
 """
+import contextvars
 import os
 import re
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from app.config import settings
 
 HEADER = '# User Profile'
+DEFAULT_USER = 'default'
 _FACT_RE = re.compile(r'^([^#>:]+?)[:：](.+?)$')
+# 当前操作主体。单用户时恒为 default；接上登录后由请求层/执行层绑定。
+# 用 contextvar 而不是加参数，是因为画像在 nodes（拼 system prompt）与
+# Hub（记忆合并）里到处都在用，逐层传参会污染整条调用链。
+_CURRENT_USER: contextvars.ContextVar[str] = contextvars.ContextVar(
+    'profile_user', default=DEFAULT_USER)
+
+
+def use(user: str | None) -> contextvars.Token:
+    """切换当前画像主体，返回可用于 reset 的 token。"""
+    return _CURRENT_USER.set(user or DEFAULT_USER)
+
+
+def reset(token: contextvars.Token) -> None:
+    _CURRENT_USER.reset(token)
+
+
+def current_user() -> str:
+    return _CURRENT_USER.get()
+
+
+def _safe(user: str) -> str:
+    """主体名进文件名前先净化，避免 `../` 之类的路径穿越。"""
+    return re.sub(r'[^A-Za-z0-9_.-]', '_', user)[:64] or DEFAULT_USER
+
+
+def _path() -> Path:
+    """当前主体的画像文件。
+
+    单用户（default）仍然用 settings.profile_path，保持既有文件与 git 习惯；
+    多用户落到同级 `users/<user>.md`，互不覆盖（文档 §10：画像按用户作用域）。
+    """
+    base = settings.profile_path
+    user = _CURRENT_USER.get()
+    if user == DEFAULT_USER:
+        return base
+    return Path(base).parent / 'users' / f'{_safe(user)}.md'
 
 
 def _now() -> str:
@@ -50,14 +89,14 @@ def _version_of(text: str) -> int:
 
 def load() -> dict:
     """读取画像事实；文件不存在时返回空。"""
-    path = settings.profile_path
+    path = _path()
     if not path.exists():
         return {}
     return _facts_of(path.read_text(encoding='utf-8'))
 
 
 def version() -> int:
-    path = settings.profile_path
+    path = _path()
     if not path.exists():
         return 0
     return _version_of(path.read_text(encoding='utf-8'))
@@ -72,7 +111,7 @@ def render(facts: dict, ver: int) -> str:
 
 def save(facts: dict) -> int:
     """原子写入，返回新版本号。"""
-    path = settings.profile_path
+    path = _path()
     path.parent.mkdir(parents=True, exist_ok=True)
     new_ver = version() + 1
     if path.exists():
@@ -107,7 +146,7 @@ def merge(updates: dict) -> dict:
 
 def raw() -> str:
     """画像文件的原始文本，供界面展示与编辑。"""
-    path = settings.profile_path
+    path = _path()
     return path.read_text(encoding='utf-8') if path.exists() else ''
 
 
@@ -118,7 +157,7 @@ def parse(text: str) -> dict:
 
 def clear() -> None:
     """清空画像。删之前先留一份 .bak——用户手一滑也能捞回来。"""
-    path = settings.profile_path
+    path = _path()
     if not path.exists():
         return
     try:

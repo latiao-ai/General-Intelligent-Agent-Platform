@@ -46,6 +46,23 @@ class Settings:
     # 用户画像文件（Markdown，人可读可改）。含电话等敏感信息，已在 .gitignore 排除。
     profile_path: Path = PROJECT_ROOT / os.getenv('PROFILE_PATH', 'profile/USER.md')
     deploy_enabled: bool = os.getenv('DEPLOY_ENABLED', 'false').lower() == 'true'
+    # ---------- 执行预算（文档 §7：步数/时长/重规划次数必须可配） ----------
+    # 计划最多几步。以前是 nodes.py 里的常量，改一次要动代码、也没法按部署环境调。
+    max_steps: int = max(1, int(os.getenv('MAX_STEPS', '8')))
+    # 单次任务总预算（秒）。注意要 > llm_attempt_timeout × 重试次数，
+    # 否则外层会先砍断内层重试，重试等于白写。
+    task_timeout: float = max(30.0, float(os.getenv('TASK_TIMEOUT', '300')))
+    # LangGraph 的递归上限：每个步骤算一跳，留出余量。
+    graph_recursion_limit: int = max(10, int(
+        os.getenv('GRAPH_RECURSION_LIMIT', '30')))
+    # run 租约时长（秒）。执行期间由看守协程续租；设得太短，别的执行者会
+    # 误判"这个人已经死了"并接手同一份计划。
+    run_lease_seconds: float = max(15.0, float(
+        os.getenv('RUN_LEASE_SECONDS', '120')))
+    # 创建任务幂等键的有效期（秒）。默认 24 小时：覆盖重试窗口，又不会让
+    # 客户端某天重用旧键时拿到一个陈年任务。
+    idempotency_ttl_seconds: float = max(60.0, float(
+        os.getenv('IDEMPOTENCY_TTL_SECONDS', '86400')))
 
 settings = Settings()
 

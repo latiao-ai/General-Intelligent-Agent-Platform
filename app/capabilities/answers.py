@@ -8,6 +8,19 @@ from app.events import action, answer_delta, emit
 from app.services import chat_reply
 
 
+# 本能力包自带的规划规则：什么时候该在聊天里作答、什么时候不必检索。
+PROMPT_RULES = (
+    '【作答】只想"问个明白"（问怎么做/是什么/哪个好，但没有要文件）→ '
+    'answer_with_sources，在聊天里带来源作答，不要为这种需求生成 HTML。'
+    '**名词解释、原理、常识、做法建议**这类问题，如果你自己有把握，就直接用 '
+    'answer_directly 作答，不要为了保险去检索——把"XX 是什么/为什么/怎么用"都变成'
+    '一次联网搜索既慢又没必要。只有下列情况才必须检索：'
+    '涉及具体数字/价格/日期/版本/排名、明确要"最新/现在/今年"、提到你不确定的新名词'
+    '或圈内事件、或者用户明说要查资料。拿不准时先直接答，并在回答里说明"未联网核实"。'
+    '寒暄、确认一律 answer_directly。'
+)
+
+
 ANSWER_SYSTEM = (
     '你是一个简洁、可靠的中文助手。直接回答用户的问题，不要编造事实。'
     '本轮没有做任何联网检索，你只有自己已有的知识。'
@@ -82,16 +95,20 @@ async def _answer_with_sources(args: dict, state: dict) -> dict:
     results = tool_results_text(state)
     if results:
         material = f'{results}\n\n{material}'
-    # 多轮追问靠这里：此前这条路径完全不带历史，问"那第二种呢"就断了线索
-    messages = context.chat_messages(
-        state.get('history'), f'问题：{question}\n\n资料：\n{material}',
-        purpose='answer')
+    # 截断声明必须**先拼进 material，再构造 messages**。
+    # 原先是先建 messages、后往 material 追加——模型收到的还是"干净"的片段，
+    # 于是把"前 3000 字"当全文，输出"资料已完整覆盖"。这正是文档 §11 点名
+    # 要避免的失败模式，而验收清单里那条 ✅ 名不副实。
     truncated_notes = [f'[{item["source_id"]}] 原文 {item["chars_full"]} 字，'
                        f'仅取前 {len(item["text"])} 字'
                        for item in selected if item.get('truncated')]
     if truncated_notes:
         material += ('\n\n[注意] 以下资料被截断，回答时不要把这些片段'
                      '当成全文，必要时说明：\n' + '\n'.join(truncated_notes))
+    # 多轮追问靠这里：此前这条路径完全不带历史，问"那第二种呢"就断了线索
+    messages = context.chat_messages(
+        state.get('history'), f'问题：{question}\n\n资料：\n{material}',
+        purpose='answer')
     body = await chat_reply(
         profile.with_profile(
             context.system_with_memory(ANSWER_WITH_SOURCES_SYSTEM,

@@ -18,12 +18,18 @@ class PlanStep(BaseModel):
 
     step_id 可以省略（服务端按顺序补 s1、s2…）；depends_on 指向前序步骤，
     执行前会校验引用合法且不构成环。
+
+    `compensate` 是**可选的补偿动作**（文档 §8.4）：本步骤及其后续失败时，
+    系统按逆序调用它撤销已经发生的副作用。它是独立动作——有单独的工具、
+    权限、账本记录，不等同于"取消任务"。
     """
     tool: str = Field(min_length=1)
     args: dict = Field(default_factory=dict)
     why: str = ''
     step_id: str = ''
     depends_on: list[str] = Field(default_factory=list)
+    # {'tool': 'mcp__delete_site', 'args': {'site_id': {'ref': {...}}}}
+    compensate: dict | None = None
 
 
 class ExecutionPlan(BaseModel):

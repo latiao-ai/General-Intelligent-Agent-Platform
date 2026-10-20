@@ -41,6 +41,8 @@ python --version             # Python 3.12.15
 | `MCP_URL` / `MCP_BEARER_TOKEN` | 远端 MCP 部署服务地址与鉴权 |
 | `MCP_TOOL_NAME` | 部署工具名（当前远端为 `deploy_site`） |
 | `MCP_EXTRA_ARGS` | 额外入参，如 `{"ttl":"7d"}` 控制站点有效期 |
+| `MCP_SERVERS` | **多服务端**：JSON 数组，每项 `{id, transport, url, token, deploy_tool, default}`；设置后不再读上面的单项 `MCP_*` |
+| `IDEMPOTENCY_TTL_SECONDS` | 创建任务幂等键的有效期，默认 86400（24 小时） |
 | `DATABASE_URL` | 数据库连接串；填 `postgresql://…` 用 PostgreSQL，**留空回落 SQLite** |
 | `DB_PATH` | 仅 SQLite 模式下的文件名，默认 `agent.db` |
 | `PROFILE_PATH` | 用户画像文件，默认 `profile/USER.md`（见 3.1.2） |
@@ -227,12 +229,13 @@ parse_request ─┬─ 需要联网 → 检索 → 抓取 → 整理报告 → 
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/` | 聊天界面 |
-| `POST` | `/api/tasks` | 开一轮任务，body `{message, session_id?}`，返回 `{task_id, session_id}` |
+| `POST` | `/api/tasks` | 开一轮任务，body `{message, session_id?, idempotency_key?}`；建议带 `Idempotency-Key` 头，重试不会建出第二个任务 |
 | `GET` | `/api/tasks/{id}/events` | **SSE 事件流**，实时推送执行过程 |
 | `POST` | `/api/tasks/{id}/cancel` | 停止任务 |
 | `GET` | `/api/tasks/{id}` | 任务状态（含 `state`、`timings`） |
 | `GET` | `/api/tasks/{id}/artifact` | 下载生成的 HTML |
 | `POST` | `/api/tasks/{id}/deploy` | 手动部署到远端服务器 |
+| `POST` | `/api/runs/{id}/compensate` | 撤销这次运行已完成的有副作用步骤（独立补偿运行） |
 | `GET` | `/api/sessions/{id}/messages` | 会话消息（多轮上下文） |
 
 ### 事件格式
@@ -361,10 +364,24 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
 - **实时通知是进程内的**。事件先落库、再推给本进程的订阅者；别的实例写入的事件要靠
   游标补发（`GET /api/tasks/{id}/events?after=<seq>` 或 `Last-Event-ID`）才能拿到，
   跨实例实时推送需要消息总线。
-- **Worker 领取有竞争窗口**。`claim_run` 是"查一条 + 更新状态"两步，本地单连接加锁没
-  问题；多 Worker 跨进程并发时应改成 PostgreSQL 的 `SELECT … FOR UPDATE SKIP LOCKED`。
+- **执行只有一条路径**：就地执行（API 进程）与 Worker 都走 `claim_run` 并写租约，
+  同一 run 不会被领两次。领取在 SQLite 上是单条 `UPDATE … RETURNING`，在
+  PostgreSQL 上是 `… FOR UPDATE SKIP LOCKED`。执行期间由 `Hub._guard` 续租，
+  租约过期才会被判定为"执行者已死"并接手。
+- **跨进程取消是协作式的**：取消请求写 `runs.cancel_requested_at`，持有租约的执行者
+  在 2 秒轮询里发现后自行停止；进程已经死了的 run 会由对账按账本处理（有 in_flight
+  动作标 `unknown` 等人工核实，没有就回到 `queued` 续跑）。
 - **PostgresStore 用单连接 + 线程锁**串行化，没有连接池。并发量上来后是瓶颈。
 - **SQLite 模式仍是单机单写**：多副本各写各的会冲突，只适合本地开发。
+- **幂等只覆盖"创建任务"**。事件追加、部署、补偿各有更精确的机制（事件序号、
+  账本 action、`compensated_at`），不共用这把钥匙。键按 `主体+接口+键` 作用域化，
+  默认 24 小时过期（`IDEMPOTENCY_TTL_SECONDS`）。
+- **补偿依赖"有撤销工具"**。计划里给某一步写了 `compensate`，失败时才会逆序执行；
+  服务端没有撤销工具时这一步就是空的，系统不会假装撤回过。结果未定（unknown）
+  的动作**不自动补偿**——那等于猜着再发一次写请求。
+- **多 MCP 服务端已支持，但只在本机用假服务端验证过**。`MCP_SERVERS` 配多个后，
+  工具名变成 `mcp__<server_id>__<tool>`；只有一个服务端时保持 `mcp__<tool>`，
+  旧计划仍可用（`find_tool` 会按尾部唯一匹配回退）。
 
 ## 4. 部署行为
 

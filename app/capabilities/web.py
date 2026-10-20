@@ -6,6 +6,15 @@ from app.capabilities.base import ToolError, error_entry
 from app.events import action, emit
 from app.config import settings
 
+# 本能力包自带的规划规则。规划器提示词按"候选工具属于哪些能力包"自动拼接，
+# 内核里不再写死检索链路（文档 §4：业务提示词归能力包）。
+PROMPT_RULES = (
+    '【联网检索】需要外部或实时事实（最新、价格、版本、新闻）或用户要求调研时，'
+    '先 web_search（用户已给 URL 就直接 fetch_pages），需要正文再用 fetch_pages 补抓。'
+    '但若「已有资料」里已经有正文，而用户只是要把这些内容整理/转换成文档或回答，'
+    '就不要再检索，直接进入收尾步骤——重复检索既慢又会引入无关来源。'
+)
+
 
 async def _web_search(args: dict, state: dict) -> dict:
     query = str(args.get('query') or '').strip()

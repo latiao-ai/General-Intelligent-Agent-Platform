@@ -15,9 +15,9 @@ lease_epoch）保证"同一运行只有一个有效执行者"。
 """
 import argparse
 import asyncio
+import logging
 import os
 import sys
-import time
 import uuid
 from pathlib import Path
 
@@ -27,15 +27,23 @@ if str(_ROOT) not in sys.path:
 
 from app.api_hub import Hub                      # noqa: E402
 from app.config import settings                  # noqa: E402
-from app.ledger import ActionLedger              # noqa: E402
+from app.logging_setup import setup_logging      # noqa: E402
+
+logger = logging.getLogger('worker')
+
+# 后台作业最多试几次。超过就留在 failed 里等人看，而不是无限重排。
+MAX_JOB_ATTEMPTS = 5
 
 
-async def run_once(hub: Hub, worker_id: str, lease_seconds: float = 120.0) -> bool:
+async def run_once(hub: Hub, worker_id: str, lease_seconds: float | None = None,
+                   run_id: str | None = None) -> bool:
     """领取并执行一个运行。返回是否真的领到了东西。"""
-    run = hub.store.claim_run(worker_id, lease_seconds)
+    lease = lease_seconds or settings.run_lease_seconds
+    run = hub.store.claim_run(worker_id, lease, run_id=run_id)
     if run is None:
         return False
     run_id = run['run_id']
+    logger.info('领取 run=%s epoch=%s', run_id, run['lease_epoch'])
     print(f'[worker] 领取 run={run_id} epoch={run["lease_epoch"]}')
 
     task = hub.store.task(run['task_id'])
@@ -55,24 +63,49 @@ async def run_once(hub: Hub, worker_id: str, lease_seconds: float = 120.0) -> bo
             return True
         record.run_id = run_id
         record.status = 'running'
-        record._task = asyncio.create_task(
-            hub._run(record, [], {}, resume_plan={'steps': steps} or None))
+        # 租约归属必须记在记录上：_run 里的看守协程靠它续租、靠它判断
+        # "我才是执行者"。漏了这一步，续租和跨进程取消都会失效。
+        record.lease_owner = run['lease_owner']
+        record._task = asyncio.create_task(hub._run(
+            record,
+            hub.history(record.session_id),
+            hub.prior_context(record.session_id),
+            resume_plan={'steps': steps} or None,
+            memory=hub.store.memory(record.session_id),
+        ))
     try:
-        await asyncio.wait_for(record._task, timeout=lease_seconds * 2)
+        # 租约由 _run 里的看守协程持续续期，这里只防"卡死永不返回"。
+        await asyncio.wait_for(record._task, timeout=settings.task_timeout * 2)
     except asyncio.TimeoutError:
         hub.store.update_run(run_id, status='reconciling',
-                             error='执行超过租约窗口')
+                             error='执行超过预算窗口')
+        logger.warning('run %s 执行超过预算窗口', run_id)
+    except asyncio.CancelledError:
+        # 跨进程取消是通过 cancel_requested_at 传话的：_guard 看到标记后会取消
+        # 这个任务，CancelledError 随之冒到这里。**不能**让它把整个 Worker 循环
+        # 带走——只取消了一个 run，不是要停进程。
+        current = hub.store.run(run_id) or {}
+        if current.get('cancel_requested_at'):
+            logger.info('run %s 已按请求取消', run_id)
+            return True
+        raise
     except Exception as exc:                      # noqa: BLE001
         hub.store.update_run(run_id, status='failed',
                              error=type(exc).__name__)
+        logger.exception('run %s 执行异常', run_id)
     return True
 
 
-def drain_jobs(hub: Hub, worker_id: str, limit: int = 5) -> int:
+async def drain_jobs(hub: Hub, worker_id: str, limit: int = 5) -> int:
     """消费后台任务（outbox）。
 
     第一版只处理 session_summary：把"该压缩会话记忆"这件事从请求链路挪到
     后台，避免阻塞每一次任务（文档 §12）。
+
+    **这个函数必须是 async 的**。以前它是同步函数、却从正在运行的事件循环里
+    被调用，内部又用 `asyncio.run(...)` —— 必然抛 `RuntimeError: asyncio.run()
+    cannot be called from a running event loop`，被 `except` 吞掉后标成"完成"。
+    结果是：摘要作业从来没成功过一次，而且失败即终态，不会重试。
     """
     done = 0
     for _ in range(limit):
@@ -82,26 +115,34 @@ def drain_jobs(hub: Hub, worker_id: str, limit: int = 5) -> int:
         try:
             if job['kind'] == 'session_summary':
                 from app import memory as memory_module
-                asyncio.run(memory_module.compact(hub.store,
-                                                  job['payload'].get('session_id', '')))
+                await memory_module.compact(
+                    hub.store, job['payload'].get('session_id', ''))
             hub.store.finish_job(job['job_id'])
             done += 1
         except Exception as exc:                  # noqa: BLE001
-            hub.store.finish_job(job['job_id'], error=type(exc).__name__)
+            attempts = int(job.get('attempts') or 0)
+            retry = attempts < MAX_JOB_ATTEMPTS
+            hub.store.finish_job(job['job_id'], error=type(exc).__name__,
+                                 retry=retry)
+            logger.warning('后台作业 %s 失败（第 %s 次，%s）',
+                           job['job_id'], attempts,
+                           '稍后重试' if retry else '不再重试', exc_info=True)
     return done
 
 
 async def main_loop(hub: Hub, worker_id: str, once: bool,
                     jobs_only: bool, interval: float) -> None:
+    logger.info('启动 worker_id=%s db=%s', worker_id, settings.db_path)
     print(f'[worker] 启动 worker_id={worker_id} db={settings.db_path}')
-    print(f'[worker] 启动对账: {hub.reconcile()}')
+    # 只对账**自己名下或租约已过期**的运行：多副本启动不能替别人判死
+    stats = hub.reconcile(owner=worker_id)
+    logger.info('启动对账 %s', stats)
+    print(f'[worker] 启动对账: {stats}')
     while True:
-        worked = drain_jobs(hub, worker_id)
+        worked = await drain_jobs(hub, worker_id)
         if not jobs_only:
             if await run_once(hub, worker_id):
                 worked += 1
-        if once and not worked:
-            return
         if once:
             return
         if not worked:
@@ -115,8 +156,9 @@ def main() -> None:
     parser.add_argument('--interval', type=float, default=1.0)
     args = parser.parse_args()
 
+    setup_logging('worker')
     worker_id = f'{os.uname().nodename}:{uuid.uuid4().hex[:6]}'
-    hub = Hub()
+    hub = Hub(owner_id=worker_id)
     try:
         asyncio.run(main_loop(hub, worker_id, args.once, args.jobs_only,
                               args.interval))

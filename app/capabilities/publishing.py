@@ -11,6 +11,15 @@ from app.config import settings
 from app.events import action, emit
 from app.rendering import save_json
 
+# 本能力包自带的规划规则：发布是**有副作用**的动作，只在明确要求时出现。
+PROMPT_RULES = (
+    '【发布】只有用户明确要求发布到服务器/要访问地址时，才在最后加 deploy_site；'
+    '若"部署"只是报告的研究主题（如"数据库的部署方式"），不要加。'
+    '若工具清单里有删除站点的工具（delete_site 或带前缀的等价名称），'
+    '把它写进 deploy_site 的 compensate，args 里用 ref 取部署返回的站点标识——'
+    '这样后续步骤失败时系统能自动收回刚发布的站点。没有就别编造。'
+)
+
 
 async def _deploy_site(args: dict, state: dict) -> dict:
     if not settings.deploy_enabled:

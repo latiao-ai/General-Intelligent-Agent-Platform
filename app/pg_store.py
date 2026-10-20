@@ -22,10 +22,15 @@ from pathlib import Path
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
-    session_id TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    session_id    TEXT PRIMARY KEY,
+    tenant_id     TEXT NOT NULL DEFAULT 'default',
+    owner_user_id TEXT NOT NULL DEFAULT 'default',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
 );
+-- 旧库升级：PG 支持 ADD COLUMN IF NOT EXISTS，直接并进建表脚本即可当迁移
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS owner_user_id TEXT NOT NULL DEFAULT 'default';
 CREATE TABLE IF NOT EXISTS messages (
     id         BIGSERIAL PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -87,6 +92,7 @@ CREATE TABLE IF NOT EXISTS runs (
     lease_expires_at    DOUBLE PRECISION,
     lease_epoch         INTEGER NOT NULL DEFAULT 0,
     error               TEXT,
+    compensated_at      TEXT,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL
 );
@@ -225,6 +231,27 @@ CREATE TABLE IF NOT EXISTS background_jobs (
     updated_at      TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_dedupe ON background_jobs(kind, dedupe_key);
+
+-- ---------- 请求幂等（POST /api/tasks） ----------
+CREATE TABLE IF NOT EXISTS request_keys (
+    scope_key     TEXT PRIMARY KEY,
+    client_key    TEXT NOT NULL,
+    tenant_id     TEXT NOT NULL DEFAULT 'default',
+    owner_user_id TEXT NOT NULL DEFAULT 'default',
+    endpoint      TEXT NOT NULL,
+    fingerprint   TEXT NOT NULL,
+    task_id       TEXT,
+    session_id    TEXT,
+    run_id        TEXT,
+    response_json TEXT,
+    created_at    TEXT NOT NULL,
+    expires_at    DOUBLE PRECISION NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_request_keys_expiry ON request_keys(expires_at);
+
+-- 旧库升级：CREATE TABLE IF NOT EXISTS 不会补列。PG 支持 IF NOT EXISTS，
+-- 所以升级语句可以和建表放在一起，启动时幂等执行。
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS compensated_at TEXT;
 """
 
 
@@ -256,23 +283,37 @@ class PostgresStore:
 
     # ---------- 会话与消息 ----------
 
-    def ensure_session(self, session_id: str) -> None:
+    def ensure_session(self, session_id: str, *, tenant_id: str = 'default',
+                       owner_user_id: str = 'default') -> None:
         stamp = now()
         with self._lock:
             self._conn.execute(
-                'INSERT INTO sessions (session_id, created_at, updated_at) '
-                'VALUES (%s, %s, %s) ON CONFLICT DO NOTHING', (session_id, stamp, stamp))
+                'INSERT INTO sessions '
+                '(session_id, tenant_id, owner_user_id, created_at, updated_at) '
+                'VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
+                (session_id, tenant_id, owner_user_id, stamp, stamp))
             self._conn.commit()
 
-    def append_message(self, session_id: str, role: str, content: str) -> None:
+    def session(self, session_id: str) -> dict | None:
+        """会话归属。接口层用它做对象权限检查（文档 §10）。"""
+        with self._lock:
+            row = self._conn.execute(
+                'SELECT * FROM sessions WHERE session_id=%s', (session_id,)).fetchone()
+        return dict(row) if row else None
+
+    def append_message(self, session_id: str, role: str, content: str, *,
+                       tenant_id: str = 'default',
+                       owner_user_id: str = 'default') -> None:
         stamp = now()
         with self._lock:
             self._conn.execute(
                 'INSERT INTO messages (session_id, role, content, created_at) '
                 'VALUES (%s, %s, %s, %s)', (session_id, role, content, stamp))
             self._conn.execute(
-                'INSERT INTO sessions (session_id, created_at, updated_at) '
-                'VALUES (%s, %s, %s) ON CONFLICT DO NOTHING', (session_id, stamp, stamp))
+                'INSERT INTO sessions '
+                '(session_id, tenant_id, owner_user_id, created_at, updated_at) '
+                'VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
+                (session_id, tenant_id, owner_user_id, stamp, stamp))
             self._conn.execute(
                 'UPDATE sessions SET updated_at=%s WHERE session_id=%s', (stamp, session_id))
             self._conn.commit()
@@ -324,11 +365,21 @@ class PostgresStore:
                                (session_id,))
             self._conn.commit()
 
-    def list_sessions(self, limit: int = 50) -> list[dict]:
+    def list_sessions(self, limit: int = 50, *, tenant_id: str | None = None,
+                      owner_user_id: str | None = None) -> list[dict]:
         """会话列表（按最近活跃排序），供前端侧边栏展示。
 
         title 取该会话第一条用户消息（截断），没有就回退到「新会话」。
+        传入 tenant_id / owner_user_id 时只返回该主体名下的会话。
         """
+        where, params = [], []
+        if tenant_id:
+            where.append('s.tenant_id=%s')
+            params.append(tenant_id)
+        if owner_user_id:
+            where.append("(s.owner_user_id=%s OR s.owner_user_id='default')")
+            params.append(owner_user_id)
+        clause = (' WHERE ' + ' AND '.join(where)) if where else ''
         with self._lock:
             rows = self._conn.execute(
                 'SELECT s.session_id, s.created_at, s.updated_at, '
@@ -336,8 +387,8 @@ class PostgresStore:
                 '    AS message_count, '
                 '  (SELECT content FROM messages m WHERE m.session_id=s.session_id '
                 '     AND m.role=\'user\' ORDER BY m.id LIMIT 1) AS first_message '
-                'FROM sessions s ORDER BY s.updated_at DESC LIMIT %s',
-                (limit,)).fetchall()
+                f'FROM sessions s{clause} ORDER BY s.updated_at DESC LIMIT %s',
+                (*params, limit)).fetchall()
         out = []
         for r in rows:
             first = (r['first_message'] or '').strip()
@@ -408,18 +459,28 @@ class PostgresStore:
     # ---------- 事件日志 ----------
 
     def append_event(self, task_id: str, event: dict) -> int:
-        """追加一条事件并返回它的序号（每任务内自增，用于订阅去重）。"""
+        """追加一条事件并返回它的序号（每任务内自增，用于订阅去重）。
+
+        序号在**一条语句**里算出来。PG 上并发写入可能有两个事务算出同一个
+        seq，靠主键冲突回滚重算；绝不允许"取到同一个号 → 后到的事件被
+        SSE 端按 seq 去重静默丢掉"。
+        """
         payload = json.dumps(event, ensure_ascii=False)
-        with self._lock:
-            row = self._conn.execute(
-                'SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM events '
-                'WHERE task_id=%s', (task_id,)).fetchone()
-            seq = row['next_seq']
-            self._conn.execute(
-                'INSERT INTO events (task_id, seq, payload, created_at) VALUES (%s, %s, %s, %s)',
-                (task_id, seq, payload, now()))
-            self._conn.commit()
-        return seq
+        statement = (
+            'INSERT INTO events (task_id, seq, payload, created_at) '
+            'SELECT %s, COALESCE(MAX(seq), 0) + 1, %s, %s FROM events '
+            'WHERE task_id=%s RETURNING seq')
+        for _ in range(5):
+            with self._lock:
+                try:
+                    row = self._conn.execute(
+                        statement, (task_id, payload, now(), task_id)).fetchone()
+                    self._conn.commit()
+                    return int(row['seq'])
+                except psycopg.errors.UniqueViolation:
+                    self._conn.rollback()
+                    continue
+        raise RuntimeError('事件序号竞争失败')
 
     def events(self, task_id: str) -> list[tuple[int, dict]]:
         with self._lock:
@@ -473,7 +534,7 @@ class PostgresStore:
     def update_run(self, run_id: str, **fields) -> None:
         allowed = {'status', 'plan_version', 'budget_json', 'consumed_json',
                    'cancel_requested_at', 'pause_requested', 'lease_owner',
-                   'lease_expires_at', 'lease_epoch', 'error'}
+                   'lease_expires_at', 'lease_epoch', 'error', 'compensated_at'}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
@@ -495,30 +556,44 @@ class PostgresStore:
         return [_decode_run(dict(r)) for r in rows]
 
     def claim_run(self, worker_id: str, lease_seconds: float = 60.0,
-                  now_ts: float | None = None) -> dict | None:
-        """原子领取一个排队中的 run，并递增租约代次。
+                  now_ts: float | None = None,
+                  run_id: str | None = None) -> dict | None:
+        """原子领取一个运行，并递增租约代次（PG 侧带 SKIP LOCKED）。
 
-        lease_epoch 是 fencing 令牌：旧 Worker 拿着过期的代次写状态会被拒，
-        避免"暂停后恢复，老的协程又把状态改回去"。
+        `run_id` 给定时只领这一条（API 进程就地执行也要先占租约，Worker 才
+        领不到它）；不给就按入队顺序领一条。子查询上的
+        `FOR UPDATE SKIP LOCKED` 是文档 §9.2 明确要求的：两个 Worker 并发
+        领取时，第二个直接跳过被锁住的行，而不是等锁再抢同一条。
         """
         stamp = now()
         current = now_ts if now_ts is not None else time.time()
+        condition = ("status IN ('queued','running','reconciling') "
+                     "AND (lease_expires_at IS NULL OR lease_expires_at < %s)")
+        if run_id is not None:
+            sql = ("UPDATE runs SET status='running', lease_owner=%s, "
+                   "lease_expires_at=%s, lease_epoch=lease_epoch+1, updated_at=%s "
+                   f"WHERE run_id=%s AND {condition} RETURNING *")
+            params = (worker_id, current + lease_seconds, stamp, run_id, current)
+        else:
+            sql = ("UPDATE runs SET status='running', lease_owner=%s, "
+                   "lease_expires_at=%s, lease_epoch=lease_epoch+1, updated_at=%s "
+                   f"WHERE run_id=(SELECT run_id FROM runs WHERE {condition} "
+                   "ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) "
+                   "RETURNING *")
+            params = (worker_id, current + lease_seconds, stamp, current)
         with self._lock:
-            row = self._conn.execute(
-                # queued 的可以领；running 但租约已过期的也要能领——
-                # 那正是 Worker 崩溃后需要接手的运行（文档 §9.2）。
-                "SELECT run_id FROM runs WHERE status IN ('queued','running') "
-                "AND (lease_expires_at IS NULL OR lease_expires_at < %s) "
-                "ORDER BY created_at LIMIT 1", (current,)).fetchone()
-            if row is None:
-                return None
-            run_id = row['run_id']
-            self._conn.execute(
-                "UPDATE runs SET status='running', lease_owner=%s, lease_expires_at=%s, "
-                "lease_epoch=lease_epoch+1, updated_at=%s WHERE run_id=%s",
-                (worker_id, current + lease_seconds, stamp, run_id))
+            row = self._conn.execute(sql, params).fetchone()
             self._conn.commit()
-        return self.run(run_id)
+        return _decode_run(dict(row)) if row else None
+
+    def release_lease(self, run_id: str, worker_id: str) -> None:
+        """执行者主动交还租约。带 owner 条件，旧代次不能覆盖新持有者（fencing）。"""
+        with self._lock:
+            self._conn.execute(
+                'UPDATE runs SET lease_owner=NULL, lease_expires_at=NULL, '
+                'updated_at=%s WHERE run_id=%s AND lease_owner=%s',
+                (now(), run_id, worker_id))
+            self._conn.commit()
 
     def renew_lease(self, run_id: str, worker_id: str, lease_seconds: float = 60.0,
                     now_ts: float | None = None) -> bool:
@@ -844,47 +919,152 @@ class PostgresStore:
         data['payload'] = json.loads(data.pop('payload_json') or '{}')
         return data
 
-    def finish_job(self, job_id: str, *, error: str | None = None) -> None:
-        with self._lock:
-            self._conn.execute(
-                "UPDATE background_jobs SET status=%s, last_error=%s, updated_at=%s "
-                'WHERE job_id=%s',
-                ('failed' if error else 'done', error, now(), job_id))
-            self._conn.commit()
+    def finish_job(self, job_id: str, *, error: str | None = None,
+                   retry: bool = False) -> None:
+        """收尾一个后台作业。
 
-    # ---------- 维护 ----------
-
-    def _recover_orphans(self) -> int:
-        """把库里遗留的 running 任务标记为 interrupted。
-
-        注意：这只是**兼容旧表**的兜底。中台下 run 的恢复由租约判定
-        （见 Store.claim_run / 文档 §9.2），不能靠"每个 API 实例启动就改写全部
-        运行态"——多实例时会互相踩。新链路请用 runs 表。
+        `retry=True`：退回 queued 并用退避时间占住租约，下一轮扫描再领。
+        一次失败就写 failed 等于把偶发错误当终态，且没人会知道。
         """
         with self._lock:
+            if error and retry:
+                row = self._conn.execute(
+                    'SELECT attempts FROM background_jobs WHERE job_id=%s',
+                    (job_id,)).fetchone()
+                attempts = int((row['attempts'] if row else 0) or 1)
+                delay = min(300.0, 5.0 * (2 ** min(attempts, 6)))
+                self._conn.execute(
+                    "UPDATE background_jobs SET status='queued', last_error=%s, "
+                    'lease_owner=NULL, lease_expires_at=%s, updated_at=%s '
+                    'WHERE job_id=%s',
+                    (error, time.time() + delay, now(), job_id))
+            else:
+                self._conn.execute(
+                    "UPDATE background_jobs SET status=%s, last_error=%s, updated_at=%s "
+                    'WHERE job_id=%s',
+                    ('failed' if error else 'done', error, now(), job_id))
+            self._conn.commit()
+
+    # ---------- 请求幂等（POST /api/tasks） ----------
+
+    def reserve_request_key(self, scope_key: str, *, client_key: str,
+                            tenant_id: str, owner_user_id: str,
+                            endpoint: str, fingerprint: str,
+                            expires_at: float) -> dict:
+        """原子占位。过期行先删再插，保证 TTL 之后同一个键可以复用。"""
+        stamp = now()
+        with self._lock:
+            self._conn.execute(
+                'DELETE FROM request_keys WHERE scope_key=%s AND expires_at < %s',
+                (scope_key, time.time()))
             cur = self._conn.execute(
-                "UPDATE tasks SET status='interrupted', updated_at=%s WHERE status='running'",
-                (now(),))
+                'INSERT INTO request_keys '
+                '(scope_key, client_key, tenant_id, owner_user_id, endpoint, '
+                ' fingerprint, created_at, expires_at) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
+                (scope_key, client_key, tenant_id, owner_user_id, endpoint,
+                 fingerprint, stamp, expires_at))
+            # 并发请求里只有一个插入成功；其它的读到同一行但没有响应 → 处理中
+            created = cur.rowcount > 0
+            row = self._conn.execute(
+                'SELECT * FROM request_keys WHERE scope_key=%s',
+                (scope_key,)).fetchone()
+            self._conn.commit()
+        data = _decode_request_key(dict(row)) if row else {}
+        data['created'] = created
+        return data
+
+    def request_key(self, scope_key: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                'SELECT * FROM request_keys WHERE scope_key=%s',
+                (scope_key,)).fetchone()
+        return _decode_request_key(dict(row)) if row else None
+
+    def complete_request_key(self, scope_key: str, response: dict, *,
+                             task_id: str = '', session_id: str = '',
+                             run_id: str = '') -> None:
+        with self._lock:
+            self._conn.execute(
+                'UPDATE request_keys SET response_json=%s, task_id=%s, '
+                'session_id=%s, run_id=%s WHERE scope_key=%s',
+                (json.dumps(response, ensure_ascii=False), task_id or None,
+                 session_id or None, run_id or None, scope_key))
+            self._conn.commit()
+
+    def release_request_key(self, scope_key: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                'DELETE FROM request_keys WHERE scope_key=%s AND response_json IS NULL',
+                (scope_key,))
+            self._conn.commit()
+
+    def purge_request_keys(self, now_ts: float | None = None) -> int:
+        current = now_ts if now_ts is not None else time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                'DELETE FROM request_keys WHERE expires_at < %s', (current,))
             self._conn.commit()
             return cur.rowcount
 
-    def reconcile_orphan_runs(self) -> dict:
-        """进程重启后对账遗留的 running run（文档 §8.3）。
+    # ---------- 维护 ----------
 
-        不能简单地"一律标记中断"：已发出但没收到回执的调用必须保持 unknown，
-        要求核实，而不是假设它没执行过。这里做三件事：
-        1. in_flight 的 action → unknown（远端可能已经执行了）
-        2. 对应步骤 → unknown
-        3. run → reconciling，等人工或后续核实流程处理
+    def stats(self) -> dict:
+        """运行态势快照：给 /api/health 与排障用。"""
+        queries = {
+            'runs_queued': "SELECT COUNT(*) AS n FROM runs WHERE status='queued'",
+            'runs_running': "SELECT COUNT(*) AS n FROM runs WHERE status='running'",
+            'runs_reconciling': "SELECT COUNT(*) AS n FROM runs "
+                                "WHERE status='reconciling'",
+            'actions_unknown': "SELECT COUNT(*) AS n FROM actions "
+                               "WHERE status='unknown'",
+            'jobs_queued': "SELECT COUNT(*) AS n FROM background_jobs "
+                           "WHERE status='queued'",
+            'jobs_failed': "SELECT COUNT(*) AS n FROM background_jobs "
+                           "WHERE status='failed'",
+        }
+        out = {}
+        with self._lock:
+            for name, sql in queries.items():
+                row = self._conn.execute(sql).fetchone()
+                out[name] = int(row['n'] if row else 0)
+        return out
+
+    def _recover_orphans(self) -> int:
+        """只把**没有活租约**的遗留 running 任务标记为 interrupted。
+
+        多副本下不能见到 running 就改写：那会把别人正在跑的任务替它判死。
         """
         with self._lock:
-            runs = self._conn.execute(
-                "SELECT run_id FROM runs WHERE status='running'").fetchall()
-            unknown_actions = 0
-            for row in runs:
+            cur = self._conn.execute(
+                "UPDATE tasks SET status='interrupted', updated_at=%s "
+                "WHERE status='running' AND NOT EXISTS ("
+                '  SELECT 1 FROM runs r WHERE r.task_id = tasks.task_id '
+                "  AND r.status='running' AND r.lease_expires_at IS NOT NULL "
+                '  AND r.lease_expires_at > %s)',
+                (now(), time.time()))
+            self._conn.commit()
+            return cur.rowcount
+
+    def reconcile_orphan_runs(self, owner: str | None = None,
+                              now_ts: float | None = None) -> dict:
+        """只对账**自己名下的、或租约已过期的**运行（文档 §8.3）。
+
+        以前是"见到 running 就判 unknown 并清租约"：多副本或 --reload 会把
+        别的进程正在跑的任务判成结果未知，清掉租约后立刻又被领一次，正好
+        制造它想防的重复执行。
+        """
+        current = now_ts if now_ts is not None else time.time()
+        stats = {'runs': 0, 'unknown_actions': 0, 'requeued': 0}
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT run_id FROM runs WHERE status IN ('running','reconciling') "
+                'AND (lease_owner IS NULL OR lease_owner = %s '
+                'OR lease_expires_at IS NULL OR lease_expires_at < %s)',
+                (owner, current)).fetchall()
+            for row in rows:
                 run_id = row['run_id']
-                # 只处理 in_flight：prepared 意味着请求根本没发出去，
-                # 可以直接重试；这一点文档 §8.3 的窗口一是分开处理的。
+                stats['runs'] += 1
                 pending = self._conn.execute(
                     "SELECT action_id, step_id FROM actions "
                     "WHERE run_id=%s AND status='in_flight'", (run_id,)).fetchall()
@@ -892,18 +1072,21 @@ class PostgresStore:
                     self._conn.execute(
                         "UPDATE actions SET status='unknown', updated_at=%s "
                         'WHERE action_id=%s', (now(), action['action_id']))
-                    unknown_actions += 1
+                    stats['unknown_actions'] += 1
                     self._conn.execute(
                         "UPDATE steps SET status='unknown', error=%s "
                         'WHERE run_id=%s AND step_id=%s',
                         ('进程重启时该调用结果未知，需核实', run_id,
                          action['step_id']))
+                target = 'reconciling' if pending else 'queued'
+                if target == 'queued':
+                    stats['requeued'] += 1
                 self._conn.execute(
-                    "UPDATE runs SET status='reconciling', lease_owner=NULL, "
+                    'UPDATE runs SET status=%s, lease_owner=NULL, '
                     'lease_expires_at=NULL, updated_at=%s WHERE run_id=%s',
-                    (now(), run_id))
+                    (target, now(), run_id))
             self._conn.commit()
-        return {'runs': len(runs), 'unknown_actions': unknown_actions}
+        return stats
 
     def close(self) -> None:
         with self._lock:
@@ -924,4 +1107,9 @@ def _decode_run(row: dict) -> dict:
 
 def _decode_action(row: dict) -> dict:
     row['receipt'] = json.loads(row.pop('receipt_json') or 'null')
+    return row
+
+
+def _decode_request_key(row: dict) -> dict:
+    row['response'] = json.loads(row.pop('response_json') or 'null')
     return row

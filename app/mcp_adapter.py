@@ -1,3 +1,11 @@
+"""MCP 客户端：连接、发现、调用。
+
+只负责"怎么跟一个 MCP 服务端说话"，**不负责选哪个服务端**——那是
+`app/mcp_servers.py` 的事。所有函数都接受一个 `server` 参数：
+
+- 传 `Server`：按它给的地址/传输/参数连；
+- 传 `None`：退回旧的单项环境变量（`MCP_URL` 等），保持既有调用点与测试可用。
+"""
 import os
 import json
 import base64
@@ -15,36 +23,69 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 # 本模块直接读 os.environ，导入 config 触发 load_dotenv，
 # 避免单独调用 connect_session 时出现 KeyError: 'MCP_URL'。
 from app import config as _config  # noqa: F401
+from app import mcp_servers
+
+
+def _cfg(server, field: str, env: str, default: str = '') -> str:
+    """取配置：显式传入的服务端优先，否则退回环境变量。
+
+    这样"多服务端"与"老的单项环境变量"共用同一套连接代码，不需要两套实现。
+    """
+    if server is not None:
+        value = getattr(server, field, '') or ''
+        if value:
+            return str(value)
+    return os.getenv(env, default)
+
+
+def _extra_args(server) -> dict:
+    if server is not None and server.extra_args:
+        return dict(server.extra_args)
+    raw = os.getenv('MCP_EXTRA_ARGS', '{}')
+    value = json.loads(raw or '{}')
+    if not isinstance(value, dict):
+        raise ValueError('MCP_EXTRA_ARGS 必须是 JSON 对象')
+    return value
 
 
 @asynccontextmanager
-async def connect_session():
-    transport = os.getenv('MCP_TRANSPORT', 'streamable_http')
-    token = os.getenv('MCP_BEARER_TOKEN', '')
+async def connect_session(server=None):
+    transport = _cfg(server, 'transport', 'MCP_TRANSPORT', 'streamable_http')
+    token = _cfg(server, 'token', 'MCP_BEARER_TOKEN', '')
     headers = {'Authorization': 'Bearer ' + token} if token else None
     if transport == 'stdio':
-        command = os.environ['MCP_STDIO_COMMAND']
-        args = json.loads(os.getenv('MCP_STDIO_ARGS', '[]'))
+        command = _cfg(server, 'stdio_command', 'MCP_STDIO_COMMAND')
+        if not command:
+            raise ValueError('stdio 传输缺少启动命令')
+        raw_args = getattr(server, 'stdio_args', ()) if server is not None else ()
+        args = list(raw_args) if raw_args else json.loads(
+            os.getenv('MCP_STDIO_ARGS', '[]'))
         params = StdioServerParameters(command=command, args=args)
         async with stdio_client(params) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 yield session
     elif transport == 'sse':
-        async with sse_client(os.environ['MCP_URL'], headers=headers) as (read, write):
+        url = _cfg(server, 'url', 'MCP_URL')
+        if not url:
+            raise ValueError('SSE 传输缺少 url')
+        async with sse_client(url, headers=headers) as (read, write):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 yield session
     elif transport == 'streamable_http':
+        url = _cfg(server, 'url', 'MCP_URL')
+        if not url:
+            raise ValueError('streamable_http 传输缺少 url')
         async with httpx.AsyncClient(headers=headers, timeout=90) as http_client:
             async with streamable_http_client(
-                os.environ['MCP_URL'], http_client=http_client
+                url, http_client=http_client
             ) as (read, write, _):
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     yield session
     else:
-        raise ValueError('未知 MCP_TRANSPORT')
+        raise ValueError(f'未知 MCP_TRANSPORT：{transport}')
 
 
 async def all_tools(session):
@@ -93,7 +134,7 @@ def effect_type(tool) -> str:
     return 'unknown'
 
 
-async def list_server_tools():
+async def list_server_tools(server=None):
     """发现服务端工具，尽量把能力信息完整带回。
 
     早先只保留 name 与 inputSchema，description/annotations 全被丢掉——
@@ -101,7 +142,7 @@ async def list_server_tools():
     这类就完全看不出）。能力描述必须在规划前就到手。
     """
     async with asyncio.timeout(30):
-        async with connect_session() as session:
+        async with connect_session(server) as session:
             tools = await all_tools(session)
             return [{
                 'name': t.name,
@@ -139,17 +180,17 @@ def dotted_get(payload, key):
     return value
 
 
-def payload_mode(tool) -> str:
+def payload_mode(tool, server=None) -> str:
     """决定文件内容怎么传给部署工具。
 
     auto（默认）：工具 inputSchema 若是 files[{path,content}] 数组就用 files_base64，
-    否则按纯文本字段传。可用 MCP_PAYLOAD_MODE 显式锁定 text / files_base64。
+    否则按纯文本字段传。可用服务端配置的 payload_mode 或 MCP_PAYLOAD_MODE 显式锁定。
     """
-    mode = os.getenv('MCP_PAYLOAD_MODE', 'auto').strip().lower()
+    mode = _cfg(server, 'payload_mode', 'MCP_PAYLOAD_MODE', 'auto').lower()
     if mode in {'text', 'files_base64'}:
         return mode
     if mode != 'auto':
-        raise ValueError('MCP_PAYLOAD_MODE 只能是 auto / text / files_base64')
+        raise ValueError('payload_mode 只能是 auto / text / files_base64')
     properties = (getattr(tool, 'inputSchema', None) or {}).get('properties') or {}
     files_schema = properties.get('files') or {}
     if files_schema.get('type') == 'array':
@@ -159,29 +200,27 @@ def payload_mode(tool) -> str:
     return 'text'
 
 
-def build_arguments(tool, artifact: dict) -> dict:
-    arguments = json.loads(os.getenv('MCP_EXTRA_ARGS', '{}'))
-    if not isinstance(arguments, dict):
-        raise ValueError('MCP_EXTRA_ARGS 必须是 JSON 对象')
-    if payload_mode(tool) == 'files_base64':
+def build_arguments(tool, artifact: dict, server=None) -> dict:
+    arguments = _extra_args(server)
+    if payload_mode(tool, server) == 'files_base64':
         # 服务端会把 content 当 base64 解码，且多数实现不校验合法性：
         # 传原始 HTML 文本会静默落成乱码站点，所以必须传真实的 base64 字节。
         raw = Path(artifact['html_path']).read_bytes()
+        entry = _cfg(server, 'entry_filename', 'MCP_ENTRY_FILENAME', 'index.html')
         if not isinstance(arguments.setdefault('files', [{
-            'path': os.getenv('MCP_ENTRY_FILENAME', 'index.html'),
+            'path': entry,
             'content': base64.b64encode(raw).decode('ascii'),
         }]), list):
             raise ValueError('MCP_EXTRA_ARGS 中的 files 必须是数组')
     else:
-        arguments[os.getenv('MCP_HTML_FIELD', 'html')] = Path(
-            artifact['html_path']
-        ).read_text(encoding='utf-8')
+        field = _cfg(server, 'html_field', 'MCP_HTML_FIELD', 'html')
+        arguments[field] = Path(artifact['html_path']).read_text(encoding='utf-8')
     return arguments
 
 
-def result_url(payload) -> str:
+def result_url(payload, server=None) -> str:
     """按配置字段取访问地址，配置项缺失时回退到常见字段名。"""
-    configured = os.getenv('MCP_RESULT_URL_FIELD', '').strip()
+    configured = _cfg(server, 'result_url_field', 'MCP_RESULT_URL_FIELD', '').strip()
     candidates = ([configured] if configured else []) + ['public_url', 'url', 'entry_url']
     for candidate in dict.fromkeys(candidates):
         try:
@@ -192,36 +231,47 @@ def result_url(payload) -> str:
             parsed = urlsplit(value)
             if parsed.scheme in {'http', 'https'} and parsed.hostname:
                 return value
-    raise RuntimeError('工具返回的访问地址无效，请核对 MCP_RESULT_URL_FIELD 字段映射')
+    raise RuntimeError('工具返回的访问地址无效，请核对 result_url_field 配置')
 
 
-async def call_tool(tool_name: str, arguments: dict, artifact: dict | None = None):
+async def call_tool(tool_name: str, arguments: dict, artifact: dict | None = None,
+                    server=None):
     """按真实 inputSchema 调用任意 MCP 工具。
 
     供动态编排使用：模型自己挑工具、自己给业务参数，但它给不出文件字节，
     所以当工具的 inputSchema 需要文件内容（files[{path,content}]）时，
     由这里用当前产物 `artifact` 自动补上，模型给的参数优先级更高（可覆盖）。
-    返回解析后的 payload。
+
+    `server` 不传时按工具名前缀路由（多服务端），再退回默认服务端——这样
+    "旧调用点只给工具名"仍然能用。
     """
+    if server is None:
+        routed, bare = mcp_servers.split_tool_name(tool_name)
+        server = routed or mcp_servers.deploy_server()
+        tool_name = bare
     async with asyncio.timeout(90):
-        async with connect_session() as session:
+        async with connect_session(server) as session:
             tools = await all_tools(session)
             tool = next((t for t in tools if t.name == tool_name), None)
             if tool is None:
                 raise RuntimeError(f'MCP 工具 {tool_name} 不存在')
             merged = dict(arguments or {})
-            if artifact is not None and payload_mode(tool) == 'files_base64':
-                merged = {**build_arguments(tool, artifact), **merged}
+            if artifact is not None and payload_mode(tool, server) == 'files_base64':
+                merged = {**build_arguments(tool, artifact, server), **merged}
             validate(instance=merged, schema=tool.inputSchema)
             result = await session.call_tool(tool_name, arguments=merged)
             return result_payload(result)
 
 
-async def deploy_html(artifact: dict):
-    tool_name = os.environ['MCP_TOOL_NAME']
-    # 先发现工具、按真实 inputSchema 组装参数；文件上传/服务端路径需另行改造。
-    payload = await call_tool(tool_name, {}, artifact=artifact)
-    url = result_url(payload)
+async def deploy_html(artifact: dict, server=None):
+    """把 HTML 产物交给承接部署的服务端。"""
+    server = server or mcp_servers.deploy_server()
+    tool_name = (getattr(server, 'deploy_tool', '') if server is not None else '') \
+        or os.getenv('MCP_TOOL_NAME', '')
+    if not tool_name:
+        raise RuntimeError('未配置部署工具名（MCP_TOOL_NAME / deploy_tool）')
+    payload = await call_tool(tool_name, {}, artifact=artifact, server=server)
+    url = result_url(payload, server)
     site_id = payload.get('site_id') if isinstance(payload, dict) else None
     return {
         'status': 'success',

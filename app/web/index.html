@@ -441,7 +441,13 @@ function currentTurnEl() {
 const TURN_STATUS = {answered: '已回答', cancelled: '已中断',
                      interrupted: '已中断', failed: '已失败',
                      deployed: '已部署', local_ready: '已完成',
-                     deploy_needs_check: '已完成'};
+                     deploy_needs_check: '已完成',
+                     // 计划没过校验就停下等人补充：不能显示成"已完成"
+                     waiting_input: '待补充信息',
+                     waiting_approval: '待确认',
+                     partially_succeeded: '部分完成',
+                     // 补偿运行：副作用已收回，与"失败"不是一回事
+                     compensated: '已撤销'};
 
 function turnSeconds(n) {
   return S.stages.filter(st => st.turn === n)
@@ -615,6 +621,29 @@ async function interrupt() {
   closeOpenStages('已中断');
 }
 
+// 创建任务时带幂等键：网络中断后重试、或用户重复点击，服务端只会建一个任务。
+// 键在"这一条消息"的生命周期内不变——重试必须用同一个键才有意义。
+function newIdempotencyKey() {
+  return (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'k-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+}
+
+async function postTask(text, key) {
+  const options = {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'Idempotency-Key': key},
+    body: JSON.stringify({message: text, session_id: S.sessionId}),
+  };
+  try {
+    return await fetch('/api/tasks', options);
+  } catch (err) {
+    // 网络层失败：请求可能已经到了服务端，用同一个键再试一次，
+    // 服务端会返回原来那个任务而不是再建一个。
+    return await fetch('/api/tasks', options);
+  }
+}
+
 async function send() {
   const text = $('msg').value.trim();
   if (!text) return;
@@ -624,11 +653,9 @@ async function send() {
   startNewTurn();
   setRunning(true);
   $('send').disabled = true;
+  const idempotencyKey = newIdempotencyKey();
   try {
-    const res = await fetch('/api/tasks', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({message: text, session_id: S.sessionId}),
-    });
+    const res = await postTask(text, idempotencyKey);
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     S.sessionId = data.session_id;

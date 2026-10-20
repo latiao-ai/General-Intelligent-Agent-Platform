@@ -14,11 +14,29 @@
 """
 import re
 
-# 每轮的常用预算（token）。规划比作答小：它只需要判断意图，不需要复述细节。
-BUDGETS = {
+# 用途决定需要哪些材料（文档 §11）。不同用途给不同预算，不要一份预算打天下。
+PURPOSES = ('plan', 'replan', 'transform', 'final_answer', 'summarize',
+            'memory_extract')
+
+# 各用途的预算（token）——**唯一口径**。
+# plan 只要判断意图；final_answer 要能答清楚；transform/summarize 处理大块
+# 内容，预算最大。以前这里还有第二张 BUDGETS 表给 select() 用，两张表各写各的，
+# 数值当时碰巧一样，改一处就悄悄漂了。现在 BUDGETS 由这张表派生。
+PURPOSE_BUDGETS = {
     'plan': 1800,
-    'answer': 3500,
+    'replan': 2200,
+    'final_answer': 3500,
+    'transform': 6000,
+    'summarize': 6000,
+    'memory_extract': 3000,
 }
+
+# 调用点的历史用途 → 预算用途。chat_messages 传的是 'answer'，
+# build 传的是 'final_answer'，两者必须映射到同一个数。
+PURPOSE_ALIASES = {'answer': 'final_answer', 'compose': 'transform'}
+
+BUDGETS = dict(PURPOSE_BUDGETS)
+BUDGETS.update({'answer': PURPOSE_BUDGETS['final_answer']})
 
 _CJK = re.compile(r'[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef]')
 
@@ -39,27 +57,20 @@ def estimate_tokens(text: str) -> int:
 
 
 def budget_of(purpose: str) -> int:
-    return BUDGETS.get(purpose, BUDGETS['answer'])
+    resolved = PURPOSE_ALIASES.get(purpose, purpose)
+    return PURPOSE_BUDGETS.get(resolved, PURPOSE_BUDGETS['final_answer'])
 
 
 def select(history, purpose: str = 'answer') -> list[dict]:
     """从最近往前挑消息，直到用完预算。
 
     永远至少返回一条：完全不带上文比多花点 token 更糟。
+
+    这里**委托给 build()**，而不是自己再实现一遍截断逻辑：两套实现就是两个
+    口径，迟早分叉（历史上就分叉过）。生产路径（规划、作答）都经由
+    `select`/`chat_messages` 走到 `build`，预算报告因此是真实的。
     """
-    limit = budget_of(purpose)
-    picked, used = [], 0
-    for message in reversed(list(history or [])):
-        content = message.get('content') or ''
-        cost = estimate_tokens(content)
-        if picked and used + cost > limit:
-            break
-        picked.append({'role': message.get('role') or 'user', 'content': content})
-        used += cost
-        if used >= limit:
-            break
-    picked.reverse()
-    return picked
+    return build(purpose=purpose, history=history)['messages']
 
 
 def memory_text(memory: dict | None) -> str:
@@ -87,21 +98,6 @@ def system_with_memory(system: str, memory: dict | None) -> str:
     return f'{system}\n\n{block}\n（以上是更早对话的压缩结果，只作背景，不要逐字复述。）'
 
 
-# 用途决定需要哪些材料（文档 §11）。不同用途给不同预算，不要一份预算打天下。
-PURPOSES = ('plan', 'replan', 'transform', 'final_answer', 'summarize',
-            'memory_extract')
-
-# 各用途的预算（token）。plan 只要判断意图；final_answer 要能答清楚；
-# transform/summarize 处理大块内容，预算最大。
-PURPOSE_BUDGETS = {
-    'plan': 1800,
-    'replan': 2200,
-    'final_answer': 3500,
-    'transform': 6000,
-    'summarize': 6000,
-    'memory_extract': 3000,
-}
-
 # 固定优先级：规则与权限 → 当前请求 → 状态与待核实 → 工具 → 证据 → 记忆 → 历史
 _PRIORITY = ('rules', 'request', 'state', 'tools', 'evidence', 'memory', 'history')
 
@@ -118,7 +114,7 @@ def build(*, purpose: str = 'final_answer', rules: str = '', request: str = '',
     核心指令与最小 schema 已经超预算时**不做静默截断**：直接标记
     `over_budget=True`，让上层选择缩小范围或暂停。
     """
-    budget = PURPOSE_BUDGETS.get(purpose, PURPOSE_BUDGETS['final_answer'])
+    budget = budget_of(purpose)
     sections = {'rules': rules or '', 'request': request or '',
                 'state': state or '', 'tools': tools or '',
                 'evidence': evidence or ''}
