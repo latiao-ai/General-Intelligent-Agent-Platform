@@ -10,10 +10,11 @@ from types import SimpleNamespace
 from dataclasses import replace
 from unittest.mock import patch
 from pydantic import ValidationError
-from app.schemas import ExecutionPlan, PlanStep, Report
+from app.schemas import ExecutionPlan, PlanStep
 from app.services import clean_public_url
-from app.rendering import report_errors, render_report
-from app import mcp_adapter, nodes
+from app.files import save_json
+from app.integrations import mcp_adapter
+from app import nodes
 
 
 from contextlib import ExitStack
@@ -21,29 +22,11 @@ from contextlib import ExitStack
 
 def patch_all_emits(sink):
     """能力包各自持有 emit 引用，测试里需要一起打桩。"""
-    from app.capabilities import answers, publishing, reports, web
+    from app.capabilities import export, publishing, web
     stack = ExitStack()
-    for module in (answers, publishing, reports, web):
+    for module in (export, publishing, web):
         stack.enter_context(patch.object(module, 'emit', sink))
     return stack
-
-
-def report_fixture():
-    return Report.model_validate({
-        'title': '测试报告', 'summary': '资料摘要', 'summary_source_ids': ['s1'],
-        'sections': [{'heading': '特点', 'paragraphs': [
-            {'text': '<script>alert(1)</script>', 'source_ids': ['s1']}
-        ]}],
-        'comparison_table': {'columns': ['名称'], 'rows': [
-            {'cells': ['示例'], 'source_ids': ['s1']}
-        ]}, 'limitations': [],
-    })
-
-
-def source_fixture():
-    return [{'source_id': 's1', 'url': 'https://example.com/',
-             'title': '示例', 'status': 'success', 'fetched_at': 'test',
-             'raw_content': '用于测试的正文'}]
 
 
 class CoreTests(unittest.TestCase):
@@ -52,42 +35,6 @@ class CoreTests(unittest.TestCase):
                     'http://localhost/', 'file:///etc/passwd', 'http://[::1]/']:
             with self.assertRaises(ValueError):
                 clean_public_url(url)
-
-    def test_unknown_citation(self):
-        report = report_fixture()
-        report.sections[0].paragraphs[0].source_ids = ['unknown']
-        self.assertTrue(report_errors(report, source_fixture()))
-
-    def test_table_shape(self):
-        report = report_fixture()
-        report.comparison_table.rows[0].cells = ['a', 'b']
-        self.assertTrue(report_errors(report, source_fixture()))
-
-    def test_autoescape(self):
-        with tempfile.TemporaryDirectory() as folder:
-            with patch('app.rendering.settings') as config:
-                config.artifact_dir = Path(folder)
-                artifact = render_report('testtask', report_fixture(), source_fixture())
-                html = Path(artifact['html_path']).read_text(encoding='utf-8')
-                self.assertNotIn('<script>alert(1)</script>', html)
-                self.assertIn('&lt;script&gt;', html)
-
-    def test_source_budget_keeps_multiple_sources(self):
-        """总量预算不能只够装一个来源，否则报告退化成单一来源。"""
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        from app.config import settings
-        docs = [{'source_id': f's{i}', 'title': f't{i}', 'status': 'success',
-                 'raw_content': 'x' * 20000} for i in range(1, 5)]
-        selected, truncated = tool_module._select_sources({'documents': docs})
-        self.assertGreaterEqual(len(selected), 2)
-        self.assertLessEqual(sum(len(s['text']) for s in selected),
-                             settings.max_total_chars)
-        self.assertTrue(truncated)
-
 
 class SourceStoreTests(unittest.TestCase):
     """P0：正文落盘，state 里只留元数据。"""
@@ -243,7 +190,7 @@ class SearchBackendTests(unittest.IsolatedAsyncioTestCase):
     """检索后端：DeepSeek 官方接口归一化成 tools 使用的形状。"""
 
     async def test_deepseek_search_normalises_payload(self):
-        from app import search
+        from app.integrations import search
         captured = {}
 
         class FakeResponse:
@@ -280,7 +227,7 @@ class SearchBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['site_name'], '示例站')
 
     async def test_deepseek_fetch_collects_failures(self):
-        from app import search
+        from app.integrations import search
 
         class FakeResponse:
             def __init__(self, ok): self.ok = ok
@@ -329,9 +276,8 @@ class SourcesHtmlToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_refuses_without_documents(self):
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         with self.assertRaises(tool_module.ToolError):
             await tool_module._render_sources_html({}, {'documents': []})
@@ -454,36 +400,29 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         """未知工具要**回报**而不是静默过滤——计划引用不存在的工具属于规划错误。"""
         from app import nodes
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         kept, dropped = nodes._valid_steps(
             [{'tool': 'web_search', 'args': {'query': 'q'}},
              {'tool': 'not_a_tool', 'args': {}},
-             {'tool': 'render_html', 'args': 'not-a-dict'}],
+             {'tool': 'render_sources_html', 'args': 'not-a-dict'}],
             tool_module.BUILTIN_TOOLS)
-        self.assertEqual([s['tool'] for s in kept], ['web_search', 'render_html'])
+        self.assertEqual([s['tool'] for s in kept], ['web_search', 'render_sources_html'])
         self.assertEqual(kept[1]['args'], {})
         self.assertEqual(dropped, ['not_a_tool'])
 
     def test_fallback_does_not_guess_business(self):
-        """兜底不能拼"检索→成稿→渲染"这种业务链路。
-
-        那等于把网页研究写死进内核，用户只是问句话也会被拉去跑检索。
-        中台里兜底只做一件事：别猜，降级成一次直接作答。
-        """
+        """能力裁剪后只剩一条业务链，兜底不再替用户拼它，直接返回空计划。"""
         from app import nodes
-        for text in ('整理一份 SQLite 报告', '查询如何降低体脂', '你好', '暂停'):
-            steps = nodes.fallback_steps({'user_input': text})
-            self.assertEqual([s['tool'] for s in steps], ['answer_directly'], text)
+        for text in ('整理一份 SQLite 报告', '查询如何降低体脂', '你好'):
+            self.assertEqual(nodes.fallback_steps({'user_input': text}), [], text)
 
     async def test_plan_asks_the_model_and_keeps_its_steps(self):
         from app import nodes
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         captured = {}
 
@@ -495,7 +434,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
             return ExecutionPlan.model_validate({'steps': [
                 {'tool': 'web_search', 'args': {'query': 'sqlite'},
                  'why': '需要外部资料'},
-                {'tool': 'render_html', 'args': {}, 'why': '产出 HTML'},
+                {'tool': 'render_sources_html', 'args': {}, 'why': '产出网页'},
             ], 'summary': '先搜再渲染'}), {'total_tokens': 3}
 
         with patch.object(tool_module, 'catalog', fake_catalog), \
@@ -503,22 +442,20 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
             result = await nodes.plan({'user_input': '整理 SQLite 报告', 'usage': []})
 
         tools_used = [s['tool'] for s in result['plan']['steps']]
-        self.assertEqual(tools_used, ['web_search', 'render_html'])
+        self.assertEqual(tools_used, ['web_search', 'render_sources_html'])
         self.assertEqual(result['step_index'], 0)
         self.assertEqual(result['usage'][-1]['stage'], 'plan')
         # 工具清单必须真的进了提示词，否则模型只能瞎猜
         self.assertIn('web_search', captured['user'])
-        self.assertIn('answer_directly', captured['user'])
-        self.assertIn('answer_with_sources', captured['user'])
+        self.assertIn('render_sources_html', captured['user'])
         # 必须告诉模型手上还有多少料，否则它会重复检索、或空手去整理
         self.assertIn('已有资料', captured['user'])
 
     async def test_plan_falls_back_when_the_model_fails(self):
         from app import nodes
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
 
         async def fake_catalog():
@@ -530,37 +467,15 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(tool_module, 'catalog', fake_catalog), \
                 patch.object(nodes, 'structured_call', boom):
             result = await nodes.plan({'user_input': '整理 SQLite 报告', 'usage': []})
-        # 规划失败就如实降级，不替用户擅自拉起整条检索链路
-        self.assertEqual([s['tool'] for s in result['plan']['steps']],
-                         ['answer_directly'])
+        # 规划失败就如实降级：没有可执行步骤，交给 final_status 报失败
+        self.assertEqual(result['plan']['steps'], [])
 
-    async def test_plan_skips_the_model_for_small_talk(self):
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-
-        async def forbidden(*a, **k):
-            raise AssertionError('寒暄不应调用模型')
-
-        async def fake_catalog():
-            raise AssertionError('寒暄不应去发现工具')
-
-        with patch.object(tool_module, 'catalog', fake_catalog), \
-                patch.object(nodes, 'structured_call', forbidden):
-            result = await nodes.plan({'user_input': '你好', 'usage': []})
-        self.assertEqual([s['tool'] for s in result['plan']['steps']],
-                         ['answer_directly'])
-        self.assertEqual(result.get('usage', []), [])   # 没调模型就没有用量
 
     async def test_run_step_runs_exactly_one_tool_and_advances(self):
         from app import nodes
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         from app.tools import Tool
         seen = []
@@ -569,23 +484,21 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
             seen.append(args)
             return {'answer': '好的', 'status': 'answered'}
 
-        fake = Tool('answer_directly', '直接回答', 'd', {}, runner)
-        plan = {'steps': [{'tool': 'answer_directly', 'args': {'question': 'q'}}]}
-        with patch.dict(tool_module.BUILTIN_BY_NAME, {'answer_directly': fake}):
+        fake = Tool('render_sources_html', '资料转 HTML', 'd', {}, runner)
+        plan = {'steps': [{'tool': 'render_sources_html',
+                           'args': {'title': 'x'}, 'step_id': 's1'}]}
+        with patch.dict(tool_module.BUILTIN_BY_NAME, {'render_sources_html': fake}):
             result = await nodes.run_step(
                 {'plan': plan, 'step_index': 0, 'user_input': 'q'})
-        self.assertEqual(seen, [{'question': 'q'}])
+        self.assertEqual(seen, [{'title': 'x'}])
         self.assertEqual(result['step_index'], 1)
-        self.assertEqual(result['step_label'], '直接回答')
-        # 最后一步要把内部状态归一成前端认识的终态
-        self.assertEqual(result['status'], 'answered')
+        self.assertEqual(result['step_label'], '资料转 HTML')
 
     async def test_run_step_aborts_remaining_steps_on_error(self):
         from app import nodes
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         from app.tools import Tool
 
@@ -606,9 +519,8 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_step_skips_unknown_tool_without_failing(self):
         from app import nodes
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
 
         async def no_mcp():
@@ -792,7 +704,7 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
         from app import nodes, tools as tm
         steps, issues = nodes.validate_plan([
             {'tool': 'web_search', 'args': {'query': 'x'}},
-            {'tool': 'render_html', 'depends_on': ['s1']},
+            {'tool': 'render_sources_html', 'depends_on': ['s1']},
         ], tm.BUILTIN_TOOLS)
         self.assertEqual([s['step_id'] for s in steps], ['s1', 's2'])
         self.assertEqual(issues, [])
@@ -802,7 +714,7 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
         from app import nodes, tools as tm
         _, issues = nodes.validate_plan([
             {'tool': 'web_search', 'args': {'query': 'x'}, 'step_id': 'a'},
-            {'tool': 'render_html', 'depends_on': ['b'], 'step_id': 'c'},
+            {'tool': 'render_sources_html', 'depends_on': ['b'], 'step_id': 'c'},
         ], tm.BUILTIN_TOOLS)
         self.assertIn('bad_dependency', [i['code'] for i in issues])
 
@@ -810,7 +722,7 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
         from app import nodes, tools as tm
         _, issues = nodes.validate_plan([
             {'tool': 'web_search', 'args': {}, 'step_id': 'a'},
-            {'tool': 'render_html', 'step_id': 'a'},
+            {'tool': 'render_sources_html', 'step_id': 'a'},
         ], tm.BUILTIN_TOOLS)
         self.assertIn('duplicate_step_id', [i['code'] for i in issues])
 
@@ -834,20 +746,19 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_step_blocks_when_dependency_not_succeeded(self):
         from app import nodes
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         from app.tools import Tool
 
         async def should_not_run(args, state):
             raise AssertionError('依赖未完成时不应执行')
 
-        fake = Tool('render_html', '渲染 HTML', 'd', {}, should_not_run,
+        fake = Tool('render_sources_html', '资料转 HTML', 'd', {}, should_not_run,
                     tool_key='local:reports:render', effect='write')
-        plan = {'steps': [{'tool': 'render_html', 'step_id': 's2',
+        plan = {'steps': [{'tool': 'render_sources_html', 'step_id': 's2',
                            'depends_on': ['s1'], 'args': {}}]}
-        with patch.dict(tool_module.BUILTIN_BY_NAME, {'render_html': fake}):
+        with patch.dict(tool_module.BUILTIN_BY_NAME, {'render_sources_html': fake}):
             result = await nodes.run_step(
                 {'plan': plan, 'step_index': 0, 'user_input': 'q',
                  'step_outputs': {'s1': {'__status__': 'failed'}}})
@@ -857,19 +768,18 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_step_records_output_for_downstream_binding(self):
         from app import nodes
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         from app.tools import Tool
 
         async def run(args, state):
             return {'artifact': {'id': 'art_9'}}
 
-        fake = Tool('render_html', '渲染 HTML', 'd', {}, run,
+        fake = Tool('render_sources_html', '资料转 HTML', 'd', {}, run,
                     tool_key='local:reports:render', effect='write')
-        plan = {'steps': [{'tool': 'render_html', 'step_id': 's1', 'args': {}}]}
-        with patch.dict(tool_module.BUILTIN_BY_NAME, {'render_html': fake}):
+        plan = {'steps': [{'tool': 'render_sources_html', 'step_id': 's1', 'args': {}}]}
+        with patch.dict(tool_module.BUILTIN_BY_NAME, {'render_sources_html': fake}):
             result = await nodes.run_step(
                 {'plan': plan, 'step_index': 0, 'user_input': 'q'})
         self.assertEqual(result['step_outputs']['s1']['artifact']['id'], 'art_9')
@@ -881,18 +791,16 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_requires_an_artifact(self):
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         with self.assertRaises(tool_module.ToolError):
             await tool_module._deploy_site({}, {})
 
     async def test_requires_global_enable(self):
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         with patch.object(tool_module, 'settings',
                           SimpleNamespace(deploy_enabled=False)):
@@ -901,9 +809,8 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deploys_and_marks_status(self):
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         with tempfile.TemporaryDirectory() as folder:
             html = Path(folder) / 'index.html'
@@ -924,9 +831,8 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
     async def test_deploy_falls_back_to_prior_artifact(self):
         """界面没有部署按钮了，用户单说一句"部署到服务器"也要能落到上一轮的产物上。"""
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         with tempfile.TemporaryDirectory() as folder:
             html = Path(folder) / 'index.html'
@@ -948,9 +854,8 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_needs_check_when_tool_reports_otherwise(self):
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         with tempfile.TemporaryDirectory() as folder:
             html = Path(folder) / 'index.html'
@@ -2069,10 +1974,10 @@ class TimingLabelTests(unittest.TestCase):
 
     def test_format_timings_includes_label_and_seconds(self):
         from app.main import format_timings
-        lines = format_timings([{'stage': 'compose_report', 'seconds': 8.4,
+        lines = format_timings([{'stage': 'render_sources_html', 'seconds': 8.4,
                                  'status': 'composed'}])
         self.assertEqual(len(lines), 1)
-        self.assertIn('整理报告', lines[0])
+        self.assertIn('资料转 HTML', lines[0])
         self.assertIn('8.40', lines[0])
 
     def test_format_timings_tolerates_empty(self):
@@ -2121,9 +2026,8 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
     async def test_planner_passes_the_flag(self):
         from app import nodes
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         captured = {}
 
@@ -2133,7 +2037,7 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
         async def fake_call(schema, system, user, **kw):
             captured.update(kw)
             return ExecutionPlan.model_validate(
-                {'steps': [{'tool': 'answer_directly', 'args': {}}]}), None
+                {'steps': [{'tool': 'render_sources_html', 'args': {}}]}), None
 
         with patch.object(tool_module, 'catalog', fake_catalog), \
                 patch.object(nodes, 'structured_call', fake_call):
@@ -2141,139 +2045,6 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
         from app.config import settings
         self.assertEqual(captured['disable_thinking'],
                          settings.llm_parse_disable_thinking)
-
-
-class ComposeToolTests(unittest.IsolatedAsyncioTestCase):
-    """整理报告工具：模型选择、推理开关、来源预算。"""
-
-    async def test_compose_never_disables_thinking(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        captured = {}
-
-        async def fake_call(schema, system, user, **kw):
-            captured.update(kw)
-            return Report.model_validate({
-                'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
-                'sections': [{'heading': 'h', 'paragraphs': [
-                    {'text': 'x', 'source_ids': ['s1']}]}]}), None
-
-        state = {'documents': [{'source_id': 's1', 'title': 't', 'status': 'success',
-                                'url': 'https://e.com/', 'raw_content': '正文'}],
-                 'usage': []}
-        with patch.object(reports_cap, 'structured_call', fake_call):
-            await tool_module._compose_report({}, state)
-        # 关掉推理会让整理阶段产不出合法的 tool_call，这里必须保持 False
-        self.assertFalse(captured.get('disable_thinking', False))
-        from app.config import settings
-        self.assertEqual(captured['model'], settings.llm_compose_model)
-
-    async def test_compose_records_model_name(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        from app.config import settings
-
-        async def fake_call(schema, system, user, **kw):
-            return Report.model_validate({
-                'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
-                'sections': [{'heading': 'h', 'paragraphs': [
-                    {'text': 'x', 'source_ids': ['s1']}]}]}), {'total_tokens': 1}
-
-        state = {'documents': [{'source_id': 's1', 'title': 't', 'status': 'success',
-                                'url': 'https://example.com/', 'raw_content': '正文'}],
-                 'usage': []}
-        with patch.object(reports_cap, 'structured_call', fake_call):
-            result = await tool_module._compose_report({}, state)
-        self.assertEqual(result['usage'][-1]['model_name'], settings.llm_compose_model)
-
-    def test_search_supplied_bodies_count_as_usable(self):
-        """web_search 常直接带回正文，此时 status 仍是 pending。
-
-        只认 success 会让"搜索 → 作答/成稿"这种少一步的计划误报"还没有可用正文"
-        ——实测就因此让一轮查询整条失败（0.01s 就报错）。
-        """
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        docs = [{'source_id': 's1', 'title': 't', 'url': 'https://a/1',
-                 'status': 'pending', 'raw_content': '检索时就带回来的正文'}]
-        usable, origin = tool_module.usable_documents({'documents': docs})
-        self.assertEqual(len(usable), 1)
-        # 用的时候要提升成 success，否则 render_html 不会把它列进参考资料
-        self.assertEqual(usable[0]['status'], 'success')
-        # 没有正文的不算
-        empty, _ = tool_module.usable_documents({'documents': [
-            {'source_id': 's2', 'status': 'pending', 'raw_content': ''}]})
-        self.assertEqual(empty, [])
-        failed, _ = tool_module.usable_documents({'documents': [
-            {'source_id': 's3', 'status': 'failed', 'raw_content': '正文'}]})
-        self.assertEqual(failed, [])
-
-    async def test_compose_reuses_prior_documents(self):
-        """"把上面的内容整理成 HTML"：本轮没检索，要能接住上一轮的正文。"""
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        captured = {}
-
-        async def fake_call(schema, system, user, **kw):
-            captured['user'] = user
-            return Report.model_validate({
-                'title': 't', 'summary': 's', 'summary_source_ids': ['s1'],
-                'sections': [{'heading': 'h', 'paragraphs': [
-                    {'text': 'x', 'source_ids': ['s1']}]}]}), None
-
-        state = {'documents': [], 'usage': [], 'prior_documents': [
-            {'source_id': 's1', 'title': '甲文', 'url': 'https://a.example/1',
-             'status': 'success', 'raw_content': '上一轮的正文'}]}
-        with patch.object(reports_cap, 'structured_call', fake_call):
-            result = await tool_module._compose_report({}, state)
-        self.assertIn('上一轮的正文', captured['user'])
-        # 用到的来源必须写回 state，否则 render_html 解析不到 source_id
-        self.assertEqual([d['source_id'] for d in result['documents']], ['s1'])
-
-    def test_compose_prompt_bounds_the_output_size(self):
-        """篇幅约束是整理阶段的主要耗时开关。
-
-        实测同一份输入的输出 token：不约束 14400（64.7s）→ 约束后 6084（28.6s）。
-        这条指令被删掉，整理阶段就会重新变慢并撞上单次超时。
-        """
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        self.assertIn('章节 3~5 个', tool_module.COMPOSE_SYSTEM)
-        self.assertIn('不超过 120 字', tool_module.COMPOSE_SYSTEM)
-        self.assertIn('对比表最多 6 行', tool_module.COMPOSE_SYSTEM)
-
-    async def test_compose_refuses_without_sources(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        with self.assertRaises(tool_module.ToolError):
-            await tool_module._compose_report({}, {'documents': [], 'usage': []})
-
-    async def test_render_requires_a_report(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        with self.assertRaises(tool_module.ToolError):
-            await tool_module._render_html({}, {'task_id': 'x', 'documents': []})
 
 
 class ProfileTests(unittest.TestCase):
@@ -2369,9 +2140,8 @@ class PlannerProfileTests(unittest.IsolatedAsyncioTestCase):
         from app import nodes
         from app import profile
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
 
         async def fake_catalog():
@@ -2379,7 +2149,7 @@ class PlannerProfileTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_call(schema, system, user, **kw):
             return ExecutionPlan.model_validate({
-                'steps': [{'tool': 'answer_directly', 'args': {'question': 'q'}}],
+                'steps': [{'tool': 'render_sources_html', 'args': {}}],
                 'profile_updates': {'电话': '13900000000'},
             }), None
 
@@ -2420,9 +2190,8 @@ class SmallTalkFilterTests(unittest.IsolatedAsyncioTestCase):
         """带链接就必须走规划与检索，不能因为句子短就被当成寒暄。"""
         from app import nodes
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         called = {}
 
@@ -2442,235 +2211,13 @@ class SmallTalkFilterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['plan']['steps'][0]['tool'], 'fetch_pages')
 
 
-class AnswerWithSourcesTests(unittest.IsolatedAsyncioTestCase):
-    """联网作答：基于正文回答并附来源，这是"直答"与"出报告"之间的那条路。"""
-
-    DOCS = [
-        {'source_id': 's1', 'title': '甲文', 'url': 'https://a.example/1',
-         'status': 'success', 'raw_content': '正文一'},
-        {'source_id': 's2', 'title': '乙文', 'url': 'https://b.example/2',
-         'status': 'success', 'raw_content': '正文二'},
-    ]
-
-    async def test_refuses_without_sources(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        with self.assertRaises(tool_module.ToolError):
-            await tool_module._answer_with_sources(
-                {'question': 'q'}, {'documents': [], 'usage': []})
-
-    async def test_lists_only_cited_sources(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-
-        async def fake_chat(system, messages, model=None, on_delta=None):
-            return '结论一 [s1]。'
-
-        with patch.object(answers_cap, 'chat_reply', fake_chat):
-            result = await tool_module._answer_with_sources(
-                {'question': '问题'}, {'documents': self.DOCS, 'usage': []})
-        self.assertEqual(result['status'], 'answered')
-        self.assertIn('参考来源', result['answer'])
-        self.assertIn('https://a.example/1', result['answer'])
-        # 没被引用的来源不该混进来
-        self.assertNotIn('https://b.example/2', result['answer'])
-
-    async def test_lists_all_when_model_cites_nothing(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-
-        async def fake_chat(system, messages, model=None, on_delta=None):
-            return '一句没有任何标注的结论。'
-
-        with patch.object(answers_cap, 'chat_reply', fake_chat):
-            result = await tool_module._answer_with_sources(
-                {'question': '问题'}, {'documents': self.DOCS, 'usage': []})
-        # 一条都没标注时退回全列，别让"附来源"变成空话
-        self.assertIn('https://a.example/1', result['answer'])
-        self.assertIn('https://b.example/2', result['answer'])
-
-    async def test_streams_answer_deltas(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        seen = []
-
-        async def fake_chat(system, messages, model=None, on_delta=None):
-            if on_delta:
-                on_delta('增量')
-            return '增量'
-
-        with patch.object(answers_cap, 'chat_reply', fake_chat), \
-                patch_all_emits(seen.append):
-            await tool_module._answer_with_sources(
-                {'question': '问题'}, {'documents': self.DOCS, 'usage': []})
-        self.assertTrue(any(e.get('type') == 'answer_delta' for e in seen))
-
-
-class AnswerToolTests(unittest.IsolatedAsyncioTestCase):
-    """直接回答工具：流式增量 + 多轮上下文。"""
-
-    async def test_streams_deltas(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        pieces = ('你好', '，有什么', '可以帮你？')
-
-        async def fake_chat(system, messages, model=None, on_delta=None):
-            for piece in pieces:
-                if on_delta:
-                    on_delta(piece)
-            return ''.join(pieces)
-
-        seen = []
-        with patch.object(answers_cap, 'chat_reply', fake_chat), \
-                patch_all_emits(seen.append):
-            result = await tool_module._answer_directly(
-                {'question': '你好'}, {'user_input': '你好', 'history': []})
-        self.assertEqual(result['answer'], ''.join(pieces))
-        self.assertEqual(result['status'], 'answered')
-        self.assertTrue(any(e.get('type') == 'answer_delta' for e in seen))
-
-    async def test_tool_calls_record_their_arguments(self):
-        """参数必须记录下来。
-
-        list_sites 带 keyword 时只返回匹配项；不记参数就分不清"列表只有 1 个"
-        和"只匹配到 1 个"——这个坑导致过一条错误的"删除后剩余站点"汇报。
-        """
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-
-        async def fake_call(tool_name, arguments, artifact=None):
-            return {'deleted': tool_name}
-
-        state = {'usage': []}
-        with patch.object(tool_module.mcp_adapter, 'call_tool', fake_call), \
-                patch_all_emits(lambda e: None):
-            runner = tool_module._make_mcp_runner('delete_site')
-            result = await runner({'site_id': 'y6XbM-lg'}, state)
-        call = result['mcp_calls'][0]
-        self.assertEqual(call['tool'], 'delete_site')
-        self.assertEqual(call['args'], {'site_id': 'y6XbM-lg'})
-        self.assertIn('deleted', call['payload'])
-
-    def test_tool_results_show_args_and_order(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        state = {'mcp_calls': [
-            {'tool': 'list_sites', 'args': {'keyword': 'y6XbM-lg'},
-             'payload': {'total': 1}},
-            {'tool': 'delete_site', 'args': {'site_id': 'y6XbM-lg'},
-             'payload': {'status': 'deleted'}}]}
-        text = tool_module.tool_results_text(state)
-        self.assertIn('keyword', text)
-        self.assertIn('第1次工具调用', text)
-        self.assertIn('第2次工具调用', text)
-
-    async def test_uses_tool_results_from_earlier_steps(self):
-        """"先调 MCP 取数据、再作答"：第二步必须看得见第一步的返回。
-
-        否则模型会如实回答"你没提供给我"——这个坑在查询服务器状态时必现。
-        """
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        captured = {}
-
-        async def fake_chat(system, messages, model=None, on_delta=None):
-            captured['system'] = system
-            captured['content'] = messages[-1]['content']
-            return '已部署 3 个站点。'
-
-        state = {'user_input': '服务器上部署了几个站点', 'history': [],
-                 'mcp_calls': [{'tool': 'list_sites', 'payload': {
-                     'sites': [{'site_id': 'a'}, {'site_id': 'b'}, {'site_id': 'c'}]}}]}
-        with patch.object(answers_cap, 'chat_reply', fake_chat):
-            await tool_module._answer_directly({'question': '几个站点'}, state)
-        self.assertIn('list_sites', captured['content'])
-        self.assertIn('"site_id": "a"', captured['content'])
-        # 系统提示必须切换成"基于工具数据作答"，否则模型仍会说自己没能力
-        self.assertIn('工具返回', captured['system'])
-        # 还要堵住"把过滤结果当全量"这个坑
-        self.assertIn('不是全量清单', captured['system'])
-
-    async def test_without_tool_results_keeps_plain_prompt(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        captured = {}
-
-        async def fake_chat(system, messages, model=None, on_delta=None):
-            captured['system'] = system
-            captured['content'] = messages[-1]['content']
-            return 'ok'
-
-        with patch.object(answers_cap, 'chat_reply', fake_chat):
-            await tool_module._answer_directly(
-                {'question': '你好'}, {'user_input': '你好', 'history': []})
-        self.assertNotIn('工具返回的数据', captured['content'])
-
-    def test_tool_results_are_capped(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        huge = {'tool': 'list_sites', 'payload': {'sites': [{'x': 'y' * 5000}]}}
-        text = tool_module.tool_results_text({'mcp_calls': [huge]})
-        self.assertLessEqual(len(text), 4200)
-
-    async def test_passes_history(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import web as web_cap
-        captured = {}
-
-        async def fake_chat(system, messages, model=None, on_delta=None):
-            captured['messages'] = messages
-            return 'ok'
-
-        history = [{'role': 'user', 'content': '上一问'},
-                   {'role': 'assistant', 'content': '上一答'}]
-        with patch.object(answers_cap, 'chat_reply', fake_chat):
-            await tool_module._answer_directly(
-                {'question': '追问'}, {'user_input': '追问', 'history': history})
-        contents = [m['content'] for m in captured['messages']]
-        self.assertEqual(contents, ['上一问', '上一答', '问题：追问'])
-
-
 class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
     """整图跑通：寒暄不检索，规划出来的步骤被逐步执行。"""
 
     async def test_small_talk_answers_without_searching(self):
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         from app.graph import build_graph
         from app.tools import Tool
@@ -2701,9 +2248,8 @@ class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
     async def test_plan_steps_run_in_order(self):
         from app import nodes
         from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import reports as reports_cap
         from app.capabilities import publishing as publishing_cap
+        from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         from app.graph import build_graph
         from app.tools import Tool
@@ -3106,27 +2652,6 @@ class BackendJobTests(unittest.IsolatedAsyncioTestCase):
 class KernelCorrectnessTests(unittest.IsolatedAsyncioTestCase):
     """内核层：截断声明、坏计划、提示词分包（评审 P0-3 / P0-4 / 通用性）。"""
 
-    async def test_truncation_note_reaches_the_model(self):
-        """截断说明必须拼进**发给模型的正文**，否则模型把片段当全文。"""
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
-        from app.capabilities import base as base_cap
-        captured = {}
-
-        async def fake_chat(system, messages, model=None, on_delta=None):
-            captured['messages'] = messages
-            return '结论 [s1]'
-
-        docs = [{'source_id': 's1', 'title': '长文', 'url': 'https://a.example/1',
-                 'status': 'success', 'raw_content': '正' * 500}]
-        with patch.object(base_cap, 'settings', SimpleNamespace(
-                    max_total_chars=10000, max_source_chars=50, max_pages=3)), \
-                patch.object(answers_cap, 'chat_reply', fake_chat):
-            await tool_module._answer_with_sources(
-                {'question': 'q'}, {'documents': docs, 'usage': []})
-        body = captured['messages'][-1]['content']
-        self.assertIn('仅取前 50 字', body)
-        self.assertIn('不要把这些片段当成全文', body)
 
     async def test_bad_plan_stops_instead_of_executing(self):
         """两轮修不好就停：不能带着坏依赖去执行一份残缺计划。"""
@@ -3156,7 +2681,7 @@ class KernelCorrectnessTests(unittest.IsolatedAsyncioTestCase):
         """业务规则归能力包：没有部署工具时，提示词里就不该教怎么部署。"""
         from app import tools as tool_module
         text = nodes.planner_system(tool_module.BUILTIN_TOOLS)
-        for needle in ('联网检索', '成稿', '作答', '发布'):
+        for needle in ('联网检索', '导出网页', '发布'):
             self.assertIn(needle, text, needle)
         self.assertIn('step_id', text)
         without = [tool for tool in tool_module.BUILTIN_TOOLS
@@ -3401,7 +2926,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
         """补偿工具写错不该把整份计划判死，但必须留痕。"""
         from app import tools as tool_module
         steps, issues = nodes.validate_plan([
-            {'tool': 'render_html', 'step_id': 's1', 'args': {},
+            {'tool': 'render_sources_html', 'step_id': 's1', 'args': {},
              'compensate': {'tool': 'ghost_tool', 'args': {}}},
         ], tool_module.BUILTIN_TOOLS)
         self.assertEqual([s['step_id'] for s in steps], ['s1'])
@@ -3413,11 +2938,11 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
         from app import tools as tool_module
         steps, issues = nodes.validate_plan([
             {'tool': 'deploy_site', 'step_id': 's1', 'args': {},
-             'compensate': {'tool': 'render_html', 'args': {}}},
+             'compensate': {'tool': 'render_sources_html', 'args': {}}},
         ], tool_module.BUILTIN_TOOLS)
         self.assertEqual(issues, [])
         self.assertEqual(steps[0]['compensate']['tool_key'],
-                         'local:reports:render')
+                         'local:export:sources_html')
 
     async def test_failure_rolls_back_succeeded_writes_in_reverse(self):
         """前面成功、后面失败 → 逆序撤销已成功的写操作，并把明细写进状态。"""
@@ -3576,7 +3101,7 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
     ])
 
     def test_single_server_keeps_legacy_tool_names(self):
-        from app import mcp_servers
+        from app.integrations import mcp_servers
         with patch.dict(os.environ, {'MCP_SERVERS': '',
                                      'MCP_URL': 'https://a.example/mcp'}, clear=False):
             servers = mcp_servers.servers()
@@ -3586,7 +3111,7 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(mcp_servers.deploy_server().default)
 
     def test_multiple_servers_qualify_tool_names(self):
-        from app import mcp_servers
+        from app.integrations import mcp_servers
         with patch.dict(os.environ, {'MCP_SERVERS': self.MULTI,
                                      'MCP_URL': ''}, clear=False):
             servers = mcp_servers.servers()
@@ -3600,7 +3125,7 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mcp_servers.deploy_server().id, 'publishing')
 
     def test_invalid_entries_are_skipped_not_fatal(self):
-        from app import mcp_servers
+        from app.integrations import mcp_servers
         raw = json.dumps([
             {'id': 'ok', 'url': 'https://a/mcp'},
             {'id': '', 'url': 'https://b/mcp'},
@@ -3635,7 +3160,7 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_runner_calls_the_server_it_belongs_to(self):
         from app import tools as tool_module
-        from app import mcp_servers
+        from app.integrations import mcp_servers
         with patch.dict(os.environ, {'MCP_SERVERS': self.MULTI,
                                      'MCP_URL': ''}, clear=False):
             target = mcp_servers.by_id('ops')

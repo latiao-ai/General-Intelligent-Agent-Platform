@@ -9,8 +9,8 @@ if str(_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_ROOT))
 
 from app.config import settings  # noqa: F401  加载 .env
-from app.mcp_adapter import list_server_tools
-from app import mcp_servers
+from app.integrations.mcp_adapter import list_server_tools
+from app.integrations import mcp_servers
 
 
 async def discover_all() -> dict:

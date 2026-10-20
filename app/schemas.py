@@ -49,29 +49,10 @@ class SessionMemory(BaseModel):
     facts: dict[str, str] = Field(default_factory=dict)
 
 
-class Paragraph(BaseModel):
-    text: str = Field(min_length=1)
-    source_ids: list[str] = Field(min_length=1)
 
-class Section(BaseModel):
-    heading: str = Field(min_length=1)
-    paragraphs: list[Paragraph] = Field(min_length=1)
 
-class TableRow(BaseModel):
-    cells: list[str] = Field(min_length=1)
-    source_ids: list[str] = Field(min_length=1)
 
-class ComparisonTable(BaseModel):
-    columns: list[str] = Field(default_factory=list)
-    rows: list[TableRow] = Field(default_factory=list)
 
-class Report(BaseModel):
-    title: str = Field(min_length=1)
-    summary: str = Field(min_length=1)
-    summary_source_ids: list[str] = Field(min_length=1)
-    sections: list[Section] = Field(min_length=1)
-    comparison_table: ComparisonTable = Field(default_factory=ComparisonTable)
-    limitations: list[str] = Field(default_factory=list)
 
 class AgentState(TypedDict, total=False):
     task_id: str
@@ -90,7 +71,7 @@ class AgentState(TypedDict, total=False):
     answer: str
     artifact: dict
     # 同一会话里上一轮已生成的产物。用户单独说"部署到服务器"时，
-    # 这一轮自己没有 render_html，就用它作为部署对象。
+    # 这一轮自己没有产出产物，就用它作为部署对象。
     prior_artifact: dict
     # 同一会话里上一轮已取得的正文来源（status=success）。用户说"把上面的内容整理成
     # HTML"时，这一轮自己没有检索，得靠它把材料接过来。

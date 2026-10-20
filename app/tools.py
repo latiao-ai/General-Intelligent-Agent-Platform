@@ -7,7 +7,7 @@
 2. 动态发现远端 MCP 工具，保留服务端给的完整能力描述与 annotations；
 3. 给规划器渲染工具清单。
 
-文件末尾保留一批名字别名（_web_search、_compose_report 等），让旧调用点和
+文件末尾保留一批名字别名（_web_search、_render_sources_html 等），让旧调用点和
 既有测试在迁移期继续可用——文档 §14 要求的"过渡期薄兼容层"。
 """
 import asyncio
@@ -16,30 +16,21 @@ import logging
 import time
 from dataclasses import dataclass, replace
 
-from app import mcp_adapter, mcp_servers
+from app.integrations import mcp_adapter, mcp_servers
 from app.capabilities.base import (ToolError, error_entry, tool_results_text,
                                    usable_documents, _select_sources, _with_text)
 from app.capabilities.web import _fetch_pages, _web_search
-from app.capabilities.reports import (COMPOSE_SYSTEM, MAX_PAGE_SOURCE_CHARS,
-                                      SOURCES_PAGE_CSS, _compose_report,
-                                      _render_html, _render_sources_html,
-                                      _sources_page)
+from app.capabilities.export import (_render_sources_html, _sources_page)
 from app.capabilities.publishing import _deploy_site
-from app.capabilities.answers import (ANSWER_SYSTEM,
-                                      ANSWER_USING_TOOL_RESULTS_SYSTEM,
-                                      ANSWER_WITH_SOURCES_SYSTEM,
-                                      _answer_directly, _answer_with_sources,
-                                      _source_line)
+from app.capabilities import export as export_capability
+from app.capabilities import publishing as publishing_capability
 from app.capabilities import web as web_capability
-from app.capabilities import answers as answers_capability
-from app.capabilities import reports as reports_capability
 from app.capabilities import publishing as publishing_capability
 from app.config import settings
 
 # 旧代码里 image: tool_module.search_backend / chat_reply / emit 的引用保留
-from app import search as search_backend
-from app.events import action, answer_delta, draft, emit
-from app.services import chat_reply
+from app.integrations import search as search_backend
+from app.events import action, emit
 
 logger = logging.getLogger(__name__)
 
@@ -87,37 +78,19 @@ BUILTIN_TOOLS = [
          {'type': 'object',
           'properties': {'urls': {'type': 'array', 'items': {'type': 'string'}}}},
          _fetch_pages),
-    Tool('compose_report', '整理报告',
-         '把已取得正文的来源整合成结构化中文报告。必须在有正文之后调用。',
-         {'type': 'object',
-          'properties': {'topic': {'type': 'string'},
-                         'required_sections': {'type': 'array',
-                                               'items': {'type': 'string'}}}},
-         _compose_report),
-    Tool('render_html', '渲染 HTML',
-         '把当前报告渲染成 HTML 产物并校验。必须在 compose_report 之后调用。',
-         {'type': 'object', 'properties': {}}, _render_html),
+
     Tool('render_sources_html', '资料转 HTML',
          '把已检索到的原始资料（网页 JSON 元信息 + Markdown 正文）直接排版成一份 HTML，'
          '不调用模型、不做摘要改写。用户说"把资料/搜索结果存成网页"时用它；'
-         '需要提炼总结成报告请用 compose_report。',
+         '要提炼总结请另外接入相应的 MCP 能力。',
          {'type': 'object', 'properties': {'title': {'type': 'string'}}},
          _render_sources_html),
     Tool('deploy_site', '部署站点',
-         '把当前 HTML 产物部署到服务器并返回访问地址。必须在 render_html 之后、'
+         '把当前 HTML 产物部署到服务器并返回访问地址。必须先有产物（如 render_sources_html 之后）、'
          '且用户明确要求发布时调用。',
          {'type': 'object', 'properties': {}}, _deploy_site),
-    Tool('answer_with_sources', '联网作答',
-         '基于已检索到的正文在聊天里回答问题，并附来源链接。用户想"问个明白"但没要'
-         '文档时用它；必须在 web_search / fetch_pages 之后调用。',
-         {'type': 'object', 'properties': {'question': {'type': 'string'}}},
-         _answer_with_sources),
-    Tool('answer_directly', '直接回答',
-         '不检索、不出报告地作答。寒暄、确认、一般性知识问答用它；'
-         '也用于"先调工具取数据、再作答"计划里的收尾一步——它会看到前面工具的真实返回。'
-         '若问题需要外部事实而你又没检索过，应该用 web_search 而不是它。',
-         {'type': 'object', 'properties': {'question': {'type': 'string'}}},
-         _answer_directly),
+
+
 ]
 
 # 内置工具的身份与动作性质：tool_key 形如 local:<能力包>:<动作>，
@@ -125,21 +98,16 @@ BUILTIN_TOOLS = [
 _LOCAL_META = {
     'web_search': ('local:web:search', 'read', 'web'),
     'fetch_pages': ('local:web:fetch', 'read', 'web'),
-    'compose_report': ('local:reports:compose', 'read', 'reports'),
-    'render_html': ('local:reports:render', 'write', 'reports'),
-    'render_sources_html': ('local:reports:render_sources', 'write', 'reports'),
+    'render_sources_html': ('local:export:sources_html', 'write', 'export'),
     'deploy_site': ('local:publishing:deploy', 'write', 'publishing'),
-    'answer_with_sources': ('local:answers:with_sources', 'read', 'answers'),
-    'answer_directly': ('local:answers:direct', 'read', 'answers'),
 }
 
 # 每个能力包自带一段"什么时候用我"的规划规则。工具注册时按 capability 取，
 # 规划器只拼接**本轮候选工具实际覆盖到的**能力——工具多起来时提示词不会膨胀。
 CAPABILITY_RULES = {
     'web': web_capability.PROMPT_RULES,
-    'reports': reports_capability.PROMPT_RULES,
+    'export': export_capability.PROMPT_RULES,
     'publishing': publishing_capability.PROMPT_RULES,
-    'answers': answers_capability.PROMPT_RULES,
 }
 
 # MCP 是"外来能力"，规则只能给通用纪律，不能替它编业务语义

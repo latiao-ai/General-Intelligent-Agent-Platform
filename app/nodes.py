@@ -70,9 +70,9 @@ def fallback_steps(state: dict) -> list[dict]:
     业务写死进内核，而且用户只是想问句话也会被拉去跑一分钟检索。
     中台不该替用户决定做什么——退化成一次直接作答，并明说规划失败。
     """
-    return [{'tool': 'answer_directly',
-             'args': {'question': state.get('user_input') or ''},
-             'why': '规划失败，降级为直接作答'}]
+    # 能力裁剪后只剩「检索 → 抓正文 → 转 HTML →（可选）部署」这一条业务链，
+    # 兜底不再替用户拼它，直接返回空计划，由 plan() 如实报失败。
+    return []
 
 
 def describe_plan(steps: list[dict], summary: str = '') -> str:
@@ -220,16 +220,6 @@ async def plan(state):
         return {'plan': plan,
                 'step_index': int(resumed.get('step_index') or 0),
                 'status': 'planned'}
-
-    # 明显的寒暄不必花一次模型调用去规划：直接给一步"直接回答"。
-    # 这一步放在发现工具之前——否则为了判一句"你好"还要去探一次 MCP 服务端。
-    if not urls_from_input(question) and is_small_talk(question):
-        emit(action('跳过规划', '识别为寒暄，直接回答', '⚡'))
-        steps = [{'tool': 'answer_directly',
-                  'args': {'question': question}, 'why': '寒暄/确认'}]
-        emit(thought(describe_plan(steps)))
-        return {'plan': {'steps': steps, 'summary': '直接回答'},
-                'step_index': 0, 'status': 'planned'}
 
     catalog = await tool_module.catalog()
     available, origin = tool_module.usable_documents(state)

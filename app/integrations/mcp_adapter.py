@@ -23,7 +23,7 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 # 本模块直接读 os.environ，导入 config 触发 load_dotenv，
 # 避免单独调用 connect_session 时出现 KeyError: 'MCP_URL'。
 from app import config as _config  # noqa: F401
-from app import mcp_servers
+from app.integrations import mcp_servers
 
 
 def _cfg(server, field: str, env: str, default: str = '') -> str:

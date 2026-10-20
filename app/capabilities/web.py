@@ -1,6 +1,7 @@
 """web 能力包：抓取资料。对应 DeepSeek 官方 Search / Fetch 两个接口。"""
 from datetime import datetime, timezone
-from app import search as search_backend, sources
+from app.integrations import search as search_backend
+from app import sources
 from app.services import clean_public_url
 from app.capabilities.base import ToolError, error_entry
 from app.events import action, emit
@@ -11,7 +12,7 @@ from app.config import settings
 PROMPT_RULES = (
     '【联网检索】需要外部或实时事实（最新、价格、版本、新闻）或用户要求调研时，'
     '先 web_search（用户已给 URL 就直接 fetch_pages），需要正文再用 fetch_pages 补抓。'
-    '但若「已有资料」里已经有正文，而用户只是要把这些内容整理/转换成文档或回答，'
+    '但若「已有资料」里已经有正文，而用户只是要把这些内容转成网页，'
     '就不要再检索，直接进入收尾步骤——重复检索既慢又会引入无关来源。'
 )
 

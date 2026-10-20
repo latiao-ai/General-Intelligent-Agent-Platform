@@ -5,11 +5,11 @@
 """
 from pathlib import Path
 
-from app import mcp_adapter
+from app.integrations import mcp_adapter
 from app.capabilities.base import ToolError
 from app.config import settings
 from app.events import action, emit
-from app.rendering import save_json
+from app.files import save_json
 
 # 本能力包自带的规划规则：发布是**有副作用**的动作，只在明确要求时出现。
 PROMPT_RULES = (

@@ -15,12 +15,8 @@ STAGE_LABELS = {
     # 工具（与 app/tools.py 的 Tool.label 对应）
     'web_search': '检索来源',
     'fetch_pages': '抓取正文',
-    'compose_report': '整理报告',
-    'render_html': '渲染 HTML',
     'render_sources_html': '资料转 HTML',
     'deploy_site': '部署站点',
-    'answer_with_sources': '联网作答',
-    'answer_directly': '直接回答',
     'manual_deploy': '手动部署',
     # 合成阶段：从服务端收到指令，到规划完成、真正开始调用工具之间的空档。
     # 它跨越了 plan 阶段，因此与"规划"的耗时会有重叠，这是刻意的：

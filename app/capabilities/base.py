@@ -27,7 +27,7 @@ def _with_text(documents) -> list[dict]:
     判定依据是**有没有正文**，不是 status：检索接口常常直接带回正文，此时
     状态可能仍是 pending。只认 success 会让"搜索 → 作答/成稿"这种少一步的
     计划误报"还没有可用正文"。命中时顺手把状态提升成 success，
-    后续 render_html 才会把它们列进参考资料。
+    后续导出页面才会把它们列进来源清单。
     """
     usable = []
     for doc in documents or []:

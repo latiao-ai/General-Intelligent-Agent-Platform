@@ -261,22 +261,3 @@ async def structured_call(
     raise RuntimeError('模型结构化输出失败；检查 tool calling 支持及 schema')
 
 
-async def chat_reply(system: str, messages: list[dict], model: str | None = None,
-                     on_delta=None) -> str:
-    """纯文本对话：不检索、不结构化。on_delta 逐段回传增量文本，做打字机效果。
-
-    闲聊/一般性问答不需要推理，这里直接关掉思考——快且便宜，正是本路径的价值。
-    """
-    llm = new_llm(model, disable_thinking=True)
-    conversation = [('system', system)] + [
-        (m['role'], m['content']) for m in messages]
-    parts = []
-    async for chunk in llm.astream(conversation):
-        text = chunk.content
-        if isinstance(text, str) and text:
-            parts.append(text)
-            if on_delta:
-                on_delta(text)
-    return ''.join(parts).strip()
-
-
