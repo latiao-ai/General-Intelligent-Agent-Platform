@@ -25,7 +25,7 @@ from app.messages import cancel_note, reply_text
 from app import ledger as ledger_module
 from app import memory as memory_module
 from app.services import is_stop_command
-from app.store import Store, now
+from app.store import Store, now, open_store
 
 TERMINAL_STATUS = {'deployed', 'deploy_needs_check', 'local_ready', 'failed',
                    'cancelled', 'interrupted', 'answered'}
@@ -114,7 +114,8 @@ class Hub:
     """会话与任务注册表。持久部分在 SQLite，实时部分是进程内的订阅队列。"""
 
     def __init__(self, store: Store | None = None) -> None:
-        self.store = store if store is not None else Store(settings.db_path)
+        # 默认按配置挑实现：DATABASE_URL 有值就是 PostgreSQL
+        self.store = store if store is not None else open_store()
         self.tasks: dict[str, TaskRecord] = {}
 
     def history(self, session_id: str) -> list:

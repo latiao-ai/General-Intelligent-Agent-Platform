@@ -1546,6 +1546,137 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(drain_jobs(hub, 'w1'), 0)
 
 
+PG_DSN = os.getenv('PG_TEST_DSN', '')
+
+
+@unittest.skipUnless(PG_DSN, '需要 PG_TEST_DSN 才跑真实 PostgreSQL 一致性测试')
+class PostgresParityTests(unittest.TestCase):
+    """在**真实 PostgreSQL** 上验证仓储实现（此前标注为未验证，现在补上）。
+
+    每个用例开头清库，保证互不影响；只验关键读写路径，不重复 SQLite 的
+    全部用例。设置 PG_TEST_DSN 后运行。
+    """
+
+    def setUp(self):
+        from app.pg_store import PostgresStore
+        self.store = PostgresStore(PG_DSN)
+        tables = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
+                  'action_attempts', 'actions', 'steps', 'plans', 'runs',
+                  'tasks_meta', 'events', 'tasks', 'session_memory',
+                  'session_summaries', 'messages', 'sessions')
+        with self.store._conn.cursor() as cur:
+            for table in tables:
+                cur.execute(f'TRUNCATE TABLE {table} CASCADE')
+        self.store._conn.commit()
+
+    def tearDown(self):
+        self.store.close()
+
+    def test_messages_and_sessions(self):
+        store = self.store
+        store.append_message('s1', 'user', '帮我查一下 SQLite 的适用场景和限制以及和 Postgres 的区别')
+        store.append_message('s1', 'assistant', '好的')
+        store.append_message('s2', 'user', '你好')
+        self.assertEqual([m['role'] for m in store.messages('s1')],
+                         ['user', 'assistant'])
+        sessions = store.list_sessions()
+        self.assertEqual([s['session_id'] for s in sessions], ['s2', 's1'])
+        self.assertEqual(sessions[1]['message_count'], 2)
+        self.assertTrue(sessions[1]['title'].endswith('…'))
+        self.assertEqual(len(store.messages_after('s1', 0)), 2)
+
+    def test_memory_and_tombstone(self):
+        store = self.store
+        store.set_memory('s1', summary='摘要', facts={'目标': '减脂'}, upto=5)
+        self.assertEqual(store.memory('s1')['facts'], {'目标': '减脂'})
+        store.clear_memory('s1')
+        self.assertEqual(store.memory('s1')['summary'], '')
+
+        store.remember(scope_type='user', scope_id='default', subject='偏好',
+                       predicate='回答', value='简洁')
+        store.remember(scope_type='user', scope_id='default', subject='偏好',
+                       predicate='回答', value='详细')
+        self.assertEqual([(m['value'], m['version'])
+                          for m in store.recall('user', 'default')], [('详细', 2)])
+        store.forget(scope_type='user', scope_id='default', subject='偏好',
+                     predicate='回答')
+        self.assertEqual(store.recall('user', 'default'), [])
+        self.assertIsNone(store.remember(scope_type='user', scope_id='default',
+                                         subject='偏好', predicate='回答',
+                                         value='又回来'))
+
+    def test_runs_leases_and_actions(self):
+        store = self.store
+        store.create_task('t1', 's1', '做点事')
+        store.ensure_task_meta('t1', session_id='s1', goal='做点事')
+        store.create_run('r1', 't1')
+        first = store.claim_run('w1', lease_seconds=30)
+        self.assertEqual(first['lease_epoch'], 1)
+        self.assertIsNone(store.claim_run('w2'))
+        self.assertEqual(store.claim_run('w2', now_ts=10 ** 12)['lease_epoch'], 2)
+        self.assertFalse(store.renew_lease('r1', 'w1'))
+
+        plan = {'steps': [{'step_id': 's1', 'tool': 'web_search',
+                           'tool_key': 'local:web:search', 'args': {}}]}
+        store.save_plan('r1', 1, goal='g', steps=plan['steps'], reason='why')
+        store.save_steps('r1', 1, plan['steps'])
+        self.assertEqual(store.plan('r1')['steps'][0]['step_id'], 's1')
+        self.assertEqual(len(store.steps_of('r1')), 1)
+
+        action = store.create_action('a1', run_id='r1', plan_version=1,
+                                     step_id='s1', tool_key='local:web:search',
+                                     args_hash='h', idempotency_key='k1')
+        self.assertEqual(store.find_action('k1')['action_id'], 'a1')
+        store.update_action('a1', status='in_flight')
+        store.add_attempt('att1', 'a1')
+        store.finish_attempt('att1', error_type='None')
+        self.assertEqual(len(store.attempts_of('a1')), 1)
+        self.assertEqual(len(store.actions_of('r1')), 1)
+
+    def test_reconcile_and_jobs(self):
+        store = self.store
+        store.create_task('t1', 's1', 'g')
+        store.ensure_task_meta('t1', session_id='s1', goal='g')
+        store.create_run('r1', 't1', status='running')
+        store.create_action('a1', run_id='r1', plan_version=1, step_id='s1',
+                            tool_key='t', args_hash='h', idempotency_key='k1')
+        store.update_action('a1', status='in_flight')
+        stats = store.reconcile_orphan_runs()
+        self.assertEqual(stats['unknown_actions'], 1)
+        self.assertEqual(store.action('a1')['status'], 'unknown')
+        self.assertEqual(store.run('r1')['status'], 'reconciling')
+
+        self.assertTrue(store.enqueue_job('j1', 'session_summary', 's1:r1',
+                                          {'session_id': 's1'}))
+        self.assertFalse(store.enqueue_job('j2', 'session_summary', 's1:r1',
+                                           {'session_id': 's1'}))
+        job = store.claim_job('w1')
+        self.assertEqual(job['kind'], 'session_summary')
+        store.finish_job(job['job_id'])
+        self.assertEqual(store.job(job['job_id'])['status'], 'done')
+
+    def test_artifacts_and_events(self):
+        store = self.store
+        store.create_task('t1', 's1', 'g')
+        store.add_artifact('art1', run_id='r1', kind='sources',
+                           storage_key='/tmp/x.html', size=245823, sha256='abc')
+        meta = store.artifact('art1')
+        self.assertEqual(meta['kind'], 'sources')
+        self.assertEqual(store.append_event('t1', {'type': 'action'}), 1)
+        self.assertEqual(store.append_event('t1', {'type': 'action'}), 2)
+        self.assertEqual([s for s, _ in store.events('t1')], [1, 2])
+
+    def test_task_roundtrip(self):
+        store = self.store
+        store.create_task('t1', 's1', '消息')
+        self.assertEqual(store.task('t1')['status'], 'running')
+        store.update_task('t1', status='local_ready', artifact_id='a1',
+                          state={'timings': [{'stage': 'plan'}]})
+        data = store.task('t1')
+        self.assertEqual(data['status'], 'local_ready')
+        self.assertEqual(data['state']['timings'][0]['stage'], 'plan')
+
+
 class RepositoryContractTests(unittest.TestCase):
     """仓储接口：换实现前先保证方法齐备（文档 §9.1）。"""
 

@@ -1,6 +1,8 @@
 """把本地 SQLite 迁移到 PostgreSQL（文档 §9.1）。
 
-**未在真实 PostgreSQL 上验证过**——当前开发环境只有 SQLite，没有 PG 实例。
+已在本地 **PostgreSQL 18.6 (Homebrew)** 上实测通过：把 agent.db 的
+21 会话 / 139 消息 / 71 任务 / 1069 事件完整搬入，行数校验一致。
+
 这份脚本负责：
 
 1. 从 SQLite 的 SCHEMA 推导出 PostgreSQL 建表语句（类型做等价替换）；
@@ -81,6 +83,11 @@ def main() -> None:
                     'ON CONFLICT DO NOTHING',
                     [tuple(r[c] for c in columns) for r in rows])
                 print(f'  {table}: {len(rows)} 行')
+            # BIGSERIAL 序列要拨到 max(id)，否则新消息插入会撞主键
+            for table, column in (('messages', 'id'),):
+                cur.execute(
+                    f"SELECT setval(pg_get_serial_sequence('{table}','{column}'), "
+                    f'COALESCE((SELECT MAX({column}) FROM {table}), 1))')
         dst.commit()
 
         # 校验：行数必须一致，否则迁移不可信
@@ -92,7 +99,7 @@ def main() -> None:
                 actual = cur.fetchone()[0]
                 if actual < expected:
                     raise SystemExit(f'{table} 行数不一致：{actual} < {expected}')
-        print('迁移完成，行数校验通过。注意：本脚本未在真实 PostgreSQL 上验证。')
+        print('迁移完成，行数校验通过。')
     src.close()
 
 

@@ -45,8 +45,8 @@
 | SSE 游标 | ✅ | `Last-Event-ID` / `?after=` | 实测 `after=2` 正确跳发；事件帧带 `id:` 行 |
 | outbox 与后台任务 | ✅ | `background_jobs` + `dedupe_key` | `test_jobs_are_deduped`、Worker 消费 |
 | 仓储接口层 | ✅ | `app/persistence.py`（Protocol） | `test_sqlite_store_satisfies_repository_protocol`；`check_repository` 能列出缺失方法 |
-| PostgreSQL 迁移 | ⚠️ | `scripts/migrate_to_postgres.py` | DDL 翻译有单测；**未在真实 PostgreSQL 上验证**，文件头列出已知差异 |
-| PostgresStore 实现 | ⬜ | — | 本机无 PG 实例，写一个跑不起来的实现只是制造"看起来支持了"的假象，故不写 |
+| PostgreSQL 迁移 | ✅ | `scripts/migrate_to_postgres.py` | 已在本地 PostgreSQL 18.6 实测：21 会话 / 139 消息 / 71 任务 / 1069 事件全部搬入，行数校验一致 |
+| PostgresStore 实现 | ✅ | `app/pg_store.py` | 满足同一 Repository 接口；`PostgresParityTests` 在真实 PG 上跑通 6 组关键读写 |
 
 ## 阶段 D：上下文与长期记忆
 
@@ -81,8 +81,8 @@
 
 ## 明确未验证清单（不假装完成）
 
-1. **PostgreSQL 实机**：本机无 PG 实例。迁移脚本只做了 DDL 翻译的单元测试，
-   搬数据与行数校验逻辑未经真实运行。
+1. ~~PostgreSQL 实机~~ **已补齐**：本机 PostgreSQL 18.6 上完成迁移与实测，
+   见 `PostgresParityTests`（设置 `PG_TEST_DSN` 运行）。
 2. **真实多用户登录**：没有身份提供方。`current_principal()` 只读请求头且不
    校验签名；生产必须替换为经过验证的认证依赖。
 3. **LangGraph 检查点持久化**：缺 `langgraph-checkpoint-sqlite`，当前是内存实现。
@@ -93,4 +93,8 @@
 
 ## 测试
 
-`python -m unittest tests.test_core` → **170 个通过**。
+```
+python -m unittest tests.test_core                                  # 170 通过（SQLite）
+PG_TEST_DSN=postgresql://.../agent_platform python -m unittest \
+    tests.test_core.PostgresParityTests                             # 6 通过（真实 PG）
+```

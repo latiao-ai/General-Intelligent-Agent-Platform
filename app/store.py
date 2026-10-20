@@ -16,6 +16,8 @@ import sqlite3
 import threading
 import time
 import uuid
+
+from app.config import settings
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -910,3 +912,17 @@ def _decode_run(row: dict) -> dict:
 def _decode_action(row: dict) -> dict:
     row['receipt'] = json.loads(row.pop('receipt_json') or 'null')
     return row
+
+
+def open_store(database_url: str | None = None):
+    """按配置返回仓储实现。
+
+    有 DATABASE_URL 就走 PostgreSQL，否则本地 SQLite。两者都满足
+    app.persistence.Repository 接口，业务代码不需要关心用的是哪个。
+    """
+    url = (settings.database_url if database_url is None
+           else database_url).strip()
+    if url.startswith(('postgresql://', 'postgres://')):
+        from app.pg_store import PostgresStore
+        return PostgresStore(url)
+    return Store(settings.db_path)

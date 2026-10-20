@@ -38,7 +38,10 @@ class Settings:
     # 会一直耗到整个任务 300s 的预算。超时即失败、不重试（重试只会把耗时翻倍）。
     llm_attempt_timeout: float = float(os.getenv('LLM_ATTEMPT_TIMEOUT', '180'))
     artifact_dir: Path = PROJECT_ROOT / os.getenv('ARTIFACT_DIR', 'artifacts')
-    # SQLite 持久化路径：会话、任务与事件日志。改这里也要同步 .gitignore。
+    # 数据库：留空用本地 SQLite；填 postgresql://... 则全部走 PostgreSQL。
+    # 仓储接口见 app/persistence.py，两种实现互换，业务代码不感知。
+    database_url: str = os.getenv('DATABASE_URL', '').strip()
+    # SQLite 持久化路径（DATABASE_URL 为空时使用）。改这里也要同步 .gitignore。
     db_path: Path = PROJECT_ROOT / os.getenv('DB_PATH', 'agent.db')
     # 用户画像文件（Markdown，人可读可改）。含电话等敏感信息，已在 .gitignore 排除。
     profile_path: Path = PROJECT_ROOT / os.getenv('PROFILE_PATH', 'profile/USER.md')
