@@ -15,3 +15,5 @@ agent.db-shm
 
 # 用户画像（含电话等敏感信息）
 profile/
+
+.conda-home/
