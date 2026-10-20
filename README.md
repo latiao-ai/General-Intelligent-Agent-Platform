@@ -11,11 +11,25 @@
 | `web_search` | 检索网页 | DeepSeek 官方 Search API |
 | `fetch_pages` | 抓取正文（Markdown） | DeepSeek 官方 Fetch API |
 | `render_sources_html` | 把资料原样排版成 HTML，不调用模型 | 本地能力包 |
+| `answer_directly` | 用模型自身知识直接回答，不检索 | 本地能力包 |
+| `answer_with_sources` | 基于已抓到的正文作答并附来源 | 本地能力包 |
 | `deploy_site` | 发布产物到服务器 | MCP 服务端 |
 | `mcp__*` | 服务端动态发现的工具（含查询/删除/更新站点） | MCP 服务端 |
 
-> 结构化报告生成（compose/render 模板）与聊天作答能力已按需移除，
-> 内核仍保留通用的计划、账本、恢复等机制。
+> 结构化报告生成（compose/render 模板）已按需移除，内核仍保留通用的计划、
+> 账本、恢复等机制。
+
+选哪个工具由规划器按"需要什么程度的能力"判断，而不是一律去检索：
+
+| 情况 | 走哪条 |
+|---|---|
+| 闲聊、概念解释、原理、常识（模型自己有把握） | `answer_directly`（不检索） |
+| 需要外部事实，但只想在聊天里问个明白 | `web_search → fetch_pages → answer_with_sources` |
+| 要产出一个 HTML 文件 | `web_search → fetch_pages → render_sources_html` |
+| 还要发布上线 | 再加 `deploy_site` |
+
+"没有合适工具"不等于"直接编一个回答"：查实时数据但手里没对应工具时，
+应当说明无法确认或请用户提供数据，而不是拿不相关的工具硬凑。
 
 ## 1. Conda 环境
 

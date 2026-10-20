@@ -221,6 +221,19 @@ async def plan(state):
                 'step_index': int(resumed.get('step_index') or 0),
                 'status': 'planned'}
 
+    # 图片里那条"简单问题、模型已有足够信息 → 直接回答"：
+    # 闲聊与确认不需要规划（省一次模型调用），但**回答仍然由模型给出**，
+    # 不是固定文案——所以计划里放一步 answer_directly，而不是在这里直接回话。
+    if not urls_from_input(question) and is_small_talk(question):
+        steps = [{'tool': 'answer_directly', 'step_id': 's1',
+                  'args': {'question': question},
+                  'depends_on': [], 'why': '闲聊/确认，无需检索与规划',
+                  'tool_key': 'local:answers:direct', 'effect': 'read'}]
+        emit(action('跳过规划', '闲聊/确认，交给模型直接回答', '⚡'))
+        emit(thought(describe_plan(steps, '直接回答')))
+        return {'plan': {'steps': steps, 'summary': '直接回答'},
+                'step_index': 0, 'status': 'planned'}
+
     catalog = await tool_module.catalog()
     available, origin = tool_module.usable_documents(state)
     payload = json.dumps({

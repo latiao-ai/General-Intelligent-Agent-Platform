@@ -32,12 +32,6 @@ async def deploy_task(task_id: str) -> dict:
     return result
 
 
-SMALL_TALK_REPLY = (
-    "你好。我可以帮你检索网页资料、把资料原样整理成 HTML 网页，"
-    "并按需通过 MCP 发布到服务器——直接说要查什么或要做什么即可。"
-)
-
-
 async def run_task(text: str, progress=None, on_event=None, history=None,
                   on_start=None, prior=None, memory=None, ledger=None,
                   run_id=None, resume_plan=None):
@@ -73,17 +67,6 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         'prior_documents': (prior or {}).get('documents') or [],
     }
     started = time.perf_counter()
-    # 闲聊/确认：能力裁剪后已经没有"直接回答"这个工具了，也没必要为一句
-    # "你好"跑一趟规划。在进图之前直接给固定应答，不产生模型调用。
-    from app.services import is_small_talk, urls_from_input
-    if not urls_from_input(text) and is_small_talk(text):
-        state.update({'answer': SMALL_TALK_REPLY, 'status': 'answered',
-                      'elapsed_seconds': round(time.perf_counter() - started, 2)})
-        save_json(folder / 'state.json', state)
-        if progress:
-            progress('small_talk', 'answered', state['elapsed_seconds'])
-        return state
-
     marked = started
     ledger_token = ledger_module.bind(ledger)
     try:

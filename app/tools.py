@@ -20,8 +20,10 @@ from app.integrations import mcp_adapter, mcp_servers
 from app.capabilities.base import (ToolError, error_entry, tool_results_text,
                                    usable_documents, _select_sources, _with_text)
 from app.capabilities.web import _fetch_pages, _web_search
+from app.capabilities.answers import (_answer_directly, _answer_with_sources)
 from app.capabilities.export import (_render_sources_html, _sources_page)
 from app.capabilities.publishing import _deploy_site
+from app.capabilities import answers as answers_capability
 from app.capabilities import export as export_capability
 from app.capabilities import publishing as publishing_capability
 from app.capabilities import web as web_capability
@@ -30,7 +32,7 @@ from app.config import settings
 
 # 旧代码里 image: tool_module.search_backend / chat_reply / emit 的引用保留
 from app.integrations import search as search_backend
-from app.events import action, emit
+from app.events import action, answer_delta, emit
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +87,16 @@ BUILTIN_TOOLS = [
          '要提炼总结请另外接入相应的 MCP 能力。',
          {'type': 'object', 'properties': {'title': {'type': 'string'}}},
          _render_sources_html),
+    Tool('answer_with_sources', '联网作答',
+         '基于已检索到的正文在聊天里回答问题，并附来源链接。用户想"问个明白"但没要'
+         '文件时用它；必须在 web_search / fetch_pages 之后调用。',
+         {'type': 'object', 'properties': {'question': {'type': 'string'}}},
+         _answer_with_sources),
+    Tool('answer_directly', '直接回答',
+         '不检索、不出文件，用模型自己的知识回答。概念解释、原理、常识、闲聊、'
+         '对上一轮的追问都用它——不要为了保险先跑一次检索。',
+         {'type': 'object', 'properties': {'question': {'type': 'string'}}},
+         _answer_directly),
     Tool('deploy_site', '部署站点',
          '把当前 HTML 产物部署到服务器并返回访问地址。必须先有产物（如 render_sources_html 之后）、'
          '且用户明确要求发布时调用。',
@@ -99,6 +111,8 @@ _LOCAL_META = {
     'web_search': ('local:web:search', 'read', 'web'),
     'fetch_pages': ('local:web:fetch', 'read', 'web'),
     'render_sources_html': ('local:export:sources_html', 'write', 'export'),
+    'answer_with_sources': ('local:answers:with_sources', 'read', 'answers'),
+    'answer_directly': ('local:answers:direct', 'read', 'answers'),
     'deploy_site': ('local:publishing:deploy', 'write', 'publishing'),
 }
 
@@ -106,6 +120,7 @@ _LOCAL_META = {
 # 规划器只拼接**本轮候选工具实际覆盖到的**能力——工具多起来时提示词不会膨胀。
 CAPABILITY_RULES = {
     'web': web_capability.PROMPT_RULES,
+    'answers': answers_capability.PROMPT_RULES,
     'export': export_capability.PROMPT_RULES,
     'publishing': publishing_capability.PROMPT_RULES,
 }

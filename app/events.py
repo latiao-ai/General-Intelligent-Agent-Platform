@@ -16,6 +16,8 @@ STAGE_LABELS = {
     'web_search': '检索来源',
     'fetch_pages': '抓取正文',
     'render_sources_html': '资料转 HTML',
+    'answer_with_sources': '联网作答',
+    'answer_directly': '直接回答',
     'deploy_site': '部署站点',
     'manual_deploy': '手动部署',
     # 合成阶段：从服务端收到指令，到规划完成、真正开始调用工具之间的空档。

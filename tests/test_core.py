@@ -22,9 +22,9 @@ from contextlib import ExitStack
 
 def patch_all_emits(sink):
     """能力包各自持有 emit 引用，测试里需要一起打桩。"""
-    from app.capabilities import export, publishing, web
+    from app.capabilities import answers, export, publishing, web
     stack = ExitStack()
-    for module in (export, publishing, web):
+    for module in (answers, export, publishing, web):
         stack.enter_context(patch.object(module, 'emit', sink))
     return stack
 
@@ -695,6 +695,80 @@ class MemoryScopeTests(unittest.TestCase):
         self.assertIsNone(store.remember(scope_type='user', scope_id='default',
                                          subject='电话', predicate='号码',
                                          value='139'))
+
+
+class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
+    """基础回答能力：简单问题不该被拖去检索（对应用户指出的流程）。"""
+
+    def test_registry_has_the_six_capabilities(self):
+        from app import tools as tool_module
+        self.assertEqual(sorted(tool_module.BUILTIN_BY_NAME),
+                         ['answer_directly', 'answer_with_sources', 'deploy_site',
+                          'fetch_pages', 'render_sources_html', 'web_search'])
+        keys = {name: tool.tool_key
+                for name, tool in tool_module.BUILTIN_BY_NAME.items()}
+        self.assertEqual(keys['web_search'], 'local:web:search')
+        self.assertEqual(keys['answer_directly'], 'local:answers:direct')
+        self.assertEqual(keys['render_sources_html'],
+                         'local:export:sources_html')
+
+    async def test_small_talk_skips_planning_but_still_answers(self):
+        """闲聊不花规划调用，但**回答仍由模型给出**（不是固定文案）。"""
+        from app import nodes
+        from app import tools as tool_module
+
+        async def forbidden(*a, **k):
+            raise AssertionError('闲聊不该调用模型做规划')
+
+        async def forbidden_catalog():
+            raise AssertionError('闲聊不该去发现工具')
+
+        with patch.object(tool_module, 'catalog', forbidden_catalog), \
+                patch.object(nodes, 'structured_call', forbidden):
+            result = await nodes.plan({'user_input': '你好', 'usage': []})
+        self.assertEqual([s['tool'] for s in result['plan']['steps']],
+                         ['answer_directly'])
+        self.assertEqual(result.get('usage', []), [])
+
+    async def test_answer_directly_never_touches_documents(self):
+        from app import tools as tool_module
+        from app.capabilities import answers as answers_cap
+
+        async def fake_chat(system, messages, model=None, on_delta=None):
+            return 'ACID 是事务的四个特性。'
+
+        with patch.object(answers_cap, 'chat_reply', fake_chat):
+            result = await tool_module._answer_directly(
+                {'question': '什么是 ACID'},
+                {'user_input': '什么是 ACID', 'history': []})
+        self.assertEqual(result['status'], 'answered')
+        self.assertIn('ACID', result['answer'])
+
+    async def test_answer_with_sources_cites_documents(self):
+        from app import sources, tools as tool_module
+        from app.capabilities import answers as answers_cap
+        with tempfile.TemporaryDirectory() as folder:
+            fake = SimpleNamespace(artifact_dir=Path(folder))
+            with patch.object(sources, 'settings', fake):
+                doc = sources.metadata('t1', 's1', url='https://a/1',
+                                       title='甲文', text='正文内容')
+
+                async def fake_chat(system, messages, model=None, on_delta=None):
+                    return '结论 [s1]。'
+
+                with patch.object(answers_cap, 'chat_reply', fake_chat), \
+                        patch_all_emits(lambda e: None):
+                    result = await tool_module._answer_with_sources(
+                        {'question': '问题'}, {'documents': [doc], 'usage': []})
+        self.assertEqual(result['status'], 'answered')
+        self.assertIn('参考来源', result['answer'])
+        self.assertIn('https://a/1', result['answer'])
+
+    async def test_answer_with_sources_requires_material(self):
+        from app import tools as tool_module
+        with self.assertRaises(tool_module.ToolError):
+            await tool_module._answer_with_sources(
+                {'question': 'q'}, {'documents': [], 'usage': []})
 
 
 class PlanContractTests(unittest.IsolatedAsyncioTestCase):
