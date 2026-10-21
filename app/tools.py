@@ -102,6 +102,48 @@ async def _discover(server) -> tuple[list[dict], str]:
         return [], f'{type(exc).__name__}: {str(exc)[:160]}'
 
 
+def _type_brief(schema: dict, depth: int = 0) -> str:
+    """把 JSON Schema 压成一眼能看懂的短类型：`string` / `[ {query:string} ]`。
+
+    只给参数名是不够的：`queries` 是"字符串数组"还是"对象数组"，差别就是一次
+    注定失败的调用（真实报错：`'xxx' is not of type 'object'`）。
+    """
+    if not isinstance(schema, dict) or depth > 2:
+        return ''
+    kind = str(schema.get('type') or '')
+    if kind == 'array':
+        item = _type_brief(schema.get('items') or {}, depth + 1)
+        return f'[{item or "any"}]'
+    if kind == 'object':
+        required = [str(key) for key in (schema.get('required') or [])][:4]
+        if required:
+            return '{' + ','.join(required) + '}'
+        properties = list((schema.get('properties') or {}))[:4]
+        return '{' + ','.join(properties) + '}' if properties else 'object'
+    return kind or 'any'
+
+
+def _signature_brief(schema: dict, limit: int = 4) -> str:
+    """内部工具的参数签名：**只列必填参数的类型**，可选的用 `+N` 概括。
+
+    规划器要的是"我必须传什么、传成什么形状"，不是完整 schema。把 36 个工具的
+    全部字段都铺开会把提示词撑到几千字，反而淹掉关键信息。
+    """
+    properties = (schema or {}).get('properties') or {}
+    required = [str(key) for key in ((schema or {}).get('required') or [])]
+    parts = []
+    for name in required[:limit]:
+        brief = _type_brief(properties.get(name) or {})
+        parts.append(f'*{name}:{brief}')
+    if not parts:
+        # 没有必填参数也要有个提示，否则模型不知道该传什么
+        return '无必填'
+    optional = len(properties) - len(required)
+    if optional > 0:
+        parts.append(f'+{optional}可选')
+    return ','.join(parts)
+
+
 async def _discover_capabilities(server) -> dict:
     """读服务端的**内部能力清单**（例如 list_capabilities）。
 
@@ -127,12 +169,20 @@ async def _discover_capabilities(server) -> dict:
     out = {}
     for item in items:
         if isinstance(item, dict) and item.get('name'):
+            schema = item.get('input_schema') or {}
+            properties = schema.get('properties') or {}
             out[str(item['name'])] = {
                 'status': str(item.get('status') or '').upper(),
                 'description': str(item.get('description') or '')[:80],
                 'capability': str(item.get('capability') or ''),
                 # 服务端通常会说清"缺什么/怎么装"，透出来才能告诉用户
                 'install': str(item.get('install_instructions') or '')[:160],
+                # **参数也必须带给规划器**：只知道名字、不知道要传什么，调用就会以
+                # "input validation failed: 'x' is a required property" 收场
+                'required': [str(key) for key in (schema.get('required') or [])][:6],
+                'params': [str(key) for key in list(properties)[:8]],
+                # 类型形状：数组元素是对象还是字符串，决定这次调用成不成立
+                'signature': _signature_brief(schema)[:150],
             }
     return out
 
@@ -149,7 +199,8 @@ def _is_available(status: str) -> bool:
     return 'AVAILABLE' in text and 'UNAVAILABLE' not in text
 
 
-def _capability_line(capabilities: dict, limit: int = 30) -> str:
+def _capability_line(capabilities: dict, limit: int = 26,
+                     max_chars: int = 1800) -> str:
     """把内部能力清单压成一行，塞进工具描述里给规划器看。
 
     真实服务端可能有几十上百个内部工具，全列出来会把规划提示词撑爆，所以各自
@@ -160,16 +211,27 @@ def _capability_line(capabilities: dict, limit: int = 30) -> str:
     usable = [name for name, info in capabilities.items()
               if _is_available(info.get('status'))]
     unusable = [name for name in capabilities if name not in usable]
+    def describe(name: str) -> str:
+        info = capabilities[name]
+        signature = info.get('signature') or ''
+        if signature:
+            return f'{name}({signature})'
+        required = info.get('required') or []
+        return (f'{name}(必填:{",".join(required)})' if required
+                else f'{name}(无必填)')
+
     parts = []
     if usable:
-        parts.append('可用（只能从这里选）：' + '、'.join(usable[:limit])
+        parts.append('可用（只能从这里选，括号里是必填参数）：'
+                     + '、'.join(describe(name) for name in usable[:limit])
                      + (f' 等 {len(usable)} 个' if len(usable) > limit else ''))
     else:
         parts.append('当前没有任何可用内部工具（缺依赖/缺 key/未安装）')
     if unusable:
         parts.append('不可用（别调度）：' + '、'.join(unusable[:limit])
                      + (f' 等 {len(unusable)} 个' if len(unusable) > limit else ''))
-    return '；'.join(parts)
+    line = '；'.join(parts)
+    return line if len(line) <= max_chars else line[:max_chars] + '…'
 
 
 async def mcp_tools(force: bool = False) -> list[Tool]:
@@ -313,6 +375,17 @@ def _check_inner_name(server, args: dict, capabilities: dict) -> None:
             f'真实存在的是：{"、".join(sorted(capabilities)[:20])}'
             + (f'；其中当前可用：{"、".join(usable[:12])}' if usable
                else '；且它们当前都不可用'))
+    # 参数也不许瞎写：服务端只会回一句 "input validation failed: 'x' is a
+    # required property"，用户看不出该传什么。这里本地就挡住并列出参数名。
+    inputs = (args or {}).get('inputs')
+    required = info.get('required') or []
+    if required and isinstance(inputs, (dict, type(None))):
+        missing = [key for key in required if key not in (inputs or {})]
+        if missing:
+            raise ToolError(
+                f'内部工具 {wanted} 缺少必填参数：{"、".join(missing)}。'
+                f'它的参数有：{"、".join(info.get("params") or required)}'
+                f'（相对路径会按项目目录解析）')
     status = (info.get('status') or '').upper()
     if not _is_available(info.get('status')):
         usable = [name for name, item in capabilities.items()
@@ -405,6 +478,10 @@ _DEPENDENCY_SIGNS = (
 
 def _dependency_note(text: str) -> str:
     lowered = (text or '').lower()
+    # 参数校验失败是**调用没写对**，不是环境问题：服务端 schema 的描述里常出现
+    # "ffmpeg" 之类字样，不加这道判断就会误报"装 ffmpeg"。
+    if 'validation failed' in lowered or 'required property' in lowered:
+        return ''
     for needle, note in _DEPENDENCY_SIGNS:
         if needle in lowered:
             return note

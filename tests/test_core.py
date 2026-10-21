@@ -4494,3 +4494,114 @@ class DependencyDiagnosisTests(unittest.IsolatedAsyncioTestCase):
         run_tool = next(t for t in tools if t.name.endswith('run_tool'))
         self.assertIn('/data/voices/zh.onnx', run_tool.description)
         tool_module._MCP_CACHE['capabilities'] = {}
+
+
+class InnerToolParamGuardTests(unittest.IsolatedAsyncioTestCase):
+    """内部工具的参数也要读出来并校验（用户报的第三次失败：'output_dir' is a required property）。"""
+
+    async def asyncSetUp(self):
+        from app import tools as tool_module
+        tool_module._MCP_CACHE['capabilities'] = {}
+        self.addCleanup(lambda: tool_module._MCP_CACHE.update(capabilities={}))
+
+    def test_required_params_are_exposed_to_the_planner(self):
+        from app import tools as tool_module
+        capabilities = {
+            'direct_clip_search': {'status': 'ToolStatus.AVAILABLE',
+                                   'required': ['output_dir', 'queries'],
+                                   'params': ['output_dir', 'queries', 'max_results']},
+            'tts_selector': {'status': 'ToolStatus.AVAILABLE', 'required': ['text']},
+        }
+        line = tool_module._capability_line(capabilities)
+        # 规划器必须看得到"要传什么"，否则调用必然因为缺必填参数失败
+        self.assertIn('direct_clip_search(必填:output_dir,queries)', line)
+        self.assertIn('tts_selector(必填:text)', line)
+
+    def test_missing_required_input_fails_before_the_call(self):
+        from app import tools as tool_module
+        from app.integrations import mcp_servers
+
+        server = mcp_servers.Server(id='montage', transport='streamable_http',
+                                    url='https://a.example/mcp',
+                                    capability_tool='list_capabilities',
+                                    tool_name_arg='name')
+        capabilities = {'direct_clip_search': {
+            'status': 'ToolStatus.AVAILABLE',
+            'required': ['output_dir', 'queries'],
+            'params': ['output_dir', 'queries', 'max_results']}}
+
+        with self.assertRaises(tool_module.ToolError) as ctx:
+            tool_module._check_inner_name(
+                server, {'name': 'direct_clip_search', 'inputs': {'queries': ['city']}},
+                capabilities)
+        message = ctx.exception.safe_message
+        self.assertIn('output_dir', message)
+        self.assertIn('缺少必填参数', message)
+
+        # 参数齐了就放行
+        tool_module._check_inner_name(
+            server, {'name': 'direct_clip_search',
+                     'inputs': {'output_dir': 'clips', 'queries': ['city']}},
+            capabilities)
+
+    async def test_discovery_records_required_and_params(self):
+        from app import tools as tool_module
+        from app.integrations import mcp_servers
+
+        server = mcp_servers.Server(id='montage', transport='streamable_http',
+                                    url='https://a.example/mcp',
+                                    capability_tool='list_capabilities',
+                                    tool_name_arg='name')
+
+        async def fake_list(_server):
+            return [{'name': 'run_tool', 'inputSchema': {'type': 'object'}}]
+
+        async def fake_call(name, arguments, artifact=None, server=None):
+            return {'tools': [{
+                'name': 'direct_clip_search', 'status': 'ToolStatus.AVAILABLE',
+                'input_schema': {'type': 'object', 'required': ['output_dir', 'queries'],
+                                 'properties': {'output_dir': {'type': 'string'},
+                                                'queries': {'type': 'array'},
+                                                'max_results': {'type': 'integer'}}}}]}
+
+        with patch.object(tool_module.mcp_adapter, 'list_server_tools', fake_list), \
+                patch.object(tool_module.mcp_adapter, 'call_tool', fake_call), \
+                patch.object(tool_module.mcp_servers, 'servers', lambda: [server]):
+            tool_module._MCP_CACHE.update(at=0.0, tools=[], signature=(),
+                                          capabilities={})
+            await tool_module.mcp_tools(force=True)
+        info = tool_module.known_inner_names('montage')['direct_clip_search']
+        self.assertEqual(info['required'], ['output_dir', 'queries'])
+        self.assertIn('queries', info['params'])
+
+    def test_signature_shows_the_shape_not_just_the_name(self):
+        """参数形状必须给出来：`queries` 是"对象数组"还是"字符串数组"决定成败。
+
+        真实报错：`'foggy city street' is not of type 'object'`——模型知道要传
+        queries，但不知道每项得是 {query: "..."}。
+        """
+        from app import tools as tool_module
+        schema = {'type': 'object', 'required': ['output_dir', 'queries'],
+                  'properties': {
+                      'output_dir': {'type': 'string'},
+                      'queries': {'type': 'array',
+                                  'items': {'type': 'object',
+                                            'required': ['query'],
+                                            'properties': {'query': {'type': 'string'}}}},
+                      'clips_per_query': {'type': 'integer'},
+                  }}
+        signature = tool_module._signature_brief(schema)
+        self.assertIn('*output_dir:string', signature)
+        self.assertIn('*queries:[{query}]', signature)   # 形状在这里
+        self.assertIn('+1可选', signature)                # 可选参数不铺开
+
+    def test_validation_failure_does_not_claim_a_missing_dependency(self):
+        """参数写错时别甩一句"装 ffmpeg"——schema 描述里就带 ffmpeg 字样。"""
+        from app import tools as tool_module
+        text = ("input validation failed: 'output_dir' is a required property "
+                "Failed validating 'required' in schema: {'description': "
+                "'Directory where clips are written; requires FFmpeg'}")
+        self.assertEqual(tool_module._dependency_note(text), '')
+        # 真正的运行时依赖缺失仍然要提示
+        self.assertIn('语音模型',
+                      tool_module._dependency_note('Piper failed: Unable to find voice'))
