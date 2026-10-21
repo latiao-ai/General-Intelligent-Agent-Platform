@@ -1766,10 +1766,11 @@ class PostgresParityTests(unittest.TestCase):
                   'action_attempts', 'actions', 'steps', 'plans', 'runs',
                   'tasks_meta', 'events', 'tasks', 'session_memory',
                   'session_summaries', 'messages', 'sessions')
-        with self.store._conn.cursor() as cur:
+        # 走公开的租借接口做清库：仓储内部怎么管连接（单连接还是连接池）
+        # 属于实现细节，用例不该依赖
+        with self.store._lease() as conn:
             for table in tables:
-                cur.execute(f'TRUNCATE TABLE {table} CASCADE')
-        self.store._conn.commit()
+                conn.execute(f'TRUNCATE TABLE {table} CASCADE')
 
     def tearDown(self):
         self.store.close()
@@ -3692,6 +3693,119 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
             # 部署待确认不是失败：对应 run 要纠正回来
             self.assertEqual(store.run('r3')['status'], 'needs_reconcile')
             store.close()
+
+
+@unittest.skipUnless(PG_DSN, '需要 PG_TEST_DSN 才跑真实 PostgreSQL 用例')
+class PostgresPoolTests(unittest.TestCase):
+    """连接池：多线程真并发、异常不掉连接、池状态可观测。
+
+    ⚠️ 同样只对一次性测试库跑（TRUNCATE 全部业务表）。
+    """
+
+    def setUp(self):
+        from app.pg_store import PostgresStore
+        if 'test' not in PG_DSN:
+            raise unittest.SkipTest('PG_TEST_DSN 必须指向测试库（库名含 test）')
+        self.store = PostgresStore(PG_DSN)
+        tables = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
+                  'action_attempts', 'actions', 'steps', 'plans', 'runs',
+                  'tasks_meta', 'events', 'tasks', 'session_memory',
+                  'session_summaries', 'messages', 'sessions')
+        with self.store._lease() as conn:
+            for table in tables:
+                conn.execute(f'TRUNCATE TABLE {table} CASCADE')
+
+    def tearDown(self):
+        self.store.close()
+
+    def test_store_is_pooled_not_single_connection(self):
+        self.assertFalse(hasattr(self.store, '_conn'),
+                         '单连接字段应当已经不存在')
+        stats = self.store.pool_stats()
+        self.assertGreaterEqual(stats['max_size'], 2)
+        self.assertEqual(stats['available'] + 0, stats['size'])
+        # 仓储接口没被破坏
+        from app.persistence import check_repository
+        self.assertEqual(check_repository(self.store), [])
+
+    def test_concurrent_writers_get_unique_event_seqs(self):
+        """8 个线程同时往同一个任务写事件：seq 必须是连续且不重复的 1..N。
+
+        seq 重复意味着 SSE 端会按序号把后到的事件当重复丢掉（静默丢消息），
+        所以这条必须靠数据库的冲突重算保证，而不是靠进程内的一把锁。
+        """
+        import threading
+        task_id = 't-concurrent'
+        self.store.create_task(task_id, 's1', '并发写')
+        total, per_thread = 8, 15
+        errors = []
+
+        def worker(index):
+            try:
+                for n in range(per_thread):
+                    self.store.append_event(task_id, {'type': 'action',
+                                                      'label': f'w{index}-{n}'})
+            except Exception as exc:              # noqa: BLE001
+                errors.append(f'{type(exc).__name__}: {exc}')
+
+        threads = [threading.Thread(target=worker, args=(i,))
+                   for i in range(total)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        self.assertEqual(errors, [])
+        events = self.store.events(task_id)
+        self.assertEqual(len(events), total * per_thread)
+        self.assertEqual([seq for seq, _ in events],
+                         list(range(1, total * per_thread + 1)))
+
+    def test_concurrent_reads_and_writes_during_pool_load(self):
+        """读写在池子里并行：8 个线程混合操作，全部成功且数据不丢。"""
+        import threading
+        self.store.ensure_session('s1')
+        errors = []
+
+        def writer(index):
+            try:
+                for n in range(10):
+                    self.store.append_message('s1', 'user', f'w{index}-{n}')
+            except Exception as exc:              # noqa: BLE001
+                errors.append(f'write {type(exc).__name__}: {exc}')
+
+        def reader():
+            try:
+                for _ in range(40):
+                    self.store.list_sessions(10)
+            except Exception as exc:              # noqa: BLE001
+                errors.append(f'read {type(exc).__name__}: {exc}')
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(4)]
+        threads += [threading.Thread(target=reader) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.store.messages('s1')), 40)
+
+    def test_failed_statement_rolls_back_and_returns_the_connection(self):
+        """事务失败不能吃掉连接，也不能留下半截写入。"""
+        self.store.ensure_session('s1')
+        before = self.store.pool_stats()['available']
+        with self.assertRaises(Exception):
+            with self.store._lease() as conn:
+                conn.execute("INSERT INTO sessions (session_id, created_at, "
+                             "updated_at) VALUES ('s-broken', 'x', 'x')")
+                conn.execute('SELECT * FROM no_such_table')     # 触发回滚
+        # 连接已经归还，池没有被吃掉
+        self.assertEqual(self.store.pool_stats()['available'], before)
+        self.assertNotIn('s-broken', [s['session_id']
+                                      for s in self.store.list_sessions(10)])
+        # 借出过的连接要么被复用、要么被换新：总数仍然受上限约束
+        self.assertLessEqual(self.store.pool_stats()['size'], self.store.pool_stats()['max_size'])
 
 
 if __name__ == '__main__':

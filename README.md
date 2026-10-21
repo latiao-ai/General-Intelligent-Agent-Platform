@@ -82,6 +82,8 @@ python --version             # Python 3.12.15
 | `IDEMPOTENCY_TTL_SECONDS` | 创建任务幂等键的有效期，默认 86400（24 小时） |
 | `DATABASE_URL` | 数据库连接串；填 `postgresql://…` 用 PostgreSQL，**留空回落 SQLite** |
 | `DB_PATH` | 仅 SQLite 模式下的文件名，默认 `agent.db` |
+| `DB_POOL_SIZE` | PostgreSQL 连接池上限，默认 4（别超过服务端 `max_connections` ÷ 副本数） |
+| `DB_POOL_TIMEOUT` | 从池里借连接的等待上限（秒），默认 10；等不到就报错，不会无限期挂住请求 |
 | `PROFILE_PATH` | 用户画像文件，默认 `profile/USER.md`（见 3.1.2） |
 
 > 改了 `.env` 必须重启进程才生效。
@@ -354,8 +356,14 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
 
 ### 实现取舍
 
-- **PostgreSQL**：`psycopg` 3.x，单连接 + 线程锁串行化（与 SQLite 实现同构）。
-  本地单 Worker 够用；并发上来后应换连接池——这一步尚未做。
+- **PostgreSQL**：`psycopg` 3.x + `psycopg_pool` **连接池**。每次调用借一条连接
+  （`PostgresStore._lease()`：正常提交 / 异常回滚 / 一定归还），池大小与等待超时
+  可配（`DB_POOL_SIZE` / `DB_POOL_TIMEOUT`），`GET /api/health` 里的 `db_pool`
+  会给出 `size / available / requests_waiting`。
+  并发正确性**不靠应用锁，靠数据库**：租约 + `lease_epoch` fencing、
+  `FOR UPDATE SKIP LOCKED` 领取、事件序号用 `pg_advisory_xact_lock` 按任务串行化。
+  （早期是"单连接 + 一把线程锁"：那不是安全，而是把吞吐锁死了——去掉锁之后，
+  事件序号的真实竞争才被并发用例暴露出来。）
 - **SQLite**：标准库 `sqlite3`，WAL 模式，零新增依赖，适合单机快速起步。
 - 仓储接口见 `app/persistence.py`，`check_repository()` 可在换实现前校验方法齐备。
 
@@ -392,7 +400,10 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
 - **跨进程取消是协作式的**：取消请求写 `runs.cancel_requested_at`，持有租约的执行者
   在 2 秒轮询里发现后自行停止；进程已经死了的 run 会由对账按账本处理（有 in_flight
   动作标 `unknown` 等人工核实，没有就回到 `queued` 续跑）。
-- **PostgresStore 用单连接 + 线程锁**串行化，没有连接池。并发量上来后是瓶颈。
+- **连接池解决的是单进程吞吐，不是高可用**。多副本之间仍然只靠数据库协作
+  （租约/账本对账），**跨实例实时事件推送**还没做：副本 A 上的客户端看不到副本 B
+  产生的实时事件（要靠重连 + `Last-Event-ID` 补发，事件本身不丢）。
+- **池大小是静态配置**，没有按负载自适应；借不到连接会直接报错而不是排队降级。
 - **SQLite 模式仍是单机单写**：多副本各写各的会冲突，只适合本地开发。
 - **幂等只覆盖"创建任务"**。事件追加、部署、补偿各有更精确的机制（事件序号、
   账本 action、`compensated_at`），不共用这把钥匙。键按 `主体+接口+键` 作用域化，

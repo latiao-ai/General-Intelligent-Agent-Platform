@@ -55,7 +55,12 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         hub.close()
-        logger.info('API 已关闭，数据库连接已收尾')
+        # 连接池也要显式关：否则退出时池里的连接靠 GC 收，日志里看不到
+        # "到底关没关"，测速/压测反复起停还会在服务端堆出空闲连接。
+        close_store = getattr(hub.store, 'close', None)
+        if callable(close_store):
+            close_store()
+        logger.info('API 已关闭，数据库连接池已收尾')
 
 
 app = FastAPI(title='通用 Agent 执行中台 API', version='2.0', lifespan=lifespan)
@@ -414,8 +419,17 @@ async def health():
     except Exception as exc:                     # noqa: BLE001
         raise HTTPException(status_code=503,
                             detail=f'数据库不可用（{type(exc).__name__}）') from None
-    return {'ok': True, 'owner': hub.owner_id, 'recovery': getattr(app.state, 'recovery', {}),
+    body = {'ok': True, 'owner': hub.owner_id,
+            'recovery': getattr(app.state, 'recovery', {}),
             'mcp': tool_module.mcp_status(), **stats}
+    pool_stats = getattr(hub.store, 'pool_stats', None)
+    if callable(pool_stats):
+        # 连接池态势：只有 PostgreSQL 实现有池，SQLite 没有这个口子
+        try:
+            body['db_pool'] = pool_stats()
+        except Exception:                        # noqa: BLE001
+            body['db_pool'] = {'error': '取连接池状态失败'}
+    return body
 
 
 @app.get('/api/profile')

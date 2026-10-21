@@ -1,16 +1,14 @@
 """持久化仓储接口：把"业务要什么"和"数据库怎么写"分开。
 
 文档 §9.1 要求"正式上线前把 SQL 与业务逻辑隔离为仓储接口，并准备 SQLite 到
-PostgreSQL 的迁移脚本"。这里定义接口，`app.store.Store` 是当前的 SQLite 实现。
+PostgreSQL 的迁移脚本"。这里定义接口，两个实现都满足它：
 
-**PostgresStore 尚未实现**。原因很直接：本开发环境没有 PostgreSQL 实例，
-写一个不能运行的实现只会制造"看起来支持了"的假象。所以这一层只交付：
+- `app.store.Store`：SQLite，单机起步用，零额外依赖；
+- `app.pg_store.PostgresStore`：PostgreSQL + 连接池，正式部署用。
 
-1. 明确的接口（Protocol），业务代码可以面向它编程；
-2. SQLite 实现，已通过测试；
-3. 迁移脚本 `scripts/migrate_to_postgres.py`（同样未在真实 PG 上验证）。
-
-接 PostgreSQL 时新增一个满足同一 Protocol 的实现即可，调用方不用改。
+`open_store()` 按 `DATABASE_URL` 前缀挑实现，业务代码不感知；换实现前可以先用
+`check_repository()` 校验方法齐备。两套实现在真实 PG 上有一致性用例
+（`PostgresParityTests`）与连接池并发用例（`PostgresPoolTests`）。
 """
 from typing import Any, Protocol, runtime_checkable
 

@@ -105,14 +105,22 @@
    本环境没有第二个真实 MCP 服务端，`deploy_tool` / 参数形态仍按原服务端契约。
 5. **补偿的远端语义**：补偿依赖"存在对应的撤销工具"。服务端没有撤销工具时，
    补偿只能是空（计划里留空），系统不会假装撤回过。
+6. **规模化**：连接池已落地（见下），但**没有**高可用承诺——多副本缺跨实例实时
+   事件推送，池大小是静态配置，借不到连接直接报错。
+7. **运维**：有结构化日志、`/api/health`（含连接池态势）与 `/api/recovery`，
+   但**没有** Prometheus 指标出口、告警、历史数据清理策略。
+8. **执行中重规划 / 并行步骤**：未实现。现有设计是"一次只走一步"，账本顺序、
+   补偿逆序、事件序号都建立在这个前提上；动它要先重设计这三条不变量。
 
 ## 测试
 
-```
-python -m unittest tests.test_core                                  # 210 通过（SQLite）
+```bash
+python -m unittest tests.test_core                       # 210 通过（SQLite，无 PG 时跳过 10 条）
+
 # PG_TEST_DSN 必须指向一次性测试库（库名需含 test），用例会 TRUNCATE 全部表
-PG_TEST_DSN=postgresql://.../agent_platform_test python -m unittest \
-    tests.test_core.PostgresParityTests                             # 6 通过（真实 PG）
+PG_TEST_DSN=postgresql://…/agent_platform_test python -m unittest \
+    tests.test_core.PostgresParityTests tests.test_core.PostgresPoolTests
+# 以上合计 214 通过：6 条仓储一致性 + 4 条连接池并发
 ```
 
 ## 本轮（2026-10-20 评审后）修复清单
@@ -152,6 +160,7 @@ PG_TEST_DSN=postgresql://.../agent_platform_test python -m unittest \
 | §5.4 | 多 MCP Server 路由 | `MCP_SERVERS` 配置多个服务端（transport/url/token/stdio），并发发现、失败隔离；工具名带服务端前缀并记录 `server_id`；旧计划里的 `mcp__<tool>` 可按尾部唯一匹配、或按 `tool_key` 尾部回退 | `McpRoutingTests`（6 条） |
 | §5.4 | **部署工具不再是一条旁路** | `deploy_site` 就是 `default` 服务端声明的那个工具：身份 `mcp:<server>:<tool>`，走统一 MCP 通道（同一份账本、同样进 `mcp_calls`、同样的结果未定判定），平台只挂适配器（调用前的开关/产物闸门 + 调用后的回执归一）。清单里只有它一份，`mcp__deploy_site` 旧名仍能解析；服务端掉线时留占位工具明确报错；`DEPLOY_ENABLED=false` 时它整体不在清单里，没法绕过闸门调原始工具 | `DeployGateTests`（9 条） |
 
+| §9 | **PostgreSQL 连接池** | 换掉"单连接 + 一把 `threading.Lock`"（那是把吞吐锁死，不是安全）：`psycopg_pool` 池化，每次调用 `_lease()` 借一条，事务边界显式（提交/回滚/归还），池大小与等待超时用 `DB_POOL_SIZE`/`DB_POOL_TIMEOUT` 配，`/api/health` 暴露 `db_pool`。去掉进程锁后暴露了一个真缺陷：`append_event` 的序号竞争在 8 线程下会打爆 5 次重试 → 改用 `pg_advisory_xact_lock(hashtext(task_id))` 按任务串行化，冲突重算留作兜底 | `PostgresPoolTests`（4 条：8 线程并发 seq 连续不重复、读写混跑、失败回滚不吃连接、池状态可观测） |
 | §7 | **终态词汇收口：状态机 / outcome / 展示标签三层分开** | `tasks.status` / `runs.status` 只存 11 个通用值（`queued` `running` `reconciling` `waiting_input` `waiting_approval` `succeeded` `partially_succeeded` `needs_reconcile` `failed` `cancelled` `interrupted`）；本轮产出写进 `state.outcome = {kind, produced[], effects[], answered, unverified}`；`answered` / `local_ready` / `deployed` / `deploy_needs_check` / `compensated` 降级成 `outcome.label()` 派生出来的展示标签，接口同时返回 `status`（标签）与 `run_status`（通用值）。工具自报的 `status` 只当阶段小结，不再写进 run 终态。历史数据用 `scripts.migrate_status_vocabulary` 迁移（生产库已跑：66 行）。越界状态由 `check_run_status` 记 error 并退化，不再像旧的 `RUN_STATUS_OF.get(status, status)` 那样静默写库 | `StatusVocabularyTests`（9 条） |
 
 设计取舍写在这里，避免以后被"看起来更简单"的做法改回去：

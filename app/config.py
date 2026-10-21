@@ -41,6 +41,12 @@ class Settings:
     # 数据库：留空用本地 SQLite；填 postgresql://... 则全部走 PostgreSQL。
     # 仓储接口见 app/persistence.py，两种实现互换，业务代码不感知。
     database_url: str = os.getenv('DATABASE_URL', '').strip()
+    # PostgreSQL 连接池大小。一个进程最多同时占用这么多条连接：SSE 写入、
+    # 后台作业、接口查询各自借各自的，不再被一把进程内的锁串行化。
+    # 注意别超过服务端的 max_connections ÷ 副本数。
+    db_pool_size: int = max(1, int(os.getenv('DB_POOL_SIZE', '4')))
+    # 从池里借连接最多等多久（秒）。等不到就报错，而不是无限期挂住一个请求。
+    db_pool_timeout: float = max(1.0, float(os.getenv('DB_POOL_TIMEOUT', '10')))
     # SQLite 持久化路径（DATABASE_URL 为空时使用）。改这里也要同步 .gitignore。
     db_path: Path = PROJECT_ROOT / os.getenv('DB_PATH', 'agent.db')
     # 用户画像文件（Markdown，人可读可改）。含电话等敏感信息，已在 .gitignore 排除。
