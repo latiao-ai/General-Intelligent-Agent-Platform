@@ -160,10 +160,11 @@ def _produced(state: dict) -> list[dict]:
     """
     produced = []
     artifact = state.get('artifact') or {}
-    if artifact.get('html_path'):
+    artifact_path = artifact.get('path') or artifact.get('html_path')
+    if artifact_path:
         produced.append({'kind': artifact.get('kind') or 'report',
                          'artifact_id': artifact.get('artifact_id') or '',
-                         'path': artifact.get('html_path'),
+                         'path': artifact_path,
                          'sha256': artifact.get('sha256') or '',
                          'size_bytes': artifact.get('size_bytes')})
     for output in (state.get('step_outputs') or {}).values():

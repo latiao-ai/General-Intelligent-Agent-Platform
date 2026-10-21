@@ -261,6 +261,34 @@ CREATE INDEX IF NOT EXISTS idx_request_keys_expiry ON request_keys(expires_at);
 -- 旧库升级：CREATE TABLE IF NOT EXISTS 不会补列。PG 支持 IF NOT EXISTS，
 -- 所以升级语句可以和建表放在一起，启动时幂等执行。
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS compensated_at TEXT;
+
+-- ---------- 身份：平台身份 → 本地主体（app/auth.py、文档 §3.1） ----------
+-- 本地用户是业务外键的唯一目标；平台标识（openid / sub / 邮箱）只用于"找到它"。
+-- 为什么不让业务表直接挂 openid：微信 openid 按 appid 隔离、部分平台的 sub 会
+-- 轮换，一旦变了，用户的历史会话、任务、产物就全部对不上人。
+CREATE TABLE IF NOT EXISTS app_users (
+    user_id      TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL DEFAULT '',
+    email        TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'active',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+-- 一个本地用户可以绑多个平台身份（微信 / 飞书 / 企业 SSO）。
+-- (provider, subject) 唯一：同一平台同一主体重复登录只会命中，不会分身账号。
+CREATE TABLE IF NOT EXISTS identities (
+    provider     TEXT NOT NULL,
+    subject      TEXT NOT NULL,
+    user_id      TEXT NOT NULL,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    email        TEXT NOT NULL DEFAULT '',
+    role         TEXT NOT NULL DEFAULT 'member',
+    created_at   TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (provider, subject)
+);
+CREATE INDEX IF NOT EXISTS idx_identities_user ON identities(user_id);
 """
 
 
@@ -287,9 +315,16 @@ class PostgresStore:
 
     def __init__(self, dsn: str, *, pool_size: int | None = None) -> None:
         self.dsn = dsn
-        size = pool_size if pool_size is not None else settings.db_pool_size
-        self._pool = AsyncConnectionPool(
-            dsn,
+        self._pool_size = pool_size
+        self._pool = self._make_pool()
+        self._open_lock: asyncio.Lock | None = None
+        self._opened = False
+        self.interrupted = 0
+
+    def _make_pool(self) -> AsyncConnectionPool:
+        size = self._pool_size if self._pool_size is not None else settings.db_pool_size
+        return AsyncConnectionPool(
+            self.dsn,
             min_size=1,
             max_size=max(1, size),
             timeout=settings.db_pool_timeout,
@@ -297,9 +332,6 @@ class PostgresStore:
             name='agent-platform',
             open=False,                 # 不在 __init__ 里做 IO：见 ready()
         )
-        self._open_lock: asyncio.Lock | None = None
-        self._opened = False
-        self.interrupted = 0
 
     async def ready(self) -> None:
         """打开连接池、建表、对账（幂等）。
@@ -314,6 +346,10 @@ class PostgresStore:
         async with self._open_lock:
             if self._opened:
                 return
+            if getattr(self._pool, 'closed', False):
+                # 之前 close() 过：psycopg 的池不能复用，只能重建一个。
+                # 不重建的话，同一实例被 close 后再用会抛 PoolClosed。
+                self._pool = self._make_pool()
             await self._pool.open(wait=True, timeout=max(5.0, settings.db_pool_timeout))
             try:
                 await self._apply_schema()
@@ -383,6 +419,73 @@ class PostgresStore:
             async with conn.cursor() as cur:
                 await cur.execute(SCHEMA)
             await conn.commit()
+
+    # ---------- 身份（app/auth.py） ----------
+
+    async def bind_identity(self, provider: str, subject: str, *,
+                            email: str = '', display_name: str = '',
+                            tenant_id: str = 'default', role: str = 'member'
+                            ) -> dict:
+        """平台身份 → 本地主体：命中就返回，没有就建号。
+
+        首登并发靠 `ON CONFLICT ... RETURNING` 收敛：两个请求同时进来时由数据库
+        决定谁赢，输的一方拿到赢家的 `user_id` 并返回，不会出现两个账号各自持有
+        一半历史。因此**返回值必须取自 RETURNING，不能用本地生成的 user_id**。
+
+        常见路径（已绑定过）只有一次 SELECT，不写库。
+        """
+        stamp = now()
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'SELECT user_id, tenant_id, role FROM identities '
+                'WHERE provider=%s AND subject=%s', (provider, subject))
+            if row is not None:
+                # last_seen 只用于运营统计，失败不该影响登录，所以不参与返回判断
+                await self._run(
+                    conn,
+                    'UPDATE identities SET last_seen_at=%s '
+                    'WHERE provider=%s AND subject=%s',
+                    (stamp, provider, subject))
+                await conn.commit()
+                return dict(row)
+
+            user_id = 'u_' + uuid.uuid4().hex[:16]
+            await self._run(
+                conn,
+                'INSERT INTO app_users '
+                '(user_id, display_name, email, status, created_at, updated_at) '
+                'VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (user_id) DO NOTHING',
+                (user_id, display_name, email, 'active', stamp, stamp))
+            row = await self._one(
+                conn,
+                'INSERT INTO identities '
+                '(provider, subject, user_id, tenant_id, email, role, '
+                ' created_at, last_seen_at) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s) '
+                'ON CONFLICT (provider, subject) DO UPDATE '
+                '  SET last_seen_at = EXCLUDED.last_seen_at '
+                'RETURNING user_id, tenant_id, role',
+                (provider, subject, user_id, tenant_id, email, role,
+                 stamp, stamp))
+            await conn.commit()
+            return dict(row)
+
+    async def user(self, user_id: str) -> dict | None:
+        async with self._lease() as conn:
+            return await self._one(
+                conn,
+                'SELECT user_id, display_name, email, status, created_at '
+                'FROM app_users WHERE user_id=%s', (user_id,))
+
+    async def identities_of(self, user_id: str) -> list[dict]:
+        """一个本地用户绑了哪些平台身份（账户合并时用来判断能不能自动并）。"""
+        async with self._lease() as conn:
+            return await self._all(
+                conn,
+                'SELECT provider, subject, email, created_at, last_seen_at '
+                'FROM identities WHERE user_id=%s ORDER BY created_at',
+                (user_id,))
 
     # ---------- 会话与消息 ----------
 

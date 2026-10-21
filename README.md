@@ -122,6 +122,31 @@ python --version             # Python 3.12.15
 
 ## 3. 运行
 
+### 零密钥中文动画解说视频
+
+主项目在 `demo` 环境运行，OpenMontage MCP 在 `openmontage` 环境运行。
+首次安装本地视频链路的依赖与中文语音模型：
+
+```bash
+conda activate demo
+python -m scripts.setup_local_video
+```
+
+该流程需要 FFmpeg/FFprobe、Piper 及 `zh_CN-huayan-medium` 模型和配套 JSON、
+Remotion 的 npm 依赖以及 Chrome（macOS 优先复用已安装的 Google Chrome）。
+模型默认保存到 `openmontage-zh-mcp/models/piper/`，也可通过
+`LOCAL_VIDEO_VOICE_MODEL` 指定完整的 `.onnx` 路径。
+
+重启网页服务后输入「制作一个 45 秒的动画解说视频，解释为什么天空是蓝色的」。
+客户端的 `make_local_explainer` 能力会先核对 MCP 的真实能力和参数，再按项目 Skills
+编写分镜，保持同一个 MCP 会话完成逐镜中文配音、动画渲染和成片检查。
+最终输出有中文旁白和字幕的 1280×720 MP4，并在网页提供播放器及下载按钮。
+当前这条本地路径不添加背景音乐，不调用付费图片或视频生成 API；
+编写剧本和分镜仍使用主项目已经配置的大模型。
+建议 `TASK_TIMEOUT=900`，为首次渲染保留足够时间。
+
+如果语音模型下载未完成，任务会在模型调用和配音前报告缺失，而不会把脚本文件当成视频交付。
+
 ```bash
 conda activate demo
 cd webpage-agent-demo
@@ -266,6 +291,17 @@ user       我只要其中关于限制和不足的部分
 - **清空**：删掉文件，或让模型"清空画像"
 
 > 画像含电话等敏感信息，已加入 `.gitignore`，不会被提交。
+
+### 切会话不打断任务
+
+- 切换会话只是**解绑事件流**，后端 run 继续跑（不会 POST `/cancel`）；
+- 切回来时 `/api/sessions/{id}/timeline` 会给出 `live_task_id`，前端重新订阅，
+  服务端按 `seq` 把期间发生的事件全量补发，过程看得完整；
+- 每轮的 `artifact`（视频/页面）也在时间线里，切回来还能播放/下载——
+  以前只有"刚跑完那一刻"才渲染过产物入口。
+
+产物接口按扩展名/`kind` 给媒体类型（`.mp4 → video/mp4`、`inline`、支持 Range），
+所以视频能直接播放、拖进度条。
 
 ## 3.1.1 闲聊不占规划
 

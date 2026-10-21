@@ -11,16 +11,18 @@
 """
 import asyncio
 import json
+import mimetypes
 import logging
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import (FileResponse, HTMLResponse, Response,
+                               StreamingResponse)
 from pydantic import BaseModel, Field
 
 from app import idempotency, memory as memory_module, outcome as outcome_module
-from app import policies, profile
+from app import auth, policies, profile
 from app import tools as tool_module
 from app.api_hub import CLOSE, Hub
 from app.config import settings
@@ -52,6 +54,9 @@ async def lifespan(app: FastAPI):
     ready = getattr(hub.store, 'ready', None)
     if callable(ready):
         await ready()
+    # 认证依赖要在请求里拿仓储（token → 平台 userinfo → 本地 user_id），
+    # 但 auth 不能 import api（会成环），所以挂在 app.state 上按请求取。
+    app.state.store = hub.store
     stats = await hub.reconcile(owner=hub.owner_id)
     app.state.recovery = stats
     purged = await hub.store.purge_request_keys()
@@ -60,6 +65,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await hub.close()
+        await auth.aclose()
         # 连接池也要显式关：否则退出时池里的连接靠 GC 收，日志里看不到
         # "到底关没关"，测速/压测反复起停还会在服务端堆出空闲连接。
         close_store = getattr(hub.store, 'close', None)
@@ -92,6 +98,62 @@ class TaskRequest(BaseModel):
 def sse(event: dict) -> str:
     """SSE 帧。事件类型放在 JSON 里，前端统一用 onmessage 处理。"""
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+
+class TokenRequest(BaseModel):
+    # 平台发的凭证。服务端会拿它去 userinfo 端点验证，**不信任其中的任何字段**。
+    token: str = Field(min_length=1, max_length=8000)
+
+
+# ---------- 身份 ----------
+# 浏览器侧必须有 cookie：EventSource 与 <a download> 都发不出自定义请求头，
+# 只支持 Authorization 的话 SSE 事件流和产物下载会全部 401。
+
+
+@app.get('/api/me')
+async def whoami(principal=Depends(policies.current_principal)):
+    """当前主体。配好 AUTH_MODE 后用它确认「token → 身份」这条链路是通的。"""
+    return {'tenant_id': principal.tenant_id,
+            'user_id': principal.user_id,
+            'role': principal.role,
+            'anonymous': principal.anonymous,
+            'auth_mode': settings.auth_mode}
+
+
+@app.post('/api/auth/session')
+async def create_session(payload: TokenRequest, request: Request,
+                         response: Response):
+    """用平台 token 换一个 HttpOnly cookie。
+
+    过渡实现：cookie 里放的就是平台 token。正式版应换成自己签发的短期票据，
+    否则平台 token 一过期用户就掉线，且撤销只能等平台。
+    """
+    if settings.auth_mode == 'off':
+        raise HTTPException(status_code=400,
+                            detail='AUTH_MODE=off，未启用认证')
+    store = getattr(request.app.state, 'store', None)
+    if store is None:
+        raise HTTPException(status_code=503, detail='身份仓储未就绪')
+    try:
+        info = await auth.fetch_userinfo(payload.token)
+    except auth.AuthError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    row = await store.bind_identity(info.provider, info.subject,
+                                    email=info.email,
+                                    display_name=info.display_name)
+    response.set_cookie(
+        settings.auth_cookie_name, payload.token,
+        max_age=settings.auth_cookie_max_age,
+        httponly=True, samesite='lax', secure=settings.auth_cookie_secure,
+        path='/')
+    return {'user_id': row['user_id'], 'tenant_id': row['tenant_id']}
+
+
+@app.delete('/api/auth/session')
+async def drop_session(response: Response):
+    response.delete_cookie(settings.auth_cookie_name, path='/')
+    return {'ok': True}
 
 
 # ---------- 对象权限 ----------
@@ -314,7 +376,8 @@ async def artifact(task_id: str,
     "资料转 HTML" 产出的是 sources.html；早先这里写死 index.html，导致资料页 404。
     """
     record = await _owned_task(task_id, principal)
-    recorded = ((record.state or {}).get('artifact') or {}).get('html_path')
+    meta = (record.state or {}).get('artifact') or {}
+    recorded = meta.get('path') or meta.get('html_path')
     if recorded:
         path = Path(recorded)
     elif record.artifact_id:
@@ -324,7 +387,15 @@ async def artifact(task_id: str,
         raise HTTPException(status_code=404, detail='产物不存在')
     if not path.exists():
         raise HTTPException(status_code=404, detail='产物不存在')
-    return FileResponse(path, media_type='text/html', filename=path.name)
+    # 媒体类型别写死 text/html：视频产物那样会被浏览器当成网页而放不出来。
+    # 优先级：产物自己声明的 mime → 按扩展名推断 → 兜底二进制流。
+    media_type = (meta.get('mime')
+                  or mimetypes.guess_type(path.name)[0]
+                  or 'application/octet-stream')
+    inline = meta.get('kind') in {'video', 'audio'} or media_type.startswith(
+        ('video/', 'audio/', 'text/html'))
+    return FileResponse(path, media_type=media_type, filename=path.name,
+                        content_disposition_type='inline' if inline else 'attachment')
 
 
 @app.get('/api/runs/{run_id}')

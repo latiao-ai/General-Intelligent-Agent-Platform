@@ -259,7 +259,9 @@ async function loadSessions() {
 }
 
 async function openSession(id) {
-  if (S.running) await interrupt();
+  // 切会话**只解绑事件流，不取消后端任务**：任务在服务端继续跑，
+  // 切回来时按 seq 补齐事件（以前这里会 POST /cancel，一换会话就把活儿停了）。
+  detachStream();
   clearAll();
   setRunning(false);
   S.sessionId = id;
@@ -273,7 +275,23 @@ async function openSession(id) {
     for (const m of (data.messages || [])) {
       addMessage(m.role, m.content);
     }
-    renderHistory(data.turns || []);
+    // 还在跑的那一轮不在这里回放（事件流会从 seq 0 全量补发，避免重复）
+    const liveTask = data.live_task_id || '';
+    renderHistory((data.turns || []).filter(t => t.task_id !== liveTask));
+    if (liveTask) {
+      S.taskId = liveTask;
+      setRunning(true);
+      startNewTurn();              // 先建好这一轮的容器，补发的事件才有地方落
+      openStream(liveTask);        // 重新接上：先补发历史事件，再继续实时
+      return;
+    }
+    // 否则恢复最近一份还能打开的产物：视频/页面切回来仍然能看
+    const withArtifact = [...(data.turns || [])].reverse()
+      .find(t => t.artifact && t.artifact.exists);
+    if (withArtifact) {
+      S.taskId = withArtifact.task_id;
+      renderResult({artifact: withArtifact.artifact}, withArtifact.task_id);
+    }
   } catch { /* 读历史失败不影响 */ }
 }
 
@@ -328,7 +346,7 @@ function renderHistory(turns) {
 }
 
 async function newSession() {
-  if (S.running) await interrupt();
+  detachStream();               // 只解绑；正在跑的任务留在服务端继续
   clearAll();
   setRunning(false);
   S.sessionId = null;
@@ -612,6 +630,11 @@ function setRunning(on) {
   $('send').textContent = '发送';
 }
 
+// 解绑当前事件流（不通知后端取消）。任务仍在服务端跑，切回来能接着看。
+function detachStream() {
+  if (S.es) { S.es.close(); S.es = null; }
+}
+
 async function interrupt() {
   if (!S.taskId || !S.running) return;
   const stream = S.es;
@@ -728,31 +751,42 @@ async function finish(status) {
   } catch { /* 结果区拿不到不影响主流程 */ }
 }
 
-function renderResult(state) {
+function renderResult(state, taskId = null) {
   if (!state) return;
   const box = $('result');
   box.innerHTML = '';
   const deployment = state.deployment || {};
+  // 回放历史产物时用那一轮的 task_id；实时结束时就是当前这一轮
+  const owner = taskId || S.taskId;
 
-  // 只有真正渲染出 HTML 的任务才有产物区（state.artifact 由 render_html 写入）。
-  // 直接回答（answered）的 state 里没有 artifact，不该出现「打开 / 下载 HTML」这种 404 链接。
+  // 只有确实产出文件时才显示播放器或下载入口。
   if (state.artifact) {
     const card = document.createElement('div');
     card.className = 'card';
-    const label = state.artifact.kind === 'sources' ? '资料页面' : '报告产物';
+    const isVideo = state.artifact.kind === 'video';
+    const label = isVideo ? '视频成片' : state.artifact.kind === 'sources' ? '资料页面' : '报告产物';
     card.innerHTML = `<b>${label}</b><div class="actions"></div>`;
     const actions = card.querySelector('.actions');
-    if (S.taskId) {
+    if (owner) {
       const a = document.createElement('a');
       a.className = 'btn';
-      a.href = `/api/tasks/${S.taskId}/artifact`;
+      a.href = `/api/tasks/${owner}/artifact`;
       a.target = '_blank';
-      a.textContent = '打开 / 下载 HTML';
+      a.textContent = isVideo ? '下载 MP4 视频' : '打开 / 下载 HTML';
+      if (isVideo) {
+        a.download = 'final.mp4';
+        const player = document.createElement('video');
+        player.controls = true;
+        player.preload = 'metadata';
+        player.src = a.href;
+        player.style.cssText = 'width:100%;max-width:960px;display:block;margin:16px 0;border-radius:12px';
+        card.insertBefore(player, actions);
+      }
       actions.appendChild(a);
     }
     const hint = document.createElement('div');
     hint.className = 'hint';
-    hint.textContent = '想发布的说一句「部署到服务器」即可。';
+    hint.textContent = isVideo ? '已生成中文旁白、动画和字幕。' : '想发布的说一句「部署到服务器」即可。';
     card.appendChild(hint);
     box.appendChild(card);
   }

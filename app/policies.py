@@ -1,20 +1,25 @@
 """身份与权限：把"谁在操作"这条缝留出来。
 
-**当前实现是单用户的**：没有接入真实登录，`current_principal()` 固定返回
-default 租户 / default 用户。这一点必须说清楚——它是**可替换的缝**，不是
-已经做完的多用户体系。
+**这条缝现在接上了真实认证**（`app.auth`）：请求里的 token 会去平台换 userinfo，
+再映射成本地 `user_id`。`AUTH_MODE=off` 时退回原来的单用户行为，所以本地开发与
+既有测试不受影响。
 
-为什么现在就要留这条缝（文档 §10、§15 阶段 C）：
+分三层，各自职责不混：
 
-- 对象权限检查、租户过滤必须从一开始就出现在查询路径上，最后再补字段会漏；
-- 但真实认证要身份提供方，本环境没有，所以只做到"缝已经存在、检查已经生效、
-  单用户时恒通过"。
+| 层 | 回答什么问题 | 在哪 |
+|---|---|---|
+| 认证 | 你是谁 | `app.auth.resolve()` |
+| 对象权限 | 这条会话/任务/产物是不是你的 | `ensure_owner()` |
+| 能力与额度 | 你能不能调这个工具、还有没有钱 | 待接入（见《多租户与能力中台方案.md》） |
 
-接真实登录时只需要替换 `current_principal()` 的实现，其余调用点不用改。
+`ensure_owner` 是**最后一道**拦截：所有按 ID 读取的接口都必须过它。漏掉一个入口，
+就等于那个入口可以靠猜 ID 拿到别人的上下文。
 """
 from dataclasses import dataclass
 
-from fastapi import Header, HTTPException
+from fastapi import HTTPException, Request
+
+from app.config import settings
 
 DEFAULT_TENANT = 'default'
 DEFAULT_USER = 'default'
@@ -22,33 +27,40 @@ DEFAULT_USER = 'default'
 
 @dataclass(frozen=True)
 class Principal:
-    """一次请求的操作主体。"""
+    """一次请求的操作主体。
+
+    `user_id` 是**本地** ID，不是平台 openid/sub。平台标识变过、换过入口，
+    历史上下文都不会断——这是接认证时最容易做错的一步。
+    """
     tenant_id: str = DEFAULT_TENANT
     user_id: str = DEFAULT_USER
+    role: str = 'member'
 
     @property
     def anonymous(self) -> bool:
         return not self.user_id or self.user_id == DEFAULT_USER
 
 
-def current_principal(x_dsh_user: str | None = Header(default=None),
-                      x_dsh_tenant: str | None = Header(default=None)
-                      ) -> Principal:
-    """从请求头取主体。
+async def current_principal(request: Request) -> Principal:
+    """从请求解析主体。
 
-    **未接入真实认证**：这里仅把请求头当作身份声明，不做签名校验。生产环境
-    必须换成经过验证的认证依赖（会话、JWT、网关注入），并且由服务端决定
-    tenant/user，而不是信任客户端自报。
+    实现全部在 `app.auth`：这里只做转发，保证 20 多个 `Depends(...)` 调用点
+    不用改。要换认证方式只改 auth，不动业务代码。
     """
-    return Principal(tenant_id=x_dsh_tenant or DEFAULT_TENANT,
-                     user_id=x_dsh_user or DEFAULT_USER)
+    from app.auth import resolve
+    return await resolve(request)
 
 
 def ensure_owner(resource: dict | None, principal: Principal,
                  kind: str = '对象') -> dict:
     """对象级权限检查：不同租户/用户之间不能交叉读取。
 
-    单用户阶段恒通过；多用户接上以后这里就是真正的拦截点。
+    **不区分"不存在"和"无权限"**，统一 404：否则攻击者能靠状态码差异枚举出
+    哪些 ID 是真实存在的。
+
+    `POLICY_LEGACY_VISIBLE`（默认开）：`owner_user_id='default'` 的存量数据对所
+    有登录用户可见。这是单用户升级期的兼容——升级前的数据本来就只属于一个人。
+    **一旦有第二个真实用户，必须把它关掉**，否则等于所有历史数据公开。
     """
     if resource is None:
         raise HTTPException(status_code=404, detail=f'{kind}不存在')
@@ -56,8 +68,11 @@ def ensure_owner(resource: dict | None, principal: Principal,
     tenant = resource.get('tenant_id') or DEFAULT_TENANT
     if principal.anonymous:
         return resource
-    if tenant != principal.tenant_id or owner not in (principal.user_id,
-                                                      DEFAULT_USER):
-        # 不区分"不存在"和"无权限"，避免泄漏对象是否存在
+
+    allowed_owners = {principal.user_id}
+    if settings.policy_legacy_visible:
+        allowed_owners.add(DEFAULT_USER)
+
+    if tenant != principal.tenant_id or owner not in allowed_owners:
         raise HTTPException(status_code=404, detail=f'{kind}不存在')
     return resource

@@ -827,8 +827,8 @@ class MemoryScopeTests(unittest.IsolatedAsyncioTestCase):
 class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
     """基础回答能力：简单问题不该被拖去检索（对应用户指出的流程）。"""
 
-    async def test_registry_has_the_five_local_capabilities(self):
-        """本地的只剩"检索 / 读用户给的 URL / 转 HTML / 两种作答"。
+    async def test_registry_has_the_local_capabilities(self):
+        """本地能力包含检索、页面、回答、文件写入及完整视频制作。
 
         部署不在里面：它由 MCP 发现得到（身份 mcp:<server>:<tool>），
         见 `DeployGateTests`。本地身份只发给"纯计算/纯回答"的工具。
@@ -836,7 +836,7 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
         from app import tools as tool_module
         self.assertEqual(sorted(tool_module.BUILTIN_BY_NAME),
                          ['answer_directly', 'answer_with_sources',
-                          'fetch_pages', 'render_sources_html', 'web_search',
+                          'fetch_pages', 'make_local_explainer', 'render_sources_html', 'web_search',
                           'write_file'])
         keys = {name: tool.tool_key
                 for name, tool in tool_module.BUILTIN_BY_NAME.items()}
@@ -3797,6 +3797,125 @@ class WriteFileTests(unittest.IsolatedAsyncioTestCase):
                 {'task_id': 't1'})
 
 
+class SessionSwitchTests(unittest.IsolatedAsyncioTestCase):
+    """切会话不能停任务，切回来还要能看到已经产出的视频（用户报的两个体验问题）。"""
+
+    async def asyncSetUp(self):
+        await reset_db()
+
+    async def test_switching_away_does_not_cancel_the_running_task(self):
+        """切会话只是解绑前端事件流，服务端任务必须继续跑。"""
+        import app.api_hub as hub_module
+        from app.api_hub import Hub
+
+        started = asyncio.Event()
+
+        async def slow_run(text, progress=None, on_event=None, history=None,
+                           on_start=None, prior=None, memory=None, ledger=None,
+                           run_id=None, resume_plan=None):
+            if on_start:
+                await on_start('a1')
+            started.set()
+            await asyncio.sleep(0.4)             # 模拟"还在生成内容"
+            return {'task_id': 'a1', 'status': 'succeeded',
+                    'artifact': {'path': '/tmp/a1/final.mp4', 'kind': 'video'},
+                    'timings': []}
+
+        hub = Hub(new_store())
+        with patch.object(hub_module, 'run_task', slow_run):
+            record = await hub.start('做个视频')
+            await asyncio.wait_for(started.wait(), timeout=5)
+            # 前端"切走"：只是不再订阅，不该发取消
+            queue, _ = await record.subscribe()
+            record.unsubscribe(queue)
+            await asyncio.wait_for(record._task, timeout=5)
+        self.assertEqual(record.status, 'succeeded', '任务不该被切会话打断')
+
+    async def test_timeline_exposes_artifact_so_it_can_be_replayed(self):
+        """切回来要能重新渲染视频：时间线必须带产物信息，而不是只有事件。"""
+        import app.api_hub as hub_module
+        from app.api_hub import Hub
+
+        with tempfile.TemporaryDirectory() as folder:
+            mp4 = Path(folder) / 'final.mp4'
+            mp4.write_bytes(b'\x00\x00\x00\x18ftypmp42' + b'\x00' * 64)
+
+            async def fake_run(text, progress=None, on_event=None, history=None,
+                               on_start=None, prior=None, memory=None, ledger=None,
+                               run_id=None, resume_plan=None):
+                if on_start:
+                    await on_start('a1')
+                return {'task_id': 'a1', 'status': 'succeeded',
+                        'artifact': {'path': str(mp4), 'kind': 'video',
+                                     'size_bytes': mp4.stat().st_size},
+                        'timings': []}
+
+            hub = Hub(new_store())
+            with patch.object(hub_module, 'run_task', fake_run):
+                record = await hub.start('做个视频')
+                await asyncio.wait_for(record._task, timeout=5)
+            timeline = await hub.session_timeline(record.session_id)
+            await hub.close()
+
+        turn = timeline['turns'][-1]
+        self.assertEqual(turn['artifact']['kind'], 'video')
+        self.assertEqual(turn['artifact']['filename'], 'final.mp4')
+        self.assertTrue(turn['artifact']['exists'])
+        self.assertFalse(turn['live'])
+        self.assertEqual(timeline['live_task_id'], '')
+
+    async def test_timeline_reports_the_live_task_of_the_session(self):
+        """会话里还有在跑的任务时，前端要能拿到 task_id 重新接上事件流。"""
+        import app.api_hub as hub_module
+        from app.api_hub import Hub
+
+        gate = asyncio.Event()
+
+        async def slow_run(text, progress=None, on_event=None, history=None,
+                           on_start=None, prior=None, memory=None, ledger=None,
+                           run_id=None, resume_plan=None):
+            if on_start:
+                await on_start('a1')
+            await gate.wait()
+            return {'task_id': 'a1', 'status': 'succeeded', 'timings': []}
+
+        hub = Hub(new_store())
+        with patch.object(hub_module, 'run_task', slow_run):
+            record = await hub.start('慢任务')
+            await asyncio.sleep(0.1)
+            timeline = await hub.session_timeline(record.session_id)
+            self.assertEqual(timeline['live_task_id'], record.task_id)
+            self.assertTrue(timeline['turns'][-1]['live'])
+            gate.set()
+            await asyncio.wait_for(record._task, timeout=5)
+        await hub.close()
+
+    def test_frontend_switch_only_detaches_the_stream(self):
+        """前端源码级约束：切会话/新会话不许调用 cancel 接口。"""
+        from pathlib import Path as _Path
+        source = _Path('app/web/index.html').read_text(encoding='utf-8')
+
+        def body_of(name: str) -> str:
+            start = source.index(f'async function {name}(')
+            end = source.index('\n}', start)
+            body = source[start:end]
+            # 注释里会提到"以前这里会 POST /cancel"，只检查真代码
+            return '\n'.join(line for line in body.splitlines()
+                             if not line.strip().startswith('//'))
+
+        for name in ('openSession', 'newSession'):
+            body = body_of(name)
+            self.assertNotIn('interrupt(', body, f'{name} 不该取消正在跑的任务')
+            self.assertNotIn('/cancel', body, f'{name} 不该调用取消接口')
+            self.assertIn('detachStream()', body, f'{name} 应当只解绑事件流')
+        # 重新接上事件流：靠时间线给出的 live_task_id
+        self.assertIn('live_task_id', body_of('openSession'))
+        self.assertIn('openStream(', body_of('openSession'))
+        # 产物回放要按那一轮的 task_id 取，不能沿用当前的
+        self.assertIn('renderResult({artifact: withArtifact.artifact}',
+                      body_of('openSession'))
+
+
 class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
     """状态机词汇封闭：业务结果进 outcome，展示词只出现在派生标签里。
 
@@ -4024,7 +4143,8 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
                           'render_sources_html': 'local:export:sources_html',
                           'answer_with_sources': 'local:answers:with_sources',
                           'answer_directly': 'local:answers:direct',
-                          'write_file': 'local:files:write'})
+                          'write_file': 'local:files:write',
+                          'make_local_explainer': 'local:video:explainer'})
 
     async def test_kernel_does_not_import_business_packages(self):
         """内核（app/tools.py）不许 import 具体业务能力包——那是一切耦合的源头。"""

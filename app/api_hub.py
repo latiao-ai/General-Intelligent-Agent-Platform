@@ -18,6 +18,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from app.config import settings
 from app.events import action, stage_end, stage_start
@@ -132,6 +133,18 @@ class TaskRecord:
         }
 
 
+def _artifact_view(state: dict) -> dict | None:
+    """把 state 里的产物压成前端够用的形状（不存在就 None）。"""
+    artifact = (state or {}).get('artifact') or {}
+    path = artifact.get('path') or artifact.get('html_path')
+    if not path:
+        return None
+    return {'kind': artifact.get('kind') or 'report',
+            'filename': Path(path).name,
+            'size_bytes': artifact.get('size_bytes'),
+            'exists': Path(path).exists()}
+
+
 class Hub:
     """会话与任务注册表。持久部分在 SQLite，实时部分是进程内的订阅队列。"""
 
@@ -164,18 +177,33 @@ class Hub:
         前端切换会话时用它重建"执行步骤"，否则那些步骤会随页面状态一起丢掉。
         草稿（draft）与逐字增量（answer_delta）本来就不落库，这里自然没有。
         """
-        turns = [{
-            'task_id': task['task_id'],
-            'message': task['message'],
-            # 库里存的是通用状态，回放时按 outcome 派生展示标签
-            'status': outcome_module.label(task['status'],
-                                           task.get('state') or {}),
-            'run_status': outcome_module.normalize_status(task['status']),
-            'created_at': task['created_at'],
-            'events': [event for _, event in await self.store.events(task['task_id'])],
-        } for task in await self.store.session_tasks(session_id)]
+        turns = []
+        live_task_id = ''
+        for task in await self.store.session_tasks(session_id):
+            state = task.get('state') or {}
+            run_status = outcome_module.normalize_status(task['status'])
+            record = self.tasks.get(task['task_id'])
+            live = bool(record is not None and record.live) or run_status in \
+                outcome_module.ACTIVE_RUN_STATUSES
+            if live and not live_task_id:
+                live_task_id = task['task_id']
+            turns.append({
+                'task_id': task['task_id'],
+                'message': task['message'],
+                # 库里存的是通用状态，回放时按 outcome 派生展示标签
+                'status': outcome_module.label(run_status, state),
+                'run_status': run_status,
+                'created_at': task['created_at'],
+                # 产物要能"切回来接着看"：视频/页面路径在这里给前端，
+                # 否则一切会话就再也找不到入口（只有最后一条 finish 时才渲染过）
+                'artifact': _artifact_view(state),
+                'live': live,
+                'events': [event for _, event in await self.store.events(task['task_id'])],
+            })
         return {'session_id': session_id,
                 'messages': await self.store.messages(session_id),
+                # 这个会话里还在跑的任务：前端切回来时要重新接上事件流
+                'live_task_id': live_task_id,
                 'turns': turns}
 
     async def prior_context(self, session_id: str) -> dict:
@@ -488,14 +516,15 @@ class Hub:
                     await self.store.update_step(record.run_id, 1, step_id,
                                            status=step_status)
         artifact = state.get('artifact') or {}
-        if artifact.get('html_path'):
+        artifact_path = artifact.get('path') or artifact.get('html_path')
+        if artifact_path:
             # 产物登记：把文件落成可授权的对象引用，而不是只有一条路径字符串
             await self.store.add_artifact(
                 artifact.get('artifact_id') or f'art_{record.run_id}',
                 run_id=record.run_id,
                 kind=artifact.get('kind') or 'report',
-                storage_key=artifact['html_path'],
-                mime='text/html',
+                storage_key=artifact_path,
+                mime=artifact.get('mime') or 'text/html',
                 size=int(artifact.get('size_bytes') or 0),
                 sha256=artifact.get('sha256') or '')
         fields = {'status': run_status,
