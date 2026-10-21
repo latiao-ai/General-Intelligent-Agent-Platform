@@ -63,6 +63,10 @@ class Server:
     #   tool_name_arg  ：调用时承载内部工具名的参数（如 name / tool_name）
     capability_tool: str = ''
     tool_name_arg: str = ''
+    # 某个工具在本机的特殊用法（例如本地 TTS 要传模型绝对路径）。
+    # 键可以是 MCP 工具名，也可以是 run_tool 的内部工具名。
+    # 这些"本机知识"放在配置里，而不是让模型去猜。
+    tool_hints: dict = field(default_factory=dict)
 
 
 def _legacy_server() -> Server | None:
@@ -139,6 +143,7 @@ def _from_entry(entry: dict) -> Server | None:
         result_url_field=str(entry.get('result_url_field') or '').strip(),
         capability_tool=str(entry.get('capability_tool') or '').strip(),
         tool_name_arg=str(entry.get('tool_name_arg') or '').strip(),
+        tool_hints=dict(entry.get('tool_hints') or {}),
         default=bool(entry.get('default')),
         title=str(entry.get('title') or ''),
     )

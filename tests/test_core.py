@@ -4303,3 +4303,74 @@ class PlannerMistakeGuardTests(unittest.IsolatedAsyncioTestCase):
             outputs)
         self.assertEqual(args['project_id'], 'p-1')
         nodes._check_placeholders(args, '工具')
+
+
+class DependencyDiagnosisTests(unittest.IsolatedAsyncioTestCase):
+    """服务端缺依赖 vs 我们调度错：失败时要能分清并给出下一步。"""
+
+    def test_dependency_signs_are_recognised(self):
+        from app import tools as tool_module
+        note = tool_module._dependency_note('Piper failed (exit 1): ValueError: Unable to find voice: en_US-lessac-medium')
+        self.assertIn('语音模型', note)
+        self.assertIn('ffmpeg', tool_module._dependency_note('FileNotFoundError: ffmpeg: not found'))
+        self.assertEqual(tool_module._dependency_note('项目不存在'), '')
+
+    async def test_business_failure_carries_a_dependency_hint(self):
+        from app import nodes
+        from app import tools as tool_module
+        from app.integrations import mcp_adapter, mcp_servers
+        from app.tools import Tool
+
+        server = mcp_servers.Server(id='montage', transport='streamable_http',
+                                    url='https://a.example/mcp')
+
+        async def fake_call(name, arguments, artifact=None, server=None):
+            raise mcp_adapter.MCPToolFailure(
+                'Piper failed (exit 1): Unable to find voice: en_US-lessac-medium',
+                'E_UNKNOWN')
+
+        tool = Tool('mcp__run_tool', 'MCP·run_tool', '', {'type': 'object'}, None,
+                    tool_key='mcp:montage:run_tool', effect='write',
+                    capability='mcp', server_id='montage')
+        tool = Tool(tool.name, tool.label, tool.description, tool.args,
+                    tool_module._make_mcp_runner('run_tool', server),
+                    tool_key=tool.tool_key, effect=tool.effect,
+                    capability=tool.capability, server_id=tool.server_id)
+        plan = {'steps': [{'tool': 'mcp__run_tool', 'step_id': 's1',
+                           'args': {'name': 'tts_selector', 'inputs': {}}}]}
+        with patch.object(tool_module, 'find_tool', AsyncMock(return_value=tool)), \
+                patch.object(tool_module.mcp_adapter, 'call_tool', fake_call), \
+                patch_all_emits(lambda e: None):
+            result = await nodes.run_step({'plan': plan, 'step_index': 0,
+                                           'user_input': '做个视频'})
+        self.assertEqual(result['status'], 'failed')
+        # 既要服务端原话，也要"这是环境问题"的下一步
+        self.assertIn('Unable to find voice', result['failure'])
+        self.assertIn('语音模型', result['failure'])
+
+    async def test_tool_hints_reach_the_planner_description(self):
+        """本机特有用法（如 TTS 模型绝对路径）由配置提供，不靠模型猜。"""
+        from app import tools as tool_module
+        from app.integrations import mcp_servers
+
+        server = mcp_servers.Server(
+            id='montage', transport='streamable_http', url='https://a.example/mcp',
+            capability_tool='list_capabilities', tool_name_arg='name',
+            tool_hints={'piper_tts': 'model 传 /data/voices/zh.onnx'})
+
+        async def fake_list(_server):
+            return [{'name': 'list_capabilities', 'inputSchema': {'type': 'object'}},
+                    {'name': 'run_tool', 'inputSchema': {'type': 'object'}}]
+
+        async def fake_call(name, arguments, artifact=None, server=None):
+            return {'tools': [{'name': 'piper_tts', 'status': 'ToolStatus.AVAILABLE'}]}
+
+        with patch.object(tool_module.mcp_adapter, 'list_server_tools', fake_list), \
+                patch.object(tool_module.mcp_adapter, 'call_tool', fake_call), \
+                patch.object(tool_module.mcp_servers, 'servers', lambda: [server]):
+            tool_module._MCP_CACHE.update(at=0.0, tools=[], signature=(),
+                                          capabilities={})
+            tools = await tool_module.mcp_tools(force=True)
+        run_tool = next(t for t in tools if t.name.endswith('run_tool'))
+        self.assertIn('/data/voices/zh.onnx', run_tool.description)
+        tool_module._MCP_CACHE['capabilities'] = {}

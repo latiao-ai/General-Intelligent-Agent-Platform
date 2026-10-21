@@ -226,6 +226,17 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
                 line = _capability_line(inner)
                 if line:
                     description = f'{description}；本服务端能力清单 → {line}'
+            hints = getattr(server, 'tool_hints', {}) or {}
+            own_hint = hints.get(item['name'])
+            if own_hint:
+                description = f'{description}；本机用法：{own_hint}'
+            elif inner:
+                # 通用调用工具的 hint：把内部工具的"本机知识"一并带上
+                inner_hints = [f'{name}：{text}' for name, text in hints.items()
+                               if name in inner]
+                if inner_hints:
+                    description = f'{description}；本机用法：' + '；'.join(
+                        inner_hints[:4])
             tools.append(Tool(
                 name, f'MCP·{item["name"]}', description, schema,
                 _make_mcp_runner(item['name'], server),
@@ -379,6 +390,27 @@ _STATE_KEYS = frozenset({'status', 'answer', 'artifact', 'documents', 'plan',
                          'failure', 'step_outputs', 'step_index', 'documents'})
 
 
+# 这些字样说明失败原因是"服务端缺依赖/缺资源"，而不是我们的参数写错。
+# 服务端自检常常报 AVAILABLE（只查命令在不在），真跑起来才炸——所以只能从
+# 失败文本里认出来，并明确告诉用户"这是环境问题，不是调度问题"。
+_DEPENDENCY_SIGNS = (
+    ('unable to find voice', 'Piper 缺语音模型：先 python -m piper.download_voices '
+                             '<voice> --data-dir <目录>，再把 model 传成绝对路径'),
+    ('piper failed', 'Piper 语音合成失败：确认语音模型文件存在且完整'),
+    ('ffmpeg', 'FFmpeg 没装或不在 PATH：brew install ffmpeg'),
+    ('no such file', '服务端缺文件（模型/素材/中间产物）：按它提示的路径补齐后再跑'),
+    ('not installed', '服务端缺依赖：按 install_instructions 安装后重试'),
+)
+
+
+def _dependency_note(text: str) -> str:
+    lowered = (text or '').lower()
+    for needle, note in _DEPENDENCY_SIGNS:
+        if needle in lowered:
+            return note
+    return ''
+
+
 def _unwrap_error(exc: BaseException, depth: int = 0) -> BaseException:
     """拆掉 anyio 任务组包的 ExceptionGroup。
 
@@ -442,8 +474,10 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
                 # 但只取前两行：服务端常把整段 traceback 塞进 message，直接展示
                 # 既看不懂又泄漏内部路径。
                 detail = ' '.join(str(leaf).split())
+                note = _dependency_note(detail)
                 raise ToolError(
-                    f'MCP 工具 {server_tool_name} 失败：{detail[:240]}') from exc
+                    f'MCP 工具 {server_tool_name} 失败：{detail[:240]}'
+                    + (f'｜{note}' if note else '')) from exc
             raise ToolError(
                 f'MCP 工具 {server_tool_name} 调用失败'
                 f'（{_describe_error(exc)}）') from exc

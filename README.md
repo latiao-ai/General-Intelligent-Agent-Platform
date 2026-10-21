@@ -527,6 +527,20 @@ async def save_note(args, state):
 | 调用前 | `name` 不在清单里 → 本地直接失败，报错里带真实可用名字（不再空跑一次远端往返） |
 | 回执 | 服务端回 `status: error` / `code: E_*` → **判为失败**、停下后续依赖步骤，并把服务端原话透到回执里 |
 
+**本机特有用法**（例如本地 TTS 必须传语音模型绝对路径）用 `tool_hints` 交给规划器，
+不用让模型猜：
+
+```jsonc
+{"id": "openmontage", ..., "tool_hints": {
+   "piper_tts": "model 要传语音模型绝对路径（~/.piper-voices/zh_CN-huayan-medium.onnx）"}}
+```
+
+键可以是 MCP 工具名，也可以是 `run_tool` 的内部工具名——后者会被拼到通用调用工具的描述里。
+
+失败时还会区分**"我们调度错了"和"服务端缺依赖"**：错误文本里出现
+`Unable to find voice` / `ffmpeg` / `not installed` 这类字样时，回执会补一句该怎么装。
+服务端自检经常只查"命令在不在"，报 AVAILABLE 但真跑起来才炸——这类只能靠失败文本认。
+
 再加两条硬规则（`MCP_PROMPT_RULES`）：
 
 - **创作内容（剧本/分镜/文案）由模型自己写**，用 `write_file` 落盘；不要假设服务端有
