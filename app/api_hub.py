@@ -29,7 +29,8 @@ from app import outcome as outcome_module
 from app import profile as profile_module
 from app.capabilities import publishing as publishing_capability
 from app.services import is_stop_command
-from app.store import Store, now, open_store
+from app.persistence import open_store
+from app.pg_store import PostgresStore, now
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,7 @@ class TaskRecord:
     task_id: str
     session_id: str
     message: str
-    store: Store
+    store: PostgresStore
     status: str = 'running'
     run_id: str = ''                    # 本次执行尝试的 ID（账本、续跑都挂在它上面）
     artifact_id: str | None = None      # run_task 内部的任务 ID，即产物目录名
@@ -137,7 +138,7 @@ class Hub:
     # 内存里最多留多少个任务记录（查过的历史任务不必永久驻留）
     MAX_CACHED_TASKS = 200
 
-    def __init__(self, store: Store | None = None, *,
+    def __init__(self, store: PostgresStore | None = None, *,
                  owner_id: str | None = None,
                  lease_seconds: float | None = None) -> None:
         # 默认按配置挑实现：DATABASE_URL 有值就是 PostgreSQL

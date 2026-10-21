@@ -7,12 +7,14 @@
 文档 §9.1 要求"正式上线前把 SQL 与业务逻辑隔离为仓储接口，并准备 SQLite 到
 PostgreSQL 的迁移脚本"。这里定义接口，两个实现都满足它：
 
-- `app.store.Store`：SQLite，单机起步用，零额外依赖；
-- `app.pg_store.PostgresStore`：PostgreSQL + 连接池，正式部署用。
+- `app.pg_store.PostgresStore`：PostgreSQL + 异步连接池（**唯一实现**）。
 
-`open_store()` 按 `DATABASE_URL` 前缀挑实现，业务代码不感知；换实现前可以先用
-`check_repository()` 校验方法齐备。两套实现在真实 PG 上有一致性用例
-（`PostgresParityTests`）与连接池并发用例（`PostgresPoolTests`）。
+SQLite 实现已删除：两套实现意味着两套行为、两套测试、两种排障路径，而正式部署
+本来就只有 PostgreSQL。本地开发也直接连本机 PG（`DATABASE_URL`），不再有"开发用
+SQLite、线上用 PG"的分叉。
+
+`open_store()` 在仓储层暴露，业务代码只认 `Repository` 协议；换实现前先用
+`check_repository()` 校验（方法齐备 + 都是协程函数）。
 """
 import inspect
 from typing import Any, Protocol, runtime_checkable
@@ -129,3 +131,21 @@ def check_repository(candidate: object) -> list[str]:
         if inspect.iscoroutinefunction(expected) and not inspect.iscoroutinefunction(actual):
             missing.append(f'{name}（实现不是 async）')
     return sorted(missing)
+
+
+def open_store(database_url: str | None = None):
+    """返回仓储实现（只有 PostgreSQL 一种）。
+
+    `DATABASE_URL` 未配置时直接报错，而不是悄悄退回一个本地文件库——"看起来能跑
+    但数据在别处"是最难查的一类环境问题。
+    """
+    from app.config import settings
+    from app.pg_store import PostgresStore
+
+    url = (settings.database_url if database_url is None else database_url).strip()
+    if not url:
+        raise RuntimeError('未配置 DATABASE_URL。本项目只支持 PostgreSQL，'
+                           '请在 .env 里给出 postgresql://... 连接串')
+    if not url.startswith(('postgresql://', 'postgres://')):
+        raise RuntimeError(f'DATABASE_URL 必须是 PostgreSQL 连接串，当前是 {url[:16]}…')
+    return PostgresStore(url)

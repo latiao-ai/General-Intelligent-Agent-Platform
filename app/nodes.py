@@ -11,11 +11,13 @@
 都由模型按输入决定，而不是写死在图的边里。
 """
 import json
+import re
 import time
 
 from app import context, ledger as ledger_module, outcome as outcome_module, profile
 from app.config import settings
 from app.events import action, emit, stage_end, stage_start, thought
+from app.capabilities.base import ToolError
 from app.schemas import ExecutionPlan
 from app.services import is_small_talk, structured_call, urls_from_input
 from app import tools as tool_module
@@ -36,6 +38,10 @@ PLANNER_SYSTEM = (
     '它会在后续步骤失败时被逆序执行，用来收回已发生的副作用。args 里的值同样'
     '可以用 ref 指向前序输出（比如站点 ID）。清单里没有撤销工具就留空，不要编造。'
     '⑦ 工具清单里的每条规则都来自对应能力包，按它说的选工具，别混用形态相近的。'
+    '⑧ 要用前面步骤的输出时，args 里写**绑定对象**：'
+    '{"ref": {"step_id": "s2", "pointer": "/project_id"}}（pointer 是受限 JSON 指针）。'
+    '绝不能写成 "{{s2.project_id}}" 这类模板字符串——系统不会替你替换它，'
+    '远端只会收到一串字面量然后报"不存在"。字面量直接写值即可。'
     'profile_updates：只填**本轮用户新说出、且画像里还没有（或已变化）**的个人信息'
     '（姓名、电话、邮箱、职业、偏好、习惯等），键用中文（如"电话"）。'
     '系统提示末端的「[用户画像]」段里已经出现过的事实，一律不要再填一遍——'
@@ -175,6 +181,24 @@ def _valid_steps(raw_steps: list[dict], catalog) -> tuple[list[dict], list[str]]
     return steps, dropped
 
 
+_PLACEHOLDER = re.compile(r'\{\{.*?\}\}')
+
+
+def _check_placeholders(args: dict, tool_label: str) -> None:
+    """参数里还留着 `{{s2.project_id}}` 这种模板 = 规划器没按绑定语法写。
+
+    真踩过：模型把跨步骤引用写成 `"project_id": "{{s2.project_id}}"`，服务端拿到
+    字面量后报"项目不存在"，而错误看起来像服务端的问题。这里在执行前就拦住，
+    并直接告诉它正确写法。
+    """
+    for key, value in (args or {}).items():
+        if isinstance(value, str) and _PLACEHOLDER.search(value):
+            raise ToolError(
+                f'{tool_label} 的参数 {key} 还是未解析的占位符 {value!r}。'
+                f'跨步骤取值请写成 {{"ref": {{"step_id": "s2", '
+                f'"pointer": "/project_id"}}}}，不要写字面模板')
+
+
 def resolve_inputs(step: dict, outputs: dict) -> dict:
     """把步骤输入里的 ref 绑定解析成真实值（文档 §6.2）。
 
@@ -196,6 +220,14 @@ def resolve_inputs(step: dict, outputs: dict) -> dict:
                 else:
                     resolved = None
                     break
+            if resolved is None:
+                # 解析不到就别把 None 喂给远端：服务端只会报一句
+                # "None is not of type string"，看不出是 planner 写错了引用
+                available = [k for k in (source or {}) if k != '__status__']
+                raise ToolError(
+                    f'步骤 {step.get("step_id")} 的参数 {key} 引用不到值：'
+                    f'{ref.get("step_id")} 的 {ref.get("pointer")} 不存在。'
+                    f'该步骤实际可用的字段：{", ".join(available) or "（空）"}')
             args[key] = resolved
         elif 'literal' in value:
             args[key] = value['literal']
@@ -463,6 +495,17 @@ async def run_step(state):
     emit(stage_start(name, tool.label))
     started = time.perf_counter()
     args = resolve_inputs(step, outputs)
+    try:
+        _check_placeholders(args, tool.label)
+    except Exception as exc:                       # noqa: BLE001
+        # 参数本身就不成立：不必打扰远端，直接当这一步失败（后续依赖不再执行）
+        emit(stage_end(name, time.perf_counter() - started, '失败', tool.label))
+        hint = getattr(exc, 'safe_message', None) or type(exc).__name__
+        emit(action(f'{tool.label}失败', hint, '⚠️'))
+        outputs[step_id] = {'__status__': 'failed'}
+        return {'step_index': len(steps), 'step_label': tool.label,
+                'step_outputs': outputs, 'status': 'failed',
+                'failure': f'{tool.label}失败：{hint}'}
 
     # 账本：调用之前先落 prepared / in_flight，回来再改。崩溃窗口才有据可查。
     book = ledger_module.current_ledger()

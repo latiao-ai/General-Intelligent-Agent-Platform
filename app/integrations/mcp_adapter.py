@@ -155,22 +155,92 @@ async def list_server_tools(server=None):
             } for t in tools]
 
 
+class MCPToolFailure(RuntimeError):
+    """MCP 调用在**业务层**失败：服务端回了 `status: error` 这类结构化失败。
+
+    很多 MCP 服务端不用协议层的 `isError`，而是正常返回一条
+    `{"status": "error", "code": "E_...", "message": "..."}`——把它当成功继续
+    往下走，就会出现"一路显示完成、最后什么也没有"。所以这里必须在拿到回执
+    的那一刻就判失败。
+    """
+
+    def __init__(self, message: str, code: str = '') -> None:
+        # 错误码必须出现在文案里：用户看到的就这一句，丢码等于丢掉唯一线索
+        if code and code not in message:
+            message = f'{message}（{code}）'
+        super().__init__(message)
+        self.code = code
+        self.safe_message = message
+
+
+# 服务端用来表示"这次调用失败"的状态词（各家说法不一，都收）
+FAILURE_STATUSES = frozenset({'error', 'failed', 'failure', 'errored', 'fatal'})
+
+
+def failure_of(payload) -> str:
+    """回执里的业务失败信息；成功就返回空串。
+
+    只认**明确**的失败信号：`status` 是失败词、`ok/success` 为 False、
+    或者 `error` 字段有内容。没有这些信号就按成功处理——不猜。
+    """
+    if not isinstance(payload, dict):
+        return ''
+    status = str(payload.get('status') or '').strip().lower()
+    code = str(payload.get('code') or '').strip()
+    if status in FAILURE_STATUSES:
+        detail = payload.get('message') or payload.get('error') or '服务端返回失败'
+        return f'{detail}' + (f'（{code}）' if code else '')
+    if code.startswith('E_') and status in {'', 'error'}:
+        return f'{payload.get("message") or code}（{code}）'
+    for flag in ('ok', 'success'):
+        if flag in payload and payload[flag] is False:
+            return str(payload.get('message') or f'{flag}=false')
+    error = payload.get('error')
+    if error:
+        if isinstance(error, dict):
+            error = error.get('message') or error.get('code') or '服务端返回 error'
+        return str(error)
+    return ''
+
+
+def summarize(payload, limit: int = 120) -> str:
+    """回执的一句话摘要，给事件流看。失败优先，其次取有意义的字段。"""
+    failed = failure_of(payload)
+    if failed:
+        return f'失败：{failed}'[:limit]
+    if not isinstance(payload, dict):
+        return json.dumps(payload, ensure_ascii=False, default=str)[:limit]
+    for key in ('status', 'job_id', 'project_id', 'site_id', 'public_url',
+                'url', 'path', 'output_path'):
+        value = payload.get(key)
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return f'{key}={value}'[:limit]
+    keys = ', '.join(list(payload)[:6])
+    return f'返回 {keys}'[:limit]
+
+
 def result_payload(result):
     if getattr(result, 'isError', False):
         # 不将可能包含内部信息的服务端报错内容直接送到页面。
         raise RuntimeError('MCP 工具返回 isError，请在服务端查看日志')
     payload = getattr(result, 'structuredContent', None)
-    if payload is not None:
-        return payload
-    for block in result.content:
-        if getattr(block, 'type', None) == 'text':
-            try:
-                value = json.loads(block.text)
-                if isinstance(value, dict):
-                    return value
-            except (ValueError, TypeError):
-                continue
-    raise RuntimeError('未找到 JSON 部署结果，请按真实返回格式修改 result_payload')
+    if payload is None:
+        for block in result.content:
+            if getattr(block, 'type', None) == 'text':
+                try:
+                    value = json.loads(block.text)
+                    if isinstance(value, dict):
+                        payload = value
+                        break
+                except (ValueError, TypeError):
+                    continue
+    if payload is None:
+        raise RuntimeError('未找到 JSON 结果，请按真实返回格式修改 result_payload')
+    # 协议层成功 ≠ 业务成功：服务端可能正常返回一条 status:error
+    failed = failure_of(payload)
+    if failed:
+        raise MCPToolFailure(failed, str(payload.get('code') or ''))
+    return payload
 
 
 def dotted_get(payload, key):

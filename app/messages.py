@@ -56,9 +56,11 @@ def reply_text(state: dict) -> str:
 
     if status == 'failed':
         reason = state.get('failure')
+        made = _produced_files(state)
+        tail = f'本次已产出：{made}。' if made else ''
         if reason:
-            return f'本次未完成：{reason}。可换个更具体的说法再试。'
-        return '本次没有产出可用结果。可换个更具体的说法再试。'
+            return f'本次未完成：{reason}。{tail}可换个更具体的说法再试。'
+        return f'{tail}本次没有产出可用结果。可换个更具体的说法再试。'
 
     if status in ('waiting_input', 'waiting_approval'):
         # 计划没过校验就停下来等人补信息——不能说"任务结束"了事
@@ -70,6 +72,18 @@ def reply_text(state: dict) -> str:
     if status == 'interrupted':
         return '执行中断了（执行者与任务的连接断开）。可重新发起一次。'
     return f'任务结束，状态：{status}'
+
+
+def _produced_files(state: dict) -> str:
+    """本轮写出来的文件（write_file 的产物），失败时也要说清楚做到哪了。"""
+    names = []
+    for output in (state.get('step_outputs') or {}).values():
+        if not isinstance(output, dict):
+            continue
+        written = output.get('written') or {}
+        if isinstance(written, dict) and written.get('relative'):
+            names.append(str(written['relative']))
+    return '、'.join(names[:5])
 
 
 def cancel_note(artifact_id: str | None) -> str:

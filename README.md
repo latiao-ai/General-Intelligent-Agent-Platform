@@ -78,10 +78,11 @@ python --version             # Python 3.12.15
 | `MCP_URL` / `MCP_BEARER_TOKEN` | 远端 MCP 部署服务地址与鉴权 |
 | `MCP_TOOL_NAME` | 部署工具名（当前远端为 `deploy_site`） |
 | `MCP_EXTRA_ARGS` | 额外入参，如 `{"ttl":"7d"}` 控制站点有效期 |
-| `MCP_SERVERS` | **多服务端**：JSON 数组，每项 `{id, transport, url, token, deploy_tool, default}`；设置后不再读上面的单项 `MCP_*` |
+| `MCP_SERVERS` | **多服务端**：JSON 数组，每项 `{id, transport, url, token, deploy_tool, default, capability_tool, tool_name_arg}`；设置后不再读上面的单项 `MCP_*` |
+| `capability_tool` | 服务端的"能力清单"工具名（如 `list_capabilities`）。有些服务端把动作藏在一个通用 `run_tool` 后面，配上它才能在规划前读到**真实内部工具名**，并在调用前校验 |
+| `tool_name_arg` | 那个通用调用工具里承载内部工具名的参数名（如 `name`） |
 | `IDEMPOTENCY_TTL_SECONDS` | 创建任务幂等键的有效期，默认 86400（24 小时） |
-| `DATABASE_URL` | 数据库连接串；填 `postgresql://…` 用 PostgreSQL，**留空回落 SQLite** |
-| `DB_PATH` | 仅 SQLite 模式下的文件名，默认 `agent.db` |
+| `DATABASE_URL` | **必填**，PostgreSQL 连接串（`postgresql://…`）。SQLite 实现已删除，留空直接报错 |
 | `DB_POOL_SIZE` | PostgreSQL 连接池上限，默认 4（别超过服务端 `max_connections` ÷ 副本数） |
 | `DB_POOL_TIMEOUT` | 从池里借连接的等待上限（秒），默认 10；等不到就报错，不会无限期挂住请求 |
 | `PROFILE_PATH` | 用户画像文件，默认 `profile/USER.md`（见 3.1.2） |
@@ -507,7 +508,32 @@ async def save_note(args, state):
 | 本地能力包 | `app/capabilities/*.py` 里的 `@tool` | import 即注册（静态） | `local:<能力>:<动作>` |
 | 远端 MCP 工具 | MCP 服务端 | 运行时发现（有 TTL、掉线、前缀） | `mcp:<server>:<tool>` |
 
-## 6. 部署行为
+## 6. 通用调用型 MCP 服务端（run_tool 形态）
+
+有些服务端只暴露一个 `run_tool`，真正的动作名放在参数里（`run_tool(name="tts_selector")`）。
+这种服务端必须多配两项，否则模型只能**猜**内部工具名：
+
+```jsonc
+{"id": "openmontage", "transport": "stdio", ...,
+ "capability_tool": "list_capabilities",   // 清单工具
+ "tool_name_arg": "name"}                  // 内部工具名参数
+```
+
+配上之后有三层保护：
+
+| 层 | 行为 |
+|---|---|
+| 发现（规划前） | 顺带调用清单工具，把**真实内部工具名 + 可用状态**写进 `run_tool`/`list_capabilities` 的工具描述里，规划器看得到 |
+| 调用前 | `name` 不在清单里 → 本地直接失败，报错里带真实可用名字（不再空跑一次远端往返） |
+| 回执 | 服务端回 `status: error` / `code: E_*` → **判为失败**、停下后续依赖步骤，并把服务端原话透到回执里 |
+
+再加两条硬规则（`MCP_PROMPT_RULES`）：
+
+- **创作内容（剧本/分镜/文案）由模型自己写**，用 `write_file` 落盘；不要假设服务端有
+  "生成脚本/分镜"的接口——多数服务端只提供执行动作。
+- **封装型执行工具**（如 `render_video`）也依赖内部工具，调度前先看清单里它们是否可用。
+
+## 7. 部署行为
 
 ```
 DEPLOY_ENABLED=false            → 清单里没有 deploy_site（连占位都没有）
@@ -534,7 +560,7 @@ python -m scripts.retry_deploy <task_id> --server-state-checked
 python -m scripts.list_mcp_tools
 ```
 
-## 7. 耗时统计
+## 8. 耗时统计
 
 每个节点的耗时写入 `state.json` 的 `timings` 与 `elapsed_seconds`（CLI 打印汇总表），
 节点包装层同时发出 `stage_start` / `stage_end` 事件供界面实时累加。
@@ -567,13 +593,24 @@ python -m scripts.list_mcp_tools
 代理/CONNECT 不可用时，**所有模型与检索调用**会报 `APIConnectionError` /
 `ConnectError`。DeepSeek 官方接口与 MCP 服务端都走网络，排查时先用 `curl` 直连确认。
 
-## 8. 测试
+## 9. 测试
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-210 条用例（6 条真实 PostgreSQL 一致性用例需 `PG_TEST_DSN`）。
+**233 条用例**。项目只支持 PostgreSQL，用例也直接跑真实 PG（每个用例前 TRUNCATE）：
+
+```bash
+PG_TEST_DSN=postgresql://…/agent_platform_test python -m unittest tests.test_core
+```
+
+没有 `PG_TEST_DSN` 时数据库相关用例会逐条跳过（不会静默退回 SQLite——已经没有那个实现）。
+
+覆盖：URL 安全校验、HTML 自动转义、无正文禁止导出、部署闸门与回执归一、结构化输出重试、
+MCP 参数组装（base64）、多服务端路由与失败隔离、**MCP 业务失败识别 / 内部工具名校验 /
+创作内容落盘 / 未解析占位符拦截**、阶段事件与实时计时、PostgreSQL 仓储一致性与连接池并发、
+任务中枢、HTTP 接口与 SSE 事件流、助手回执文案、状态机词汇封闭与 outcome 派生、能力包注册化。
 
 覆盖：URL 安全校验、引用存在性、HTML 自动转义、无正文禁止导出、部署闸门与回执归一、
 结构化输出重试、MCP 参数组装（base64）、多服务端路由与失败隔离、阶段事件与实时计时、

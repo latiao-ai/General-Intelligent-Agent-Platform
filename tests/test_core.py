@@ -19,6 +19,34 @@ from app import nodes
 
 from contextlib import ExitStack
 
+# 项目只支持 PostgreSQL，测试也跟着只跑 PG：没有 PG_TEST_DSN 就逐条跳过。
+PG_DSN = os.getenv('PG_TEST_DSN', '')
+TEST_TABLES = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
+               'action_attempts', 'actions', 'steps', 'plans', 'runs',
+               'tasks_meta', 'events', 'tasks', 'session_memory',
+               'session_summaries', 'messages', 'sessions', 'request_keys')
+
+
+def new_store():
+    """测试用仓储：真实 PostgreSQL（库名必须含 test，用例会 TRUNCATE）。"""
+    if not PG_DSN:
+        raise unittest.SkipTest('需要 PG_TEST_DSN（项目已不再支持 SQLite）')
+    if 'test' not in PG_DSN:
+        raise unittest.SkipTest('PG_TEST_DSN 必须指向一次性测试库（库名含 test）')
+    from app.pg_store import PostgresStore
+    return PostgresStore(PG_DSN)
+
+
+async def reset_db() -> None:
+    """清空全部业务表，让每个用例互不影响（以前靠 SQLite :memory: 隔离）。"""
+    store = new_store()
+    try:
+        async with store._lease() as conn:
+            for table in TEST_TABLES:
+                await conn.execute(f'TRUNCATE TABLE {table} CASCADE')
+    finally:
+        await store.close()
+
 
 def patch_all_emits(sink):
     """能力包各自持有 emit 引用，测试里需要一起打桩。"""
@@ -390,6 +418,10 @@ class ContextBuilderTests(unittest.TestCase):
 class SessionMemoryTests(unittest.IsolatedAsyncioTestCase):
     """P2：滚动摘要 + 关键事实。"""
 
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
+
     async def test_parse_and_render_facts(self):
         from app import memory
         self.assertEqual(memory.parse_facts('目标：减脂\n- 已否决: 节食\n\n'),
@@ -408,8 +440,7 @@ class SessionMemoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_compact_folds_old_messages_into_summary(self):
         from app import memory
         from app.schemas import SessionMemory
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         for i in range(memory.MAX_MESSAGES + 4):
             await store.append_message('s1', 'user' if i % 2 == 0 else 'assistant',
                                  f'第{i}条消息')
@@ -430,8 +461,7 @@ class SessionMemoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_compact_failure_is_silent(self):
         from app import memory
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         for i in range(memory.MAX_MESSAGES + 4):
             await store.append_message('s1', 'user', f'第{i}条')
 
@@ -631,13 +661,16 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 class ActionLedgerTests(unittest.IsolatedAsyncioTestCase):
     """动作账本：已成功不重发、结果不确定不重试（文档 §8）。"""
 
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
+
     def ledger(self, store):
         from app.ledger import ActionLedger
         return ActionLedger(store, 'run1', 1)
 
     async def test_succeeded_action_is_replayed_not_resent(self):
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         book = self.ledger(store)
         first = await book.begin(step_id='s1', tool_key='local:publishing:deploy',
                            effect='write', args={'a': 1})
@@ -654,8 +687,7 @@ class ActionLedgerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(await store.attempts_of(first['action_id'])), 1)
 
     async def test_changed_args_is_a_different_action(self):
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         book = self.ledger(store)
         a = await book.begin(step_id='s1', tool_key='t', effect='write', args={'a': 1})
         b = await book.begin(step_id='s1', tool_key='t', effect='write', args={'a': 2})
@@ -663,8 +695,7 @@ class ActionLedgerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_result_blocks_blind_retry(self):
         """结果不确定时不能当成失败去重发，也不能当成功复用。"""
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         book = self.ledger(store)
         first = await book.begin(step_id='s1', tool_key='mcp:publishing:deploy_site',
                            effect='write', args={})
@@ -677,8 +708,7 @@ class ActionLedgerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await store.action(first['action_id']))['status'], 'unknown')
 
     async def test_failure_records_error_type(self):
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         book = self.ledger(store)
         first = await book.begin(step_id='s1', tool_key='t', effect='read', args={})
         attempt = await book.in_flight(first['action_id'])
@@ -695,9 +725,12 @@ class ActionLedgerTests(unittest.IsolatedAsyncioTestCase):
 class RunLeaseTests(unittest.IsolatedAsyncioTestCase):
     """租约与 fencing：两个 Worker 抢同一个 run，只有一个能领到。"""
 
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
+
     async def test_claim_is_exclusive_and_epoch_increments(self):
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         await store.create_run('run1', 'task1')
         first = await store.claim_run('w1', lease_seconds=30)
         self.assertEqual(first['run_id'], 'run1')
@@ -710,8 +743,7 @@ class RunLeaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await store.renew_lease('run1', 'w1'))
 
     async def test_jobs_are_deduped(self):
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         self.assertTrue(await store.enqueue_job('j1', 'summary', 'sess:1'))
         self.assertFalse(await store.enqueue_job('j2', 'summary', 'sess:1'))
 
@@ -754,9 +786,12 @@ class ContextBudgetTests(unittest.TestCase):
 class MemoryScopeTests(unittest.IsolatedAsyncioTestCase):
     """长期记忆：作用域、版本替代、遗忘墓碑（文档 §12）。"""
 
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
+
     def store(self):
-        from app.store import Store
-        return Store(':memory:')
+        return new_store()
 
     async def test_value_update_supersedes_previous(self):
         store = self.store()
@@ -801,7 +836,8 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
         from app import tools as tool_module
         self.assertEqual(sorted(tool_module.BUILTIN_BY_NAME),
                          ['answer_directly', 'answer_with_sources',
-                          'fetch_pages', 'render_sources_html', 'web_search'])
+                          'fetch_pages', 'render_sources_html', 'web_search',
+                          'write_file'])
         keys = {name: tool.tool_key
                 for name, tool in tool_module.BUILTIN_BY_NAME.items()}
         self.assertEqual(keys['web_search'], 'local:web:search')
@@ -911,11 +947,20 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args, {'artifact_id': 'art_1', 'title': '活动页',
                                 'plain': 'as-is'})
 
-    async def test_missing_binding_resolves_to_none(self):
+    async def test_missing_binding_fails_instead_of_feeding_none(self):
+        """引用解析不到就报错——把 None 喂给远端只会换来一句看不出来的 400。"""
         from app import nodes
+        from app.capabilities.base import ToolError
+        with self.assertRaises(ToolError) as ctx:
+            nodes.resolve_inputs(
+                {'step_id': 's9',
+                 'args': {'x': {'ref': {'step_id': 'nope', 'pointer': '/a'}}}}, {})
+        self.assertIn('引用不到值', ctx.exception.safe_message)
+        # 字段存在就能正常解析
         args = nodes.resolve_inputs(
-            {'args': {'x': {'ref': {'step_id': 'nope', 'pointer': '/a'}}}}, {})
-        self.assertIsNone(args['x'])
+            {'args': {'x': {'ref': {'step_id': 's1', 'pointer': '/a'}}}},
+            {'s1': {'a': 'ok'}})
+        self.assertEqual(args['x'], 'ok')
 
     async def test_run_step_blocks_when_dependency_not_succeeded(self):
         from app import nodes
@@ -1163,10 +1208,13 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
 class StoreTests(unittest.IsolatedAsyncioTestCase):
     """SQLite 持久化层。"""
 
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
+
     @staticmethod
     def store():
-        from app.store import Store
-        return Store(':memory:')
+        return new_store()
 
     async def test_messages_roundtrip(self):
         store = self.store()
@@ -1219,14 +1267,13 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored[1][1]['label'], 'e1')
 
     async def test_orphan_running_task_marked_interrupted_on_reopen(self):
-        from app.store import Store
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'agent.db'
-            first = Store(path)
+            first = new_store()
             await first.create_task('t1', 's1', '中断前的任务')
             await first.close()
             # 重新打开：遗留的 running 任务必须被标记，否则前端会一直等下去。
-            second = Store(path)
+            second = new_store()
             self.assertEqual((await second.task('t1'))['status'], 'interrupted')
             self.assertEqual(second.interrupted, 1)
             await second.close()
@@ -1238,11 +1285,14 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
 class HubTests(unittest.IsolatedAsyncioTestCase):
     """任务中枢：事件广播、多轮历史、取消、重启恢复。"""
 
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
+
     @staticmethod
     def hub():
         from app.api_hub import Hub
-        from app.store import Store
-        return Hub(Store(':memory:'))
+        return Hub(new_store())
 
     @staticmethod
     async def events_of(record):
@@ -1302,16 +1352,15 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         """模拟进程重启：新 Hub 打开同一个库，应能查到旧任务并补发事件。"""
         import app.api_hub as hub_module
         from app.api_hub import Hub
-        from app.store import Store
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'agent.db'
-            first = Hub(Store(path))
+            first = Hub(new_store())
             with patch.object(hub_module, 'run_task', self.stub()):
                 record = await first.start('老任务')
                 await asyncio.wait_for(record._task, timeout=10)
             await first.store.close()
 
-            second = Hub(Store(path))
+            second = Hub(new_store())
             restored = await second.get(record.task_id)
             self.assertIsNotNone(restored)
             self.assertEqual(restored.status, 'succeeded')
@@ -1578,10 +1627,13 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
 class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
     """run 生命周期与断点续跑（文档 §7、§8）。"""
 
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
+
     def hub(self):
         from app.api_hub import Hub
-        from app.store import Store
-        return Hub(Store(':memory:'))
+        return Hub(new_store())
 
     async def test_finishing_a_run_persists_plan_and_steps(self):
         import app.api_hub as hub_module
@@ -1663,10 +1715,9 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         from app import nodes
         from app import tools as tool_module
         from app.ledger import ActionLedger, use_ledger
-        from app.store import Store
         from app.tools import Tool
 
-        store = Store(':memory:')
+        store = new_store()
         book = ActionLedger(store, 'run1', 1)
         first = await book.begin(step_id='s1', tool_key='local:publishing:deploy',
                            effect='write', args={})
@@ -1726,10 +1777,13 @@ class PolicyTests(unittest.TestCase):
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
     """独立 Worker：领取租约、消费 outbox。"""
 
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
+
     def hub(self):
         from app.api_hub import Hub
-        from app.store import Store
-        return Hub(Store(':memory:'))
+        return Hub(new_store())
 
     async def test_worker_claims_and_reports_nothing_to_do(self):
         from scripts.run_worker import run_once
@@ -1886,10 +1940,13 @@ class PostgresParityTests(unittest.IsolatedAsyncioTestCase):
 class RepositoryContractTests(unittest.TestCase):
     """仓储接口：换实现前先保证方法齐备（文档 §9.1）。"""
 
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
+
     def test_sqlite_store_satisfies_repository_protocol(self):
         from app.persistence import Repository, check_repository
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         self.assertEqual(check_repository(store), [])
         self.assertIsInstance(store, Repository)
 
@@ -1902,37 +1959,25 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn('claim_run', check_repository(Partial()))
 
 
-class PostgresMigrationTests(unittest.TestCase):
-    """迁移脚本：DDL 翻译正确（**未在真实 PostgreSQL 上验证**）。"""
-
-    def test_ddl_translation(self):
-        from app.store import SCHEMA
-        from scripts.migrate_to_postgres import to_postgres_ddl
-        ddl = to_postgres_ddl(SCHEMA)
-        self.assertIn('BIGSERIAL PRIMARY KEY', ddl)
-        self.assertIn('DOUBLE PRECISION', ddl)
-        self.assertNotIn('AUTOINCREMENT', ddl)
-
-
 class ApiTests(unittest.IsolatedAsyncioTestCase):
     """HTTP 接口与 SSE 端点。"""
 
     async def asyncSetUp(self):
-        from fastapi.testclient import TestClient
+        await reset_db()
+        import httpx
         import app.api as api_module
         from app.api_hub import Hub
-        from app.store import Store
         # 每个测试用独立的内存库：互不污染，也不去碰真实的 agent.db
-        api_module.hub = Hub(Store(':memory:'))
+        api_module.hub = Hub(new_store())
         self.api_module = api_module
-        # 用上下文方式持有 TestClient：它只起**一条**事件循环并跑完 lifespan。
-        # 直接 new 一个的话每个请求各起一条循环，请求结束就把循环里的后台任务
-        # 取消掉——SSE 用例会一直等在 queue.get() 上。
-        self.client = TestClient(api_module.app)
-        self.client.__enter__()
+        # 用 ASGITransport 在**当前**事件循环里发请求。TestClient 会为每个请求
+        # 另起一条循环，而仓储/连接池是绑循环的，两边共用必然挂死。
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_module.app),
+            base_url='http://test')
 
     async def asyncTearDown(self):
-        self.client.__exit__(None, None, None)
+        await self.client.aclose()
 
     async def _wait_settled(self, task_id: str, timeout: float = 5.0):
         """等任务落定（完成/取消/失败都算）。
@@ -1949,7 +1994,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         return await self.api_module.hub.get(task_id)
 
     async def test_index_serves_chat_ui(self):
-        res = self.client.get('/')
+        res = await self.client.get('/')
         self.assertEqual(res.status_code, 200)
         self.assertIn('智能体执行过程', res.text)
         self.assertIn('EventSource', res.text)
@@ -1967,9 +2012,9 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('(e.metaKey || e.ctrlKey)', res.text)
 
     async def test_unknown_task_returns_404(self):
-        self.assertEqual(self.client.get('/api/tasks/nope').status_code, 404)
-        self.assertEqual(self.client.post('/api/tasks/nope/cancel').status_code, 404)
-        self.assertEqual(self.client.get('/api/tasks/nope/artifact').status_code, 404)
+        self.assertEqual((await self.client.get('/api/tasks/nope')).status_code, 404)
+        self.assertEqual((await self.client.post('/api/tasks/nope/cancel')).status_code, 404)
+        self.assertEqual((await self.client.get('/api/tasks/nope/artifact')).status_code, 404)
 
     async def test_create_task_streams_events_and_ends(self):
         import app.api_hub as hub_module
@@ -1986,14 +2031,14 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                     'deployment': {'status': 'skipped'}, 'timings': []}
 
         with patch.object(hub_module, 'run_task', fake_run_task):
-            res = self.client.post('/api/tasks', json={'message': '测试'})
+            res = await self.client.post('/api/tasks', json={'message': '测试'})
             self.assertEqual(res.status_code, 200)
             payload = res.json()
             self.assertTrue(payload['task_id'] and payload['session_id'])
             await self._wait_settled(payload['task_id'])
-            with self.client.stream(
+            async with self.client.stream(
                     'GET', f"/api/tasks/{payload['task_id']}/events") as stream:
-                body = ''.join(stream.iter_text())
+                body = ''.join([chunk async for chunk in stream.aiter_text()])
         # 过程事件与结束标记都要通过 SSE 送达。
         self.assertIn('已搜索网页', body)
         self.assertIn('SQLite 适用场景', body)
@@ -2029,9 +2074,9 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                     'timings': []}
 
         with patch.object(hub_module, 'run_task', fake_run_task):
-            created = self.client.post('/api/tasks', json={'message': '你好'}).json()
-        messages = self.client.get(
-            f"/api/sessions/{created['session_id']}/messages").json()['messages']
+            created = (await self.client.post('/api/tasks', json={'message': '你好'})).json()
+        messages = (await self.client.get(
+            f"/api/sessions/{created['session_id']}/messages")).json()['messages']
         self.assertEqual(messages[0]['role'], 'user')
         self.assertEqual(messages[0]['content'], '你好')
 
@@ -2056,7 +2101,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                     'timings': []}
 
         with patch.object(hub_module, 'run_task', fake_run_task):
-            created = self.client.post('/api/tasks', json={'message': '查一下'}).json()
+            created = (await self.client.post('/api/tasks', json={'message': '查一下'})).json()
             record = await self.api_module.hub.get(created['task_id'])
             for _ in range(100):          # 后台任务跑完再取，事件才都落库
                 if record.done:
@@ -2064,8 +2109,8 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0.02)
         self.assertTrue(record.done, '假任务应当在超时前结束')
 
-        data = self.client.get(
-            f"/api/sessions/{created['session_id']}/timeline").json()
+        data = (await self.client.get(
+            f"/api/sessions/{created['session_id']}/timeline")).json()
         self.assertEqual(data['messages'][0]['content'], '查一下')
         self.assertEqual(len(data['turns']), 1)
         turn = data['turns'][0]
@@ -2089,12 +2134,12 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                               SimpleNamespace(profile_path=path)):
                 profile.merge({'身高': '173cm', '体重': '50kg'})
 
-                got = self.client.get('/api/profile').json()
+                got = (await self.client.get('/api/profile')).json()
                 self.assertEqual(got['facts'], {'身高': '173cm', '体重': '50kg'})
                 self.assertIn('身高', got['text'])
 
                 # 整体覆盖：改一条、加一条、删一条
-                res = self.client.put('/api/profile', json={'text':
+                res = await self.client.put('/api/profile', json={'text':
                     '身高：174cm\n饮食：低糖\n'})
                 self.assertEqual(res.status_code, 200)
                 self.assertEqual(res.json()['facts'],
@@ -2102,7 +2147,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(profile.load(), {'身高': '174cm', '饮食': '低糖'})
 
                 # 清空要留 .bak，手滑也能捞回来
-                self.client.delete('/api/profile')
+                await self.client.delete('/api/profile')
                 self.assertEqual(profile.load(), {})
                 backup = Path(str(path) + '.bak')
                 self.assertTrue(backup.exists())
@@ -2110,7 +2155,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_profile_rejects_oversized_text(self):
         self.assertEqual(
-            self.client.put('/api/profile', json={'text': 'x' * 20001}).status_code,
+            (await self.client.put('/api/profile', json={'text': 'x' * 20001})).status_code,
             422)
 
     async def test_artifact_endpoint_serves_whatever_was_produced(self):
@@ -2131,13 +2176,13 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
                                      'html_path': str(sources_html)}}
 
             with patch.object(hub_module, 'run_task', fake_run_task):
-                created = self.client.post('/api/tasks', json={'message': '存成网页'}).json()
+                created = (await self.client.post('/api/tasks', json={'message': '存成网页'})).json()
                 record = await self.api_module.hub.get(created['task_id'])
                 for _ in range(100):
                     if record.done:
                         break
                     await asyncio.sleep(0.02)
-            res = self.client.get(f"/api/tasks/{created['task_id']}/artifact")
+            res = await self.client.get(f"/api/tasks/{created['task_id']}/artifact")
         self.assertEqual(res.status_code, 200)
         self.assertIn('资料页', res.text)
 
@@ -2146,25 +2191,24 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         hub = self.api_module.hub
         await hub.store.append_message('s1', 'user', '你好')
 
-        empty = self.client.get('/api/sessions/s1/memory').json()
+        empty = (await self.client.get('/api/sessions/s1/memory')).json()
         self.assertEqual(empty['summary'], '')
         self.assertEqual(empty['facts'], {})
 
-        saved = self.client.put('/api/sessions/s1/memory', json={
-            'summary': '用户在减脂', 'facts': '目标：降到15%\n已否决：节食'}).json()
+        saved = (await self.client.put('/api/sessions/s1/memory', json={
+            'summary': '用户在减脂', 'facts': '目标：降到15%\n已否决：节食'})).json()
         self.assertEqual(saved['facts'], {'目标': '降到15%', '已否决': '节食'})
 
-        got = self.client.get('/api/sessions/s1/memory').json()
+        got = (await self.client.get('/api/sessions/s1/memory')).json()
         self.assertEqual(got['summary'], '用户在减脂')
         self.assertIn('目标：降到15%', got['facts_text'])
 
-        self.client.delete('/api/sessions/s1/memory')
-        self.assertEqual(self.client.get('/api/sessions/s1/memory').json()['summary'], '')
+        await self.client.delete('/api/sessions/s1/memory')
+        self.assertEqual((await self.client.get('/api/sessions/s1/memory')).json()['summary'], '')
 
     async def test_session_timeline_orders_turns_oldest_first(self):
         """回放必须按发生顺序，否则步骤看起来是倒着走的。"""
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         await store.append_message('s1', 'user', '第一问')
         await store.create_task('t1', 's1', '第一问')
         await store.append_message('s1', 'user', '第二问')
@@ -2828,11 +2872,14 @@ class ExecutionPathTests(unittest.IsolatedAsyncioTestCase):
     写操作会真的建出第二个站点，模型费用也会翻倍。
     """
 
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
+
     @staticmethod
     def hub(store=None):
         from app.api_hub import Hub
-        from app.store import Store
-        return Hub(store if store is not None else Store(':memory:'))
+        return Hub(store if store is not None else new_store())
 
     @staticmethod
     def stub(delay=0.0, status='local_ready'):
@@ -2894,10 +2941,9 @@ class ExecutionPathTests(unittest.IsolatedAsyncioTestCase):
     async def test_resume_works_after_restart(self):
         """杀进程 → 新 Hub → 续跑：resume 必须回库，而不是只查内存。"""
         import app.api_hub as hub_module
-        from app.store import Store
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'a.db'
-            first = self.hub(Store(path))
+            first = self.hub(new_store())
             with patch.object(hub_module, 'run_task', self.stub()):
                 record = await first.start('第一次')
                 await asyncio.wait_for(record._task, timeout=5)
@@ -2910,7 +2956,7 @@ class ExecutionPathTests(unittest.IsolatedAsyncioTestCase):
             task_id, run_id = record.task_id, record.run_id
             await first.store.close()
 
-            second = self.hub(Store(path))
+            second = self.hub(new_store())
             seen = {}
 
             async def fake(text, progress=None, on_event=None, history=None,
@@ -2935,10 +2981,13 @@ class ExecutionPathTests(unittest.IsolatedAsyncioTestCase):
 class BackendJobTests(unittest.IsolatedAsyncioTestCase):
     """后台作业：必须真的 await，失败要退避重排而不是一次终结。"""
 
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
+
     def hub(self):
         from app.api_hub import Hub
-        from app.store import Store
-        return Hub(Store(':memory:'))
+        return Hub(new_store())
 
     async def test_failed_job_is_requeued_with_backoff(self):
         from app import memory as memory_module
@@ -3023,19 +3072,21 @@ class KernelCorrectnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('【发布】', nodes.planner_system(without))
 
 
-class ApiOwnershipTests(unittest.TestCase):
+class ApiOwnershipTests(unittest.IsolatedAsyncioTestCase):
     """接口归属校验：知道 session_id 不等于有权限（评审 P0-8）。"""
 
-    def setUp(self):
-        from fastapi.testclient import TestClient
+    async def asyncSetUp(self):
+        await reset_db()
+        import httpx
         import app.api as api_module
         from app.api_hub import Hub
-        from app.store import Store
-        api_module.hub = Hub(Store(':memory:'))
+        api_module.hub = Hub(new_store())
         self.api_module = api_module
-        self.client = TestClient(api_module.app)
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_module.app),
+            base_url='http://test')
 
-    def _create(self, message='你好'):
+    async def _create(self, message='你好'):
         import app.api_hub as hub_module
 
         async def fake(text, progress=None, on_event=None, history=None,
@@ -3045,13 +3096,13 @@ class ApiOwnershipTests(unittest.TestCase):
                     'deployment': {}, 'answer': '好的'}
 
         with patch.object(hub_module, 'run_task', fake):
-            return self.client.post('/api/tasks', json={'message': message},
-                                    headers={'X-DSH-User': 'u1'}).json()
+            return (await self.client.post('/api/tasks', json={'message': message},
+                                    headers={'X-DSH-User': 'u1'})).json()
 
-    def test_other_user_cannot_read_a_session(self):
-        created = self._create()
+    async def test_other_user_cannot_read_a_session(self):
+        created = await self._create()
         session_id = created['session_id']
-        as_owner = self.client.get(f'/api/sessions/{session_id}/messages',
+        as_owner = await self.client.get(f'/api/sessions/{session_id}/messages',
                                    headers={'X-DSH-User': 'u1'})
         self.assertEqual(as_owner.status_code, 200)
         # 只把 ID 换成别人的身份：一律按"不存在"处理，不泄漏对象是否存在
@@ -3060,29 +3111,29 @@ class ApiOwnershipTests(unittest.TestCase):
                      f'/api/sessions/{session_id}/memory',
                      f"/api/tasks/{created['task_id']}",
                      f"/api/tasks/{created['task_id']}/artifact"):
-            res = self.client.get(path, headers={'X-DSH-User': 'u2'})
+            res = await self.client.get(path, headers={'X-DSH-User': 'u2'})
             self.assertEqual(res.status_code, 404, path)
 
-    def test_profile_is_scoped_per_user(self):
+    async def test_profile_is_scoped_per_user(self):
         from app import profile
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'USER.md'
             with patch.object(profile, 'settings',
                               SimpleNamespace(profile_path=path)):
-                self.client.put('/api/profile', json={'text': '姓名：甲'},
+                await self.client.put('/api/profile', json={'text': '姓名：甲'},
                                 headers={'X-DSH-User': 'u1'})
-                self.client.put('/api/profile', json={'text': '姓名：乙'},
+                await self.client.put('/api/profile', json={'text': '姓名：乙'},
                                 headers={'X-DSH-User': 'u2'})
-                first = self.client.get('/api/profile',
-                                        headers={'X-DSH-User': 'u1'}).json()
-                second = self.client.get('/api/profile',
-                                         headers={'X-DSH-User': 'u2'}).json()
+                first = (await self.client.get('/api/profile',
+                                        headers={'X-DSH-User': 'u1'})).json()
+                second = (await self.client.get('/api/profile',
+                                         headers={'X-DSH-User': 'u2'})).json()
                 self.assertEqual(first['facts'], {'姓名': '甲'})
                 self.assertEqual(second['facts'], {'姓名': '乙'})
                 self.assertFalse(path.exists(), '默认用户不该被别人的画像覆盖')
 
-    def test_health_exposes_queue_state(self):
-        data = self.client.get('/api/health').json()
+    async def test_health_exposes_queue_state(self):
+        data = (await self.client.get('/api/health')).json()
         self.assertTrue(data['ok'])
         for key in ('runs_queued', 'runs_running', 'actions_unknown',
                     'jobs_queued'):
@@ -3092,13 +3143,16 @@ class ApiOwnershipTests(unittest.TestCase):
 class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
     """创建任务幂等：客户端重试不能变成"两个任务、两次部署"。"""
 
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
+
     def principal(self, user='u1'):
         return SimpleNamespace(tenant_id='default', user_id=user)
 
     async def test_same_key_and_body_replays_the_same_task(self):
         from app import idempotency
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         body = {'message': '做个报告', 'session_id': None}
         first = await idempotency.reserve(store, principal=self.principal(),
                                     endpoint='tasks.create', client_key='k1',
@@ -3115,8 +3169,7 @@ class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_same_key_with_different_body_conflicts(self):
         from app import idempotency
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         await idempotency.reserve(store, principal=self.principal(),
                             endpoint='tasks.create', client_key='k1',
                             payload={'message': '甲'}, ttl_seconds=3600)
@@ -3128,8 +3181,7 @@ class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_concurrent_duplicate_is_reported_as_in_flight(self):
         """并发的重复请求只能有一个赢家；另一个不能顺手又建一个任务。"""
         from app import idempotency
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         await idempotency.reserve(store, principal=self.principal(),
                             endpoint='tasks.create', client_key='k1',
                             payload={'message': '甲'}, ttl_seconds=3600)
@@ -3141,8 +3193,7 @@ class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_key_is_scoped_per_user(self):
         """同一个键给不同用户用，不该互相顶掉。"""
         from app import idempotency
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         await idempotency.reserve(store, principal=self.principal('u1'),
                             endpoint='tasks.create', client_key='k1',
                             payload={'message': '甲'}, ttl_seconds=3600)
@@ -3152,8 +3203,7 @@ class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(other.replayed)
 
     async def test_expired_key_can_be_reused(self):
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         await store.reserve_request_key('scope', client_key='k1', tenant_id='default',
                                   owner_user_id='u1', endpoint='tasks.create',
                                   fingerprint='old', expires_at=time.time() - 5)
@@ -3165,8 +3215,7 @@ class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_release_allows_retry_after_failure(self):
         from app import idempotency
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         reservation = await idempotency.reserve(
             store, principal=self.principal(), endpoint='tasks.create',
             client_key='k1', payload={'message': '甲'}, ttl_seconds=3600)
@@ -3181,15 +3230,17 @@ class ApiIdempotencyTests(unittest.IsolatedAsyncioTestCase):
     """接口层：重试同一个键只建一个任务；换内容返回 409。"""
 
     async def asyncSetUp(self):
-        from fastapi.testclient import TestClient
+        await reset_db()
+        import httpx
         import app.api as api_module
         from app.api_hub import Hub
-        from app.store import Store
-        api_module.hub = Hub(Store(':memory:'))
+        api_module.hub = Hub(new_store())
         self.api_module = api_module
-        self.client = TestClient(api_module.app)
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_module.app),
+            base_url='http://test')
 
-    def _post(self, message='做个报告', key='k1', user='u1'):
+    async def _post(self, message='做个报告', key='k1', user='u1'):
         import app.api_hub as hub_module
 
         async def fake(text, progress=None, on_event=None, history=None,
@@ -3202,12 +3253,12 @@ class ApiIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         if key:
             headers['Idempotency-Key'] = key
         with patch.object(hub_module, 'run_task', fake):
-            return self.client.post('/api/tasks', json={'message': message},
+            return await self.client.post('/api/tasks', json={'message': message},
                                     headers=headers)
 
     async def test_retry_with_same_key_returns_the_same_task(self):
-        first = self._post().json()
-        second = self._post().json()
+        first = (await self._post()).json()
+        second = (await self._post()).json()
         self.assertEqual(first['task_id'], second['task_id'])
         self.assertEqual(first['run_id'], second['run_id'])
         self.assertTrue(second['idempotent_replay'])
@@ -3215,19 +3266,23 @@ class ApiIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(tasks), 1, '重试不能建出第二个任务')
 
     async def test_same_key_with_another_message_is_rejected(self):
-        self._post()
-        res = self._post(message='换个题目')
+        await self._post()
+        res = await self._post(message='换个题目')
         self.assertEqual(res.status_code, 409)
         self.assertIn('幂等键', res.json()['detail'])
 
     async def test_without_key_each_request_creates_its_own_task(self):
-        first = self._post(key=None).json()
-        second = self._post(key=None).json()
+        first = (await self._post(key=None)).json()
+        second = (await self._post(key=None)).json()
         self.assertNotEqual(first['task_id'], second['task_id'])
 
 
 class CompensationTests(unittest.IsolatedAsyncioTestCase):
     """补偿步骤（文档 §8.4）：撤销是有副作用动作，要单独执行、单独记账。"""
+
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
 
     @staticmethod
     def _tools(calls):
@@ -3341,10 +3396,9 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
         """结果未定的写操作不能自动去撤：那是基于猜测再发一次写请求。"""
         from app import tools as tool_module
         from app import ledger as ledger_module
-        from app.store import Store
         calls = []
         tools = self._tools(calls)
-        store = Store(':memory:')
+        store = new_store()
         book = ledger_module.ActionLedger(store, 'r1', 1)
         prepared = await book.begin(step_id='s2', tool_key='local:x:boom',
                               effect='write', args={})
@@ -3376,8 +3430,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
         """手工补偿是一次独立运行，原运行只记 compensated_at。"""
         import app.api_hub as hub_module
         from app.api_hub import Hub
-        from app.store import Store
-        hub = Hub(Store(':memory:'))
+        hub = Hub(new_store())
         await hub.store.create_task('t1', 's1', '发布页面')
         await hub.store.ensure_task_meta('t1', session_id='s1', goal='发布页面')
         await hub.store.create_run('r1', 't1', status='succeeded')
@@ -3415,8 +3468,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_compensation_skips_steps_that_never_succeeded(self):
         from app.api_hub import Hub
-        from app.store import Store
-        hub = Hub(Store(':memory:'))
+        hub = Hub(new_store())
         await hub.store.create_task('t1', 's1', 'g')
         await hub.store.ensure_task_meta('t1', session_id='s1', goal='g')
         await hub.store.create_run('r1', 't1', status='failed')
@@ -3534,12 +3586,202 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIs(found, legacy)
 
 
+class McpBusinessFailureTests(unittest.IsolatedAsyncioTestCase):
+    """MCP 的"业务失败"必须被认出来（需求 4），内部工具名必须校验（需求 2）。
+
+    背景：真实事故里服务端正常返回
+    `{"status": "error", "code": "E_RESOURCE_NOT_FOUND", "message": "tool ... not found"}`，
+    协议层没有 isError，于是被当成成功一路往下走，最后用户只看到"没有产出可用结果"。
+    """
+
+    def test_failure_envelope_is_detected(self):
+        from app.integrations import mcp_adapter
+        self.assertTrue(mcp_adapter.failure_of(
+            {'status': 'error', 'code': 'E_RESOURCE_NOT_FOUND',
+             'message': 'tool generate_script not found'}))
+        self.assertTrue(mcp_adapter.failure_of({'status': 'failed'}))
+        self.assertTrue(mcp_adapter.failure_of({'ok': False}))
+        self.assertTrue(mcp_adapter.failure_of({'error': 'boom'}))
+        # 成功的回执不能被误判
+        self.assertEqual(mcp_adapter.failure_of({'status': 'deployed'}), '')
+        self.assertEqual(mcp_adapter.failure_of({'status': 'success', 'url': 'x'}), '')
+        self.assertEqual(mcp_adapter.failure_of({'tools': []}), '')
+
+    def test_result_payload_raises_on_error_envelope(self):
+        from types import SimpleNamespace as NS
+        from app.integrations import mcp_adapter
+
+        block = NS(type='text', text='{"status": "error", '
+                                    '"code": "E_RESOURCE_NOT_FOUND", '
+                                    '"message": "tool generate_script not found"}')
+        result = NS(isError=False, structuredContent=None, content=[block])
+        with self.assertRaises(mcp_adapter.MCPToolFailure) as ctx:
+            mcp_adapter.result_payload(result)
+        self.assertIn('generate_script', str(ctx.exception))
+
+        ok = NS(isError=False, structuredContent={'status': 'ok', 'job_id': 'j1'},
+                content=[])
+        self.assertEqual(mcp_adapter.result_payload(ok)['job_id'], 'j1')
+
+    async def test_runner_turns_business_failure_into_step_failure(self):
+        """status:error 的回执 → ToolError（带着服务端原话），不是"成功"。"""
+        from app import nodes
+        from app import tools as tool_module
+        from app.integrations import mcp_adapter, mcp_servers
+        from app.tools import Tool
+
+        server = mcp_servers.Server(id='montage', transport='streamable_http',
+                                    url='https://a.example/mcp')
+
+        # 真实链路上是 result_payload 抛 MCPToolFailure（服务端正常返回一条 error）
+        async def fake_call(name, arguments, artifact=None, server=None):
+            raise mcp_adapter.MCPToolFailure(
+                f'tool {arguments.get("name")} not found', 'E_RESOURCE_NOT_FOUND')
+
+        tool = Tool('mcp__run_tool', 'MCP·run_tool', '', {'type': 'object',
+                                                          'properties': {}},
+                    tool_module._make_mcp_runner('run_tool', server),
+                    tool_key='mcp:montage:run_tool', effect='write',
+                    capability='mcp', server_id='montage')
+        plan = {'steps': [{'tool': 'mcp__run_tool', 'step_id': 's1',
+                           'args': {'name': 'generate_script', 'inputs': {}}},
+                          {'tool': 'mcp__run_tool', 'step_id': 's2',
+                           'args': {'name': 'generate_storyboard', 'inputs': {}},
+                           'depends_on': ['s1']}]}
+        with patch.object(tool_module, 'find_tool', AsyncMock(return_value=tool)), \
+                patch.object(tool_module.mcp_adapter, 'call_tool', fake_call), \
+                patch_all_emits(lambda e: None):
+            result = await nodes.run_step({'plan': plan, 'step_index': 0,
+                                           'user_input': '做个视频'})
+        # 失败步骤：整份计划停下（依赖它的 s2 不会跑）
+        self.assertEqual(result['failure'] and True, True)
+        self.assertIn('E_RESOURCE_NOT_FOUND', result['failure'])
+        self.assertIn('generate_script', result['failure'])
+        self.assertEqual(result['step_index'], len(plan['steps']))
+        self.assertEqual(nodes.next_step({**result, 'plan': plan}), 'end')
+
+    async def test_inner_tool_name_must_come_from_discovery(self):
+        """run_tool.name 不在发现结果里 → 本地就挡住，并把真实名字给出来。"""
+        from app import tools as tool_module
+        from app.integrations import mcp_servers
+
+        server = mcp_servers.Server(id='montage', transport='streamable_http',
+                                    url='https://a.example/mcp',
+                                    capability_tool='list_capabilities',
+                                    tool_name_arg='name')
+        capabilities = {'tts_selector': {'status': 'AVAILABLE'},
+                        'subtitle_gen': {'status': 'AVAILABLE'},
+                        'video_compose': {'status': 'UNAVAILABLE'}}
+        tool_module._MCP_CACHE['capabilities'] = {'montage': capabilities}
+
+        # 1) 编造的名字：直接失败，报错里有真实清单
+        with self.assertRaises(tool_module.ToolError) as ctx:
+            tool_module._check_inner_name(
+                server, {'name': 'generate_script'}, capabilities)
+        message = ctx.exception.safe_message
+        self.assertIn('generate_script', message)
+        self.assertIn('tts_selector', message)
+
+        # 2) 存在但不可用的工具：明确说不可用，别去调度
+        with self.assertRaises(tool_module.ToolError) as ctx:
+            tool_module._check_inner_name(
+                server, {'name': 'video_compose'}, capabilities)
+        self.assertIn('不可用', ctx.exception.safe_message)
+
+        # 3) 清单里的可用工具：放行
+        tool_module._check_inner_name(server, {'name': 'tts_selector'}, capabilities)
+        tool_module._MCP_CACHE['capabilities'] = {}
+
+    async def test_discovery_reads_the_capability_list(self):
+        """发现阶段顺带读内部能力清单，并把名字告诉规划器（需求 1）。"""
+        from app import tools as tool_module
+        from app.integrations import mcp_servers
+
+        server = mcp_servers.Server(id='montage', transport='streamable_http',
+                                    url='https://a.example/mcp',
+                                    capability_tool='list_capabilities',
+                                    tool_name_arg='name')
+
+        async def fake_list(_server):
+            return [{'name': 'list_capabilities', 'inputSchema': {'type': 'object'},
+                     'description': '列能力'},
+                    {'name': 'run_tool', 'inputSchema': {'type': 'object'},
+                     'description': '执行任意工具'}]
+
+        async def fake_call(name, arguments, artifact=None, server=None):
+            self.assertEqual(name, 'list_capabilities')
+            return {'tools': [{'name': 'tts_selector', 'status': 'AVAILABLE',
+                               'capability': 'tts'},
+                              {'name': 'video_compose', 'status': 'UNAVAILABLE',
+                               'capability': 'video_post'}]}
+
+        with patch.object(tool_module.mcp_adapter, 'list_server_tools', fake_list), \
+                patch.object(tool_module.mcp_adapter, 'call_tool', fake_call), \
+                patch.object(tool_module.mcp_servers, 'servers', lambda: [server]):
+            tool_module._MCP_CACHE.update(at=0.0, tools=[], signature=(),
+                                          capabilities={})
+            tools = await tool_module.mcp_tools(force=True)
+
+        names = {tool.name: tool for tool in tools}
+        self.assertIn('mcp__list_capabilities', names)
+        # 规划器能在描述里直接看到真实名字（可用的与不可用的分开说）
+        description = names['mcp__list_capabilities'].description
+        self.assertIn('tts_selector', description)
+        self.assertIn('video_compose', description)
+        self.assertIn('不可用', description)
+        # 校验用的清单也进了缓存
+        self.assertIn('tts_selector', tool_module.known_inner_names('montage'))
+        tool_module._MCP_CACHE['capabilities'] = {}
+
+
+class WriteFileTests(unittest.IsolatedAsyncioTestCase):
+    """write_file：创作内容自己写、自己落盘（需求 3）。"""
+
+    async def test_writes_into_the_task_workspace(self):
+        from app.capabilities import files as files_cap
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(files_cap, 'settings',
+                              SimpleNamespace(artifact_dir=Path(folder))), \
+                    patch_all_emits(lambda e: None):
+                result = await files_cap._write_file(
+                    {'path': 'storyboard/scene-01.md', 'content': '# 场景一\n天空为什么是蓝的'},
+                    {'task_id': 't1'})
+            written = Path(result['written']['path'])
+            self.assertTrue(written.exists())
+            self.assertIn('场景一', written.read_text(encoding='utf-8'))
+            self.assertIn('workspace', str(written))
+            self.assertEqual(result['status'], 'written')
+
+    async def test_rejects_escaping_paths(self):
+        from app.capabilities import files as files_cap
+        from app.capabilities.base import ToolError
+        for bad in ('/etc/passwd', '../escape.md', 'a/../../b.md', '~/x.md'):
+            with self.subTest(path=bad), self.assertRaises(ToolError):
+                await files_cap._write_file({'path': bad, 'content': 'x'},
+                                            {'task_id': 't1'})
+
+    async def test_rejects_empty_content_and_huge_payloads(self):
+        from app.capabilities import files as files_cap
+        from app.capabilities.base import ToolError
+        with self.assertRaises(ToolError):
+            await files_cap._write_file({'path': 'a.md', 'content': '  '},
+                                        {'task_id': 't1'})
+        with self.assertRaises(ToolError):
+            await files_cap._write_file(
+                {'path': 'a.md', 'content': 'x' * (files_cap.MAX_CHARS + 1)},
+                {'task_id': 't1'})
+
+
 class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
     """状态机词汇封闭：业务结果进 outcome，展示词只出现在派生标签里。
 
     这条约束是上一轮讨论的落点——"接 N 个 MCP Server 就要加 N 个状态值"
     之所以不成立，全靠这里钉住：加一个业务终态会先让这组用例红。
     """
+
+    async def asyncSetUp(self):
+        # 每个用例先清库：以前靠 SQLite :memory: 隔离
+        await reset_db()
 
     async def test_run_status_vocabulary_is_closed(self):
         from app import outcome
@@ -3653,7 +3895,6 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
         """就算执行层交出旧词，落库的也必须是通用状态。"""
         import app.api_hub as hub_module
         from app.api_hub import Hub
-        from app.store import Store
 
         async def fake_run_task(text, progress=None, on_event=None, history=None,
                                 on_start=None, prior=None, memory=None,
@@ -3665,7 +3906,7 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
                                  'kind': 'sources'},
                     'timings': []}
 
-        hub = Hub(Store(':memory:'))
+        hub = Hub(new_store())
         with patch.object(hub_module, 'run_task', fake_run_task):
             record = await hub.start('存成网页')
             await asyncio.wait_for(record._task, timeout=10)
@@ -3689,13 +3930,11 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
     async def test_migration_script_rewrites_legacy_rows(self):
         """历史数据迁移：业务终态 → 通用状态，且可重复执行。"""
         import importlib
-        from app.store import Store
         from types import SimpleNamespace as NS
         migrate = importlib.import_module('scripts.migrate_status_vocabulary')
 
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / 'legacy.db'
-            store = Store(path)
+        if True:
+            store = new_store()
             await store.create_task('t1', 's1', '问个问题')
             await store.update_task('t1', status='answered')
             await store.create_task('t2', 's1', '存成网页')
@@ -3707,11 +3946,12 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
             await store.create_run('r3', 't3', status='failed')      # 当年被折成失败
             await store.close()
 
+            # 迁移脚本现在只认 PostgreSQL（SQLite 实现已删除）
             with patch.object(migrate, 'settings',
-                              NS(database_url='', db_path=path)):
+                              NS(database_url=PG_DSN, db_path=None)):
                 self.assertEqual(migrate.main(['--apply']), 0)
 
-            store = Store(path)
+            store = new_store()
             self.assertEqual((await store.task('t1'))['status'], 'succeeded')
             self.assertEqual((await store.task('t2'))['status'], 'succeeded')
             self.assertEqual((await store.task('t3'))['status'], 'needs_reconcile')
@@ -3758,7 +3998,8 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
                           'fetch_pages': 'local:web:fetch',
                           'render_sources_html': 'local:export:sources_html',
                           'answer_with_sources': 'local:answers:with_sources',
-                          'answer_directly': 'local:answers:direct'})
+                          'answer_directly': 'local:answers:direct',
+                          'write_file': 'local:files:write'})
 
     async def test_kernel_does_not_import_business_packages(self):
         """内核（app/tools.py）不许 import 具体业务能力包——那是一切耦合的源头。"""
@@ -3824,7 +4065,7 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
 class AsyncDriverTests(unittest.IsolatedAsyncioTestCase):
     """仓储接口必须是异步的：同步 DB 调用会卡住整个事件循环。
 
-    这一组盯"换 async 驱动"这件事本身，而不只是结果对不对。
+    项目只支持 PostgreSQL（SQLite 实现已删除），所以这里只校验 PG 侧契约。
     """
 
     def test_repository_protocol_is_async(self):
@@ -3836,34 +4077,32 @@ class AsyncDriverTests(unittest.IsolatedAsyncioTestCase):
                         and not inspect.iscoroutinefunction(getattr(Repository, name))]
         self.assertEqual(sync_methods, [])
 
-    def test_both_implementations_are_async(self):
-        import inspect
-        from app.persistence import check_repository
-        from app.store import Store
-        sqlite = Store(':memory:')
-        self.assertEqual(check_repository(sqlite), [])
-        self.assertTrue(inspect.iscoroutinefunction(sqlite.append_message))
-        self.assertTrue(inspect.iscoroutinefunction(sqlite.close))
-        # 私有实现保持同步：真正干活的是它，异步外壳只负责借线程
-        self.assertFalse(inspect.iscoroutinefunction(sqlite._recover_orphans))
+    def test_only_postgres_is_supported(self):
+        """没有 DATABASE_URL、或不是 PG 连接串时直接报错，不悄悄退回去。"""
+        from app.persistence import open_store
+        with self.assertRaises(RuntimeError):
+            open_store('')
+        with self.assertRaises(RuntimeError):
+            open_store('sqlite:///tmp/agent.db')
 
     async def test_postgres_uses_async_pool_not_a_sync_connection(self):
         """PG 侧用的是 psycopg 的**异步**连接池，不是同步连接 + 线程。"""
+        import inspect
         from psycopg_pool import AsyncConnectionPool
-        from app.pg_store import PostgresStore
-        store = PostgresStore(PG_DSN or 'postgresql://127.0.0.1:1/none')
+        from app.persistence import check_repository
+        store = new_store()
         try:
             self.assertIsInstance(store._pool, AsyncConnectionPool)
             self.assertFalse(hasattr(store, '_conn'), '不该再有单连接字段')
-            # 构造不碰 IO：真正的连接在 ready() 里建立
-            self.assertFalse(store._opened)
+            self.assertEqual(check_repository(store), [])
+            self.assertTrue(inspect.iscoroutinefunction(store.append_message))
+            self.assertTrue(inspect.iscoroutinefunction(store.close))
         finally:
             await store.close()
 
     async def test_event_loop_is_not_blocked_by_store_calls(self):
         """写库期间事件循环还能跑别的协程（同步实现做不到这一点）。"""
-        from app.store import Store
-        store = Store(':memory:')
+        store = new_store()
         ticks = 0
 
         async def ticker():
@@ -3997,3 +4236,45 @@ class PostgresPoolTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+class PlannerMistakeGuardTests(unittest.IsolatedAsyncioTestCase):
+    """规划器的两类"看起来像服务端故障"的错误，必须在本地说清楚。
+
+    1. 参数里留着 `{{s2.project_id}}` 字面模板（把跨步骤引用写成了字符串）；
+    2. 通用调用工具的内部工具名是编的（见 McpBusinessFailureTests）。
+    """
+
+    async def test_unresolved_placeholder_fails_fast_with_a_hint(self):
+        from app import nodes
+        from app import tools as tool_module
+
+        called = []
+
+        async def fake(args, state):
+            called.append(args)
+            return {}
+
+        tool = tool_module.Tool('write_file', '写文件', 'd', {}, fake,
+                                tool_key='local:files:write', effect='write')
+        plan = {'steps': [{'tool': 'write_file', 'step_id': 's1',
+                           'args': {'path': 'a.md',
+                                    'content': '{{s2.content}}'}}]}
+        with patch.dict(tool_module.BUILTIN_BY_NAME, {'write_file': tool}), \
+                patch_all_emits(lambda e: None):
+            result = await nodes.run_step({'plan': plan, 'step_index': 0,
+                                           'user_input': '写个文件'})
+        self.assertEqual(called, [], '参数不成立就不该调用工具')
+        self.assertEqual(result['status'], 'failed')
+        self.assertIn('占位符', result['failure'])
+        self.assertIn('ref', result['failure'])
+
+    async def test_real_ref_binding_still_works(self):
+        """正确写法（{"ref": {...}}）不受影响。"""
+        from app import nodes
+        outputs = {'s1': {'project_id': 'p-1', 'path': 'x'}}
+        args = nodes.resolve_inputs(
+            {'args': {'project_id': {'ref': {'step_id': 's1',
+                                             'pointer': '/project_id'}}}},
+            outputs)
+        self.assertEqual(args['project_id'], 'p-1')
+        nodes._check_placeholders(args, '工具')

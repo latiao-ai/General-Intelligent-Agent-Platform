@@ -57,6 +57,12 @@ class Server:
     result_url_field: str = ''
     default: bool = False
     title: str = ''
+    # 有些服务端把真正的动作藏在**一个**通用工具后面（例如 run_tool，名字放参数里）。
+    # 这时必须先从清单工具读出"有哪些名字"再规划，否则模型只能编：
+    #   capability_tool：清单工具名（如 list_capabilities）
+    #   tool_name_arg  ：调用时承载内部工具名的参数（如 name / tool_name）
+    capability_tool: str = ''
+    tool_name_arg: str = ''
 
 
 def _legacy_server() -> Server | None:
@@ -78,6 +84,8 @@ def _legacy_server() -> Server | None:
         entry_filename=os.getenv('MCP_ENTRY_FILENAME', '').strip(),
         extra_args=_json_object(os.getenv('MCP_EXTRA_ARGS', '') or '{}') or {},
         result_url_field=os.getenv('MCP_RESULT_URL_FIELD', '').strip(),
+        capability_tool=os.getenv('MCP_CAPABILITY_TOOL', '').strip(),
+        tool_name_arg=os.getenv('MCP_TOOL_NAME_ARG', '').strip(),
         default=True,
         title='默认服务端（MCP_* 单项配置）',
     )
@@ -129,6 +137,8 @@ def _from_entry(entry: dict) -> Server | None:
         entry_filename=str(entry.get('entry_filename') or '').strip(),
         extra_args=dict(entry.get('extra_args') or {}),
         result_url_field=str(entry.get('result_url_field') or '').strip(),
+        capability_tool=str(entry.get('capability_tool') or '').strip(),
+        tool_name_arg=str(entry.get('tool_name_arg') or '').strip(),
         default=bool(entry.get('default')),
         title=str(entry.get('title') or ''),
     )

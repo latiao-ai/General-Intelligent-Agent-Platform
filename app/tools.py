@@ -53,6 +53,17 @@ MCP_PROMPT_RULES = (
     '全量清单；删改类操作（delete_*/update_*）之后若要告诉用户"还剩什么/还剩几个"，'
     '必须再加一步**不带过滤参数**的查询（如 mcp__list_sites 且参数为空），'
     '绝不能拿操作前的过滤结果或操作返回体去推断。'
+    '【先发现，再调用】服务端要是有"清单/描述"类工具（名字或描述里带 list/describe/'
+    'capabilities），先调它把真实能力读出来；通用调用类工具（如 run_tool）名字参数里的'
+    '内部工具名**只能取自清单**，清单里没有就是没有，不要凭经验编。'
+    '清单里标为不可用（缺依赖/缺 key/未安装）的工具不要调度。'
+    '【创作内容自己写】剧本、分镜、旁白、文案这类内容由你自己产出，再用 write_file'
+    '落盘；不要假设服务端有"生成脚本/生成分镜"的接口——多数服务端只提供执行动作。'
+    '【封装工具也有依赖】像 render_video 这类"封装型"执行工具，内部还要用到清单里的'
+    '工具（合成、字幕等）：调度前先确认它们可用；不可用就别调度，直接说清缺什么。'
+    '【业务失败要认】工具返回 status: error / failed、或 code 以 E_ 开头，就是这一步'
+    '失败：不要当成功继续，也不要换个参数重试同一个不存在的名字；如实报告失败原因'
+    '与缺失的能力，并把已经产出的文件说清楚。'
 )
 
 
@@ -69,7 +80,8 @@ MCP_HINTS = {
 }
 # 每次任务都去 discover 一次太慢（一次可能几十秒），进程内缓存一小段时间。
 # 缓存要跟"服务端配置签名"绑定：改了 MCP_SERVERS 立刻重新发现，不能等 TTL。
-_MCP_CACHE: dict = {'at': 0.0, 'tools': [], 'errors': {}, 'signature': ()}
+_MCP_CACHE: dict = {'at': 0.0, 'tools': [], 'errors': {}, 'signature': (),
+                    'capabilities': {}}
 _MCP_TTL = 300.0
 
 
@@ -88,6 +100,62 @@ async def _discover(server) -> tuple[list[dict], str]:
         logger.warning('MCP 服务端 %s 工具发现失败：%s', server.id,
                        type(exc).__name__, exc_info=True)
         return [], f'{type(exc).__name__}: {str(exc)[:160]}'
+
+
+async def _discover_capabilities(server) -> dict:
+    """读服务端的**内部能力清单**（例如 list_capabilities）。
+
+    有些服务端把动作藏在**一个**通用工具后面（`run_tool(name="tts_selector")`）。
+    这时只看到 `run_tool` 是没用的——模型只能猜内部名字，猜错就是一堆
+    E_RESOURCE_NOT_FOUND。所以发现阶段顺带把清单读回来：既能让规划器看到真实
+    名字，也能在调用前校验（见 `_check_inner_name`）。
+
+    返回 {名字: {'status': .., 'description': ..}}；服务端不支持就返回空。
+    """
+    tool_name = getattr(server, 'capability_tool', '') or ''
+    if not tool_name:
+        return {}
+    try:
+        payload = await mcp_adapter.call_tool(tool_name, {}, server=server)
+    except Exception as exc:                       # noqa: BLE001
+        logger.warning('MCP 服务端 %s 的能力清单读取失败：%s', server.id,
+                       type(exc).__name__)
+        return {}
+    items = payload.get('tools') if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        return {}
+    out = {}
+    for item in items:
+        if isinstance(item, dict) and item.get('name'):
+            out[str(item['name'])] = {
+                'status': str(item.get('status') or '').upper(),
+                'description': str(item.get('description') or '')[:80],
+                'capability': str(item.get('capability') or ''),
+            }
+    return out
+
+
+def _capability_line(capabilities: dict, limit: int = 30) -> str:
+    """把内部能力清单压成一行，塞进工具描述里给规划器看。
+
+    真实服务端可能有几十上百个内部工具，全列出来会把规划提示词撑爆，所以各自
+    截断并标出总数——"还有 N 个"比把名字全塞进去更有用。
+    """
+    if not capabilities:
+        return ''
+    usable = [name for name, info in capabilities.items()
+              if info.get('status') in ('', 'AVAILABLE')]
+    unusable = [name for name in capabilities if name not in usable]
+    parts = []
+    if usable:
+        parts.append('可用（只能从这里选）：' + '、'.join(usable[:limit])
+                     + (f' 等 {len(usable)} 个' if len(usable) > limit else ''))
+    else:
+        parts.append('当前没有任何可用内部工具（缺依赖/缺 key/未安装）')
+    if unusable:
+        parts.append('不可用（别调度）：' + '、'.join(unusable[:limit])
+                     + (f' 等 {len(unusable)} 个' if len(unusable) > limit else ''))
+    return '；'.join(parts)
 
 
 async def mcp_tools(force: bool = False) -> list[Tool]:
@@ -110,6 +178,12 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
     servers = mcp_servers.servers()
     discovered = await asyncio.gather(*(_discover(server) for server in servers)) \
         if servers else []
+    # 有"通用调用 + 内部工具名"设计的服务端，顺带把内部能力清单读回来：
+    # 规划器要能看到真实名字，执行前也要能校验（见 _check_inner_name）
+    capability_lists = await asyncio.gather(
+        *(_discover_capabilities(server) for server in servers)) if servers else []
+    capabilities = {server.id: caps
+                    for server, caps in zip(servers, capability_lists) if caps}
     total = len(servers)
     tools: list[Tool] = []
     errors: dict[str, str] = {}
@@ -117,6 +191,7 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
         if error:
             errors[server.id] = error
             continue
+        inner = capabilities.get(server.id) or {}
         for item in items:
             if publishing_capability.claims(server, item['name']):
                 tools.append(_deploy_tool(server, item))
@@ -132,6 +207,11 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
             hint = MCP_HINTS.get(item['name'], '')
             if hint:
                 description = f'{description} {hint}'
+            if inner and item['name'] == getattr(server, 'capability_tool', ''):
+                # 清单工具本身没什么可编排的，真正的价值是把名字告诉规划器
+                line = _capability_line(inner)
+                if line:
+                    description = f'{description}；本服务端能力清单 → {line}'
             tools.append(Tool(
                 name, f'MCP·{item["name"]}', description, schema,
                 _make_mcp_runner(item['name'], server),
@@ -148,8 +228,47 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
         stub = _deploy_placeholder(errors)
         if stub is not None:
             tools.append(stub)
-    _MCP_CACHE.update(at=now, tools=tools, errors=errors, signature=signature)
+    _MCP_CACHE.update(at=now, tools=tools, errors=errors, signature=signature,
+                      capabilities=capabilities)
     return tools
+
+
+def known_inner_names(server_id: str) -> dict:
+    """某个服务端上一次发现到的内部能力清单（没有就空）。"""
+    return dict((_MCP_CACHE.get('capabilities') or {}).get(server_id) or {})
+
+
+def _check_inner_name(server, args: dict, capabilities: dict) -> None:
+    """调用**之前**校验内部工具名（run_tool.name 必须在发现结果里）。
+
+    这类服务端只有一个通用调用工具，真正的动作名放在参数里。名字不存在时
+    服务端只会回一条 E_RESOURCE_NOT_FOUND——对用户来说就是"跑了一分多钟
+    什么也没有"。所以在本地先挡住，并把**真实可用的名字**写进报错里，
+    让重规划有据可依。
+    """
+    arg = getattr(server, 'tool_name_arg', '') or ''
+    if not arg:
+        return
+    wanted = str((args or {}).get(arg) or '').strip()
+    if not wanted or not capabilities:
+        return
+    info = capabilities.get(wanted)
+    if info is None:
+        usable = [name for name, item in capabilities.items()
+                  if item.get('status') in ('', 'AVAILABLE')]
+        raise ToolError(
+            f'内部工具名 {wanted} 不在服务端的能力清单里。'
+            f'真实存在的是：{"、".join(sorted(capabilities)[:20])}'
+            + (f'；其中当前可用：{"、".join(usable[:12])}' if usable
+               else '；且它们当前都不可用'))
+    status = (info.get('status') or '').upper()
+    if status and status != 'AVAILABLE':
+        usable = [name for name, item in capabilities.items()
+                  if item.get('status') in ('', 'AVAILABLE')]
+        raise ToolError(
+            f'内部工具 {wanted} 当前不可用（{status}）。'
+            + (f'可用的只有：{"、".join(usable[:12])}' if usable
+               else '该服务端当前没有任何可用工具，请如实说明能力缺失'))
 
 
 def _has_publishing(tools) -> bool:
@@ -213,6 +332,30 @@ def mcp_status() -> dict:
             'servers': mcp_servers.status()}
 
 
+# 这些键属于图状态本身，回执里的同名字段不能覆盖它们
+_STATE_KEYS = frozenset({'status', 'answer', 'artifact', 'documents', 'plan',
+                         'errors', 'usage', 'deployment', 'mcp_calls', 'outcome',
+                         'failure', 'step_outputs', 'step_index', 'documents'})
+
+
+def _unwrap_error(exc: BaseException, depth: int = 0) -> BaseException:
+    """拆掉 anyio 任务组包的 ExceptionGroup。
+
+    MCP 客户端（anyio）经常抛 `ExceptionGroup`，直接透出去就是"ExceptionGroup"
+    三个字，等于没说；真正的业务失败（比如 MCPToolFailure）在里面。
+    """
+    while isinstance(exc, BaseExceptionGroup) and exc.exceptions and depth < 4:
+        exc = exc.exceptions[0]
+        depth += 1
+    return exc
+
+
+def _describe_error(exc: BaseException) -> str:
+    leaf = _unwrap_error(exc)
+    text = str(leaf).strip() or type(leaf).__name__
+    return f'{type(leaf).__name__}: {text}'[:200]
+
+
 def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
     """所有远端工具共用的一条调用通道。
 
@@ -222,6 +365,11 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
     """
     async def run(args: dict, state: dict) -> dict:
         artifact = state.get('artifact')
+        # 有"通用调用 + 内部工具名"设计的服务端：名字必须来自发现结果，
+        # 否则直接停在这一步，并把真实可用的名字写进报错（不烧一次远端往返）。
+        if server is not None:
+            _check_inner_name(server, args or {},
+                              known_inner_names(getattr(server, 'id', '')))
         if adapter is not None:
             precheck = getattr(adapter, 'precheck', None)
             if precheck is not None:
@@ -246,9 +394,16 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
                     server_tool_name, dict(args or {}), artifact=artifact,
                     server=server)
         except Exception as exc:
-            raise ToolError(f'MCP 工具 {server_tool_name} 调用失败') from exc
-        emit(action('MCP 工具返回', json.dumps(
-            payload, ensure_ascii=False)[:120], '📦'))
+            leaf = _unwrap_error(exc)
+            if isinstance(leaf, mcp_adapter.MCPToolFailure):
+                # 业务层失败（status: error / E_*）：必须当成失败停下，而且要把
+                # 服务端原话透出来，否则用户只看到"没有产出可用结果"。
+                raise ToolError(
+                    f'MCP 工具 {server_tool_name} 失败：{leaf}') from exc
+            raise ToolError(
+                f'MCP 工具 {server_tool_name} 调用失败'
+                f'（{_describe_error(exc)}）') from exc
+        emit(action('MCP 工具返回', mcp_adapter.summarize(payload), '📦'))
         # 参数必须一起记：过滤类工具（如 list_sites 的 keyword）传不传参数，
         # 返回语义完全不同——不记下来就分不清"列表只有 1 个"和"只匹配到 1 个"。
         # 服务端也要记：多服务端时同名工具的行为可能完全不同。
@@ -256,6 +411,14 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
             {'tool': server_tool_name, 'args': dict(args or {}),
              'server': getattr(server, 'id', '') or '',
              'payload': payload}]}
+        # 回执里的标量也提到**步骤输出**上：下游要用
+        # {"ref": {"step_id": "s1", "pointer": "/project_id"}} 取值，
+        # 埋在 payload 里就取不到，只能编一个占位符。
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                if key in _STATE_KEYS or not isinstance(value, (str, int, float, bool)):
+                    continue
+                updates.setdefault(key, value)
         interpret = getattr(adapter, 'interpret', None)
         if interpret is not None:
             updates.update(interpret(payload, dict(args or {}), state) or {})

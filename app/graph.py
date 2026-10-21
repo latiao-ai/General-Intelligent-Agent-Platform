@@ -51,16 +51,19 @@ def checkpointer():
     LangGraph 的检查点负责"图跑到哪了"，我们的 runs/steps/actions 账本负责
     "外部调用到底发生过没有"。两者职责不同，缺了检查点也能靠账本续跑——
     已成功的动作会直接复用回执。所以这里做成软依赖：
-    - 装了 langgraph-checkpoint-sqlite → 用它持久化
+
+    - 装了 `langgraph-checkpoint-postgres` → 用同一个 PostgreSQL 持久化
     - 否则退回内存实现（进程内可用，重启即丢，不静默假装持久）
+
+    以前这里会往 `settings.db_path`（SQLite 文件）里写检查点；SQLite 实现删掉
+    之后就没有那个文件了，检查点也跟着回到"要么 PG、要么内存"。
     """
     try:
-        from langgraph.checkpoint.sqlite import SqliteSaver  # noqa: F401
-        import sqlite3
+        from langgraph.checkpoint.postgres import PostgresSaver  # noqa: F401
+        from psycopg.rows import dict_row
 
         from app.config import settings
-        conn = sqlite3.connect(str(settings.db_path), check_same_thread=False)
-        return SqliteSaver(conn)
+        return PostgresSaver.from_conn_string(settings.database_url).__enter__()
     except Exception:
         try:
             from langgraph.checkpoint.memory import InMemorySaver
