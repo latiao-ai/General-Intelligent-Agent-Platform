@@ -69,15 +69,15 @@ class ActionLedger:
     def key_of(self, step_id: str, tool_key: str, args: dict) -> str:
         return f'{self.run_id}:{self.plan_version}:{step_id}:{args_hash(args)}'
 
-    def begin(self, *, step_id: str, tool_key: str, effect: str,
-              args: dict, authorized_by: str = '') -> dict:
+    async def begin(self, *, step_id: str, tool_key: str, effect: str,
+                    args: dict, authorized_by: str = '') -> dict:
         """准备一次动作。
 
         返回 {'action_id', 'replay'}：replay 非空表示这个动作之前已经成功过，
         直接用它的回执，不要再调用远端——这正是"已成功不重发"的落地。
         """
         key = self.key_of(step_id, tool_key, args)
-        existing = self.store.find_action(key)
+        existing = await self.store.find_action(key)
         if existing is not None:
             if existing['status'] == 'succeeded':
                 return {'action_id': existing['action_id'],
@@ -90,43 +90,43 @@ class ActionLedger:
             return {'action_id': existing['action_id'], 'replay': None}
 
         action_id = 'act_' + uuid.uuid4().hex[:16]
-        self.store.create_action(
+        await self.store.create_action(
             action_id, run_id=self.run_id, plan_version=self.plan_version,
             step_id=step_id, tool_key=tool_key, args_hash=args_hash(args),
             idempotency_key=key, effect=effect, authorized_by=authorized_by)
         return {'action_id': action_id, 'replay': None}
 
-    def in_flight(self, action_id: str) -> str:
+    async def in_flight(self, action_id: str) -> str:
         """真正发出请求之前调用：先把状态标成 in_flight 再发。
 
         顺序很重要——如果先发后标，崩溃就落在"已发送但没记录"的窗口里，
         恢复时无法判断到底发没发。
         """
         attempt_id = 'att_' + uuid.uuid4().hex[:12]
-        self.store.update_action(action_id, status='in_flight')
-        self.store.add_attempt(attempt_id, action_id)
+        await self.store.update_action(action_id, status='in_flight')
+        await self.store.add_attempt(attempt_id, action_id)
         return attempt_id
 
-    def succeed(self, action_id: str, attempt_id: str | None,
-                receipt: dict | None) -> None:
-        self.store.update_action(action_id, status='succeeded',
-                                 receipt_json=receipt or {})
+    async def succeed(self, action_id: str, attempt_id: str | None,
+                      receipt: dict | None) -> None:
+        await self.store.update_action(action_id, status='succeeded',
+                                       receipt_json=receipt or {})
         if attempt_id:
-            self.store.finish_attempt(attempt_id, result_ref='inline')
+            await self.store.finish_attempt(attempt_id, result_ref='inline')
 
-    def fail(self, action_id: str, attempt_id: str | None,
-             error_type: str) -> None:
-        self.store.update_action(action_id, status='failed')
+    async def fail(self, action_id: str, attempt_id: str | None,
+                   error_type: str) -> None:
+        await self.store.update_action(action_id, status='failed')
         if attempt_id:
-            self.store.finish_attempt(attempt_id, error_type=error_type)
+            await self.store.finish_attempt(attempt_id, error_type=error_type)
 
-    def mark_unknown(self, action_id: str, attempt_id: str | None,
-                     error_type: str) -> None:
+    async def mark_unknown(self, action_id: str, attempt_id: str | None,
+                           error_type: str) -> None:
         """结果不确定（超时、连接中断）：绝不能当成失败去重试。
 
         文档 §8.3：远端没有幂等与核实能力时，这一步必须保持 unknown，
         要求外部核实或人工处理，系统要如实报告不确定。
         """
-        self.store.update_action(action_id, status='unknown')
+        await self.store.update_action(action_id, status='unknown')
         if attempt_id:
-            self.store.finish_attempt(attempt_id, error_type=error_type)
+            await self.store.finish_attempt(attempt_id, error_type=error_type)

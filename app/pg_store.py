@@ -15,12 +15,13 @@
 - 启动时把库里遗留的 `running` 运行交给对账（`reconcile_orphan_runs`）——
   进程重启后不可能还有任务在跑，否则前端会一直等一个永远不会结束的任务。
 """
+import asyncio
 import json
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 
 import psycopg
 from psycopg.rows import dict_row
-from psycopg_pool import ConnectionPool
+from psycopg_pool import AsyncConnectionPool
 import time
 import uuid
 from datetime import datetime, timezone
@@ -268,57 +269,103 @@ def now() -> str:
 
 
 class PostgresStore:
-    """PostgreSQL 仓储实现（满足 `app.persistence.Repository`）。
+    """PostgreSQL 仓储实现（满足 `app.persistence.Repository`），**全异步**。
 
-    连接用法：**连接池 + 每次调用借一条**。以前是"一个进程一条连接 + 一把
-    threading.Lock"，把所有 DB 访问串行化——单 Worker 够用，但 SSE 写入、
-    后台作业、接口查询会互相排队，长事务还会把整个进程的读写一起拖住。
-    现在每次调用从池里借一条（`_lease()`），事务边界仍然显式写在方法里：
-    正常提交、异常回滚、最后一定归还。
+    连接用法：`psycopg_pool.AsyncConnectionPool` + 每次调用借一条。以前是
+    "一个进程一条连接 + 一把 threading.Lock"，把所有 DB 访问串行化，而且同步
+    调用会直接阻塞事件循环；现在借连接、执行、提交全部 await，等 IO 的时候
+    事件循环可以继续跑别的协程（SSE 推送、其他任务）。
 
-    并发正确性不靠这把锁，靠数据库：租约 + `lease_epoch` 做 fencing，
-    `claim_run` 用 `FOR UPDATE SKIP LOCKED`，事件序号靠主键冲突重算。
-    所以多进程、多线程同时用一个库是安全的（这点有并发用例覆盖）。
+    并发正确性仍然**不靠应用锁，靠数据库**：租约 + `lease_epoch` fencing、
+    `claim_run` 的 `FOR UPDATE SKIP LOCKED`、事件序号用 `pg_advisory_xact_lock`
+    按任务串行化。所以多进程、多协程同时用一个库是安全的。
+
+    构造本身不碰 IO（连接池以 `open=False` 创建），真正的初始化在第一次
+    `await ready()` 里做：打开池 → 建表 → 对账。这样 `PostgresStore(dsn)` 可以
+    在模块导入期构造，服务启动时再用 `await store.ready()` 把失败提前暴露。
     """
 
     def __init__(self, dsn: str, *, pool_size: int | None = None) -> None:
         self.dsn = dsn
         size = pool_size if pool_size is not None else settings.db_pool_size
-        self._pool = ConnectionPool(
+        self._pool = AsyncConnectionPool(
             dsn,
-            min_size=1,                 # 留一条热连接：启动即失败，而不是等第一次查询
+            min_size=1,
             max_size=max(1, size),
             timeout=settings.db_pool_timeout,
             kwargs={'row_factory': dict_row, 'autocommit': False},
             name='agent-platform',
-            open=True,
+            open=False,                 # 不在 __init__ 里做 IO：见 ready()
         )
-        # 抛错就别假装启动成功：连不上库时要立刻在启动日志里看到原因
-        self._pool.wait(timeout=max(5.0, settings.db_pool_timeout))
-        self._apply_schema()
-        self.interrupted = self._recover_orphans()
+        self._open_lock: asyncio.Lock | None = None
+        self._opened = False
+        self.interrupted = 0
 
-    @contextmanager
-    def _lease(self):
+    async def ready(self) -> None:
+        """打开连接池、建表、对账（幂等）。
+
+        启动方（API lifespan / Worker / 脚本）应当显式 await 一次：连不上库时
+        失败发生在启动阶段，而不是等到第一个用户请求才炸。
+        """
+        if self._opened:
+            return
+        if self._open_lock is None:
+            self._open_lock = asyncio.Lock()
+        async with self._open_lock:
+            if self._opened:
+                return
+            await self._pool.open(wait=True, timeout=max(5.0, settings.db_pool_timeout))
+            try:
+                await self._apply_schema()
+                self.interrupted = await self._recover_orphans()
+            except BaseException:
+                # 建表/对账失败就别留着半开的池
+                await self._pool.close()
+                raise
+            self._opened = True
+
+    @asynccontextmanager
+    async def _lease(self, *, bootstrap: bool = False):
         """借一条连接：块内正常结束提交，出异常回滚，无论如何归还。
 
         事务边界写在这里，而不是依赖连接池的隐式提交——账本、事件这类写入
-        必须明确"要么提交、要么回滚"，不能靠上下文管理器的心情。
+        必须明确"要么提交、要么回滚"。
         """
-        conn = self._pool.getconn()
+        if not bootstrap:
+            await self.ready()
+        conn = await self._pool.getconn()
         try:
             yield conn
             if not conn.autocommit:
-                conn.commit()
+                await conn.commit()
         except BaseException:
             try:
-                conn.rollback()
+                await conn.rollback()
             except Exception:                       # noqa: BLE001
                 # 连接已经坏了：回滚失败不掩盖原始异常，交给池回收
                 pass
             raise
         finally:
-            self._pool.putconn(conn)
+            await self._pool.putconn(conn)
+
+    # ---------- 单语句小工具：把 await 收在一处 ----------
+    # psycopg 的异步游标连 fetchone/fetchall 都要 await，写开就是两层嵌套；
+    # 这层薄封装让每个方法体保持"一条 SQL 一行"的可读性。
+
+    @staticmethod
+    async def _one(conn, sql: str, params=()):
+        cur = await conn.execute(sql, params)
+        return await cur.fetchone()
+
+    @staticmethod
+    async def _all(conn, sql: str, params=()):
+        cur = await conn.execute(sql, params)
+        return await cur.fetchall()
+
+    @staticmethod
+    async def _run(conn, sql: str, params=()):
+        """执行语句并返回游标（要 rowcount 时用它）。"""
+        return await conn.execute(sql, params)
 
     def pool_stats(self) -> dict:
         """连接池现状：给 /api/health 与排障看（不涉及任何业务语义）。"""
@@ -330,98 +377,89 @@ class PostgresStore:
                 'requests_waiting': stats.get('requests_waiting'),
                 'usage_ms': stats.get('usage_ms')}
 
-    def _apply_schema(self) -> None:
+    async def _apply_schema(self) -> None:
         """建表。语句是幂等的，每次启动都跑一遍即可当迁移。"""
-        with self._lease() as conn:
-            with conn.cursor() as cur:
-                cur.execute(SCHEMA)
-            conn.commit()
+        async with self._lease(bootstrap=True) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(SCHEMA)
+            await conn.commit()
 
     # ---------- 会话与消息 ----------
 
-    def ensure_session(self, session_id: str, *, tenant_id: str = 'default',
+    async def ensure_session(self, session_id: str, *, tenant_id: str = 'default',
                        owner_user_id: str = 'default') -> None:
         stamp = now()
-        with self._lease() as conn:
-            conn.execute(
-                'INSERT INTO sessions '
+        async with self._lease() as conn:
+            await self._run(conn, 'INSERT INTO sessions '
                 '(session_id, tenant_id, owner_user_id, created_at, updated_at) '
                 'VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
                 (session_id, tenant_id, owner_user_id, stamp, stamp))
-            conn.commit()
+            await conn.commit()
 
-    def session(self, session_id: str) -> dict | None:
+    async def session(self, session_id: str) -> dict | None:
         """会话归属。接口层用它做对象权限检查（文档 §10）。"""
-        with self._lease() as conn:
-            row = conn.execute(
-                'SELECT * FROM sessions WHERE session_id=%s', (session_id,)).fetchone()
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT * FROM sessions WHERE session_id=%s', (session_id,))
         return dict(row) if row else None
 
-    def append_message(self, session_id: str, role: str, content: str, *,
+    async def append_message(self, session_id: str, role: str, content: str, *,
                        tenant_id: str = 'default',
                        owner_user_id: str = 'default') -> None:
         stamp = now()
-        with self._lease() as conn:
-            conn.execute(
-                'INSERT INTO messages (session_id, role, content, created_at) '
+        async with self._lease() as conn:
+            await self._run(conn, 'INSERT INTO messages (session_id, role, content, created_at) '
                 'VALUES (%s, %s, %s, %s)', (session_id, role, content, stamp))
-            conn.execute(
-                'INSERT INTO sessions '
+            await self._run(conn, 'INSERT INTO sessions '
                 '(session_id, tenant_id, owner_user_id, created_at, updated_at) '
                 'VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
                 (session_id, tenant_id, owner_user_id, stamp, stamp))
-            conn.execute(
-                'UPDATE sessions SET updated_at=%s WHERE session_id=%s', (stamp, session_id))
-            conn.commit()
+            await self._run(conn, 'UPDATE sessions SET updated_at=%s WHERE session_id=%s', (stamp, session_id))
+            await conn.commit()
 
-    def messages(self, session_id: str) -> list[dict]:
-        with self._lease() as conn:
-            rows = conn.execute(
-                'SELECT role, content FROM messages WHERE session_id=%s ORDER BY id',
-                (session_id,)).fetchall()
+    async def messages(self, session_id: str) -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(conn, 'SELECT role, content FROM messages WHERE session_id=%s ORDER BY id',
+                (session_id,))
         return [{'role': r['role'], 'content': r['content']} for r in rows]
 
-    def messages_after(self, session_id: str, after_id: int = 0) -> list[dict]:
+    async def messages_after(self, session_id: str, after_id: int = 0) -> list[dict]:
         """取 id 大于 after_id 的消息（带 id），供压缩与增量历史使用。"""
-        with self._lease() as conn:
-            rows = conn.execute(
-                'SELECT id, role, content FROM messages '
+        async with self._lease() as conn:
+            rows = await self._all(conn, 'SELECT id, role, content FROM messages '
                 'WHERE session_id=%s AND id>%s ORDER BY id',
-                (session_id, after_id)).fetchall()
+                (session_id, after_id))
         return [{'id': r['id'], 'role': r['role'], 'content': r['content']}
                 for r in rows]
 
-    def memory(self, session_id: str) -> dict:
+    async def memory(self, session_id: str) -> dict:
         """会话记忆；没有就是空摘要 + 空事实 + upto=0。"""
-        with self._lease() as conn:
-            row = conn.execute(
-                'SELECT summary, facts, upto FROM session_memory WHERE session_id=%s',
-                (session_id,)).fetchone()
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT summary, facts, upto FROM session_memory WHERE session_id=%s',
+                (session_id,))
         if row is None:
             return {'summary': '', 'facts': {}, 'upto': 0}
         return {'summary': row['summary'],
                 'facts': json.loads(row['facts'] or '{}'),
                 'upto': row['upto']}
 
-    def set_memory(self, session_id: str, *, summary: str, facts: dict,
+    async def set_memory(self, session_id: str, *, summary: str, facts: dict,
                    upto: int) -> None:
-        with self._lease() as conn:
-            conn.execute(
-                'INSERT INTO session_memory (session_id, summary, facts, upto, updated_at) '
+        async with self._lease() as conn:
+            await self._run(conn, 'INSERT INTO session_memory (session_id, summary, facts, upto, updated_at) '
                 'VALUES (%s, %s, %s, %s, %s) ON CONFLICT(session_id) DO UPDATE SET '
                 'summary=excluded.summary, facts=excluded.facts, '
                 'upto=excluded.upto, updated_at=excluded.updated_at',
                 (session_id, summary or '',
                  json.dumps(facts or {}, ensure_ascii=False), int(upto), now()))
-            conn.commit()
+            await conn.commit()
 
-    def clear_memory(self, session_id: str) -> None:
-        with self._lease() as conn:
-            conn.execute('DELETE FROM session_memory WHERE session_id=%s',
+    async def clear_memory(self, session_id: str) -> None:
+        async with self._lease() as conn:
+            await self._run(conn, 'DELETE FROM session_memory WHERE session_id=%s',
                                (session_id,))
-            conn.commit()
+            await conn.commit()
 
-    def list_sessions(self, limit: int = 50, *, tenant_id: str | None = None,
+    async def list_sessions(self, limit: int = 50, *, tenant_id: str | None = None,
                       owner_user_id: str | None = None) -> list[dict]:
         """会话列表（按最近活跃排序），供前端侧边栏展示。
 
@@ -436,15 +474,14 @@ class PostgresStore:
             where.append("(s.owner_user_id=%s OR s.owner_user_id='default')")
             params.append(owner_user_id)
         clause = (' WHERE ' + ' AND '.join(where)) if where else ''
-        with self._lease() as conn:
-            rows = conn.execute(
-                'SELECT s.session_id, s.created_at, s.updated_at, '
+        async with self._lease() as conn:
+            rows = await self._all(conn, 'SELECT s.session_id, s.created_at, s.updated_at, '
                 '  (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.session_id) '
                 '    AS message_count, '
                 '  (SELECT content FROM messages m WHERE m.session_id=s.session_id '
                 '     AND m.role=\'user\' ORDER BY m.id LIMIT 1) AS first_message '
                 f'FROM sessions s{clause} ORDER BY s.updated_at DESC LIMIT %s',
-                (*params, limit)).fetchall()
+                (*params, limit))
         out = []
         for r in rows:
             first = (r['first_message'] or '').strip()
@@ -458,16 +495,15 @@ class PostgresStore:
 
     # ---------- 任务 ----------
 
-    def create_task(self, task_id: str, session_id: str, message: str) -> None:
+    async def create_task(self, task_id: str, session_id: str, message: str) -> None:
         stamp = now()
-        with self._lease() as conn:
-            conn.execute(
-                'INSERT INTO tasks (task_id, session_id, message, status, created_at, '
+        async with self._lease() as conn:
+            await self._run(conn, 'INSERT INTO tasks (task_id, session_id, message, status, created_at, '
                 'updated_at) VALUES (%s, %s, %s, %s, %s, %s)',
                 (task_id, session_id, message, 'running', stamp, stamp))
-            conn.commit()
+            await conn.commit()
 
-    def update_task(self, task_id: str, **fields) -> None:
+    async def update_task(self, task_id: str, **fields) -> None:
         allowed = {'status', 'artifact_id', 'error', 'state'}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
@@ -475,41 +511,37 @@ class PostgresStore:
         if 'state' in updates and not isinstance(updates['state'], str):
             updates['state'] = json.dumps(updates['state'], ensure_ascii=False)
         columns = ', '.join(f'{k}=%s' for k in updates)
-        with self._lease() as conn:
-            conn.execute(
-                f'UPDATE tasks SET {columns}, updated_at=%s WHERE task_id=%s',
+        async with self._lease() as conn:
+            await self._run(conn, f'UPDATE tasks SET {columns}, updated_at=%s WHERE task_id=%s',
                 (*updates.values(), now(), task_id))
-            conn.commit()
+            await conn.commit()
 
-    def task(self, task_id: str) -> dict | None:
-        with self._lease() as conn:
-            row = conn.execute(
-                'SELECT * FROM tasks WHERE task_id=%s', (task_id,)).fetchone()
+    async def task(self, task_id: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT * FROM tasks WHERE task_id=%s', (task_id,))
         if row is None:
             return None
         data = dict(row)
         data['state'] = json.loads(data['state']) if data['state'] else None
         return data
 
-    def tasks_of(self, session_id: str, limit: int = 50) -> list[dict]:
-        with self._lease() as conn:
+    async def tasks_of(self, session_id: str, limit: int = 50) -> list[dict]:
+        async with self._lease() as conn:
             # rowid 是隐式列，可用于排序但不能进索引定义。
-            rows = conn.execute(
-                'SELECT task_id, message, status, created_at FROM tasks '
+            rows = await self._all(conn, 'SELECT task_id, message, status, created_at FROM tasks '
                 'WHERE session_id=%s ORDER BY created_at DESC LIMIT %s',
-                (session_id, limit)).fetchall()
+                (session_id, limit))
         return [dict(r) for r in rows]
 
-    def session_tasks(self, session_id: str, limit: int = 50) -> list[dict]:
+    async def session_tasks(self, session_id: str, limit: int = 50) -> list[dict]:
         """会话里的任务，按时间**正序**——回放执行过程时要按发生顺序。
 
         与 tasks_of 的区别只在排序方向：那个是给"最近任务"用的。
         """
-        with self._lease() as conn:
-            rows = conn.execute(
-                'SELECT task_id, message, status, state, created_at FROM tasks '
+        async with self._lease() as conn:
+            rows = await self._all(conn, 'SELECT task_id, message, status, state, created_at FROM tasks '
                 'WHERE session_id=%s ORDER BY created_at ASC LIMIT %s',
-                (session_id, limit)).fetchall()
+                (session_id, limit))
         # state 一起带上：回放时要用它把通用状态派生成展示标签（outcome.label）
         out = []
         for row in rows:
@@ -520,7 +552,7 @@ class PostgresStore:
 
     # ---------- 事件日志 ----------
 
-    def append_event(self, task_id: str, event: dict) -> int:
+    async def append_event(self, task_id: str, event: dict) -> int:
         """追加一条事件并返回它的序号（每任务内自增，用于订阅去重）。
 
         序号必须在**数据库里**算，且同一任务的事件追加要串行：两个事务同时
@@ -538,71 +570,64 @@ class PostgresStore:
             'SELECT %s, COALESCE(MAX(seq), 0) + 1, %s, %s FROM events '
             'WHERE task_id=%s RETURNING seq')
         for _ in range(8):
-            with self._lease() as conn:
+            async with self._lease() as conn:
                 try:
                     # 事务级建议锁：随提交/回滚自动释放，不需要额外的解锁路径
-                    conn.execute('SELECT pg_advisory_xact_lock(hashtext(%s))',
+                    await self._run(conn, 'SELECT pg_advisory_xact_lock(hashtext(%s))',
                                  (task_id,))
-                    row = conn.execute(
-                        statement, (task_id, payload, now(), task_id)).fetchone()
+                    row = await self._one(conn, statement, (task_id, payload, now(), task_id))
                     return int(row['seq'])
                 except psycopg.errors.UniqueViolation:
                     # 建议锁下不该再发生；真发生（哈希撞了别人的锁又抢到同一号）
                     # 就重算一次，绝不返回一个可能重复的号
-                    conn.rollback()
+                    await conn.rollback()
                     continue
         raise RuntimeError('事件序号竞争失败')
 
-    def events(self, task_id: str) -> list[tuple[int, dict]]:
-        with self._lease() as conn:
-            rows = conn.execute(
-                'SELECT seq, payload FROM events WHERE task_id=%s ORDER BY seq',
-                (task_id,)).fetchall()
+    async def events(self, task_id: str) -> list[tuple[int, dict]]:
+        async with self._lease() as conn:
+            rows = await self._all(conn, 'SELECT seq, payload FROM events WHERE task_id=%s ORDER BY seq',
+                (task_id,))
         return [(r['seq'], json.loads(r['payload'])) for r in rows]
 
     # ---------- 中台对象：task / run / plan / step / action ----------
     # 这一层是文档 §3/§6/§8/§9 的落地。旧 tasks 表仍在用（界面查询与事件回放），
     # 新执行链路逐步迁到 run 模型，两边通过 task_id 关联。
 
-    def ensure_task_meta(self, task_id: str, *, session_id: str, goal: str,
+    async def ensure_task_meta(self, task_id: str, *, session_id: str, goal: str,
                          tenant_id: str = 'default',
                          owner_user_id: str = 'default') -> None:
-        with self._lease() as conn:
-            conn.execute(
-                'INSERT INTO tasks_meta '
+        async with self._lease() as conn:
+            await self._run(conn, 'INSERT INTO tasks_meta '
                 '(task_id, tenant_id, owner_user_id, goal, created_at) '
                 'VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
                 (task_id, tenant_id, owner_user_id, goal, now()))
-            conn.commit()
+            await conn.commit()
 
-    def task_meta(self, task_id: str) -> dict | None:
-        with self._lease() as conn:
-            row = conn.execute(
-                'SELECT * FROM tasks_meta WHERE task_id=%s', (task_id,)).fetchone()
+    async def task_meta(self, task_id: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT * FROM tasks_meta WHERE task_id=%s', (task_id,))
         return dict(row) if row else None
 
-    def create_run(self, run_id: str, task_id: str, *, budget: dict | None = None,
+    async def create_run(self, run_id: str, task_id: str, *, budget: dict | None = None,
                    tenant_id: str = 'default', status: str = 'queued') -> None:
         stamp = now()
-        with self._lease() as conn:
-            conn.execute(
-                'INSERT INTO runs (run_id, task_id, tenant_id, status, '
+        async with self._lease() as conn:
+            await self._run(conn, 'INSERT INTO runs (run_id, task_id, tenant_id, status, '
                 'budget_json, consumed_json, created_at, updated_at) '
                 'VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
                 (run_id, task_id, tenant_id, status,
                  json.dumps(budget or {}, ensure_ascii=False), '{}', stamp, stamp))
-            conn.execute(
-                'UPDATE tasks_meta SET current_run_id=%s WHERE task_id=%s',
+            await self._run(conn, 'UPDATE tasks_meta SET current_run_id=%s WHERE task_id=%s',
                 (run_id, task_id))
-            conn.commit()
+            await conn.commit()
 
-    def run(self, run_id: str) -> dict | None:
-        with self._lease() as conn:
-            row = conn.execute(
-                'SELECT * FROM runs WHERE run_id=%s', (run_id,)).fetchone()
+    async def run(self, run_id: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT * FROM runs WHERE run_id=%s', (run_id,))
         return _decode_run(dict(row)) if row else None
 
-    def update_run(self, run_id: str, **fields) -> None:
+    async def update_run(self, run_id: str, **fields) -> None:
         allowed = {'status', 'plan_version', 'budget_json', 'consumed_json',
                    'cancel_requested_at', 'pause_requested', 'lease_owner',
                    'lease_expires_at', 'lease_epoch', 'error', 'compensated_at'}
@@ -613,20 +638,18 @@ class PostgresStore:
             if key in updates and not isinstance(updates[key], str):
                 updates[key] = json.dumps(updates[key], ensure_ascii=False)
         columns = ', '.join(f'{k}=%s' for k in updates)
-        with self._lease() as conn:
-            conn.execute(
-                f'UPDATE runs SET {columns}, updated_at=%s WHERE run_id=%s',
+        async with self._lease() as conn:
+            await self._run(conn, f'UPDATE runs SET {columns}, updated_at=%s WHERE run_id=%s',
                 (*updates.values(), now(), run_id))
-            conn.commit()
+            await conn.commit()
 
-    def runs_of(self, task_id: str) -> list[dict]:
-        with self._lease() as conn:
-            rows = conn.execute(
-                'SELECT * FROM runs WHERE task_id=%s ORDER BY created_at',
-                (task_id,)).fetchall()
+    async def runs_of(self, task_id: str) -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(conn, 'SELECT * FROM runs WHERE task_id=%s ORDER BY created_at',
+                (task_id,))
         return [_decode_run(dict(r)) for r in rows]
 
-    def claim_run(self, worker_id: str, lease_seconds: float = 60.0,
+    async def claim_run(self, worker_id: str, lease_seconds: float = 60.0,
                   now_ts: float | None = None,
                   run_id: str | None = None) -> dict | None:
         """原子领取一个运行，并递增租约代次（PG 侧带 SKIP LOCKED）。
@@ -652,67 +675,61 @@ class PostgresStore:
                    "ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED) "
                    "RETURNING *")
             params = (worker_id, current + lease_seconds, stamp, current)
-        with self._lease() as conn:
-            row = conn.execute(sql, params).fetchone()
-            conn.commit()
+        async with self._lease() as conn:
+            row = await self._one(conn, sql, params)
+            await conn.commit()
         return _decode_run(dict(row)) if row else None
 
-    def release_lease(self, run_id: str, worker_id: str) -> None:
+    async def release_lease(self, run_id: str, worker_id: str) -> None:
         """执行者主动交还租约。带 owner 条件，旧代次不能覆盖新持有者（fencing）。"""
-        with self._lease() as conn:
-            conn.execute(
-                'UPDATE runs SET lease_owner=NULL, lease_expires_at=NULL, '
+        async with self._lease() as conn:
+            await self._run(conn, 'UPDATE runs SET lease_owner=NULL, lease_expires_at=NULL, '
                 'updated_at=%s WHERE run_id=%s AND lease_owner=%s',
                 (now(), run_id, worker_id))
-            conn.commit()
+            await conn.commit()
 
-    def renew_lease(self, run_id: str, worker_id: str, lease_seconds: float = 60.0,
+    async def renew_lease(self, run_id: str, worker_id: str, lease_seconds: float = 60.0,
                     now_ts: float | None = None) -> bool:
         current = now_ts if now_ts is not None else time.time()
-        with self._lease() as conn:
-            cur = conn.execute(
-                'UPDATE runs SET lease_expires_at=%s, updated_at=%s '
+        async with self._lease() as conn:
+            cur = await self._run(conn, 'UPDATE runs SET lease_expires_at=%s, updated_at=%s '
                 "WHERE run_id=%s AND lease_owner=%s AND status='running'",
                 (current + lease_seconds, now(), run_id, worker_id))
-            conn.commit()
+            await conn.commit()
             return cur.rowcount > 0
 
     # ---------- 计划与步骤 ----------
 
-    def save_plan(self, run_id: str, version: int, *, goal: str,
+    async def save_plan(self, run_id: str, version: int, *, goal: str,
                   steps: list[dict], reason: str = '') -> None:
-        with self._lease() as conn:
-            conn.execute(
-                'INSERT INTO plans '
+        async with self._lease() as conn:
+            await self._run(conn, 'INSERT INTO plans '
                 '(run_id, version, goal, steps_json, reason, created_at) '
                 'VALUES (%s, %s, %s, %s, %s, %s) '
                 'ON CONFLICT (run_id, version) DO UPDATE SET goal=EXCLUDED.goal, '
                 'steps_json=EXCLUDED.steps_json, reason=EXCLUDED.reason',
                 (run_id, version, goal,
                  json.dumps(steps, ensure_ascii=False), reason, now()))
-            conn.commit()
+            await conn.commit()
 
-    def plan(self, run_id: str, version: int | None = None) -> dict | None:
-        with self._lease() as conn:
+    async def plan(self, run_id: str, version: int | None = None) -> dict | None:
+        async with self._lease() as conn:
             if version is None:
-                row = conn.execute(
-                    'SELECT * FROM plans WHERE run_id=%s ORDER BY version DESC LIMIT 1',
-                    (run_id,)).fetchone()
+                row = await self._one(conn, 'SELECT * FROM plans WHERE run_id=%s ORDER BY version DESC LIMIT 1',
+                    (run_id,))
             else:
-                row = conn.execute(
-                    'SELECT * FROM plans WHERE run_id=%s AND version=%s',
-                    (run_id, version)).fetchone()
+                row = await self._one(conn, 'SELECT * FROM plans WHERE run_id=%s AND version=%s',
+                    (run_id, version))
         if row is None:
             return None
         data = dict(row)
         data['steps'] = json.loads(data.pop('steps_json'))
         return data
 
-    def save_steps(self, run_id: str, plan_version: int, steps: list[dict]) -> None:
-        with self._lease() as conn:
+    async def save_steps(self, run_id: str, plan_version: int, steps: list[dict]) -> None:
+        async with self._lease() as conn:
             for index, step in enumerate(steps):
-                conn.execute(
-                    'INSERT INTO steps '
+                await self._run(conn, 'INSERT INTO steps '
                     '(run_id, plan_version, step_id, seq, tool_key, status, '
                     'inputs_json, output_json, action_id) '
                     'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) '
@@ -723,18 +740,16 @@ class PostgresStore:
                      step.get('status', 'pending'),
                      json.dumps(step.get('inputs') or {}, ensure_ascii=False),
                      None, None))
-            conn.commit()
+            await conn.commit()
 
-    def steps_of(self, run_id: str, plan_version: int | None = None) -> list[dict]:
-        with self._lease() as conn:
+    async def steps_of(self, run_id: str, plan_version: int | None = None) -> list[dict]:
+        async with self._lease() as conn:
             if plan_version is None:
-                row = conn.execute(
-                    'SELECT MAX(plan_version) AS v FROM steps WHERE run_id=%s',
-                    (run_id,)).fetchone()
+                row = await self._one(conn, 'SELECT MAX(plan_version) AS v FROM steps WHERE run_id=%s',
+                    (run_id,))
                 plan_version = (row['v'] if row else 0) or 0
-            rows = conn.execute(
-                'SELECT * FROM steps WHERE run_id=%s AND plan_version=%s ORDER BY seq',
-                (run_id, plan_version)).fetchall()
+            rows = await self._all(conn, 'SELECT * FROM steps WHERE run_id=%s AND plan_version=%s ORDER BY seq',
+                (run_id, plan_version))
         out = []
         for r in rows:
             item = dict(r)
@@ -743,7 +758,7 @@ class PostgresStore:
             out.append(item)
         return out
 
-    def update_step(self, run_id: str, plan_version: int, step_id: str, **fields) -> None:
+    async def update_step(self, run_id: str, plan_version: int, step_id: str, **fields) -> None:
         allowed = {'status', 'output', 'action_id', 'error'}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
@@ -757,45 +772,41 @@ class PostgresStore:
                                      'cancelled', 'superseded'}:
             updates['ended_at'] = now()
         columns = ', '.join(f'{k}=%s' for k in updates)
-        with self._lease() as conn:
-            conn.execute(
-                f'UPDATE steps SET {columns} WHERE run_id=%s AND plan_version=%s '
+        async with self._lease() as conn:
+            await self._run(conn, f'UPDATE steps SET {columns} WHERE run_id=%s AND plan_version=%s '
                 'AND step_id=%s',
                 (*updates.values(), run_id, plan_version, step_id))
-            conn.commit()
+            await conn.commit()
 
     # ---------- 动作账本（文档 §8） ----------
 
-    def find_action(self, idempotency_key: str) -> dict | None:
-        with self._lease() as conn:
-            row = conn.execute(
-                'SELECT * FROM actions WHERE idempotency_key=%s',
-                (idempotency_key,)).fetchone()
+    async def find_action(self, idempotency_key: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT * FROM actions WHERE idempotency_key=%s',
+                (idempotency_key,))
         return _decode_action(dict(row)) if row else None
 
-    def create_action(self, action_id: str, *, run_id: str, plan_version: int,
+    async def create_action(self, action_id: str, *, run_id: str, plan_version: int,
                       step_id: str, tool_key: str, args_hash: str,
                       idempotency_key: str, effect: str = 'unknown',
                       authorized_by: str = '') -> dict:
         stamp = now()
-        with self._lease() as conn:
-            conn.execute(
-                'INSERT INTO actions (action_id, run_id, plan_version, step_id, '
+        async with self._lease() as conn:
+            await self._run(conn, 'INSERT INTO actions (action_id, run_id, plan_version, step_id, '
                 'tool_key, args_hash, idempotency_key, effect, status, '
                 'authorized_by, created_at, updated_at) '
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'prepared', %s, %s, %s)",
                 (action_id, run_id, plan_version, step_id, tool_key, args_hash,
                  idempotency_key, effect, authorized_by, stamp, stamp))
-            conn.commit()
-        return self.action(action_id)
+            await conn.commit()
+        return await self.action(action_id)
 
-    def action(self, action_id: str) -> dict | None:
-        with self._lease() as conn:
-            row = conn.execute(
-                'SELECT * FROM actions WHERE action_id=%s', (action_id,)).fetchone()
+    async def action(self, action_id: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT * FROM actions WHERE action_id=%s', (action_id,))
         return _decode_action(dict(row)) if row else None
 
-    def update_action(self, action_id: str, **fields) -> None:
+    async def update_action(self, action_id: str, **fields) -> None:
         allowed = {'status', 'receipt_json'}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
@@ -804,66 +815,59 @@ class PostgresStore:
             updates['receipt_json'] = json.dumps(updates['receipt_json'],
                                                 ensure_ascii=False)
         columns = ', '.join(f'{k}=%s' for k in updates)
-        with self._lease() as conn:
-            conn.execute(
-                f'UPDATE actions SET {columns}, updated_at=%s WHERE action_id=%s',
+        async with self._lease() as conn:
+            await self._run(conn, f'UPDATE actions SET {columns}, updated_at=%s WHERE action_id=%s',
                 (*updates.values(), now(), action_id))
-            conn.commit()
+            await conn.commit()
 
-    def actions_of(self, run_id: str) -> list[dict]:
-        with self._lease() as conn:
-            rows = conn.execute(
-                'SELECT * FROM actions WHERE run_id=%s ORDER BY created_at',
-                (run_id,)).fetchall()
+    async def actions_of(self, run_id: str) -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(conn, 'SELECT * FROM actions WHERE run_id=%s ORDER BY created_at',
+                (run_id,))
         return [_decode_action(dict(r)) for r in rows]
 
-    def add_attempt(self, attempt_id: str, action_id: str) -> None:
-        with self._lease() as conn:
-            conn.execute(
-                'INSERT INTO action_attempts (attempt_id, action_id, started_at) '
+    async def add_attempt(self, attempt_id: str, action_id: str) -> None:
+        async with self._lease() as conn:
+            await self._run(conn, 'INSERT INTO action_attempts (attempt_id, action_id, started_at) '
                 'VALUES (%s, %s, %s)', (attempt_id, action_id, now()))
-            conn.commit()
+            await conn.commit()
 
-    def finish_attempt(self, attempt_id: str, *, error_type: str | None = None,
+    async def finish_attempt(self, attempt_id: str, *, error_type: str | None = None,
                        result_ref: str | None = None) -> None:
-        with self._lease() as conn:
-            conn.execute(
-                'UPDATE action_attempts SET ended_at=%s, error_type=%s, result_ref=%s '
+        async with self._lease() as conn:
+            await self._run(conn, 'UPDATE action_attempts SET ended_at=%s, error_type=%s, result_ref=%s '
                 'WHERE attempt_id=%s', (now(), error_type, result_ref, attempt_id))
-            conn.commit()
+            await conn.commit()
 
-    def attempts_of(self, action_id: str) -> list[dict]:
-        with self._lease() as conn:
-            rows = conn.execute(
-                'SELECT * FROM action_attempts WHERE action_id=%s ORDER BY started_at',
-                (action_id,)).fetchall()
+    async def attempts_of(self, action_id: str) -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(conn, 'SELECT * FROM action_attempts WHERE action_id=%s ORDER BY started_at',
+                (action_id,))
         return [dict(r) for r in rows]
 
     # ---------- 产物登记 ----------
 
-    def add_artifact(self, artifact_id: str, *, run_id: str, kind: str,
+    async def add_artifact(self, artifact_id: str, *, run_id: str, kind: str,
                      storage_key: str, mime: str = 'text/html', size: int = 0,
                      sha256: str = '') -> None:
-        with self._lease() as conn:
-            conn.execute(
-                'INSERT INTO artifacts (artifact_id, run_id, kind, '
+        async with self._lease() as conn:
+            await self._run(conn, 'INSERT INTO artifacts (artifact_id, run_id, kind, '
                 'storage_key, mime, size, sha256, created_at) '
                 'VALUES (%s, %s, %s, %s, %s, %s, %s, %s) '
                 'ON CONFLICT (artifact_id) DO UPDATE SET size=EXCLUDED.size, '
                 'sha256=EXCLUDED.sha256',
                 (artifact_id, run_id, kind, storage_key, mime, size, sha256, now()))
-            conn.commit()
+            await conn.commit()
 
-    def artifact(self, artifact_id: str) -> dict | None:
-        with self._lease() as conn:
-            row = conn.execute(
-                'SELECT * FROM artifacts WHERE artifact_id=%s',
-                (artifact_id,)).fetchone()
+    async def artifact(self, artifact_id: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT * FROM artifacts WHERE artifact_id=%s',
+                (artifact_id,))
         return dict(row) if row else None
 
     # ---------- 长期记忆（文档 §12） ----------
 
-    def remember(self, *, scope_type: str, scope_id: str, subject: str,
+    async def remember(self, *, scope_type: str, scope_id: str, subject: str,
                  predicate: str, value: str, source: str = '',
                  created_by: str = 'default',
                  tenant_id: str = 'default') -> str | None:
@@ -872,23 +876,19 @@ class PostgresStore:
         返回 None 表示这次写入被墓碑挡住（用户已明确忘记过这个事实）。
         """
         fact_key = f'{subject}|{predicate}'
-        with self._lease() as conn:
-            blocked = conn.execute(
-                'SELECT 1 FROM memory_tombstones WHERE scope_type=%s AND '
-                'scope_id=%s AND fact_key=%s', (scope_type, scope_id, fact_key)
-            ).fetchone()
+        async with self._lease() as conn:
+            blocked = await self._one(conn, 'SELECT 1 FROM memory_tombstones WHERE scope_type=%s AND '
+                'scope_id=%s AND fact_key=%s', (scope_type, scope_id, fact_key))
             if blocked:
                 return None
-            current = conn.execute(
-                'SELECT memory_id, version FROM memories WHERE scope_type=%s AND '
+            current = await self._one(conn, 'SELECT memory_id, version FROM memories WHERE scope_type=%s AND '
                 'scope_id=%s AND subject=%s AND predicate=%s AND status=%s '
                 'ORDER BY version DESC LIMIT 1',
-                (scope_type, scope_id, subject, predicate, 'active')).fetchone()
+                (scope_type, scope_id, subject, predicate, 'active'))
             memory_id = 'mem_' + uuid.uuid4().hex[:12]
             version = (current['version'] + 1) if current else 1
             stamp = now()
-            conn.execute(
-                'INSERT INTO memories (memory_id, tenant_id, scope_type, scope_id, '
+            await self._run(conn, 'INSERT INTO memories (memory_id, tenant_id, scope_type, scope_id, '
                 'subject, predicate, value, status, version, supersedes, source, '
                 'created_by, created_at, updated_at) '
                 "VALUES (%s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s, %s, %s, %s)",
@@ -896,23 +896,21 @@ class PostgresStore:
                  value, version, current['memory_id'] if current else None,
                  source, created_by, stamp, stamp))
             if current:
-                conn.execute(
-                    "UPDATE memories SET status='superseded', valid_to=%s, "
+                await self._run(conn, "UPDATE memories SET status='superseded', valid_to=%s, "
                     'updated_at=%s WHERE memory_id=%s',
                     (stamp, stamp, current['memory_id']))
-            conn.commit()
+            await conn.commit()
         return memory_id
 
-    def recall(self, scope_type: str, scope_id: str) -> list[dict]:
+    async def recall(self, scope_type: str, scope_id: str) -> list[dict]:
         """读取该作用域下仍然有效的记忆（被替代/已失效的不返回）。"""
-        with self._lease() as conn:
-            rows = conn.execute(
-                'SELECT * FROM memories WHERE scope_type=%s AND scope_id=%s '
+        async with self._lease() as conn:
+            rows = await self._all(conn, 'SELECT * FROM memories WHERE scope_type=%s AND scope_id=%s '
                 "AND status='active' ORDER BY updated_at DESC",
-                (scope_type, scope_id)).fetchall()
+                (scope_type, scope_id))
         return [dict(r) for r in rows]
 
-    def forget(self, *, scope_type: str, scope_id: str, subject: str,
+    async def forget(self, *, scope_type: str, scope_id: str, subject: str,
                predicate: str, reason: str = '') -> int:
         """显式遗忘：写墓碑 + 把现有事实置为 forgotten。
 
@@ -921,115 +919,103 @@ class PostgresStore:
         """
         fact_key = f'{subject}|{predicate}'
         stamp = now()
-        with self._lease() as conn:
-            cur = conn.execute(
-                "UPDATE memories SET status='forgotten', valid_to=%s, updated_at=%s "
+        async with self._lease() as conn:
+            cur = await self._run(conn, "UPDATE memories SET status='forgotten', valid_to=%s, updated_at=%s "
                 'WHERE scope_type=%s AND scope_id=%s AND subject=%s AND predicate=%s '
                 "AND status='active'",
                 (stamp, stamp, scope_type, scope_id, subject, predicate))
             changed = cur.rowcount
-            conn.execute(
-                'INSERT INTO memory_tombstones '
+            await self._run(conn, 'INSERT INTO memory_tombstones '
                 '(tombstone_id, scope_type, scope_id, fact_key, reason, created_at) '
                 'VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
                 ('tmb_' + uuid.uuid4().hex[:10], scope_type, scope_id, fact_key,
                  reason, stamp))
-            conn.commit()
+            await conn.commit()
         return changed
 
-    def is_forgotten(self, scope_type: str, scope_id: str, subject: str,
+    async def is_forgotten(self, scope_type: str, scope_id: str, subject: str,
                      predicate: str) -> bool:
-        with self._lease() as conn:
-            row = conn.execute(
-                'SELECT 1 FROM memory_tombstones WHERE scope_type=%s AND '
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT 1 FROM memory_tombstones WHERE scope_type=%s AND '
                 'scope_id=%s AND fact_key=%s',
-                (scope_type, scope_id, f'{subject}|{predicate}')).fetchone()
+                (scope_type, scope_id, f'{subject}|{predicate}'))
         return row is not None
 
     # ---------- 后台任务（outbox） ----------
 
-    def enqueue_job(self, job_id: str, kind: str, dedupe_key: str,
+    async def enqueue_job(self, job_id: str, kind: str, dedupe_key: str,
                     payload: dict | None = None) -> bool:
         """按 (kind, dedupe_key) 幂等入队；返回是否真的新入队。"""
-        with self._lease() as conn:
-            cur = conn.execute(
-                'INSERT INTO background_jobs '
+        async with self._lease() as conn:
+            cur = await self._run(conn, 'INSERT INTO background_jobs '
                 '(job_id, kind, dedupe_key, payload_json, created_at, updated_at) '
                 'VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
                 (job_id, kind, dedupe_key,
                  json.dumps(payload or {}, ensure_ascii=False), now(), now()))
-            conn.commit()
+            await conn.commit()
             return cur.rowcount > 0
 
-    def claim_job(self, worker_id: str, lease_seconds: float = 60.0,
+    async def claim_job(self, worker_id: str, lease_seconds: float = 60.0,
                   now_ts: float | None = None) -> dict | None:
         current = now_ts if now_ts is not None else time.time()
-        with self._lease() as conn:
-            row = conn.execute(
-                "SELECT job_id FROM background_jobs WHERE status='queued' "
+        async with self._lease() as conn:
+            row = await self._one(conn, "SELECT job_id FROM background_jobs WHERE status='queued' "
                 "AND (lease_expires_at IS NULL OR lease_expires_at < %s) "
-                "ORDER BY created_at LIMIT 1", (current,)).fetchone()
+                "ORDER BY created_at LIMIT 1", (current,))
             if row is None:
                 return None
             job_id = row['job_id']
-            conn.execute(
-                "UPDATE background_jobs SET status='running', lease_owner=%s, "
+            await self._run(conn, "UPDATE background_jobs SET status='running', lease_owner=%s, "
                 'lease_expires_at=%s, attempts=attempts+1, updated_at=%s '
                 'WHERE job_id=%s',
                 (worker_id, current + lease_seconds, now(), job_id))
-            conn.commit()
-        return self.job(job_id)
+            await conn.commit()
+        return await self.job(job_id)
 
-    def job(self, job_id: str) -> dict | None:
-        with self._lease() as conn:
-            row = conn.execute(
-                'SELECT * FROM background_jobs WHERE job_id=%s', (job_id,)).fetchone()
+    async def job(self, job_id: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT * FROM background_jobs WHERE job_id=%s', (job_id,))
         if row is None:
             return None
         data = dict(row)
         data['payload'] = json.loads(data.pop('payload_json') or '{}')
         return data
 
-    def finish_job(self, job_id: str, *, error: str | None = None,
+    async def finish_job(self, job_id: str, *, error: str | None = None,
                    retry: bool = False) -> None:
         """收尾一个后台作业。
 
         `retry=True`：退回 queued 并用退避时间占住租约，下一轮扫描再领。
         一次失败就写 failed 等于把偶发错误当终态，且没人会知道。
         """
-        with self._lease() as conn:
+        async with self._lease() as conn:
             if error and retry:
-                row = conn.execute(
-                    'SELECT attempts FROM background_jobs WHERE job_id=%s',
-                    (job_id,)).fetchone()
+                row = await self._one(conn, 'SELECT attempts FROM background_jobs WHERE job_id=%s',
+                    (job_id,))
                 attempts = int((row['attempts'] if row else 0) or 1)
                 delay = min(300.0, 5.0 * (2 ** min(attempts, 6)))
-                conn.execute(
-                    "UPDATE background_jobs SET status='queued', last_error=%s, "
+                await self._run(conn, "UPDATE background_jobs SET status='queued', last_error=%s, "
                     'lease_owner=NULL, lease_expires_at=%s, updated_at=%s '
                     'WHERE job_id=%s',
                     (error, time.time() + delay, now(), job_id))
             else:
-                conn.execute(
-                    "UPDATE background_jobs SET status=%s, last_error=%s, updated_at=%s "
+                await self._run(conn, "UPDATE background_jobs SET status=%s, last_error=%s, updated_at=%s "
                     'WHERE job_id=%s',
                     ('failed' if error else 'done', error, now(), job_id))
-            conn.commit()
+            await conn.commit()
 
     # ---------- 请求幂等（POST /api/tasks） ----------
 
-    def reserve_request_key(self, scope_key: str, *, client_key: str,
+    async def reserve_request_key(self, scope_key: str, *, client_key: str,
                             tenant_id: str, owner_user_id: str,
                             endpoint: str, fingerprint: str,
                             expires_at: float) -> dict:
         """原子占位。过期行先删再插，保证 TTL 之后同一个键可以复用。"""
         stamp = now()
-        with self._lease() as conn:
-            conn.execute(
-                'DELETE FROM request_keys WHERE scope_key=%s AND expires_at < %s',
+        async with self._lease() as conn:
+            await self._run(conn, 'DELETE FROM request_keys WHERE scope_key=%s AND expires_at < %s',
                 (scope_key, time.time()))
-            cur = conn.execute(
-                'INSERT INTO request_keys '
+            cur = await self._run(conn, 'INSERT INTO request_keys '
                 '(scope_key, client_key, tenant_id, owner_user_id, endpoint, '
                 ' fingerprint, created_at, expires_at) '
                 'VALUES (%s, %s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
@@ -1037,50 +1023,45 @@ class PostgresStore:
                  fingerprint, stamp, expires_at))
             # 并发请求里只有一个插入成功；其它的读到同一行但没有响应 → 处理中
             created = cur.rowcount > 0
-            row = conn.execute(
-                'SELECT * FROM request_keys WHERE scope_key=%s',
-                (scope_key,)).fetchone()
-            conn.commit()
+            row = await self._one(conn, 'SELECT * FROM request_keys WHERE scope_key=%s',
+                (scope_key,))
+            await conn.commit()
         data = _decode_request_key(dict(row)) if row else {}
         data['created'] = created
         return data
 
-    def request_key(self, scope_key: str) -> dict | None:
-        with self._lease() as conn:
-            row = conn.execute(
-                'SELECT * FROM request_keys WHERE scope_key=%s',
-                (scope_key,)).fetchone()
+    async def request_key(self, scope_key: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT * FROM request_keys WHERE scope_key=%s',
+                (scope_key,))
         return _decode_request_key(dict(row)) if row else None
 
-    def complete_request_key(self, scope_key: str, response: dict, *,
+    async def complete_request_key(self, scope_key: str, response: dict, *,
                              task_id: str = '', session_id: str = '',
                              run_id: str = '') -> None:
-        with self._lease() as conn:
-            conn.execute(
-                'UPDATE request_keys SET response_json=%s, task_id=%s, '
+        async with self._lease() as conn:
+            await self._run(conn, 'UPDATE request_keys SET response_json=%s, task_id=%s, '
                 'session_id=%s, run_id=%s WHERE scope_key=%s',
                 (json.dumps(response, ensure_ascii=False), task_id or None,
                  session_id or None, run_id or None, scope_key))
-            conn.commit()
+            await conn.commit()
 
-    def release_request_key(self, scope_key: str) -> None:
-        with self._lease() as conn:
-            conn.execute(
-                'DELETE FROM request_keys WHERE scope_key=%s AND response_json IS NULL',
+    async def release_request_key(self, scope_key: str) -> None:
+        async with self._lease() as conn:
+            await self._run(conn, 'DELETE FROM request_keys WHERE scope_key=%s AND response_json IS NULL',
                 (scope_key,))
-            conn.commit()
+            await conn.commit()
 
-    def purge_request_keys(self, now_ts: float | None = None) -> int:
+    async def purge_request_keys(self, now_ts: float | None = None) -> int:
         current = now_ts if now_ts is not None else time.time()
-        with self._lease() as conn:
-            cur = conn.execute(
-                'DELETE FROM request_keys WHERE expires_at < %s', (current,))
-            conn.commit()
+        async with self._lease() as conn:
+            cur = await self._run(conn, 'DELETE FROM request_keys WHERE expires_at < %s', (current,))
+            await conn.commit()
             return cur.rowcount
 
     # ---------- 维护 ----------
 
-    def stats(self) -> dict:
+    async def stats(self) -> dict:
         """运行态势快照：给 /api/health 与排障用。"""
         queries = {
             'runs_queued': "SELECT COUNT(*) AS n FROM runs WHERE status='queued'",
@@ -1095,29 +1076,28 @@ class PostgresStore:
                            "WHERE status='failed'",
         }
         out = {}
-        with self._lease() as conn:
+        async with self._lease() as conn:
             for name, sql in queries.items():
-                row = conn.execute(sql).fetchone()
+                row = await self._one(conn, sql)
                 out[name] = int(row['n'] if row else 0)
         return out
 
-    def _recover_orphans(self) -> int:
+    async def _recover_orphans(self) -> int:
         """只把**没有活租约**的遗留 running 任务标记为 interrupted。
 
         多副本下不能见到 running 就改写：那会把别人正在跑的任务替它判死。
         """
-        with self._lease() as conn:
-            cur = conn.execute(
-                "UPDATE tasks SET status='interrupted', updated_at=%s "
+        async with self._lease(bootstrap=True) as conn:
+            cur = await self._run(conn, "UPDATE tasks SET status='interrupted', updated_at=%s "
                 "WHERE status='running' AND NOT EXISTS ("
                 '  SELECT 1 FROM runs r WHERE r.task_id = tasks.task_id '
                 "  AND r.status='running' AND r.lease_expires_at IS NOT NULL "
                 '  AND r.lease_expires_at > %s)',
                 (now(), time.time()))
-            conn.commit()
+            await conn.commit()
             return cur.rowcount
 
-    def reconcile_orphan_runs(self, owner: str | None = None,
+    async def reconcile_orphan_runs(self, owner: str | None = None,
                               now_ts: float | None = None) -> dict:
         """只对账**自己名下的、或租约已过期的**运行（文档 §8.3）。
 
@@ -1127,48 +1107,43 @@ class PostgresStore:
         """
         current = now_ts if now_ts is not None else time.time()
         stats = {'runs': 0, 'unknown_actions': 0, 'requeued': 0}
-        with self._lease() as conn:
-            rows = conn.execute(
-                "SELECT run_id FROM runs WHERE status IN ('running','reconciling') "
+        async with self._lease() as conn:
+            rows = await self._all(conn, "SELECT run_id FROM runs WHERE status IN ('running','reconciling') "
                 'AND (lease_owner IS NULL OR lease_owner = %s '
                 'OR lease_expires_at IS NULL OR lease_expires_at < %s)',
-                (owner, current)).fetchall()
+                (owner, current))
             for row in rows:
                 run_id = row['run_id']
                 stats['runs'] += 1
-                pending = conn.execute(
-                    "SELECT action_id, step_id FROM actions "
-                    "WHERE run_id=%s AND status='in_flight'", (run_id,)).fetchall()
+                pending = await self._all(conn, "SELECT action_id, step_id FROM actions "
+                    "WHERE run_id=%s AND status='in_flight'", (run_id,))
                 for action in pending:
-                    conn.execute(
-                        "UPDATE actions SET status='unknown', updated_at=%s "
+                    await self._run(conn, "UPDATE actions SET status='unknown', updated_at=%s "
                         'WHERE action_id=%s', (now(), action['action_id']))
                     stats['unknown_actions'] += 1
-                    conn.execute(
-                        "UPDATE steps SET status='unknown', error=%s "
+                    await self._run(conn, "UPDATE steps SET status='unknown', error=%s "
                         'WHERE run_id=%s AND step_id=%s',
                         ('进程重启时该调用结果未知，需核实', run_id,
                          action['step_id']))
                 target = 'reconciling' if pending else 'queued'
                 if target == 'queued':
                     stats['requeued'] += 1
-                conn.execute(
-                    'UPDATE runs SET status=%s, lease_owner=NULL, '
+                await self._run(conn, 'UPDATE runs SET status=%s, lease_owner=NULL, '
                     'lease_expires_at=NULL, updated_at=%s WHERE run_id=%s',
                     (target, now(), run_id))
-            conn.commit()
+            await conn.commit()
         return stats
 
-    def close(self) -> None:
+    async def close(self) -> None:
         """关闭连接池（幂等）。进程退出、测试收尾都走这里。"""
         pool = getattr(self, '_pool', None)
-        if pool is None:
+        if pool is None or not self._opened:
             return
         try:
-            pool.close()
-            pool.wait(timeout=5)
+            await pool.close()
         except Exception:                           # noqa: BLE001
             pass
+        self._opened = False
 
     # ---------- 兼容接口（SQLite 实现里有、PG 侧不需要的） ----------
 

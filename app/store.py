@@ -3,14 +3,18 @@
 设计取舍：
 
 - **标准库 `sqlite3`**，不引入新依赖；
-- 单连接 + 线程锁，同步调用。SQLite 本地写入是亚毫秒级，demo 规模完全够用；
-  真正高并发时应改为 `asyncio.to_thread` 或换专门的数据库；
+- **对外的仓储接口是异步的**（与 `PostgresStore` 一致）。sqlite3 没有官方异步
+  驱动，所以具体执行用 `asyncio.to_thread` 丢到线程池里跑，事件循环不被阻塞。
+  实现体本身仍是同步的、单连接 + 线程锁——这对 SQLite 是正确的做法（它本来就是
+  单写者），需要高并发就换 PostgreSQL；
 - **WAL 模式**，读不阻塞写；
 - **事件日志以 SQLite 为准，内存只负责实时投递**：这样进程重启后客户端仍能拿到
   完整的执行过程（见 app/api_hub.py 的 subscribe/去重逻辑）；
 - 启动时把库里遗留的 `running` 任务标记为 `interrupted`——进程重启后不可能还有
   任务在跑，否则前端会一直等一个永远不会结束的任务。
 """
+import asyncio
+import functools
 import json
 import sqlite3
 import threading
@@ -753,9 +757,12 @@ class Store:
                 (action_id, run_id, plan_version, step_id, tool_key, args_hash,
                  idempotency_key, effect, authorized_by, stamp, stamp))
             self._conn.commit()
-        return self.action(action_id)
+        return self._action_row(action_id)
 
     def action(self, action_id: str) -> dict | None:
+        return self._action_row(action_id)
+
+    def _action_row(self, action_id: str) -> dict | None:
         with self._lock:
             row = self._conn.execute(
                 'SELECT * FROM actions WHERE action_id=?', (action_id,)).fetchone()
@@ -942,9 +949,12 @@ class Store:
                 'WHERE job_id=?',
                 (worker_id, current + lease_seconds, now(), job_id))
             self._conn.commit()
-        return self.job(job_id)
+        return self._job_row(job_id)
 
     def job(self, job_id: str) -> dict | None:
+        return self._job_row(job_id)
+
+    def _job_row(self, job_id: str) -> dict | None:
         with self._lock:
             row = self._conn.execute(
                 'SELECT * FROM background_jobs WHERE job_id=?', (job_id,)).fetchone()
@@ -1165,6 +1175,36 @@ def _decode_action(row: dict) -> dict:
 def _decode_request_key(row: dict) -> dict:
     row['response'] = json.loads(row.pop('response_json') or 'null')
     return row
+
+
+def _offload(fn):
+    """把同步实现搬到线程里跑，对外提供异步接口。
+
+    `app.persistence.Repository` 只定义一套（异步）接口：SQLite 与 PostgreSQL
+    两种实现必须长得一样，调用方不必记住"当前是哪种模式"。SQLite 没有官方
+    异步驱动，所以具体执行丢进线程池；`sqlite3` 连接自带一把锁，多线程调用安全。
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    wrapper.__wrapped_sync__ = fn          # 测试用它断言"确实有同步实现"
+    return wrapper
+
+
+# 给 Store 的**公开方法**套异步外壳。
+#
+# 为什么用循环而不是手写 56 个 async def 转发：那 56 个转发除了名字什么都不写，
+# 真正的信息（借不借线程、怎么提交）一条都不在里面，只会让人觉得"这层有内容"。
+# 私有方法（_recover_orphans / _action_row …）与属性（path）不套，保持同步——
+# 它们要么在构造期跑，要么根本不做 IO。
+import types as _types
+
+_SYNC_METHODS = []
+for _name, _member in list(vars(Store).items()):
+    if not isinstance(_member, _types.FunctionType) or _name.startswith('_'):
+        continue
+    _SYNC_METHODS.append(_name)
+    setattr(Store, _name, _offload(_member))
 
 
 def open_store(database_url: str | None = None):

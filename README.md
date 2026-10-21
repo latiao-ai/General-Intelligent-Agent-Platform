@@ -89,6 +89,36 @@ python --version             # Python 3.12.15
 > 改了 `.env` 必须重启进程才生效。
 > `LLM_MODEL` 必须与网关实际可用模型名完全一致（`model_not_found` 多为名称不匹配）。
 
+### 接入本机 OpenMontage
+
+客户端已支持 `stdio`：由客户端启动 OpenMontage 子进程，通过标准输入输出通信。
+在 `.env` 的 `MCP_SERVERS` 数组中追加以下对象；原有发布服务条目和默认服务设置继续保留：
+
+```json
+{
+  "id": "openmontage",
+  "title": "OpenMontage 本地视频制作",
+  "transport": "stdio",
+  "stdio_command": "/opt/anaconda3/bin/conda",
+  "stdio_args": [
+    "run", "--no-capture-output", "-n", "openmontage",
+    "python", "-m", "openmontage_mcp.server",
+    "--project-dir", "/Users/latiao/Desktop/demo demo/webpage-agent-demo/openmontage-zh-mcp"
+  ]
+}
+```
+
+`.env` 中 `MCP_SERVERS` 的实际值是完整 JSON 数组，须放在同一行。
+`conda run` 让 Server 使用独立的 `openmontage` 环境；客户端继续使用 `demo` 环境。
+`--no-capture-output` 保证 MCP 消息直接通过输入输出传递。换机器时修改 Conda 和项目路径。
+无需在另一个终端手动启动 Server。更新配置后重启客户端，然后执行
+`python -m scripts.list_mcp_tools`，应能在 `openmontage` 下发现 9 个业务工具。
+多个服务端同时配置时，模型看到的工具名如 `mcp__openmontage__list_capabilities`。
+
+当前连接方式适合工具发现与同步调用。客户端每次调用结束都会关闭 stdio 子进程，
+而 OpenMontage 的异步任务保存在进程内存中；正式使用后台视频任务与跨调用轮询前，
+需将客户端改为复用持续存活的会话。
+
 ## 3. 运行
 
 ```bash
@@ -356,16 +386,22 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
 
 ### 实现取舍
 
-- **PostgreSQL**：`psycopg` 3.x + `psycopg_pool` **连接池**。每次调用借一条连接
-  （`PostgresStore._lease()`：正常提交 / 异常回滚 / 一定归还），池大小与等待超时
-  可配（`DB_POOL_SIZE` / `DB_POOL_TIMEOUT`），`GET /api/health` 里的 `db_pool`
-  会给出 `size / available / requests_waiting`。
+- **PostgreSQL**：`psycopg` 3.x **异步**驱动 + `AsyncConnectionPool` 连接池。
+  每次调用 `async with store._lease()` 借一条连接（正常提交 / 异常回滚 / 一定
+  归还），全链路 `await`——等数据库的时候事件循环可以继续跑别的协程（SSE 推送、
+  其他任务）。池大小与等待超时可配（`DB_POOL_SIZE` / `DB_POOL_TIMEOUT`），
+  `GET /api/health` 里的 `db_pool` 给出 `size / available / requests_waiting`。
   并发正确性**不靠应用锁，靠数据库**：租约 + `lease_epoch` fencing、
   `FOR UPDATE SKIP LOCKED` 领取、事件序号用 `pg_advisory_xact_lock` 按任务串行化。
-  （早期是"单连接 + 一把线程锁"：那不是安全，而是把吞吐锁死了——去掉锁之后，
-  事件序号的真实竞争才被并发用例暴露出来。）
+  （演进过程：单连接 + 线程锁 → 连接池 → 异步驱动。每一步都把上一步盖住的
+  问题暴露出来：去掉进程锁才发现事件序号的真实竞争，改成异步之后同步调用卡住
+  事件循环这件事也没了。）
 - **SQLite**：标准库 `sqlite3`，WAL 模式，零新增依赖，适合单机快速起步。
-- 仓储接口见 `app/persistence.py`，`check_repository()` 可在换实现前校验方法齐备。
+  它没有官方异步驱动，所以对外同样是异步接口、内部用 `asyncio.to_thread`
+  把同步执行丢进线程池——**两种实现对调用方长得完全一样**。
+- 仓储接口见 `app/persistence.py`（全部 `async def`），`check_repository()`
+  会同时校验"方法齐备"和"实现确实是协程函数"（同步实现会在异步调用点返回一个
+  没人 await 的协程，表现成"调了但什么都没发生"，最难查）。
 
 ### 验证持久化
 
@@ -400,10 +436,12 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
 - **跨进程取消是协作式的**：取消请求写 `runs.cancel_requested_at`，持有租约的执行者
   在 2 秒轮询里发现后自行停止；进程已经死了的 run 会由对账按账本处理（有 in_flight
   动作标 `unknown` 等人工核实，没有就回到 `queued` 续跑）。
-- **连接池解决的是单进程吞吐，不是高可用**。多副本之间仍然只靠数据库协作
-  （租约/账本对账），**跨实例实时事件推送**还没做：副本 A 上的客户端看不到副本 B
-  产生的实时事件（要靠重连 + `Last-Event-ID` 补发，事件本身不丢）。
+- **异步驱动 + 连接池解决的是单进程吞吐，不是高可用**。多副本之间仍然只靠数据库
+  协作（租约/账本对账），**跨实例实时事件推送**还没做：副本 A 上的客户端看不到
+  副本 B 产生的实时事件（要靠重连 + `Last-Event-ID` 补发，事件本身不丢）。
 - **池大小是静态配置**，没有按负载自适应；借不到连接会直接报错而不是排队降级。
+- **SQLite 模式仍是"线程池 + 单写者"**：接口异步了，但底层还是一条写连接；
+  真要并发就换 PostgreSQL。
 - **SQLite 模式仍是单机单写**：多副本各写各的会冲突，只适合本地开发。
 - **幂等只覆盖"创建任务"**。事件追加、部署、补偿各有更精确的机制（事件序号、
   账本 action、`compensated_at`），不共用这把钥匙。键按 `主体+接口+键` 作用域化，

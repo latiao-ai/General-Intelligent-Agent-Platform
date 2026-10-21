@@ -76,32 +76,33 @@ class Reservation:
         return bool(self.row.get('response') or self.row.get('task_id'))
 
     @property
-    def response(self) -> dict | None:
+    async def response(self) -> dict | None:
         """上次的响应；占位后崩溃的情况按已存的 task/run 现场重组。"""
         if self.row.get('response'):
             return self.row['response']
         task_id = self.row.get('task_id')
         if not task_id:
             return None
-        data = self.store.task(task_id) or {}
+        data = await self.store.task(task_id) or {}
         return {'task_id': task_id,
                 'session_id': self.row.get('session_id') or data.get('session_id'),
                 'run_id': self.row.get('run_id') or '',
                 'status': data.get('status') or 'unknown'}
 
-    def complete(self, response: dict, *, task_id: str = '',
-                 session_id: str = '', run_id: str = '') -> None:
-        self.store.complete_request_key(self.scope, response, task_id=task_id,
-                                        session_id=session_id, run_id=run_id)
+    async def complete(self, response: dict, *, task_id: str = '',
+                       session_id: str = '', run_id: str = '') -> None:
+        await self.store.complete_request_key(
+            self.scope, response, task_id=task_id,
+            session_id=session_id, run_id=run_id)
         self.row['response'] = response
 
-    def release(self) -> None:
+    async def release(self) -> None:
         """失败撤销占位。不撤销的话，同一个键会永远返回一个不存在的任务。"""
-        self.store.release_request_key(self.scope)
+        await self.store.release_request_key(self.scope)
 
 
-def reserve(store, *, principal, endpoint: str, client_key: str,
-            payload: dict, ttl_seconds: float) -> Reservation:
+async def reserve(store, *, principal, endpoint: str, client_key: str,
+                  payload: dict, ttl_seconds: float) -> Reservation:
     """占位或取回已有记录。
 
     并发重复请求时，只有一个能插入成功；另一个读到同一行且没有响应——那是
@@ -112,7 +113,7 @@ def reserve(store, *, principal, endpoint: str, client_key: str,
     scope = scope_key(getattr(principal, 'tenant_id', 'default'),
                       getattr(principal, 'user_id', 'default'),
                       endpoint, key)
-    row = store.reserve_request_key(
+    row = await store.reserve_request_key(
         scope, client_key=key,
         tenant_id=getattr(principal, 'tenant_id', 'default'),
         owner_user_id=getattr(principal, 'user_id', 'default'),

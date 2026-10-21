@@ -39,9 +39,9 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     """跑一次任务。
 
     progress(node, status, elapsed)  节点级进度
-    on_event(event)                  节点内部的细粒度事件（搜索了什么、命中多少）
+    on_event(event)                  节点内部的细粒度事件（搜索了什么、命中多少），可以是协程
     history                          多轮对话历史，供解析阶段还原指代型追加要求
-    on_start(task_id)                任务创建后立刻回调，便于外部记录任务 ID
+    on_start(task_id)                任务创建后立刻回调（可以是协程），便于外部记录任务 ID
     """
     check_runtime_keys()
     if not text.strip():
@@ -53,7 +53,7 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     folder.mkdir(parents=True, exist_ok=True)
     if on_start:
         # 早点把 task_id 交出去，外部才能在任务被取消后定位已生成的产物。
-        on_start(task_id)
+        await on_start(task_id)
     state = {
         'task_id': task_id, 'user_input': text,
         'documents': [], 'mcp_calls': [], 'errors': [], 'usage': [],
@@ -79,7 +79,7 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
                 if mode == 'custom':
                     # 节点内部发出的动作事件，直接透传给调用方。
                     if on_event:
-                        on_event(chunk)
+                        await on_event(chunk)
                     continue
                 for name, update in chunk.items():
                     now = time.perf_counter()

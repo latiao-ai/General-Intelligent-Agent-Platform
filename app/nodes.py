@@ -391,7 +391,7 @@ async def _run_compensations(state: dict, steps: list[dict], outputs: dict,
         started = time.perf_counter()
         action_id, attempt_id = None, None
         if book is not None:
-            prepared = book.begin(step_id=step_id, tool_key=tool.tool_key or name,
+            prepared = await book.begin(step_id=step_id, tool_key=tool.tool_key or name,
                                   effect=tool.effect, args=args,
                                   authorized_by='compensation')
             if prepared.get('replay') is not None:
@@ -407,20 +407,20 @@ async def _run_compensations(state: dict, steps: list[dict], outputs: dict,
                 emit(stage_end(step_id, 0, '结果未定', tool.label))
                 continue
             action_id = prepared['action_id']
-            attempt_id = book.in_flight(action_id)
+            attempt_id = await book.in_flight(action_id)
         try:
             await tool.run(args, state)
         except Exception as exc:                      # noqa: BLE001
             hint = getattr(exc, 'safe_message', None) or type(exc).__name__
             if book is not None and action_id:
-                book.fail(action_id, attempt_id, type(exc).__name__)
+                await book.fail(action_id, attempt_id, type(exc).__name__)
             results.append({'step_id': step['step_id'], 'tool': name,
                             'status': 'failed', 'error': hint})
             emit(stage_end(step_id, time.perf_counter() - started, '失败', tool.label))
             emit(action('回滚失败', f'{tool.label}：{hint}', '⚠️'))
             continue
         if book is not None and action_id:
-            book.succeed(action_id, attempt_id, {'compensated': step['step_id']})
+            await book.succeed(action_id, attempt_id, {'compensated': step['step_id']})
         results.append({'step_id': step['step_id'], 'tool': name,
                         'status': 'succeeded'})
         emit(stage_end(step_id, time.perf_counter() - started, '已回滚', tool.label))
@@ -468,7 +468,7 @@ async def run_step(state):
     book = ledger_module.current_ledger()
     action_id, attempt_id, reused = None, None, False
     if book is not None:
-        prepared = book.begin(step_id=step_id, tool_key=tool.tool_key or name,
+        prepared = await book.begin(step_id=step_id, tool_key=tool.tool_key or name,
                               effect=tool.effect, args=args)
         if prepared.get('blocked'):
             # 之前已发出但没拿到确定回执：不能重发，也不能当成功
@@ -487,7 +487,7 @@ async def run_step(state):
             reused = True
         action_id = prepared['action_id']
         if not reused:
-            attempt_id = book.in_flight(action_id)
+            attempt_id = await book.in_flight(action_id)
 
     try:
         if not reused:
@@ -501,10 +501,10 @@ async def run_step(state):
             uncertain = type(exc).__name__ in {'TimeoutError', 'AttemptTimeout',
                                                'ConnectError', 'ReadTimeout'}
             if uncertain:
-                book.mark_unknown(action_id, attempt_id, type(exc).__name__)
+                await book.mark_unknown(action_id, attempt_id, type(exc).__name__)
                 emit(action('结果不确定', '远端可能已执行，需要核实', '❓'))
             else:
-                book.fail(action_id, attempt_id, type(exc).__name__)
+                await book.fail(action_id, attempt_id, type(exc).__name__)
         errors = list(state.get('errors', [])) + [
             {'stage': name, 'type': type(exc).__name__}]
         # 出错就中止剩余步骤：后面的多半依赖这一步的产物。
@@ -533,7 +533,7 @@ async def run_step(state):
     # 现在它只留在这一步的输出与耗时行上，run 终态由 outcome 统一判定。
     marker = str(updates.pop('status', '') or '')
     if book is not None and action and not reused:
-        book.succeed(action_id, attempt_id,
+        await book.succeed(action_id, attempt_id,
                      {k: v for k, v in updates.items()
                       if isinstance(v, (str, int, float, bool, dict, list))})
     record = {k: v for k, v in updates.items()

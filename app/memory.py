@@ -69,8 +69,8 @@ async def compact(store, session_id: str) -> dict:
 
     任何异常都退化成"不压缩"，绝不向上抛：压缩是优化，不是任务的前置条件。
     """
-    memory = store.memory(session_id)
-    pending = store.messages_after(session_id, memory.get('upto') or 0)
+    memory = await store.memory(session_id)
+    pending = await store.messages_after(session_id, memory.get('upto') or 0)
     if not needs_compaction(pending):
         return {**memory, 'compacted': False}
 
@@ -95,6 +95,6 @@ async def compact(store, session_id: str) -> dict:
     summary = (data.get('summary') or '').strip()
     facts = data.get('facts') or {}
     upto = fold[-1]['id']
-    store.set_memory(session_id, summary=summary, facts=facts, upto=upto)
+    await store.set_memory(session_id, summary=summary, facts=facts, upto=upto)
     return {'summary': summary, 'facts': facts, 'upto': upto,
             'compacted': True, 'folded': len(fold)}

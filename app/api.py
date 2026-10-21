@@ -41,20 +41,25 @@ hub = Hub()
 async def lifespan(app: FastAPI):
     """进程生命周期：启动时对账、退出时收尾。
 
-    对账**不能放在模块导入处**（原来是 `RECOVERY = hub.reconcile()`）：那样
+    对账**不能放在模块导入处**（原来是 `RECOVERY = await hub.reconcile()`）：那样
     `uvicorn --reload` 一次、或者起第二个副本，就会把别的进程正在跑的任务判成
     "结果未知"并清掉租约，于是立刻又被领走 —— 正好制造它想避免的重复执行。
     现在只处理**自己名下的或租约已过期**的运行。
     """
     setup_logging('api')
-    stats = hub.reconcile(owner=hub.owner_id)
+    # 先确保仓储就绪（PG 会在这里打开连接池并建表）：连不上库应当在启动日志里
+    # 直接失败，而不是等第一个请求到了才炸
+    ready = getattr(hub.store, 'ready', None)
+    if callable(ready):
+        await ready()
+    stats = await hub.reconcile(owner=hub.owner_id)
     app.state.recovery = stats
-    purged = hub.store.purge_request_keys()
+    purged = await hub.store.purge_request_keys()
     logger.info('API 启动完成，对账结果 %s，清理过期幂等键 %s 条', stats, purged)
     try:
         yield
     finally:
-        hub.close()
+        await hub.close()
         # 连接池也要显式关：否则退出时池里的连接靠 GC 收，日志里看不到
         # "到底关没关"，测速/压测反复起停还会在服务端堆出空闲连接。
         close_store = getattr(hub.store, 'close', None)
@@ -95,8 +100,8 @@ def sse(event: dict) -> str:
 # 会话——而 session_id 是客户端传入的 12 位十六进制，猜中即接管上下文。
 
 
-def _owned_task(task_id: str, principal):
-    record = hub.get(task_id)
+async def _owned_task(task_id: str, principal):
+    record = await hub.get(task_id)
     if record is None:
         raise HTTPException(status_code=404, detail='任务不存在')
     policies.ensure_owner({'tenant_id': record.tenant_id,
@@ -105,19 +110,19 @@ def _owned_task(task_id: str, principal):
     return record
 
 
-def _owned_session(session_id: str, principal) -> dict:
-    row = hub.store.session(session_id)
+async def _owned_session(session_id: str, principal) -> dict:
+    row = await hub.store.session(session_id)
     if row is None:
         # 有些旧数据只有 messages 没有 sessions 行；按"没有"处理更安全
         raise HTTPException(status_code=404, detail='会话不存在')
     return policies.ensure_owner(row, principal, '会话')
 
 
-def _owned_run(run_id: str, principal) -> dict:
-    run = hub.store.run(run_id)
+async def _owned_run(run_id: str, principal) -> dict:
+    run = await hub.store.run(run_id)
     if run is None:
         raise HTTPException(status_code=404, detail='运行不存在')
-    meta = hub.store.task_meta(run['task_id']) or {}
+    meta = await hub.store.task_meta(run['task_id']) or {}
     resource = dict(run)
     resource['owner_user_id'] = meta.get('owner_user_id') or 'default'
     resource['tenant_id'] = run.get('tenant_id') or 'default'
@@ -155,10 +160,10 @@ async def create_task(payload: TaskRequest, request: Request,
     client_key = (request.headers.get('idempotency-key')
                   or payload.idempotency_key or '').strip()
     if not client_key:
-        return _start_task(payload, principal)
+        return await _start_task(payload, principal)
 
     try:
-        reservation = idempotency.reserve(
+        reservation = await idempotency.reserve(
             hub.store, principal=principal, endpoint='tasks.create',
             client_key=client_key,
             payload={'message': payload.message,
@@ -173,24 +178,24 @@ async def create_task(payload: TaskRequest, request: Request,
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
     if reservation.replayed:
-        body = dict(reservation.response or {})
+        body = dict(await reservation.response or {})
         body['idempotent_replay'] = True
         logger.info('幂等重放 task=%s', body.get('task_id'))
         return body
 
     try:
-        body = _start_task(payload, principal)
+        body = await _start_task(payload, principal)
     except BaseException:
         # 占位了却没建成任务：撤销占位，否则这个键会永远返回一个不存在的任务
-        reservation.release()
+        await reservation.release()
         raise
-    reservation.complete(body, task_id=body['task_id'],
-                         session_id=body['session_id'], run_id=body['run_id'])
+    await reservation.complete(body, task_id=body['task_id'],
+                              session_id=body['session_id'], run_id=body['run_id'])
     return body
 
 
-def _start_task(payload: TaskRequest, principal) -> dict:
-    record = hub.start(payload.message, payload.session_id, principal)
+async def _start_task(payload: TaskRequest, principal) -> dict:
+    record = await hub.start(payload.message, payload.session_id, principal)
     # status 是展示标签（旧字段名不变），run_status 才是状态机里的通用状态
     return {'task_id': record.task_id, 'session_id': record.session_id,
             'run_id': record.run_id,
@@ -200,14 +205,14 @@ def _start_task(payload: TaskRequest, principal) -> dict:
 @app.get('/api/tasks/{task_id}')
 async def get_task(task_id: str,
                    principal=Depends(policies.current_principal)):
-    return _owned_task(task_id, principal).summary()
+    return (await _owned_task(task_id, principal)).summary()
 
 
 @app.post('/api/tasks/{task_id}/cancel')
 async def cancel_task(task_id: str,
                       principal=Depends(policies.current_principal)):
-    record = _owned_task(task_id, principal)
-    if not hub.cancel(record.task_id):
+    record = await _owned_task(task_id, principal)
+    if not await hub.cancel(record.task_id):
         # 老实说"没停成"，而不是把 run 标成 cancelled 让界面以为停了
         raise HTTPException(status_code=409, detail='该任务已经结束，无法取消')
     return {'cancelled': True}
@@ -217,13 +222,13 @@ async def cancel_task(task_id: str,
 async def task_events(task_id: str, request: Request,
                       after: str | None = Query(default=None),
                       principal=Depends(policies.current_principal)):
-    record = _owned_task(task_id, principal)
+    record = await _owned_task(task_id, principal)
 
     # 游标：优先用 Last-Event-ID 头，其次 ?after=，从最后确认的 seq 之后补发
     cursor = request.headers.get('last-event-id') or after or '0'
 
     async def stream():
-        queue, history = record.subscribe()
+        queue, history = await record.subscribe()
         try:
             last_seq = int(cursor)
         except (TypeError, ValueError):
@@ -284,7 +289,7 @@ async def deploy(task_id: str,
     没有事件序号（界面看不到过程）、不经过策略检查，暂停/取消也管不到它。
     现在它是一次正常执行：建 run → 一步计划 → 账本 + 事件 + 取消语义全都复用。
     """
-    record = _owned_task(task_id, principal)
+    record = await _owned_task(task_id, principal)
     artifact = (record.state or {}).get('artifact') or {}
     if not artifact.get('html_path'):
         raise HTTPException(status_code=409, detail='该任务还没有生成产物')
@@ -308,7 +313,7 @@ async def artifact(task_id: str,
     文件路径以任务 state 里记的 `artifact.html_path` 为准——报告是 index.html，
     "资料转 HTML" 产出的是 sources.html；早先这里写死 index.html，导致资料页 404。
     """
-    record = _owned_task(task_id, principal)
+    record = await _owned_task(task_id, principal)
     recorded = ((record.state or {}).get('artifact') or {}).get('html_path')
     if recorded:
         path = Path(recorded)
@@ -326,18 +331,18 @@ async def artifact(task_id: str,
 async def read_run(run_id: str,
                    principal=Depends(policies.current_principal)):
     """run 的状态、计划与步骤（文档 §13）。"""
-    run = _owned_run(run_id, principal)
-    plan = hub.store.plan(run_id) or {}
+    run = await _owned_run(run_id, principal)
+    plan = await hub.store.plan(run_id) or {}
     return {'run': run, 'plan': plan,
-            'steps': hub.store.steps_of(run_id),
-            'actions': [a for a in (hub.store.actions_of(run_id))]}
+            'steps': await hub.store.steps_of(run_id),
+            'actions': [a for a in (await hub.store.actions_of(run_id))]}
 
 
 @app.post('/api/runs/{run_id}/pause')
 async def pause_run(run_id: str,
                     principal=Depends(policies.current_principal)):
-    _owned_run(run_id, principal)
-    if not hub.pause(run_id):
+    await _owned_run(run_id, principal)
+    if not await hub.pause(run_id):
         raise HTTPException(status_code=409, detail='该运行不在可暂停状态')
     return {'paused': True}
 
@@ -345,8 +350,8 @@ async def pause_run(run_id: str,
 @app.post('/api/runs/{run_id}/resume')
 async def resume_run(run_id: str,
                      principal=Depends(policies.current_principal)):
-    _owned_run(run_id, principal)
-    record = hub.resume(run_id)
+    await _owned_run(run_id, principal)
+    record = await hub.resume(run_id)
     if record is None:
         raise HTTPException(status_code=409, detail='没有可续跑的计划')
     return {'resumed': True, 'task_id': record.task_id, 'run_id': record.run_id}
@@ -360,7 +365,7 @@ async def compensate_run(run_id: str,
     撤销是一次独立执行：新建 run、走账本、发事件，原 run 只记 `compensated_at`。
     取消不会撤销已经发出去的写操作，要收回副作用就走这里。
     """
-    _owned_run(run_id, principal)
+    await _owned_run(run_id, principal)
     try:
         result = await hub.compensate(run_id)
     except RuntimeError as exc:
@@ -378,8 +383,8 @@ async def cancel_run(run_id: str,
     跨进程取消靠库里的 cancel_requested_at，执行者轮询到才会真的停。所以这里
     只承诺"请求已送达"，不再无条件把 run 标成 cancelled 假装成功。
     """
-    _owned_run(run_id, principal)
-    if not hub.cancel_run(run_id):
+    await _owned_run(run_id, principal)
+    if not await hub.cancel_run(run_id):
         raise HTTPException(status_code=409, detail='该运行已经结束，无法取消')
     return {'cancelled': True,
             'detail': '取消请求已发出；在途动作的回执仍会记录，不会重复发送'}
@@ -393,10 +398,10 @@ async def read_artifact(artifact_id: str,
     文件内容仍走任务产物下载接口；这里给的是"这个东西是什么、多大、
     哈希多少"的权威记录，便于界面与审计引用。
     """
-    meta = hub.store.artifact(artifact_id)
+    meta = await hub.store.artifact(artifact_id)
     if meta is None:
         raise HTTPException(status_code=404, detail='产物不存在')
-    run = hub.store.run(meta['run_id']) or {}
+    run = await hub.store.run(meta['run_id']) or {}
     policies.ensure_owner(
         {'tenant_id': run.get('tenant_id', 'default'),
          'owner_user_id': run.get('owner_user_id', 'default')}, principal, '产物')
@@ -415,7 +420,7 @@ async def health():
     没有这个口子，上面那些状态只能手工查库——排障成本高到没人会去查。
     """
     try:
-        stats = hub.store.stats()
+        stats = await hub.store.stats()
     except Exception as exc:                     # noqa: BLE001
         raise HTTPException(status_code=503,
                             detail=f'数据库不可用（{type(exc).__name__}）') from None
@@ -461,8 +466,8 @@ async def delete_profile(principal=Depends(policies.current_principal)):
 async def read_memory(session_id: str,
                       principal=Depends(policies.current_principal)):
     """会话记忆：更早对话的压缩结果，可读可改。"""
-    _owned_session(session_id, principal)
-    state = hub.store.memory(session_id)
+    await _owned_session(session_id, principal)
+    state = await hub.store.memory(session_id)
     return {'summary': state['summary'], 'facts': state['facts'],
             'facts_text': memory_module.render_facts(state['facts']),
             'upto': state['upto']}
@@ -472,11 +477,12 @@ async def read_memory(session_id: str,
 async def write_memory(session_id: str, payload: MemoryRequest,
                        principal=Depends(policies.current_principal)):
     """手动改写会话记忆（摘要 + 关键事实）。"""
-    _owned_session(session_id, principal)
+    await _owned_session(session_id, principal)
     facts = memory_module.parse_facts(payload.facts)
-    upto = hub.store.memory(session_id)['upto']
-    hub.store.set_memory(session_id, summary=payload.summary, facts=facts,
-                         upto=upto)
+    current = await hub.store.memory(session_id)
+    upto = current['upto']
+    await hub.store.set_memory(session_id, summary=payload.summary, facts=facts,
+                               upto=upto)
     return {'summary': payload.summary, 'facts': facts, 'upto': upto}
 
 
@@ -484,27 +490,27 @@ async def write_memory(session_id: str, payload: MemoryRequest,
 async def delete_memory(session_id: str,
                         principal=Depends(policies.current_principal)):
     """清空会话记忆，下轮会从原文重新开始累积。"""
-    _owned_session(session_id, principal)
-    hub.store.clear_memory(session_id)
+    await _owned_session(session_id, principal)
+    await hub.store.clear_memory(session_id)
     return {'cleared': True}
 
 
 @app.get('/api/sessions')
 async def list_sessions(principal=Depends(policies.current_principal)):
     """会话列表（侧边栏用）：按最近活跃排序，含标题与消息数。"""
-    return {'sessions': hub.list_sessions(principal=principal)}
+    return {'sessions': await hub.list_sessions(principal=principal)}
 
 
 @app.get('/api/sessions/{session_id}/messages')
 async def session_messages(session_id: str,
                            principal=Depends(policies.current_principal)):
-    _owned_session(session_id, principal)
-    return {'session_id': session_id, 'messages': hub.history(session_id)}
+    await _owned_session(session_id, principal)
+    return {'session_id': session_id, 'messages': await hub.history(session_id)}
 
 
 @app.get('/api/sessions/{session_id}/timeline')
 async def session_timeline(session_id: str,
                            principal=Depends(policies.current_principal)):
     """会话回放：消息气泡 + 每轮执行过程事件，供切换会话时重建步骤面板。"""
-    _owned_session(session_id, principal)
-    return hub.session_timeline(session_id)
+    await _owned_session(session_id, principal)
+    return await hub.session_timeline(session_id)
