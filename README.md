@@ -439,7 +439,37 @@ python -m scripts.migrate_status_vocabulary --apply    # 写库
 读取端也留了兜底：库里若还有旧的业务终态（比如从旧备份恢复），
 `outcome.normalize_status()` 会归一后再用，不会把 `local_ready` 当成一个新状态。
 
-## 5. 部署行为
+## 5. 加一个能力包（不用改内核）
+
+本地工具由能力包自己用 `@tool` 声明，内核只负责汇总。加一个能力 = 加一个文件：
+
+```python
+# app/capabilities/notes.py —— 全部内容都在这一个文件里
+from app.capabilities.registry import tool
+
+CAPABILITY = 'notes'
+PROMPT_RULES = '【笔记】用户要记/查笔记时才用这些工具……'   # 自动拼进规划器提示词
+
+@tool(name='save_note', label='记笔记', effect='write',
+      description='把一段文本存成本地笔记',
+      args={'type': 'object', 'properties': {'text': {'type': 'string'}}})
+async def save_note(args, state):
+    ...
+```
+
+重启进程即可：`app/capabilities/registry.py` 扫 `app/capabilities/*.py`，`@tool`
+登记的东西自动出现在规划器清单里，`tool_key` 默认 `local:<CAPABILITY>:<name>`。
+`app/tools.py`（内核）**一个字都不用改**，它也不 import 任何具体业务包
+（`CapabilityRegistryTests.test_kernel_does_not_import_business_packages` 盯着这条）。
+
+两条来源分得很清，别混：
+
+| 来源 | 谁提供 | 怎么来 | 身份 |
+|---|---|---|---|
+| 本地能力包 | `app/capabilities/*.py` 里的 `@tool` | import 即注册（静态） | `local:<能力>:<动作>` |
+| 远端 MCP 工具 | MCP 服务端 | 运行时发现（有 TTL、掉线、前缀） | `mcp:<server>:<tool>` |
+
+## 6. 部署行为
 
 ```
 DEPLOY_ENABLED=false            → 清单里没有 deploy_site（连占位都没有）
@@ -466,7 +496,7 @@ python -m scripts.retry_deploy <task_id> --server-state-checked
 python -m scripts.list_mcp_tools
 ```
 
-## 6. 耗时统计
+## 7. 耗时统计
 
 每个节点的耗时写入 `state.json` 的 `timings` 与 `elapsed_seconds`（CLI 打印汇总表），
 节点包装层同时发出 `stage_start` / `stage_end` 事件供界面实时累加。
@@ -499,7 +529,7 @@ python -m scripts.list_mcp_tools
 代理/CONNECT 不可用时，**所有模型与检索调用**会报 `APIConnectionError` /
 `ConnectError`。DeepSeek 官方接口与 MCP 服务端都走网络，排查时先用 `curl` 直连确认。
 
-## 7. 测试
+## 8. 测试
 
 ```bash
 python -m unittest discover -s tests -v

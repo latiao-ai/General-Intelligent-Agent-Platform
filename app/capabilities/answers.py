@@ -4,8 +4,12 @@ import json
 from app import context, profile, sources
 from app.capabilities.base import (ToolError, _select_sources,
                                    tool_results_text, usable_documents)
+from app.capabilities.registry import tool
 from app.events import action, answer_delta, emit
 from app.services import chat_reply
+
+# 能力包名，也进 tool_key（local:answers:<动作>）
+CAPABILITY = 'answers'
 
 
 # 本能力包自带的规划规则：什么时候该在聊天里作答、什么时候不必检索。
@@ -45,6 +49,12 @@ ANSWER_USING_TOOL_RESULTS_SYSTEM = (
 )
 
 
+@tool(name='answer_directly', label='直接回答', effect='read',
+      key='local:answers:direct',
+      description='不检索、不出文件，用模型自己的知识回答。概念解释、原理、常识、'
+                  '闲聊、对上一轮的追问都用它——不要为了保险先跑一次检索。',
+      args={'type': 'object',
+            'properties': {'question': {'type': 'string'}}})
 async def _answer_directly(args: dict, state: dict) -> dict:
     question = str(args.get('question') or state.get('user_input') or '')
     results = tool_results_text(state)
@@ -76,6 +86,13 @@ def _source_line(doc: dict) -> str:
     return f'[{doc["source_id"]}] {doc.get("title") or doc["url"]} — {doc["url"]}'
 
 
+@tool(name='answer_with_sources', label='联网作答', effect='read',
+      key='local:answers:with_sources',
+      description='基于已检索到的正文在聊天里回答问题，并附来源链接。'
+                  '用户想"问个明白"但没要文件时用它；'
+                  '必须在 web_search / fetch_pages 之后调用。',
+      args={'type': 'object',
+            'properties': {'question': {'type': 'string'}}})
 async def _answer_with_sources(args: dict, state: dict) -> dict:
     """联网检索后在聊天里作答，并附上来源。
 

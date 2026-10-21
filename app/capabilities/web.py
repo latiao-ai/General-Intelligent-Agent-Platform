@@ -1,11 +1,16 @@
 """web 能力包：抓取资料。对应 DeepSeek 官方 Search / Fetch 两个接口。"""
 from datetime import datetime, timezone
-from app.integrations import search as search_backend
+
 from app import sources
-from app.services import clean_public_url, urls_from_input
 from app.capabilities.base import ToolError, error_entry
-from app.events import action, emit
+from app.capabilities.registry import tool
 from app.config import settings
+from app.events import action, emit
+from app.integrations import search as search_backend
+from app.services import clean_public_url, urls_from_input
+
+# 能力包名，也进 tool_key（local:web:<动作>）
+CAPABILITY = 'web'
 
 # 本能力包自带的规划规则。规划器提示词按"候选工具属于哪些能力包"自动拼接，
 # 内核里不再写死检索链路（文档 §4：业务提示词归能力包）。
@@ -19,6 +24,13 @@ PROMPT_RULES = (
 )
 
 
+@tool(name='web_search', label='检索来源', effect='read',
+      key='local:web:search',
+      description='联网搜索，把命中的网页登记为来源（含摘要，部分自带正文）。'
+                  '需要外部/实时事实时先调它。',
+      args={'type': 'object',
+            'properties': {'query': {'type': 'string'}},
+            'required': ['query']})
 async def _web_search(args: dict, state: dict) -> dict:
     query = str(args.get('query') or '').strip()
     if not query:
@@ -67,6 +79,15 @@ async def _web_search(args: dict, state: dict) -> dict:
             'status': 'searched'}
 
 
+@tool(name='fetch_pages', label='抓取正文', effect='read',
+      key='local:web:fetch',
+      description='读取**本轮用户输入里给出的 URL** 的正文（Markdown）。'
+                  '输入里没有 URL 就不要调用：搜索结果自带的正文已经够用，'
+                  '不需要再逐条抓一遍。',
+      args={'type': 'object',
+            'properties': {'urls': {'type': 'array', 'minItems': 1,
+                                    'items': {'type': 'string'}}},
+            'required': ['urls']})
 async def _fetch_pages(args: dict, state: dict) -> dict:
     """读取**用户在本轮输入里给出的 URL**。
 

@@ -74,7 +74,8 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
     """P0：检索/成稿都走落盘正文，state 不再背几百 KB。"""
 
     async def test_search_keeps_text_out_of_state(self):
-        from app import sources, tools as tool_module
+        from app import sources
+        from app.capabilities import web as web_cap
 
         async def fake_search(query):
             return {'results': [{'url': 'https://example.com/a', 'title': '甲文',
@@ -84,9 +85,9 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as folder:
             with patch.object(sources, 'settings',
                               SimpleNamespace(artifact_dir=Path(folder))), \
-                    patch.object(tool_module.search_backend, 'search', fake_search), \
+                    patch.object(web_cap.search_backend, 'search', fake_search), \
                     patch_all_emits(lambda e: None):
-                result = await tool_module._web_search(
+                result = await web_cap._web_search(
                     {'query': 'q'}, {'task_id': 't1', 'documents': [],
                                      'errors': [], 'usage': []})
         doc = result['documents'][0]
@@ -115,7 +116,7 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
                     patch_all_emits(lambda e: None):
                 doc = sources.metadata('t1', 's1', url='https://example.com/a',
                                        title='甲', text='')
-                result = await tool_module._fetch_pages(
+                result = await web_cap._fetch_pages(
                     {'urls': ['https://example.com/a']},
                     {'task_id': 't1', 'user_input': '阅读 https://example.com/a',
                          'documents': [doc], 'errors': [],
@@ -325,15 +326,16 @@ class SourcesHtmlToolTests(unittest.IsolatedAsyncioTestCase):
     """资料转 HTML：不调模型，把原始资料直接排版成网页。"""
 
     async def test_renders_page_from_disk_markdown(self):
-        from app import sources, tools as tool_module
+        from app import sources
+        from app.capabilities import export as export_cap
         with tempfile.TemporaryDirectory() as folder:
             fake = SimpleNamespace(artifact_dir=Path(folder))
             with patch.object(sources, 'settings', fake), \
-                    patch.object(tool_module, 'settings', fake), \
+                    patch.object(export_cap, 'settings', fake), \
                     patch_all_emits(lambda e: None):
                 doc = sources.metadata('t1', 's1', url='https://a/1', title='甲文',
                                        text='# 小标题\n\n正文内容')
-                result = await tool_module._render_sources_html(
+                result = await export_cap._render_sources_html(
                     {'title': '我的资料'}, {'task_id': 't1', 'documents': [doc]})
                 html = Path(result['artifact']['html_path']).read_text('utf-8')
         self.assertEqual(result['status'], 'rendered')
@@ -349,7 +351,7 @@ class SourcesHtmlToolTests(unittest.IsolatedAsyncioTestCase):
         from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
         with self.assertRaises(tool_module.ToolError):
-            await tool_module._render_sources_html({}, {'documents': []})
+            await export_cap._render_sources_html({}, {'documents': []})
 
 
 class ContextBuilderTests(unittest.TestCase):
@@ -835,7 +837,7 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
             return 'ACID 是事务的四个特性。'
 
         with patch.object(answers_cap, 'chat_reply', fake_chat):
-            result = await tool_module._answer_directly(
+            result = await answers_cap._answer_directly(
                 {'question': '什么是 ACID'},
                 {'user_input': '什么是 ACID', 'history': []})
         self.assertEqual(result['status'], 'answered')
@@ -855,16 +857,17 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
 
                 with patch.object(answers_cap, 'chat_reply', fake_chat), \
                         patch_all_emits(lambda e: None):
-                    result = await tool_module._answer_with_sources(
+                    result = await answers_cap._answer_with_sources(
                         {'question': '问题'}, {'documents': [doc], 'usage': []})
         self.assertEqual(result['status'], 'answered')
         self.assertIn('参考来源', result['answer'])
         self.assertIn('https://a/1', result['answer'])
 
     async def test_answer_with_sources_requires_material(self):
-        from app import tools as tool_module
-        with self.assertRaises(tool_module.ToolError):
-            await tool_module._answer_with_sources(
+        from app.capabilities import answers as answers_cap
+        from app.capabilities.base import ToolError
+        with self.assertRaises(ToolError):
+            await answers_cap._answer_with_sources(
                 {'question': 'q'}, {'documents': [], 'usage': []})
 
 
@@ -3693,6 +3696,107 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
             # 部署待确认不是失败：对应 run 要纠正回来
             self.assertEqual(store.run('r3')['status'], 'needs_reconcile')
             store.close()
+
+
+class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
+    """能力包注册化：机制在内核，声明归能力包。
+
+    这一组回答一个问题——"加一个新能力要不要改内核？"答案必须是不要。
+    """
+
+    def test_registry_is_idempotent(self):
+        from app.capabilities import registry
+        first = [tool.name for tool in registry.load()]
+        second = [tool.name for tool in registry.load()]
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), len(set(first)))
+        # 顺序稳定（按能力包名 + 工具名），提示词与 diff 才稳定
+        specs = registry.snapshot()
+        self.assertEqual(first, sorted(first,
+                                       key=lambda n: (specs[n].capability, n)))
+
+    def test_every_registered_tool_has_a_valid_spec(self):
+        from app.capabilities import registry
+        for spec in registry.load():
+            with self.subTest(tool=spec.name):
+                self.assertTrue(spec.label.strip())
+                self.assertTrue(spec.description.strip())
+                self.assertIn(spec.effect, registry.VALID_EFFECTS)
+                self.assertEqual(spec.args.get('type'), 'object')
+                self.assertTrue(spec.tool_key.startswith('local:'))
+                self.assertIn(spec.capability, spec.tool_key)
+                self.assertTrue(callable(spec.run))
+
+    def test_tool_keys_are_stable_identity(self):
+        """tool_key 已经写进账本与幂等键，换注册方式不能顺带改了身份。"""
+        from app import tools as tool_module
+        self.assertEqual({name: spec.tool_key
+                          for name, spec in tool_module.BUILTIN_BY_NAME.items()},
+                         {'web_search': 'local:web:search',
+                          'fetch_pages': 'local:web:fetch',
+                          'render_sources_html': 'local:export:sources_html',
+                          'answer_with_sources': 'local:answers:with_sources',
+                          'answer_directly': 'local:answers:direct'})
+
+    def test_kernel_does_not_import_business_packages(self):
+        """内核（app/tools.py）不许 import 具体业务能力包——那是一切耦合的源头。"""
+        import ast
+        source = Path('app/tools.py').read_text(encoding='utf-8')
+        imported = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.ImportFrom):
+                module = node.module or ''
+                if module == 'app.capabilities':
+                    # from app.capabilities import web as x
+                    imported.update(alias.name for alias in node.names)
+                elif module.startswith('app.capabilities.'):
+                    imported.add(module.split('.')[-1])
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name.startswith('app.capabilities.'):
+                        imported.add(alias.name.split('.')[-1])
+        # 只允许：注册器、共享底座、以及提供部署适配器的 publishing
+        # （publishing 不注册本地工具，deploy_site 来自 MCP 发现）
+        self.assertEqual(imported, {'registry', 'base', 'publishing'})
+
+    async def test_a_new_capability_is_just_a_new_file(self):
+        """模拟"加一个能力包"：只写一个文件，内核与清单一个字都不改。
+
+        用 exec 一个独立模块来模拟 `app/capabilities/demo.py`：它自己声明
+        CAPABILITY / PROMPT_RULES / @tool，注册器立刻能看见它。
+        """
+        import sys
+        import types
+        from app import tools as tool_module
+        from app.capabilities import registry
+
+        source = (
+            "from app.capabilities.registry import tool\n"
+            "CAPABILITY = 'demo'\n"
+            "PROMPT_RULES = '【演示】用户要演示时才用 demo_ping。'\n"
+            "@tool(name='demo_ping', label='演示工具', description='回一个 pong',\n"
+            "      args={'type': 'object', 'properties': {}}, effect='read')\n"
+            "async def demo_ping(args, state):\n"
+            "    return {'answer': 'pong'}\n"
+        )
+        module = types.ModuleType('app.capabilities.demo')
+        module.__package__ = 'app.capabilities'
+        sys.modules['app.capabilities.demo'] = module
+        try:
+            exec(compile(source, '<demo capability>', 'exec'), module.__dict__)
+
+            spec = registry.snapshot()['demo_ping']
+            self.assertEqual(spec.tool_key, 'local:demo:demo_ping')   # 身份自动生成
+            self.assertEqual(spec.capability, 'demo')
+            # 规则跟着包走：规划器只拼"候选工具所属能力"的规则
+            self.assertEqual(tool_module.planner_rules([spec]),
+                             ['【演示】用户要演示时才用 demo_ping。'])
+            # 执行层能按名字找到它，不需要任何清单改动
+            found = await tool_module.find_tool('demo_ping')
+            self.assertIsNotNone(found)
+            self.assertEqual(found.tool_key, 'local:demo:demo_ping')
+        finally:
+            sys.modules.pop('app.capabilities.demo', None)
 
 
 @unittest.skipUnless(PG_DSN, '需要 PG_TEST_DSN 才跑真实 PostgreSQL 用例')

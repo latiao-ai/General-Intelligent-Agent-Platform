@@ -10,9 +10,13 @@ from pathlib import Path
 
 from app import md, sources
 from app.capabilities.base import ToolError, usable_documents
+from app.capabilities.registry import tool
+from app.config import settings
 from app.events import action, emit
 from app.files import save_json
-from app.config import settings
+
+# 能力包名，也进 tool_key（local:export:<动作>）
+CAPABILITY = 'export'
 
 PROMPT_RULES = (
     '【导出网页】用户要"把资料/搜索结果原样存成网页"时用 render_sources_html：'
@@ -82,6 +86,14 @@ def _sources_page(title: str, documents: list[dict]) -> str:
 </main></body></html>"""
 
 
+@tool(name='render_sources_html', label='资料转 HTML', effect='write',
+      key='local:export:sources_html',
+      description='把已检索到的原始资料（网页 JSON 元信息 + Markdown 正文）'
+                  '直接排版成一份 HTML，不调用模型、不做摘要改写。'
+                  '用户说"把资料/搜索结果存成网页"时用它；'
+                  '要提炼总结请另外接入相应的 MCP 能力。',
+      args={'type': 'object',
+            'properties': {'title': {'type': 'string'}}})
 async def _render_sources_html(args: dict, state: dict) -> dict:
     """把已检索到的资料（JSON 元信息 + Markdown 正文）导出成一份 HTML。
 

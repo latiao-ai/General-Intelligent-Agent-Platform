@@ -1,61 +1,41 @@
-"""工具注册表：把能力包提供的工具汇总成模型可选的清单。
+"""工具清单：把**本地能力包注册的工具**与**运行时发现的 MCP 工具**汇总成一份。
 
-实现已经按业务拆到 app/capabilities/（web / export / publishing / answers），
-这里只做三件事：
+这里只做三件事，**不认识任何具体业务**：
 
-1. 汇总内置工具并补上稳定身份（tool_key）与动作性质（effect）；
+1. 从 `app.capabilities.registry` 取本地工具（能力包自己用 `@tool` 声明）；
 2. 动态发现远端 MCP 工具，保留服务端给的完整能力描述与 annotations；
-   **部署工具也在这里注册**，它只是"带平台适配器的 MCP 工具"，不是另一条通道；
+   部署工具也走这条（它是带平台适配器的 MCP 工具，不是另一条通道）；
 3. 给规划器渲染工具清单。
 
-文件末尾保留一批名字别名（_web_search、_render_sources_html 等），让旧调用点和
-既有测试在迁移期继续可用——文档 §14 要求的"过渡期薄兼容层"。
+两条来源必须分开：本地能力是进程内的静态声明（import 即注册），MCP 工具是运行时
+发现（有 TTL、掉线、服务端前缀命名）。把它们混成一个注册表，"谁负责刷新"就说不清了。
+
+加一个本地能力 = 在 `app/capabilities/` 下加一个文件，这个文件一个字都不用改。
 """
 import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass, replace
 
 from app.integrations import mcp_adapter, mcp_servers
+from app.capabilities import publishing as publishing_capability
+from app.capabilities import registry
 from app.capabilities.base import (ToolError, error_entry, tool_results_text,
                                    usable_documents, _select_sources, _with_text)
-from app.capabilities.web import _fetch_pages, _web_search
-from app.capabilities.answers import (_answer_directly, _answer_with_sources)
-from app.capabilities.export import (_render_sources_html, _sources_page)
-from app.capabilities import answers as answers_capability
-from app.capabilities import export as export_capability
-from app.capabilities import publishing as publishing_capability
-from app.capabilities import web as web_capability
+# Tool 定义搬到了注册器里（内核与能力包共用一份）；这里重新导出，
+# 旧调用点与既有用例 `from app.tools import Tool` 继续可用。
+from app.capabilities.registry import Tool
 from app.config import settings
 
-# 旧代码里 image: tool_module.search_backend / chat_reply / emit 的引用保留
+# 旧代码里 tool_module.search_backend / chat_reply / emit 的引用保留
 from app.integrations import search as search_backend
 from app.events import action, answer_delta, emit
 
 logger = logging.getLogger(__name__)
 
-
-@dataclass(frozen=True)
-class Tool:
-    name: str
-    label: str          # 中文阶段名，前端耗时表用它
-    description: str    # 给规划器看：这个工具干什么
-    args: dict          # 参数 JSON Schema，给规划器看
-    run: object         # async def run(args, state) -> dict（state 增量）
-    # 稳定身份：local:<能力包>:<动作> 或 mcp:<server_id>:<名称>。
-    # 模型只看 name，但记录、审计、幂等键都应挂在 tool_key 上。
-    tool_key: str = ''
-    # 动作性质：read / write / destructive / unknown。
-    # MCP 侧取自服务端 annotations，本地写死；没信息就是 unknown，不靠名字猜。
-    effect: str = 'unknown'
-    capability: str = ''
-    # 规划规则：由**能力包自带**，规划器提示词按候选工具所属能力拼接。
-    # 以前这些规则写死在 nodes.PLANNER_SYSTEM 里，新增一个工单/数据库能力
-    # 必须改内核提示词——跟"业务提示词归能力包"是反的（文档 §4）。
-    prompt_rules: str = ''
-    # 远端工具来自哪个服务端（本地工具为空）。多服务端时靠它做路由与排障。
-    server_id: str = ''
+# 本地工具：由能力包通过 @tool 声明，这里只做加载与导出
+BUILTIN_TOOLS = registry.load()
+BUILTIN_BY_NAME = {tool.name: tool for tool in BUILTIN_TOOLS}
 
 
 def describe_tool(tool: Tool) -> str:
@@ -67,64 +47,6 @@ def describe_tool(tool: Tool) -> str:
     return (f'- {tool.name}［{tool.effect}］：{tool.description}\n'
             f'  参数：{json.dumps(tool.args, ensure_ascii=False)}')
 
-
-BUILTIN_TOOLS = [
-    Tool('web_search', '检索来源',
-         '联网搜索，把命中的网页登记为来源（含摘要，部分自带正文）。需要外部/实时事实时先调它。',
-         {'type': 'object', 'properties': {'query': {'type': 'string'}},
-          'required': ['query']},
-         _web_search),
-    Tool('fetch_pages', '抓取正文',
-         '读取**本轮用户输入里给出的 URL** 的正文（Markdown）。输入里没有 URL 就不要调用：'
-         '搜索结果自带的正文已经够用，不需要再逐条抓一遍。',
-         {'type': 'object',
-          'properties': {'urls': {'type': 'array', 'minItems': 1,
-                                  'items': {'type': 'string'}}},
-          'required': ['urls']},
-         _fetch_pages),
-
-    Tool('render_sources_html', '资料转 HTML',
-         '把已检索到的原始资料（网页 JSON 元信息 + Markdown 正文）直接排版成一份 HTML，'
-         '不调用模型、不做摘要改写。用户说"把资料/搜索结果存成网页"时用它；'
-         '要提炼总结请另外接入相应的 MCP 能力。',
-         {'type': 'object', 'properties': {'title': {'type': 'string'}}},
-         _render_sources_html),
-    Tool('answer_with_sources', '联网作答',
-         '基于已检索到的正文在聊天里回答问题，并附来源链接。用户想"问个明白"但没要'
-         '文件时用它；必须在 web_search / fetch_pages 之后调用。',
-         {'type': 'object', 'properties': {'question': {'type': 'string'}}},
-         _answer_with_sources),
-    Tool('answer_directly', '直接回答',
-         '不检索、不出文件，用模型自己的知识回答。概念解释、原理、常识、闲聊、'
-         '对上一轮的追问都用它——不要为了保险先跑一次检索。',
-         {'type': 'object', 'properties': {'question': {'type': 'string'}}},
-         _answer_directly),
-]
-
-
-# 内置工具的身份与动作性质：tool_key 形如 local:<能力包>:<动作>，
-# capability 便于以后按业务拆文件，也便于界面分组。
-#
-# 注意：**部署不在这张表里**。部署工具来自 MCP 发现（见 mcp_tools），身份是
-# mcp:<server_id>:<tool>，这里只给"本地纯计算/纯回答"的工具发本地身份。
-_LOCAL_META = {
-    'web_search': ('local:web:search', 'read', 'web'),
-    'fetch_pages': ('local:web:fetch', 'read', 'web'),
-    'render_sources_html': ('local:export:sources_html', 'write', 'export'),
-    'answer_with_sources': ('local:answers:with_sources', 'read', 'answers'),
-    'answer_directly': ('local:answers:direct', 'read', 'answers'),
-}
-
-# 每个能力包自带一段"什么时候用我"的规划规则。工具注册时按 capability 取，
-# 规划器只拼接**本轮候选工具实际覆盖到的**能力——工具多起来时提示词不会膨胀。
-CAPABILITY_RULES = {
-    'web': web_capability.PROMPT_RULES,
-    'answers': answers_capability.PROMPT_RULES,
-    'export': export_capability.PROMPT_RULES,
-    # publishing 的规则挂在 MCP 发现出来的部署工具上（它由能力包适配），
-    # 所以这里不需要再登记一份。
-}
-
 # MCP 是"外来能力"，规则只能给通用纪律，不能替它编业务语义
 MCP_PROMPT_RULES = (
     '【MCP 工具】调用查询类 MCP 工具时，只有不带过滤参数（如 keyword）的结果才是'
@@ -132,15 +54,6 @@ MCP_PROMPT_RULES = (
     '必须再加一步**不带过滤参数**的查询（如 mcp__list_sites 且参数为空），'
     '绝不能拿操作前的过滤结果或操作返回体去推断。'
 )
-
-BUILTIN_TOOLS = [
-    replace(tool, tool_key=_LOCAL_META[tool.name][0],
-            effect=_LOCAL_META[tool.name][1], capability=_LOCAL_META[tool.name][2],
-            prompt_rules=CAPABILITY_RULES.get(_LOCAL_META[tool.name][2], ''))
-    for tool in BUILTIN_TOOLS
-]
-
-BUILTIN_BY_NAME = {tool.name: tool for tool in BUILTIN_TOOLS}
 
 
 # ---------- MCP 动态工具 ----------
@@ -351,8 +264,8 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
 
 
 async def catalog() -> list[Tool]:
-    """本轮可用的全部工具：内置 + MCP 发现。"""
-    tools = list(BUILTIN_TOOLS)
+    """本轮可用的全部工具：本地能力包（注册来的）+ MCP 发现。"""
+    tools = list(registry.registered())
     tools.extend(await mcp_tools())
     if not settings.deploy_enabled:
         # 关掉部署时连占位工具都不给，免得计划里出现注定失败的一步。
@@ -370,7 +283,9 @@ async def find_tool(name: str):
     的尾部——身份才是稳定的，名字只是对模型的展示形式。只有唯一命中才算数，
     两个服务端都有这个工具时不做猜测。
     """
-    tool = BUILTIN_BY_NAME.get(name)
+    # 先看模块级快照（既有用例会 patch 它注入假工具），再看注册表的实时视图：
+    # 这样"新增一个能力包文件"不需要动任何清单，名字也能解析到。
+    tool = BUILTIN_BY_NAME.get(name) or registry.snapshot().get(name)
     if tool is not None:
         return tool
     tools = await mcp_tools()
