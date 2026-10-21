@@ -29,12 +29,8 @@ def reply_text(state: dict) -> str:
         if kind == 'answer':
             # 直接回答：answer 本身就是给用户看的完整回执，不再包装
             return state.get('answer') or '（模型没有返回内容）'
-        if kind == 'artifact':
-            # 产出可能是页面，也可能是原样转换的资料页，回执要说清是哪种
-            what = '资料页面' if (state.get('artifact') or {}).get('kind') == 'sources' \
-                else '页面'
-            return (f'{what}已生成，保存在本地。想发布就说一句「部署到服务器」。'
-                    f'任务 ID：{state.get("task_id")}')
+        if kind in ('artifact', 'files'):
+            return _artifact_reply(state)
         if kind == 'compensation':
             done = [item for item in (state.get('compensations') or [])
                     if item.get('status') == 'succeeded']
@@ -73,6 +69,19 @@ def reply_text(state: dict) -> str:
         return '执行中断了（执行者与任务的连接断开）。可重新发起一次。'
     return f'任务结束，状态：{status}'
 
+
+def _artifact_reply(state: dict) -> str:
+    """产出了东西（页面或文件）时的回执。"""
+    blocked = ((state.get('plan') or {}).get('blocked') or [])
+    note = f'！未完成的部分：{blocked[0]}。' if blocked else ''
+    files = _produced_files(state)
+    if (state.get('artifact') or {}).get('html_path'):
+        what = '资料页面' if (state.get('artifact') or {}).get('kind') == 'sources' \
+            else '页面'
+        tail = f'想发布就说一句「部署到服务器」。任务 ID：{state.get("task_id")}'
+        return f'{what}已生成，保存在本地。{note}{tail}'
+    return (f'已产出 {files or "工作文件"}。{note}'
+            f'任务 ID：{state.get("task_id")}')
 
 def _produced_files(state: dict) -> str:
     """本轮写出来的文件（write_file 的产物），失败时也要说清楚做到哪了。"""

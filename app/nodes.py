@@ -129,6 +129,17 @@ def validate_plan(raw_steps: list[dict], catalog) -> tuple[list[dict], list[dict
                 # 只能依赖**前面**的步骤：指向后面或不存在都会让执行顺序失效
                 issues.append({'code': 'bad_dependency', 'step_id': step_id,
                                'detail': f'依赖 {dep!r} 不是更早的步骤'})
+        # 服务端整体不可用（清单里一个能用的都没有）：执行类步骤不该出现在计划里。
+        # 这不是"工具不存在"，而是"现在干不了"——所以要停下来问用户/说明缺什么，
+        # 而不是把 render_video 跑一遍等它报 E_PROJECT_ARTIFACT_MISSING。
+        server_id = known[name].server_id
+        effect = known[name].effect
+        if server_id and effect != 'read':
+            blocked_reason = tool_module.unusable_reason(server_id)
+            if blocked_reason:
+                issues.append({'code': 'capability_unavailable', 'step_id': step_id,
+                               'tool': name, 'detail': blocked_reason})
+                continue
         compensate = _validate_compensation(raw.get('compensate'), step_id,
                                             name, known, issues)
         step = {'tool': name, 'step_id': step_id,
@@ -353,6 +364,17 @@ async def plan(state):
         steps, _ = _valid_steps(fallback_steps(state), catalog)
         summary = summary or '降级计划'
 
+    # 能力不可用：模型可能已经把这些步骤删掉了，但**用户仍需知道**为什么没做成
+    # 那件事（不然只会看到"已产出 script.md"，以为视频做完了）。
+    blocked_notes = list(state.get('capability_blocked') or [])
+    for item in issues:
+        if item.get('code') == 'capability_unavailable':
+            detail = f'{item["tool"]}：{item["detail"]}'
+            if detail not in blocked_notes:
+                blocked_notes.append(detail)
+    if blocked_notes:
+        emit(action('有步骤因能力不可用被移除', blocked_notes[0][:120], '⚠️'))
+
     # warning 级问题不阻断执行，但必须留痕：否则"补偿被静默丢掉"没人知道。
     warnings = [item for item in issues if item.get('severity') == 'warning']
     if warnings:
@@ -367,8 +389,11 @@ async def plan(state):
         emit(action('已记住', profile.describe(changed), '🧠'))
     emit(thought(describe_plan(steps, summary)))
     result = {'plan': {'steps': steps, 'summary': summary,
-                       **({'warnings': warnings} if warnings else {})},
+                       **({'warnings': warnings} if warnings else {}),
+                       **({'blocked': blocked_notes} if blocked_notes else {})},
               'step_index': 0, 'usage': usage, 'status': 'planned'}
+    if blocked_notes:
+        result['capability_blocked'] = blocked_notes
     if errors:
         result['errors'] = errors
     return result

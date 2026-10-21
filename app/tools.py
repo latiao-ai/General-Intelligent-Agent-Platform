@@ -131,8 +131,22 @@ async def _discover_capabilities(server) -> dict:
                 'status': str(item.get('status') or '').upper(),
                 'description': str(item.get('description') or '')[:80],
                 'capability': str(item.get('capability') or ''),
+                # 服务端通常会说清"缺什么/怎么装"，透出来才能告诉用户
+                'install': str(item.get('install_instructions') or '')[:160],
             }
     return out
+
+
+def _is_available(status: str) -> bool:
+    """服务端的状态字符串五花八门：`ToolStatus.AVAILABLE`、`AVAILABLE`、`available`…
+
+    统一判断成"能用/不能用"，别拿全等去比——真踩过：带枚举前缀的字符串全被
+    当成不可用，于是整台服务端被判成"什么都不能做"。
+    """
+    text = str(status or '').upper()
+    if not text:
+        return True                     # 服务端没报状态，按能用处理
+    return 'AVAILABLE' in text and 'UNAVAILABLE' not in text
 
 
 def _capability_line(capabilities: dict, limit: int = 30) -> str:
@@ -144,7 +158,7 @@ def _capability_line(capabilities: dict, limit: int = 30) -> str:
     if not capabilities:
         return ''
     usable = [name for name, info in capabilities.items()
-              if info.get('status') in ('', 'AVAILABLE')]
+              if _is_available(info.get('status'))]
     unusable = [name for name in capabilities if name not in usable]
     parts = []
     if usable:
@@ -233,6 +247,33 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
     return tools
 
 
+def unusable_reason(server_id: str) -> str:
+    """这个服务端当前"一个能用的内部工具都没有"时，返回一句人话原因。
+
+    有清单、且清单里没有任何 AVAILABLE —— 说明缺依赖/缺 key/没装技能。
+    这时候**不该**再调度它的执行类工具：跑了必然失败，只是在浪费步骤和时间。
+    """
+    caps = known_inner_names(server_id)
+    if not caps:
+        return ''
+    usable = [name for name, item in caps.items()
+              if _is_available(item.get('status'))]
+    if usable:
+        return ''
+    hints = []
+    for name, item in caps.items():
+        install = (item.get('install') or '').strip()
+        if install and install not in hints:
+            hints.append(install)
+        if len(hints) >= 2:
+            break
+    reason = (f'服务端 {server_id} 的 {len(caps)} 个内部工具当前全不可用'
+              f'（缺依赖 / 缺 key / 未安装），执行类工具没法跑')
+    if hints:
+        reason += '；安装提示：' + '；'.join(hints)
+    return reason
+
+
 def known_inner_names(server_id: str) -> dict:
     """某个服务端上一次发现到的内部能力清单（没有就空）。"""
     return dict((_MCP_CACHE.get('capabilities') or {}).get(server_id) or {})
@@ -255,16 +296,16 @@ def _check_inner_name(server, args: dict, capabilities: dict) -> None:
     info = capabilities.get(wanted)
     if info is None:
         usable = [name for name, item in capabilities.items()
-                  if item.get('status') in ('', 'AVAILABLE')]
+                  if _is_available(item.get('status'))]
         raise ToolError(
             f'内部工具名 {wanted} 不在服务端的能力清单里。'
             f'真实存在的是：{"、".join(sorted(capabilities)[:20])}'
             + (f'；其中当前可用：{"、".join(usable[:12])}' if usable
                else '；且它们当前都不可用'))
     status = (info.get('status') or '').upper()
-    if status and status != 'AVAILABLE':
+    if not _is_available(info.get('status')):
         usable = [name for name, item in capabilities.items()
-                  if item.get('status') in ('', 'AVAILABLE')]
+                  if _is_available(item.get('status'))]
         raise ToolError(
             f'内部工具 {wanted} 当前不可用（{status}）。'
             + (f'可用的只有：{"、".join(usable[:12])}' if usable
@@ -398,8 +439,11 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
             if isinstance(leaf, mcp_adapter.MCPToolFailure):
                 # 业务层失败（status: error / E_*）：必须当成失败停下，而且要把
                 # 服务端原话透出来，否则用户只看到"没有产出可用结果"。
+                # 但只取前两行：服务端常把整段 traceback 塞进 message，直接展示
+                # 既看不懂又泄漏内部路径。
+                detail = ' '.join(str(leaf).split())
                 raise ToolError(
-                    f'MCP 工具 {server_tool_name} 失败：{leaf}') from exc
+                    f'MCP 工具 {server_tool_name} 失败：{detail[:240]}') from exc
             raise ToolError(
                 f'MCP 工具 {server_tool_name} 调用失败'
                 f'（{_describe_error(exc)}）') from exc

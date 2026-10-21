@@ -114,7 +114,9 @@ def final_status(state: dict) -> str:
     if deployment:
         return 'succeeded' if deployment.get('status') == 'success' \
             else 'needs_reconcile'
-    if state.get('answer') or (state.get('artifact') or {}).get('html_path'):
+    # 有产出（页面或 write_file 写出的文件）就是成功：不能因为"没生成视频"
+    # 就把三个脚本文件说成"没有产出可用结果"。
+    if state.get('answer') or _produced(state):
         return 'succeeded'
     return 'failed'
 
@@ -151,14 +153,31 @@ def view(status, state: dict | None = None) -> dict:
 
 
 def _produced(state: dict) -> list[dict]:
+    """本轮真正产出的东西：页面产物 + write_file 写出来的文件。
+
+    write_file 的产物以前不算数，于是"写了三个脚本文件"的任务被判成 failed——
+    用户看到的却是"本次没有产出可用结果"，自相矛盾。
+    """
+    produced = []
     artifact = state.get('artifact') or {}
-    if not artifact.get('html_path'):
-        return []
-    return [{'kind': artifact.get('kind') or 'report',
-             'artifact_id': artifact.get('artifact_id') or '',
-             'path': artifact.get('html_path'),
-             'sha256': artifact.get('sha256') or '',
-             'size_bytes': artifact.get('size_bytes')}]
+    if artifact.get('html_path'):
+        produced.append({'kind': artifact.get('kind') or 'report',
+                         'artifact_id': artifact.get('artifact_id') or '',
+                         'path': artifact.get('html_path'),
+                         'sha256': artifact.get('sha256') or '',
+                         'size_bytes': artifact.get('size_bytes')})
+    for output in (state.get('step_outputs') or {}).values():
+        if not isinstance(output, dict):
+            continue
+        written = output.get('written')
+        if isinstance(written, dict) and written.get('path'):
+            produced.append({'kind': 'file',
+                             'artifact_id': '',
+                             'path': written['path'],
+                             'sha256': '',
+                             'size_bytes': written.get('size_bytes'),
+                             'relative': written.get('relative') or ''})
+    return produced
 
 
 def _effects(plan: dict, outputs: dict) -> list[dict]:

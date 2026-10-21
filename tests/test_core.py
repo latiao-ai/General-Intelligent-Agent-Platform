@@ -3623,6 +3623,31 @@ class McpBusinessFailureTests(unittest.IsolatedAsyncioTestCase):
                 content=[])
         self.assertEqual(mcp_adapter.result_payload(ok)['job_id'], 'j1')
 
+    def test_enum_prefixed_status_is_parsed_correctly(self):
+        """`ToolStatus.AVAILABLE` 这种带枚举前缀的状态不能当成"不可用"。
+
+        真踩过：拿全等去比，于是整台服务端被判成"什么都不能做"，计划里的执行
+        步骤被全部拦掉。
+        """
+        from app import tools as tool_module
+        self.assertTrue(tool_module._is_available('ToolStatus.AVAILABLE'))
+        self.assertTrue(tool_module._is_available('available'))
+        self.assertTrue(tool_module._is_available(''))
+        self.assertFalse(tool_module._is_available('ToolStatus.UNAVAILABLE'))
+        self.assertFalse(tool_module._is_available('UNAVAILABLE'))
+        # 只要还有能用的工具，就不该把整台服务端判死
+        tool_module._MCP_CACHE['capabilities'] = {'montage': {
+            'video_compose': {'status': 'ToolStatus.AVAILABLE'},
+            'video_stitch': {'status': 'ToolStatus.UNAVAILABLE'}}}
+        self.assertEqual(tool_module.unusable_reason('montage'), '')
+        tool_module._MCP_CACHE['capabilities'] = {'montage': {
+            'video_compose': {'status': 'ToolStatus.UNAVAILABLE',
+                              'install': 'Install FFmpeg: https://ffmpeg.org'}}}
+        reason = tool_module.unusable_reason('montage')
+        self.assertIn('全不可用', reason)
+        self.assertIn('FFmpeg', reason)
+        tool_module._MCP_CACHE['capabilities'] = {}
+
     async def test_runner_turns_business_failure_into_step_failure(self):
         """status:error 的回执 → ToolError（带着服务端原话），不是"成功"。"""
         from app import nodes
