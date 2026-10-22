@@ -281,6 +281,7 @@ CREATE TABLE IF NOT EXISTS identities (
     provider     TEXT NOT NULL,
     subject      TEXT NOT NULL,
     user_id      TEXT NOT NULL,
+    identity_provider_id TEXT NOT NULL DEFAULT '',
     tenant_id    TEXT NOT NULL DEFAULT 'default',
     email        TEXT NOT NULL DEFAULT '',
     role         TEXT NOT NULL DEFAULT 'member',
@@ -289,7 +290,56 @@ CREATE TABLE IF NOT EXISTS identities (
     PRIMARY KEY (provider, subject)
 );
 CREATE INDEX IF NOT EXISTS idx_identities_user ON identities(user_id);
+-- 旧库升级：CREATE TABLE IF NOT EXISTS 不补列，ALTER 必须显式执行（且在建索引之前）
+ALTER TABLE identities ADD COLUMN IF NOT EXISTS identity_provider_id TEXT NOT NULL DEFAULT '';
+-- 老数据的身份源就用原来的 provider，保证存量绑定继续命中同一个账号
+UPDATE identities SET identity_provider_id = provider WHERE identity_provider_id = '';
+
+-- 身份绑定的**唯一关系**：企业 + 身份源 + 外部用户 → 中台用户。
+-- 老列 (provider, subject) 保留给旧数据：迁移后 provider 与身份源一致。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_identities_scope
+    ON identities(tenant_id, identity_provider_id, subject)
+    WHERE identity_provider_id <> '';
+
+-- 票据兑换记录：(issuer, jti) 唯一 → 同一张票据在多实例并发下也只能成功一次
+CREATE TABLE IF NOT EXISTS ticket_redemptions (
+    issuer      TEXT NOT NULL,
+    jti         TEXT NOT NULL,
+    connection_id TEXT NOT NULL DEFAULT '',
+    platform_id TEXT NOT NULL DEFAULT '',
+    tenant_id   TEXT NOT NULL DEFAULT '',
+    expires_at  BIGINT NOT NULL,
+    used_at     TEXT NOT NULL,
+    auth_session_id TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (issuer, jti)
+);
+CREATE INDEX IF NOT EXISTS idx_ticket_redemptions_used
+    ON ticket_redemptions(used_at);
+
+-- 中台自己的登录会话。凭证原文只在浏览器，这里只存摘要。
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    auth_session_id  TEXT PRIMARY KEY,
+    token_digest     TEXT NOT NULL UNIQUE,
+    user_id          TEXT NOT NULL,
+    tenant_id        TEXT NOT NULL DEFAULT 'default',
+    platform_id      TEXT NOT NULL DEFAULT '',
+    connection_id    TEXT NOT NULL DEFAULT '',
+    identity_provider_id TEXT NOT NULL DEFAULT '',
+    subject          TEXT NOT NULL DEFAULT '',
+    issued_at        TEXT NOT NULL,
+    expires_at       DOUBLE PRECISION NOT NULL,
+    last_seen_at     TEXT NOT NULL,
+    revoked_at       TEXT,
+    user_agent       TEXT NOT NULL DEFAULT '',
+    remote_addr      TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
+CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);
 """
+
+
+class TicketAlreadyUsed(RuntimeError):
+    """同一张票据被第二次兑换（含并发）。调用方应回 409。"""
 
 
 def now() -> str:
@@ -424,8 +474,8 @@ class PostgresStore:
 
     async def bind_identity(self, provider: str, subject: str, *,
                             email: str = '', display_name: str = '',
-                            tenant_id: str = 'default', role: str = 'member'
-                            ) -> dict:
+                            tenant_id: str = 'default', role: str = 'member',
+                            identity_provider_id: str = '') -> dict:
         """平台身份 → 本地主体：命中就返回，没有就建号。
 
         首登并发靠 `ON CONFLICT ... RETURNING` 收敛：两个请求同时进来时由数据库
@@ -435,18 +485,21 @@ class PostgresStore:
         常见路径（已绑定过）只有一次 SELECT，不写库。
         """
         stamp = now()
+        # 身份源的稳定编号是隔离键：两个平台各自有个 user-123，必须落到两个账号
+        idp = (identity_provider_id or provider).strip()
         async with self._lease() as conn:
             row = await self._one(
                 conn,
                 'SELECT user_id, tenant_id, role FROM identities '
-                'WHERE provider=%s AND subject=%s', (provider, subject))
+                'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
+                (tenant_id, idp, subject))
             if row is not None:
                 # last_seen 只用于运营统计，失败不该影响登录，所以不参与返回判断
                 await self._run(
                     conn,
                     'UPDATE identities SET last_seen_at=%s '
-                    'WHERE provider=%s AND subject=%s',
-                    (stamp, provider, subject))
+                    'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
+                    (stamp, tenant_id, idp, subject))
                 await conn.commit()
                 return dict(row)
 
@@ -460,16 +513,145 @@ class PostgresStore:
             row = await self._one(
                 conn,
                 'INSERT INTO identities '
-                '(provider, subject, user_id, tenant_id, email, role, '
-                ' created_at, last_seen_at) '
-                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s) '
-                'ON CONFLICT (provider, subject) DO UPDATE '
-                '  SET last_seen_at = EXCLUDED.last_seen_at '
+                '(provider, subject, user_id, tenant_id, identity_provider_id, '
+                ' email, role, created_at, last_seen_at) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) '
+                'ON CONFLICT (tenant_id, identity_provider_id, subject) '
+                '  WHERE identity_provider_id <> \'\' '
+                '  DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at '
                 'RETURNING user_id, tenant_id, role',
-                (provider, subject, user_id, tenant_id, email, role,
+                (idp, subject, user_id, tenant_id, idp, email, role,
                  stamp, stamp))
             await conn.commit()
             return dict(row)
+
+    async def redeem_ticket(self, *, issuer: str, jti: str, expires_at: int,
+                            connection_id: str, platform_id: str,
+                            tenant_id: str, identity_provider_id: str,
+                            subject: str, session_id: str,
+                            session_digest: str, session_expires_at: float,
+                            email: str = '', display_name: str = '',
+                            user_agent: str = '', remote_addr: str = ''
+                            ) -> dict:
+        """**一次事务里**完成：登记票据已用 → 绑定身份 → 建中台登录会话。
+
+        为什么必须同一个事务：中途失败若留下"票据已登记但没会话"，平台重试会被
+        当成重复兑换而永远登不进来；若留下"会话已建但票据没登记"，同一张票据就能
+        被反复兑换。两种半成品都不可接受。
+
+        并发由数据库裁决：`(issuer, jti)` 是主键，第二个事务插入冲突 → 抛
+        `TicketAlreadyUsed`，不会建出第二个会话。
+        """
+        stamp = now()
+        async with self._lease() as conn:
+            try:
+                await self._run(
+                    conn,
+                    'INSERT INTO ticket_redemptions '
+                    '(issuer, jti, connection_id, platform_id, tenant_id, '
+                    ' expires_at, used_at, auth_session_id) '
+                    'VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
+                    (issuer, jti, connection_id, platform_id, tenant_id,
+                     int(expires_at), stamp, session_id))
+            except psycopg.errors.UniqueViolation as exc:
+                await conn.rollback()
+                raise TicketAlreadyUsed(f'票据 {jti} 已被兑换过') from exc
+
+            idp = (identity_provider_id or connection_id).strip()
+            row = await self._one(
+                conn,
+                'SELECT user_id, tenant_id, role FROM identities '
+                'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
+                (tenant_id, idp, subject))
+            if row is None:
+                user_id = 'u_' + uuid.uuid4().hex[:16]
+                await self._run(
+                    conn,
+                    'INSERT INTO app_users '
+                    '(user_id, display_name, email, status, created_at, updated_at) '
+                    'VALUES (%s, %s, %s, %s, %s, %s) '
+                    'ON CONFLICT (user_id) DO NOTHING',
+                    (user_id, display_name, email, 'active', stamp, stamp))
+                row = await self._one(
+                    conn,
+                    'INSERT INTO identities '
+                    '(provider, subject, user_id, tenant_id, identity_provider_id, '
+                    ' email, role, created_at, last_seen_at) '
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (tenant_id, identity_provider_id, subject) "
+                    "  WHERE identity_provider_id <> '' "
+                    '  DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at '
+                    'RETURNING user_id, tenant_id, role',
+                    (idp, subject, user_id, tenant_id, idp, email, 'member',
+                     stamp, stamp))
+            else:
+                await self._run(
+                    conn,
+                    'UPDATE identities SET last_seen_at=%s '
+                    'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
+                    (stamp, tenant_id, idp, subject))
+
+            await self._run(
+                conn,
+                'INSERT INTO auth_sessions '
+                '(auth_session_id, token_digest, user_id, tenant_id, platform_id, '
+                ' connection_id, identity_provider_id, subject, issued_at, '
+                ' expires_at, last_seen_at, user_agent, remote_addr) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
+                (session_id, session_digest, row['user_id'], tenant_id,
+                 platform_id, connection_id, idp, subject, stamp,
+                 float(session_expires_at), stamp, user_agent[:200],
+                 remote_addr[:64]))
+            return {'user_id': row['user_id'], 'tenant_id': row['tenant_id'],
+                    'role': row.get('role') or 'member',
+                    'auth_session_id': session_id}
+
+    async def auth_session(self, token_digest: str) -> dict | None:
+        """按凭证摘要取中台登录会话（**库里没有明文凭证**）。"""
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'SELECT * FROM auth_sessions WHERE token_digest=%s',
+                (token_digest,))
+            if row is None:
+                return None
+            await self._run(
+                conn,
+                'UPDATE auth_sessions SET last_seen_at=%s '
+                'WHERE auth_session_id=%s', (now(), row['auth_session_id']))
+            return dict(row)
+
+    async def revoke_auth_session(self, auth_session_id: str) -> bool:
+        async with self._lease() as conn:
+            cur = await self._run(
+                conn,
+                'UPDATE auth_sessions SET revoked_at=%s '
+                'WHERE auth_session_id=%s AND revoked_at IS NULL',
+                (now(), auth_session_id))
+            return bool(cur.rowcount)
+
+    async def revoke_user_sessions(self, user_id: str) -> int:
+        """停用用户时一并踢掉：否则旧会话还能用到过期。"""
+        async with self._lease() as conn:
+            cur = await self._run(
+                conn,
+                'UPDATE auth_sessions SET revoked_at=%s '
+                'WHERE user_id=%s AND revoked_at IS NULL', (now(), user_id))
+            return int(cur.rowcount or 0)
+
+    async def purge_auth_sessions(self, before_ts: float | None = None) -> int:
+        """清理过期会话与旧票据记录（保留期内用于排障）。"""
+        current = before_ts if before_ts is not None else time.time()
+        async with self._lease() as conn:
+            cur = await self._run(
+                conn,
+                'DELETE FROM auth_sessions WHERE expires_at < %s',
+                (current - 86400,))
+            await self._run(
+                conn,
+                'DELETE FROM ticket_redemptions WHERE expires_at < %s',
+                (int(current) - 86400 * 7,))
+            return int(cur.rowcount or 0)
 
     async def user(self, user_id: str) -> dict | None:
         async with self._lease() as conn:

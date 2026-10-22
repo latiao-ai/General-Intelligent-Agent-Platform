@@ -13,6 +13,7 @@ import asyncio
 import json
 import mimetypes
 import logging
+import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
@@ -101,36 +102,104 @@ def sse(event: dict) -> str:
 
 
 class TokenRequest(BaseModel):
-    # 平台发的凭证。服务端会拿它去 userinfo 端点验证，**不信任其中的任何字段**。
+    # 旧 token 模式的平台凭证。服务端会拿它去 userinfo 端点验证，不信任其中字段。
     token: str = Field(min_length=1, max_length=8000)
+
+
+class ExchangeRequest(BaseModel):
+    """平台后端签发的**登录票据**（JWT，一次性、短期）。
+
+    注意：票据只能拿来兑换，**不能**当业务接口的凭证用。
+    """
+    ticket: str = Field(min_length=1, max_length=8192)
 
 
 # ---------- 身份 ----------
 # 浏览器侧必须有 cookie：EventSource 与 <a download> 都发不出自定义请求头，
 # 只支持 Authorization 的话 SSE 事件流和产物下载会全部 401。
 
+SESSION_COOKIE_PATH = '/'
+
+
+def _set_session_cookie(response: Response, token: str, max_age: int) -> None:
+    """写中台会话 cookie。
+
+    HttpOnly 挡住脚本读取；SameSite 默认 lax（同源代理场景够用）；Secure 由
+    `AUTH_COOKIE_SECURE` 控制（本地 http 调试时需要关掉，否则浏览器不存）。
+    """
+    response.set_cookie(
+        settings.auth_session_cookie, token, max_age=max_age,
+        httponly=True, samesite=settings.auth_cookie_samesite,
+        secure=settings.auth_cookie_secure, path=SESSION_COOKIE_PATH)
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(settings.auth_session_cookie, path=SESSION_COOKIE_PATH)
+
 
 @app.get('/api/me')
 async def whoami(principal=Depends(policies.current_principal)):
-    """当前主体。配好 AUTH_MODE 后用它确认「token → 身份」这条链路是通的。"""
+    """当前主体。身份来自**已验证的中台登录会话**（ticket 模式）。"""
     return {'tenant_id': principal.tenant_id,
             'user_id': principal.user_id,
             'role': principal.role,
+            'platform_id': principal.platform_id,
+            'authenticated': principal.authenticated,
             'anonymous': principal.anonymous,
             'auth_mode': settings.auth_mode}
 
 
-@app.post('/api/auth/session')
-async def create_session(payload: TokenRequest, request: Request,
-                         response: Response):
-    """用平台 token 换一个 HttpOnly cookie。
+@app.post('/api/auth/exchange')
+async def exchange_ticket(payload: ExchangeRequest, request: Request,
+                          response: Response):
+    """平台票据 → 中台登录会话。
 
-    过渡实现：cookie 里放的就是平台 token。正式版应换成自己签发的短期票据，
-    否则平台 token 一过期用户就掉线，且撤销只能等平台。
+    这是**唯一**接受外部票据的入口。票据一次性：同一张票据第二次来会得到 409，
+    平台应重新签发一张（而不是重试同一张）。
     """
     if settings.auth_mode == 'off':
-        raise HTTPException(status_code=400,
-                            detail='AUTH_MODE=off，未启用认证')
+        raise HTTPException(status_code=400, detail='AUTH_MODE=off，未启用认证')
+    store = getattr(request.app.state, 'store', None)
+    if store is None:
+        raise HTTPException(status_code=503, detail='身份仓储未就绪')
+    try:
+        result = await auth.exchange(
+            payload.ticket, store,
+            user_agent=request.headers.get('user-agent', ''),
+            remote_addr=(request.client.host if request.client else ''))
+    except auth.ExchangeError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.reason) from exc
+
+    _set_session_cookie(response, result['token'], settings.auth_session_ttl)
+    # 凭证原文只在 Set-Cookie 里出现一次，响应体不再重复（避免被日志/前端留存）
+    return {'user_id': result['user_id'],
+            'tenant_id': result['tenant_id'],
+            'role': result['role'],
+            'platform_id': result['platform_id'],
+            'connection_id': result['connection_id'],
+            'auth_session_id': result['auth_session_id'],
+            'expires_at': result['expires_at']}
+
+
+@app.delete('/api/auth/session')
+async def drop_session(request: Request, response: Response):
+    """退出登录：撤销数据库里的会话，并清 cookie。已连上的 SSE 会在下个检查点断开。"""
+    store = getattr(request.app.state, 'store', None)
+    revoked = False
+    try:
+        revoked = await auth.revoke(request, store) if store else False
+    except Exception:                                   # noqa: BLE001
+        logger.warning('撤销登录会话失败', exc_info=True)
+    _clear_session_cookie(response)
+    return {'ok': True, 'revoked': revoked}
+
+
+@app.post('/api/auth/session')
+async def create_session(payload: TokenRequest, request: Request,
+                        response: Response):
+    """旧 token 模式的登录（保留兼容，新接入请用 /api/auth/exchange）。"""
+    if settings.auth_mode == 'off':
+        raise HTTPException(status_code=400, detail='AUTH_MODE=off，未启用认证')
     store = getattr(request.app.state, 'store', None)
     if store is None:
         raise HTTPException(status_code=503, detail='身份仓储未就绪')
@@ -148,12 +217,6 @@ async def create_session(payload: TokenRequest, request: Request,
         httponly=True, samesite='lax', secure=settings.auth_cookie_secure,
         path='/')
     return {'user_id': row['user_id'], 'tenant_id': row['tenant_id']}
-
-
-@app.delete('/api/auth/session')
-async def drop_session(response: Response):
-    response.delete_cookie(settings.auth_cookie_name, path='/')
-    return {'ok': True}
 
 
 # ---------- 对象权限 ----------
@@ -257,7 +320,11 @@ async def create_task(payload: TaskRequest, request: Request,
 
 
 async def _start_task(payload: TaskRequest, principal) -> dict:
-    record = await hub.start(payload.message, payload.session_id, principal)
+    try:
+        record = await hub.start(payload.message, payload.session_id, principal)
+    except PermissionError:
+        # 传入的 session_id 不属于当前主体：按项目约定回 404，不区分"不存在/无权限"
+        raise HTTPException(status_code=404, detail='会话不存在') from None
     # status 是展示标签（旧字段名不变），run_status 才是状态机里的通用状态
     return {'task_id': record.task_id, 'session_id': record.session_id,
             'run_id': record.run_id,
@@ -308,6 +375,7 @@ async def task_events(task_id: str, request: Request,
                 yield sse({'type': 'end',
                            **outcome_module.view(record.status, record.state or {})})
                 return
+            last_auth_check = time.time()
             while True:
                 try:
                     item = await asyncio.wait_for(queue.get(),
@@ -316,6 +384,16 @@ async def task_events(task_id: str, request: Request,
                     # 用真实事件而不是 SSE 注释（": keepalive"）做心跳：
                     # 注释不会触发浏览器的 onmessage，前端就没法判断连接是否还活着，
                     # 后端一死那一行就会永远停在"进行中"、耗时一路涨。
+                    # 长连接期间定期复查登录态：会话被撤销/过期后要**主动断开**，
+                    # 否则退出登录的人还能从已连上的流里继续看自己的任务过程。
+                    if time.time() - last_auth_check >= settings.auth_sse_recheck:
+                        last_auth_check = time.time()
+                        try:
+                            await policies.current_principal(request)
+                        except HTTPException:
+                            yield sse({'type': 'end', 'status': 'interrupted',
+                                       'detail': '登录已失效，请重新登录'})
+                            return
                     yield sse({'type': 'ping'})
                     continue
                 if item is CLOSE:

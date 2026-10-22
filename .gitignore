@@ -22,3 +22,6 @@ profile/
 
 # 本地语音模型（几十 MB，不入库）
 .piper-voices/
+
+# 模拟平台的私钥与接入配置（绝不入库）
+secrets/

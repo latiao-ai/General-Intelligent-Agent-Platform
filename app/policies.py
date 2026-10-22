@@ -1,8 +1,8 @@
 """身份与权限：把"谁在操作"这条缝留出来。
 
-**这条缝现在接上了真实认证**（`app.auth`）：请求里的 token 会去平台换 userinfo，
-再映射成本地 `user_id`。`AUTH_MODE=off` 时退回原来的单用户行为，所以本地开发与
-既有测试不受影响。
+**这条缝接上了真实认证**（`app.auth`）：`AUTH_MODE=ticket` 时，业务接口只认
+"平台签票 → 中台换来的登录会话"，请求头里填什么都不影响身份。`AUTH_MODE=off`
+时退回单用户行为，本地开发与既有测试不受影响。
 
 分三层，各自职责不混：
 
@@ -31,14 +31,21 @@ class Principal:
 
     `user_id` 是**本地** ID，不是平台 openid/sub。平台标识变过、换过入口，
     历史上下文都不会断——这是接认证时最容易做错的一步。
+
+    `authenticated` 表示身份来自**已验证的登录会话**；ticket 模式下所有业务
+    接口都要求它为真，"匿名兜底"只在 AUTH_MODE=off 的开发环境存在。
     """
     tenant_id: str = DEFAULT_TENANT
     user_id: str = DEFAULT_USER
     role: str = 'member'
+    platform_id: str = ''          # 这次登录来自哪个接入平台（排障/审计用）
+    auth_session_id: str = ''      # 中台登录会话 ID（撤销、踢人用）
+    authenticated: bool = False
 
     @property
     def anonymous(self) -> bool:
-        return not self.user_id or self.user_id == DEFAULT_USER
+        """是否**没有**经过认证。ticket 模式下恒为 False（认证过的才拿得到请求）。"""
+        return not self.authenticated
 
 
 async def current_principal(request: Request) -> Principal:
@@ -66,11 +73,15 @@ def ensure_owner(resource: dict | None, principal: Principal,
         raise HTTPException(status_code=404, detail=f'{kind}不存在')
     owner = resource.get('owner_user_id') or DEFAULT_USER
     tenant = resource.get('tenant_id') or DEFAULT_TENANT
-    if principal.anonymous:
+    if not principal.authenticated and principal.user_id == DEFAULT_USER:
+        # 只有 AUTH_MODE=off 的本地单用户（没有任何身份声明）才跳过归属校验。
+        # 一旦有具体 user_id（认证过，或测试里显式构造），就必须按归属判断。
         return resource
 
     allowed_owners = {principal.user_id}
-    if settings.policy_legacy_visible:
+    # 存量 default 数据的兼容可见性：**有第二个真实用户前必须关掉**。
+    # ticket 模式下默认关闭（见 config.policy_legacy_visible 的默认值）。
+    if settings.policy_legacy_visible and not principal.authenticated:
         allowed_owners.add(DEFAULT_USER)
 
     if tenant != principal.tenant_id or owner not in allowed_owners:

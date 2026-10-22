@@ -68,11 +68,26 @@ class Settings:
     idempotency_ttl_seconds: float = max(60.0, float(
         os.getenv('IDEMPOTENCY_TTL_SECONDS', '86400')))
 
-    # ---------- 身份：外部 token 换本地主体（app/auth.py） ----------
+    # ---------- 身份（app/auth.py / app/ticket_auth.py） ----------
     # off      = 不介入，保持单用户行为（默认，本地开发与既有测试不受影响）
-    # optional = 带了 token 就验证，没带就匿名（灰度期）
-    # token    = 必须带合法 token，否则 401（正式启用）
+    # optional = 有中台会话就按会话，没有就匿名（灰度期）
+    # ticket   = **平台签票 → 中台换会话**。所有业务接口必须带有效会话，否则 401
+    # token    = 旧模式：拿平台 token 直连 userinfo（保留兼容，不建议新接入）
     auth_mode: str = os.getenv('AUTH_MODE', 'off').strip().lower()
+    # 票据有效期上限（秒）。票据是"一次性短期凭证"，不该活很久。
+    auth_ticket_max_lifetime: int = max(5, int(
+        os.getenv('AUTH_TICKET_MAX_LIFETIME', '60')))
+    # 中台登录会话有效期（秒）。到期后由平台重新申请票据续期。
+    auth_session_ttl: int = max(60, int(os.getenv('AUTH_SESSION_TTL', '7200')))
+    # 中台会话 cookie 名（与旧 auth_cookie_name 分开，避免把外部 token 当会话）
+    auth_session_cookie: str = os.getenv('AUTH_SESSION_COOKIE',
+                                         'agent_session').strip() or 'agent_session'
+    # SPA 与中台不同源时用它（例如平台前端经同源代理访问，可不设）
+    auth_cookie_samesite: str = (
+        os.getenv('AUTH_COOKIE_SAMESITE', 'lax').strip().lower() or 'lax')
+    # SSE 期间多久复查一次会话是否被撤销/过期（秒）
+    auth_sse_recheck: float = max(5.0, float(
+        os.getenv('AUTH_SSE_RECHECK', '20')))
     # 只作标签，落 identities.provider。同一平台同一主体不会重复建号。
     auth_provider: str = os.getenv('AUTH_PROVIDER', 'oidc').strip() or 'oidc'
     # 平台 userinfo 端点。留空时 token 模式无法工作（会明确报 401 而不是静默放行）
@@ -99,8 +114,10 @@ class Settings:
     # ---------- 对象权限 ----------
     # owner_user_id='default' 的存量数据是否对所有登录用户可见。
     # 单用户升级期必须为 true；有第二个真实用户后必须改成 false。
+    # 默认关闭：ticket 模式下若还让 default 数据对所有人可见，等于把存量历史
+    # 公开。本地单用户（AUTH_MODE=off）想保留旧行为可显式设 true。
     policy_legacy_visible: bool = (
-        os.getenv('POLICY_LEGACY_VISIBLE', 'true').strip().lower() == 'true')
+        os.getenv('POLICY_LEGACY_VISIBLE', 'false').strip().lower() == 'true')
 
 settings = Settings()
 

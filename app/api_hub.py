@@ -162,6 +162,17 @@ class Hub:
         self.owner_id = owner_id or f'api:{time.time_ns():x}:{uuid.uuid4().hex[:6]}'
         self.lease_seconds = lease_seconds or settings.run_lease_seconds
 
+    async def _assert_session_owner(self, session_id: str, tenant_id: str,
+                                    user_id: str) -> None:
+        """会话归属校验：不存在或不属于当前主体 → 一律 404（不泄漏存在性）。"""
+        row = await self.store.session(session_id)
+        if row is None:
+            return                      # 全新会话 ID：允许（稍后创建时写入主人）
+        owner = row.get('owner_user_id') or 'default'
+        tenant = row.get('tenant_id') or 'default'
+        if tenant != tenant_id or owner != user_id:
+            raise PermissionError(f'会话 {session_id} 不属于当前主体')
+
     async def history(self, session_id: str) -> list:
         return await self.store.messages(session_id)
 
@@ -276,10 +287,14 @@ class Hub:
         API 和 Worker，同一个任务就会跑两遍，部署类写操作真的会建出第二个站点。
         """
         session_id = session_id or uuid.uuid4().hex[:12]
-        if is_stop_command(message):
-            return await self.stop_session(session_id, message, principal)
         tenant = getattr(principal, 'tenant_id', 'default')
         owner = getattr(principal, 'user_id', 'default')
+        # 传入已有 session_id 时**先验归属**再读历史：否则只要猜到 12 位 hex 就能
+        # 把消息追加进别人的会话，并把对方的历史当上下文读出来。
+        if session_id is not None:
+            await self._assert_session_owner(session_id, tenant, owner)
+        if is_stop_command(message):
+            return await self.stop_session(session_id, message, principal)
         history = await self.history(session_id)
         prior = await self.prior_context(session_id)
         await self.store.append_message(session_id, 'user', message,

@@ -12,3 +12,5 @@ fastapi>=0.115,<1
 # psycopg-pool 提供连接池：一个进程按 DB_POOL_SIZE 借连接，不再"单连接 + 全局锁"。
 psycopg[binary]>=3.2,<4
 psycopg-pool>=3.2,<4
+# 平台票据验证：RS256 签名/验签（自带 cryptography 依赖，不自研加密）
+PyJWT[crypto]>=2.9,<3

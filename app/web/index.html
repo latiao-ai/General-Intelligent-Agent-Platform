@@ -250,7 +250,7 @@ function renderSessionList() {
 
 async function loadSessions() {
   try {
-    const res = await fetch('/api/sessions');
+    const res = checkAuth(await fetch(API_PREFIX + '/sessions'));
     if (!res.ok) return;
     const data = await res.json();
     S.sessions = data.sessions || [];
@@ -269,7 +269,7 @@ async function openSession(id) {
   S.status = null;
   renderSessionList();          // 高亮当前会话
   try {
-    const res = await fetch(`/api/sessions/${id}/timeline`);
+    const res = checkAuth(await fetch(`${API_PREFIX}/sessions/${id}/timeline`));
     if (!res.ok) return;
     const data = await res.json();
     for (const m of (data.messages || [])) {
@@ -459,6 +459,24 @@ function currentTurnEl() {
 // 展示词汇：后端返回的 status 已经是派生出来的标签，通用状态也在其中
 // （succeeded/needs_reconcile 这类以后端 run_status 出现）。新增能力若要新的
 // 展示词，改这张表即可——状态机那边不需要加值。
+// API 前缀可配置：中台独立部署，但浏览器可能通过客户平台的**同源路径代理**访问
+// （例如 客户平台 /agent/* → 中台）。写死 API_PREFIX + '/...' 在那种部署下会全部 404。
+// 部署时给 <body data-api-prefix="/agent/api"> 即可，不用改代码。
+const API_PREFIX = (document.body.dataset.apiPrefix || '/api').replace(/\/$/, '');
+
+// 登录失效统一收口：关掉事件流、停表并提示重新登录，而不是界面空转。
+function handleUnauthorized() {
+  if (S.es) { S.es.close(); S.es = null; }
+  S.running = false;
+  const box = $('result');
+  if (box) box.innerHTML = '<div class="card">登录已失效，请回到平台重新进入智能体。</div>';
+}
+
+function checkAuth(res) {
+  if (res && res.status === 401) handleUnauthorized();
+  return res;
+}
+
 const TURN_STATUS = {answered: '已回答', cancelled: '已中断',
                      interrupted: '已中断', failed: '已失败',
                      deployed: '已部署', local_ready: '已完成',
@@ -639,7 +657,7 @@ async function interrupt() {
   if (!S.taskId || !S.running) return;
   const stream = S.es;
   try {
-    await fetch(`/api/tasks/${S.taskId}/cancel`, {method: 'POST'});
+    await fetch(`${API_PREFIX}/tasks/${S.taskId}/cancel`, {method: 'POST'});
   } catch { /* 取消失败也让新一轮继续 */ }
   const deadline = Date.now() + 2000;
   while (S.running && Date.now() < deadline) {
@@ -666,11 +684,11 @@ async function postTask(text, key) {
     body: JSON.stringify({message: text, session_id: S.sessionId}),
   };
   try {
-    return await fetch('/api/tasks', options);
+    return await fetch(API_PREFIX + '/tasks', options);
   } catch (err) {
     // 网络层失败：请求可能已经到了服务端，用同一个键再试一次，
     // 服务端会返回原来那个任务而不是再建一个。
-    return await fetch('/api/tasks', options);
+    return await fetch(API_PREFIX + '/tasks', options);
   }
 }
 
@@ -703,7 +721,7 @@ async function send() {
 
 function openStream(taskId) {
   if (S.es) S.es.close();
-  const es = new EventSource(`/api/tasks/${taskId}/events`);
+  const es = new EventSource(`${API_PREFIX}/tasks/${taskId}/events`);
   S.es = es;
   S.lastEventAt = Date.now();
   es.onmessage = e => {
@@ -745,7 +763,7 @@ async function finish(status) {
   loadSessions();            // 消息数、活跃时间变了，刷新侧边栏
   if (!S.taskId) return;
   try {
-    const res = await fetch(`/api/tasks/${S.taskId}`);
+    const res = checkAuth(await fetch(`${API_PREFIX}/tasks/${S.taskId}`));
     const data = await res.json();
     renderResult(data.state);
   } catch { /* 结果区拿不到不影响主流程 */ }
@@ -770,7 +788,7 @@ function renderResult(state, taskId = null) {
     if (owner) {
       const a = document.createElement('a');
       a.className = 'btn';
-      a.href = `/api/tasks/${owner}/artifact`;
+      a.href = `${API_PREFIX}/tasks/${owner}/artifact`;
       a.target = '_blank';
       a.textContent = isVideo ? '下载 MP4 视频' : '打开 / 下载 HTML';
       if (isVideo) {
@@ -804,7 +822,7 @@ function showDeployed(url, siteId) {
 // ---------- 我的画像 ----------
 
 async function loadProfileForm() {
-  const res = await fetch('/api/profile');
+  const res = await fetch(API_PREFIX + '/profile');
   const data = await res.json();
   $('profileText').value = data.text || '';
   const n = Object.keys(data.facts || {}).length;
@@ -825,7 +843,7 @@ function closeProfile() {
 async function saveProfile() {
   $('profileStatus').textContent = '保存中…';
   try {
-    const res = await fetch('/api/profile', {
+    const res = await fetch(API_PREFIX + '/profile', {
       method: 'PUT', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({text: $('profileText').value}),
     });
@@ -842,7 +860,7 @@ async function clearProfile() {
   if (!confirm('确定清空画像？会在 profile/USER.md.bak 留一份备份。')) return;
   $('profileStatus').textContent = '清空中…';
   try {
-    await fetch('/api/profile', {method: 'DELETE'});
+    await fetch(API_PREFIX + '/profile', {method: 'DELETE'});
     await loadProfileForm();
     $('profileStatus').textContent = '已清空';
   } catch (err) {
@@ -859,7 +877,7 @@ async function loadMemoryForm() {
     $('memoryFacts').value = '';
     return;
   }
-  const res = await fetch(`/api/sessions/${S.sessionId}/memory`);
+  const res = await fetch(`${API_PREFIX}/sessions/${S.sessionId}/memory`);
   const data = await res.json();
   $('memorySummary').value = data.summary || '';
   $('memoryFacts').value = data.facts_text || '';
@@ -881,7 +899,7 @@ async function saveMemory() {
   if (!S.sessionId) { $('memoryStatus').textContent = '当前没有会话'; return; }
   $('memoryStatus').textContent = '保存中…';
   try {
-    const res = await fetch(`/api/sessions/${S.sessionId}/memory`, {
+    const res = await fetch(`${API_PREFIX}/sessions/${S.sessionId}/memory`, {
       method: 'PUT', headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({summary: $('memorySummary').value,
                             facts: $('memoryFacts').value}),
@@ -899,7 +917,7 @@ async function clearMemory() {
   if (!S.sessionId) { $('memoryStatus').textContent = '当前没有会话'; return; }
   if (!confirm('清空会话记忆？之后会从原文重新累积。')) return;
   try {
-    await fetch(`/api/sessions/${S.sessionId}/memory`, {method: 'DELETE'});
+    await fetch(`${API_PREFIX}/sessions/${S.sessionId}/memory`, {method: 'DELETE'});
     await loadMemoryForm();
     $('memoryStatus').textContent = '已清空';
   } catch (err) {

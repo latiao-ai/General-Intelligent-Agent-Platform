@@ -83,6 +83,13 @@ python --version             # Python 3.12.15
 | `tool_name_arg` | 那个通用调用工具里承载内部工具名的参数名（如 `name`） |
 | `IDEMPOTENCY_TTL_SECONDS` | 创建任务幂等键的有效期，默认 86400（24 小时） |
 | `DATABASE_URL` | **必填**，PostgreSQL 连接串（`postgresql://…`）。SQLite 实现已删除，留空直接报错 |
+| `AUTH_MODE` | `off`（默认，本地单用户）/ `optional` / **`ticket`**（正式）/ `token`（旧） |
+| `AUTH_CONNECTIONS_FILE` | 可信平台登记表（公钥只用这里的） |
+| `AUTH_TICKET_MAX_LIFETIME` | 票据有效期上限，默认 60 秒 |
+| `AUTH_SESSION_TTL` | 中台登录会话有效期，默认 7200 秒 |
+| `AUTH_SESSION_COOKIE` / `AUTH_COOKIE_SAMESITE` / `AUTH_COOKIE_SECURE` | 会话 cookie 参数 |
+| `AUTH_SSE_RECHECK` | 长连 SSE 复查登录态的周期，默认 20 秒 |
+| `POLICY_LEGACY_VISIBLE` | 存量 `default` 数据是否对所有登录用户可见，**ticket 模式必须 false** |
 | `DB_POOL_SIZE` | PostgreSQL 连接池上限，默认 4（别超过服务端 `max_connections` ÷ 副本数） |
 | `DB_POOL_TIMEOUT` | 从池里借连接的等待上限（秒），默认 10；等不到就报错，不会无限期挂住请求 |
 | `PROFILE_PATH` | 用户画像文件，默认 `profile/USER.md`（见 3.1.2） |
@@ -489,6 +496,61 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
 - **多 MCP 服务端已支持，但只在本机用假服务端验证过**。`MCP_SERVERS` 配多个后，
   工具名变成 `mcp__<server_id>__<tool>`；只有一个服务端时保持 `mcp__<tool>`，
   旧计划仍可用（`find_tool` 会按尾部唯一匹配回退）。
+
+## 3.4 登录与用户隔离（平台签票 → 中台换会话）
+
+中台不存客户平台的账号体系，也不信任浏览器自报身份。流程是：
+
+```
+浏览器 ──(平台自己的登录 cookie)──▶ 客户平台后端
+                                   │ 用平台私钥签短期票据（RS256，≤60s，一次性）
+                                   ├──▶ 中台 POST /api/auth/exchange
+                                   ◀── Set-Cookie: agent_session=…
+浏览器 ──(agent_session)──▶ 中台全部业务接口（聊天/历史/画像/事件流/产物）
+```
+
+平台后端的签票身份**必须来自它已验证的登录态**，不能让浏览器传个 `user_id` 就代签。
+
+| 组件 | 文件 | 职责 |
+|---|---|---|
+| 登记表 | `app/auth_connections.py` | 谁可信、允许哪些企业/平台、公钥与 kid |
+| 票据验证 | `app/ticket_auth.py` | 票据 → 可信身份；只做这一件事 |
+| 兑换与会话 | `app/auth.py` | 验票 + 一次性登记 + 绑定身份 + 建会话（同一事务） |
+| 接口 | `app/api.py` | `POST /api/auth/exchange`、`GET /api/me`、`DELETE /api/auth/session` |
+
+几条硬约束（都有用例钉着）：
+
+- **算法固定 RS256**，拒绝 `alg=none` 与"拿公钥当 HMAC 密钥"的 HS256 混淆；
+- **公钥只来自登记表**，票据里带的地址永远不会被信任；
+- 同一张票据 `(issuer, jti)` 唯一 → 重复/并发兑换只会成功一次（第二次 409）；
+- **库里没有明文**：票据不落库，会话凭证只存 SHA-256 摘要；
+- 身份 = 企业 + 身份源 + 外部用户 → 中台 `user_id`；中台 ID 终身不变，
+  不同平台的同名 `user_id-123` 是两个账号；
+- `AUTH_MODE=ticket` 时业务接口一律要求中台会话，**改 `X-DSH-User` 无效**；
+- 退出登录撤销数据库会话；已连上的 SSE 会按 `AUTH_SSE_RECHECK` 周期复查并断开。
+
+### 本地跑通（两个模拟平台）
+
+```bash
+# 1) 生成模拟平台的密钥对与接入登记表（私钥只在 secrets/ 下，已 gitignore）
+python -c "from scripts.mock_identity_platform import main"   # 或直接跑下面的服务
+
+# 2) 中台（ticket 模式）
+AUTH_MODE=ticket AUTH_CONNECTIONS_FILE=secrets/auth-connections.json \
+AUTH_COOKIE_SECURE=false python -m scripts.serve_api --port 8010
+
+# 3) 模拟两个客户平台
+python -m scripts.mock_identity_platform --port 8090 --hub http://127.0.0.1:8010
+```
+
+打开 `http://127.0.0.1:8090/`，用"平台A/张三"和"平台B/王五"分别登录——两边的
+`sub` 都是 `user-123`，但落到两个不同的中台账号，历史与画像互不可见。
+
+浏览器接入第一版用**同源路径代理**（客户平台 `/agent/api/*` → 中台）；前端 API
+前缀已可配：给 `<body data-api-prefix="/agent/api">` 即可，不用改代码。
+
+正式环境：`AUTH_MODE=ticket` + `AUTH_COOKIE_SECURE=true` +
+`POLICY_LEGACY_VISIBLE=false`（否则存量 `default` 数据对所有登录用户可见）。
 
 ## 4. 状态、outcome 与展示标签
 
