@@ -529,6 +529,9 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
 - `AUTH_MODE=ticket` 时业务接口一律要求中台会话，**改 `X-DSH-User` 无效**；
 - 退出登录撤销数据库会话；已连上的 SSE 会按 `AUTH_SSE_RECHECK` 周期复查并断开。
 
+> **给客户平台研发的对接文档**：[`docs/platform-integration.md`](docs/platform-integration.md)
+> —— 签什么票、怎么调、错误码怎么处置、续期/退出、同源代理配置、验收表，都在这份里。
+
 ### 本地跑通（两个模拟平台）
 
 ```bash
