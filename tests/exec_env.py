@@ -22,6 +22,7 @@ PG_DSN = os.getenv('PG_TEST_DSN', '')
 
 TEST_TABLES = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
                'action_attempts', 'actions', 'steps', 'plans', 'run_snapshots',
+               'run_inputs', 'run_input_processing',
                'runs', 'tasks_meta', 'events', 'tasks', 'session_memory',
                'session_summaries', 'messages', 'sessions', 'request_keys')
 
@@ -103,13 +104,23 @@ class Remote:
 
 
 def install_tools(tools_by_name: dict):
-    """把工具查找换成受控实现。返回一个 ExitStack 上下文。"""
+    """把工具查找换成受控实现。
+
+    连 `catalog()` 一起替换：修订计划时会用它判断"工具是否存在"，
+    只换 `find_tool` 会让修订器以为工具清单是空的。
+    """
     from app import tools as tool_module
 
     async def fake_find(name):
         return tools_by_name.get(name)
 
-    return patch.object(tool_module, 'find_tool', fake_find)
+    async def fake_catalog():
+        return list(tools_by_name.values())
+
+    stack = ExitStack()
+    stack.enter_context(patch.object(tool_module, 'find_tool', fake_find))
+    stack.enter_context(patch.object(tool_module, 'catalog', fake_catalog))
+    return stack
 
 
 def install_plan(steps: list[dict], summary: str = '测试计划'):
@@ -131,7 +142,9 @@ def install_plan(steps: list[dict], summary: str = '测试计划'):
                     'step_index': int(resumed.get('step_index') or 0),
                     'status': 'planned'}
         calls.append(state.get('user_input') or '')
-        return {'plan': {'steps': steps, 'summary': summary},
+        # 计划必须带上"依据的要求版本"：准入与计划提交都靠它做 CAS
+        return {'plan': {'steps': steps, 'summary': summary, 'version': 1,
+                         'intent_version': int(state.get('intent_version') or 0)},
                 'step_index': 0, 'status': 'planned'}
 
     return patch.object(nodes, 'plan', fake_plan), calls

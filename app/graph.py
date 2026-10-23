@@ -1,3 +1,21 @@
+"""Planner-Executor 执行图。
+
+控制流（文档 harness-live-input §5 第十步）：
+
+    START → intake
+    intake → plan | revise_plan | run_step | finalize
+    plan → persist_plan
+    revise_plan → persist_plan
+    persist_plan → run_step | finalize | END
+    run_step ↺ → run_step | revise_plan | finalize | END
+    finalize → revise_plan（又有新补充）| END
+
+`run_step` 每次只执行**一步**，所以每一步都有独立的阶段事件与耗时。
+
+`intake` 放在最前面是有意的：恢复、续跑、运行中补充是同一件事的三个入口，
+它们都要先看"库里现在要求的是哪一版、计划是哪一份、还有哪些补充没人处理"。
+把这段逻辑放进图里，CLI 与 Worker 才真的只有一条路径。
+"""
 import inspect
 import time
 
@@ -10,8 +28,10 @@ from app import nodes
 # run_step 会自我循环，每次只跑计划里的一步——故意**不**套 instrument，
 # 这样它想发的是按工具名区分的阶段（"检索来源"/"整理报告"…），而不是笼统的
 # "执行步骤"，前端耗时表才看得出来每一步干了什么。
-NODE_NAMES = ['plan', 'run_step']
-PLAIN_NODES = {'run_step'}
+NODE_NAMES = ['intake', 'plan', 'persist_plan', 'revise_plan', 'run_step',
+              'finalize']
+# 这几个节点很轻（只读写数据库/组装提示词），不需要自己的阶段行
+PLAIN_NODES = {'run_step', 'intake', 'persist_plan'}
 
 
 def _status_of(result) -> str:
@@ -59,21 +79,55 @@ def checkpointer():
     return None
 
 
-def build_graph(checkpointer_=None):
-    """Planner-Executor：先规划，再逐步执行，直到计划走完。
+def _next_after_persist(state) -> str:
+    """计划提交之后：要求又变了就重新修订，否则继续执行（或直接收尾）。"""
+    if state.get('intent_changed'):
+        return 'revise_plan'
+    if (state.get('plan') or {}).get('steps'):
+        return 'run_step'
+    return 'finalize'
 
-    唯一的环在 run_step 上——它每次只执行一步，所以"搜几次、要不要成稿、
-    要不要部署"由计划决定，而不是由图的固定边决定。
-    """
+
+def _next_after_revise(state) -> str:
+    """修订之后：拿到新计划就去提交，否则按停下来的原因退出。"""
+    steps = (state.get('plan') or {}).get('steps') or []
+    if steps and not state.get('intent_changed'):
+        return 'persist_plan'
+    if state.get('status') in ('waiting_input', 'failed', 'paused'):
+        return 'end'
+    return 'finalize'
+
+
+def _next_after_finalize(state) -> str:
+    """收尾门禁发现"又有新补充"时回到修订，否则结束。"""
+    return 'revise_plan' if state.get('intent_changed') else 'end'
+
+
+def _map(*targets):
+    """把路由函数的返回值映射到图节点名；`end`/`stop` 都收敛到 END。"""
+    mapping = {name: name for name in targets}
+    mapping['end'] = END
+    mapping['stop'] = END
+    return mapping
+
+
+def build_graph(checkpointer_=None):
+    """Planner-Executor + 受控修订：先规划，再逐步执行，中途可纳入补充要求。"""
     graph = StateGraph(AgentState)
     for name in NODE_NAMES:
         node = getattr(nodes, name)
         graph.add_node(name, node if name in PLAIN_NODES
                        else instrument(name, node))
-    graph.add_edge(START, 'plan')
-    graph.add_edge('plan', 'run_step')
-    graph.add_conditional_edges('run_step', nodes.next_step, {
-        'run_step': 'run_step',
-        'end': END,
-    })
+    graph.add_edge(START, 'intake')
+    graph.add_conditional_edges('intake', nodes.route_entry,
+                                _map('plan', 'revise_plan', 'run_step', 'finalize'))
+    graph.add_edge('plan', 'persist_plan')
+    graph.add_conditional_edges('persist_plan', _next_after_persist,
+                                _map('revise_plan', 'run_step', 'finalize'))
+    graph.add_conditional_edges('revise_plan', _next_after_revise,
+                                _map('persist_plan', 'finalize'))
+    graph.add_conditional_edges('run_step', nodes.next_step,
+                                _map('run_step', 'revise_plan', 'finalize'))
+    graph.add_conditional_edges('finalize', _next_after_finalize,
+                                _map('revise_plan'))
     return graph.compile(checkpointer=checkpointer_)

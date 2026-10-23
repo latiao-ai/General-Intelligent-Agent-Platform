@@ -49,6 +49,32 @@ class ControlStopped(RuntimeError):
         self.status = status
 
 
+class IntentChanged(RuntimeError):
+    """用户要求已经更新：基于旧要求的计划**不得**再派发新动作。
+
+    这是**控制流**异常，不是工具失败：
+
+    - 不能包成 `ToolError`（那会被记成"远端失败"，还会触发补偿）；
+    - 不能把动作记成 failed/unknown（它根本没有发出去）；
+    - 不能撤销已经执行的操作（新要求不自动回滚旧效果）。
+
+    与 `LeaseLost` 的区别：租约代表"谁有权推进"，`intent_version` 代表"用户要求
+    更新到哪一版"。两者必须分开校验——同一次领取里，用户完全可以补一句话，
+    于是版本变了，但执行权没有变。
+
+    与 `ControlStopped` 的区别：暂停/取消是**停下来等人**，版本变化是**换个计划
+    继续干**（重新规划后仍由同一个执行者推进）。
+    """
+
+    def __init__(self, run_id: str = '', expected: int = 0, actual: int = 0) -> None:
+        detail = (f'（计划依据版本 {expected}，当前要求版本 {actual}）'
+                  if actual or expected else '')
+        super().__init__(f'run {run_id} 的用户要求已更新{detail}')
+        self.run_id = run_id
+        self.expected = int(expected or 0)
+        self.actual = int(actual or 0)
+
+
 @dataclass(frozen=True)
 class ExecutionContext:
     """一次运行的执行权凭证。**数据库判断，内存只做传递**。"""

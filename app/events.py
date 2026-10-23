@@ -10,7 +10,11 @@ from langgraph.config import get_stream_writer
 # 各阶段的中文名，CLI / Streamlit / API 三处共用。
 STAGE_LABELS = {
     # 编排本身
+    'intake': '接续运行',
     'plan': '规划',
+    'persist_plan': '保存计划',
+    'revise_plan': '按新要求调整',
+    'finalize': '收尾检查',
     'run_step': '执行步骤',
     # 工具（与 app/tools.py 的 Tool.label 对应）
     'web_search': '检索来源',

@@ -28,6 +28,8 @@ from app import execution_control
 from app import ledger as ledger_module
 from app import memory as memory_module
 from app import outcome as outcome_module
+from app import policies
+from app import run_inputs as run_inputs_module
 from app import profile as profile_module
 from app.capabilities import publishing as publishing_capability
 from app.services import is_stop_command
@@ -217,8 +219,12 @@ class Hub:
                 outcome_module.ACTIVE_RUN_STATUSES
             if live and not live_task_id:
                 live_task_id = task['task_id']
+            meta = await self.store.task_meta(task['task_id']) or {}
+            run_id = str(meta.get('current_run_id') or '')
             turns.append({
                 'task_id': task['task_id'],
+                # 切回历史会话时，前端要靠 run_id 才能给**正在跑的那一轮**补要求
+                'run_id': run_id,
                 'message': task['message'],
                 # 库里存的是通用状态，回放时按 outcome 派生展示标签
                 'status': outcome_module.label(run_status, state),
@@ -230,10 +236,15 @@ class Hub:
                 'live': live,
                 'events': [event for _, event in await self.store.events(task['task_id'])],
             })
+        live_run_id = ''
+        if live_task_id:
+            meta = await self.store.task_meta(live_task_id) or {}
+            live_run_id = str(meta.get('current_run_id') or '')
         return {'session_id': session_id,
                 'messages': await self.store.messages(session_id),
                 # 这个会话里还在跑的任务：前端切回来时要重新接上事件流
                 'live_task_id': live_task_id,
+                'live_run_id': live_run_id,
                 'turns': turns}
 
     async def prior_context(self, session_id: str) -> dict:
@@ -638,14 +649,42 @@ class Hub:
         book = ledger_module.ActionLedger(self.store, record.run_id, plan_version,
                                           context=context)
         context_token = execution_control.bind(context)
-        try:
-            state = await run_task(
+
+        async def execute_round(plan_hint: dict | None) -> dict:
+            """跑一轮图。要求版本变化时会被调用多次（**不是**重试同一个计划）。"""
+            return await run_task(
                 record.message, on_event=relay,
                 on_start=on_start, history=history,
                 prior=prior, memory=memory,
                 ledger=book, run_id=record.run_id,
-                resume_plan=resume_plan,
+                resume_plan=plan_hint,
             )
+
+        try:
+            state = None
+            # 为什么这里有个循环：收尾前用户可能又补了要求，`_finish_run` 的
+            # 版本 CAS 会抛 IntentChanged。此时**不能**把 run 标成结束（否则那条
+            # 补充就永远没人处理），要回到消费循环重新修订（文档 §5 第十一步）。
+            max_rounds = max(1, int(settings.run_max_revisions or 1)) + 1
+            for round_index in range(max_rounds):
+                if round_index:
+                    # 新一轮要读数据库里最新的计划与补充，而不是拿着旧的提示
+                    resume_plan = await self._resume_plan(record.run_id)
+                state = await execute_round(resume_plan)
+                status_now = outcome_module.check_run_status(
+                    state.get('status') or 'failed')
+                try:
+                    await self._settle_round(
+                        record, state, status_now, context=context,
+                        close_instruction=close_instruction,
+                        close_open_stage=close_open_stage)
+                    break
+                except execution_control.IntentChanged as exc:
+                    logger.info('run %s 收尾时发现新要求（%s → %s），回到消费循环',
+                                record.run_id, exc.expected, exc.actual)
+                    await record.publish(action(
+                        '收到新的要求', '按最新要求调整后继续', '📝'))
+                    continue
         except execution_control.LeaseLost as exc:
             # 失租：**不写任何业务状态**。这一次执行已经没有资格推进 run，
             # 由当前持租约的执行者或对账流程收尾。
@@ -714,6 +753,8 @@ class Hub:
         except Exception as exc:
             await close_instruction('已失败')
             await close_open_stage('已失败')
+            # 堆栈进服务端日志：状态里只留类型与一句安全文案
+            logger.exception('run %s 执行异常', record.run_id)
             record.error = f'{type(exc).__name__}: {exc}'
             record.status = 'failed'
             await self.store.finish_run_owned(context, run_id=record.run_id,
@@ -722,25 +763,7 @@ class Hub:
             await record.publish({'type': 'status', 'status': 'failed',
                             'run_status': 'failed', 'detail': record.error})
         else:
-            await close_instruction('解析完成')
-            await close_open_stage('已结束')
-            record.state = state
-            status = outcome_module.check_run_status(state.get('status') or 'failed')
-            reply = reply_text(state)
-            await self.store.append_message(record.session_id, 'assistant', reply)
-            if record.latency is not None:
-                # 同步写进持久化的 timings，state.json 与 CLI 汇总表同样能看到
-                state.setdefault('timings', []).insert(0, {
-                    'stage': INSTRUCTION_STAGE,
-                    'seconds': round(record.latency, 2),
-                    'status': '解析完成，开始搜索',
-                })
-            # 先落记录（内存 + tasks 行），再收尾 run：两者都写、职责不同。
-            await record.persist(status=status, state=state)
-            await self._finish_run(record, state, status)
-            # 状态事件里 `status` 仍是展示标签（前端认这套），另带 run_status
-            await record.publish({'type': 'status', **outcome_module.view(status, state),
-                            'detail': reply})
+            pass
         finally:
             execution_control.unbind(context_token)
             profile_module.reset(profile_token)
@@ -761,6 +784,56 @@ class Hub:
             record.close()
 
     # ---------- run 生命周期（文档 §7、§8.4） ----------
+
+    async def _resume_plan(self, run_id: str) -> dict | None:
+        """读库里当前的计划与起点（续跑/修订后重新执行用）。"""
+        plan = await self.store.plan(run_id) or {}
+        steps = plan.get('steps') or []
+        if not steps:
+            return None
+        actions = await self.store.actions_of(run_id)
+        info = await self.store.run_intent(run_id)
+        return {'steps': steps, 'summary': plan.get('goal') or '续跑',
+                'plan_version': int(plan.get('version') or 1),
+                'intent_version': int(plan.get('intent_version')
+                                      or info.get('intent_version') or 0),
+                'processed_intent_version': int(
+                    info.get('processed_intent_version') or 0),
+                'step_index': _resume_index(steps, actions)}
+
+    async def _settle_round(self, record: 'TaskRecord', state: dict, status: str, *,
+                            context, close_instruction, close_open_stage) -> None:
+        """一轮执行结束的收尾：先过门禁，再落记录与事件。
+
+        `_finish_run` 里带版本 CAS：若用户在收尾前补了要求，会抛 `IntentChanged`，
+        这里**不写任何东西**（事务在第一句校验就失败了），交给调用方回到消费循环。
+        """
+        await close_instruction('解析完成')
+        await close_open_stage('已结束')
+        record.state = state
+        reply = reply_text(state)
+        if record.latency is not None:
+            # 同步写进持久化的 timings，state.json 与 CLI 汇总表同样能看到
+            state.setdefault('timings', []).insert(0, {
+                'stage': INSTRUCTION_STAGE,
+                'seconds': round(record.latency, 2),
+                'status': '解析完成，开始搜索',
+            })
+        # 只有"声称做完了"的状态才必须保证没有未处理的补充；停下等人
+        # （waiting_input / failed / paused）允许留着，那正是它们在等的东西。
+        await self._finish_run(
+            record, state, status, context=context,
+            expected_intent_version=state.get('intent_version'),
+            require_pending_clear=status in ('succeeded', 'partially_succeeded',
+                                             'needs_reconcile'))
+        await self.store.append_message(record.session_id, 'assistant', reply)
+        # 先落记录（内存 + tasks 行），再发事件：两者都写、职责不同。
+        await record.persist(status=status, state=state)
+        # 状态事件里 `status` 仍是展示标签（前端认这套），另带 run_status
+        await record.publish({'type': 'status', **outcome_module.view(status, state),
+                              'detail': reply,
+                              'intent_version': int(state.get('intent_version') or 0),
+                              'plan_version': int(state.get('plan_version') or 0)})
 
     async def _recovery_state(self, run_id: str) -> dict:
         """恢复用的最新 state：坏数据/没快照时退回空 dict，绝不因此失败。"""
@@ -790,12 +863,19 @@ class Hub:
             return True
         return any(str(a.get('status')) in {'in_flight', 'unknown'} for a in actions)
 
-    async def _finish_run(self, record: TaskRecord, state: dict, status: str) -> None:
+    async def _finish_run(self, record: TaskRecord, state: dict, status: str, *,
+                          context=None,
+                          expected_intent_version: int | None = None,
+                          require_pending_clear: bool = True) -> None:
         """把 run 收尾，并把计划与步骤落库，供续跑与界面查询。
 
         `status` 必须是**通用**状态：run 层不认识 `local_ready` 这类展示词。
         以前这里用 `RUN_STATUS_OF.get(status, status)` 折算，兜底会让新业务词
         静默写进状态机；现在越界会被 `check_run_status` 记 error 并退化。
+
+        `expected_intent_version` 是这次收尾**依据的要求版本**。用户在收尾前又补充
+        了要求时，仓储层会抛 `IntentChanged`——这时一个字都不能写，否则那条补充
+        就永远没人处理了（文档 §5 第十一步）。
         """
         run_status = outcome_module.check_run_status(status)
         plan = state.get('plan') or {}
@@ -833,8 +913,12 @@ class Hub:
                 mime=artifact.get('mime') or 'text/html',
                 size=int(artifact.get('size_bytes') or 0),
                 sha256=artifact.get('sha256') or '')
+        plan_version = int(state.get('plan_version')
+                           or (state.get('plan') or {}).get('version')
+                           or (context.plan_version if context else 0)
+                           or (1 if steps else 0))
         fields = {'status': run_status,
-                  'plan_version': 1 if (steps and run_status != 'waiting_input') else 0}
+                  'plan_version': plan_version if steps else 0}
         if (state.get('compensations')
                 and (plan.get('kind') or '') != 'compensation'):
             # 撤销是独立动作，必须有独立时间戳：只看 run 状态分不清
@@ -848,12 +932,94 @@ class Hub:
             # 失败原因必须落在 run 行上：Worker/运维只看库，不能只留在一份
             # 内存 state 里——那等于"失败了但没人知道为什么"。
             fields['error'] = state['failure']
-        await self.store.update_run(record.run_id, **fields)
+        if context is not None and context.lease_owner:
+            # 有执行权就走带门禁的收尾：版本 + 待处理补充一起校验，一次事务。
+            try:
+                await self.store.finish_run_owned(
+                    context, run_id=record.run_id, status=run_status,
+                    error=fields.get('error'), state=state,
+                    expected_intent_version=expected_intent_version,
+                    plan_version=fields['plan_version'],
+                    compensated_at=fields.get('compensated_at'),
+                    require_no_pending_inputs=require_pending_clear)
+            except execution_control.LeaseLost:
+                logger.warning('run %s 收尾时已失租，不写终态', record.run_id)
+                return
+            record.status = run_status
+        else:
+            await self.store.update_run(record.run_id, **fields)
         # outbox：业务事件与派生作业在同一处写入，消费者按 dedupe_key 幂等
         await self.store.enqueue_job(
             uuid.uuid4().hex[:12], 'session_summary',
             f"{record.session_id}:{record.run_id}",
             {'session_id': record.session_id})
+
+    # ---------- 运行中补充输入（文档 harness-live-input §3） ----------
+
+    async def append_run_input(self, run_id: str, *, request_id: str,
+                               message: str, principal=None,
+                               task_id: str = '') -> dict:
+        """接收一条"给当前任务的补充要求"。
+
+        **不进入 `Hub.start()`**：不建 task、不建 run、不重新领取租约。补充要求
+        只是把 `runs.intent_version` 推高一版，让旧计划的下一个动作在准入时被拦下
+        （文档 §3 第二步）。
+
+        授权与归属在这里做（`ensure_owner`），事务在仓储层。对于同一个
+        `request_id` 的重试，仓储层会先返回原回执——即使这个 run 已经结束，
+        也不能把"我收到了"变成"我没收到"。
+        """
+        run = await self.store.run(run_id)
+        if run is None:
+            raise run_inputs_module.InputRejected('run_missing', '运行不存在')
+        meta = await self.store.task_meta(run['task_id']) or {}
+        # 没有 principal（单机/测试）时用匿名主体：它对本机数据是放行的
+        policies.ensure_owner({'tenant_id': run.get('tenant_id') or 'default',
+                               'owner_user_id': meta.get('owner_user_id')
+                               or 'default'},
+                              principal or policies.Principal(), '运行')
+        if task_id and task_id != run['task_id']:
+            # 客户端拿的是别的任务：不能把输入转发到这条 run 上
+            raise run_inputs_module.InputRejected('run_not_current',
+                                                  '该运行不属于这个任务')
+        result = await self.store.append_run_input(
+            run_id=run_id, request_id=request_id, message=message,
+            task_id=run['task_id'],
+            max_pending=settings.run_input_max_pending,
+            max_chars=settings.run_input_max_chars)
+        if not result.get('replayed'):
+            logger.info('run %s 接受补充 #%s（要求版本 %s）', run_id,
+                        result.get('input_seq'), result.get('intent_version'))
+            # 提交之后才通知进程内执行者：通知只是加速，安全靠数据库
+            await self._wake_executor(run_id)
+        return result
+
+    async def run_inputs(self, run_id: str, *, after_seq: int = 0,
+                         limit: int = 50) -> dict:
+        """回读补充输入与处理状态（按 input_seq 分页）。"""
+        items = await self.store.run_inputs(run_id, after_seq=after_seq,
+                                           limit=limit)
+        info = await self.store.run_intent(run_id)
+        return {'run_id': run_id, 'inputs': items,
+                'intent_version': int(info.get('intent_version') or 0),
+                'processed_intent_version': int(
+                    info.get('processed_intent_version') or 0),
+                'pending_input_count': int(info.get('pending_input_count') or 0)}
+
+    async def _wake_executor(self, run_id: str) -> None:
+        """尽力唤醒本进程内正在跑这条 run 的执行者。
+
+        真正生效的阻断来自 `admit_action` 的事务比较；这里只是让"正在等着的
+        执行者"早点知道，少跑一步无用功。跨进程通知未实现（写入数据库即达成
+        一致的可见性，另一个执行者会在自己的边界读到）。
+        """
+        for record in list(self.tasks.values()):
+            if record.run_id != run_id or not record.live:
+                continue
+            try:
+                await record.publish(action('补充要求已保存', '下一个边界按新要求调整', '📝'))
+            except Exception:                       # noqa: BLE001
+                logger.warning('唤醒执行者失败 run=%s', run_id, exc_info=True)
 
     async def pause(self, run_id: str) -> dict:
         """请求暂停。返回 `{ok, status, pause_requested}`。

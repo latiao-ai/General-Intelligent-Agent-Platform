@@ -43,6 +43,21 @@ class ExecutionPlan(BaseModel):
     # 本轮用户透露的个人信息，没有就留空。与旧版解析阶段的行为保持一致。
     profile_updates: dict[str, str] = Field(default_factory=dict)
 
+class RevisedPlan(BaseModel):
+    """运行中补充要求后的**剩余计划**（文档 harness-live-input §5 第十步）。
+
+    与 `ExecutionPlan` 的差别：这里只描述"接下来还要做什么"，已经执行成功的
+    步骤通过 `ref` 引用它们的输出，不重写、不删除。`superseded` 列出被这次
+    调整作废的旧步骤 ID，保留审计。
+    """
+    steps: list[PlanStep] = Field(default_factory=list, max_length=8)
+    summary: str = ''
+    # 被作废的、原计划里尚未执行的步骤 ID
+    superseded: list[str] = Field(default_factory=list)
+    # 需要用户先澄清的问题；非空表示这一轮不产生可执行计划
+    questions: list[str] = Field(default_factory=list)
+
+
 class SessionMemory(BaseModel):
     """会话记忆：更早对话的压缩结果。人可读，也可被用户直接编辑。"""
     summary: str = ''
@@ -95,6 +110,20 @@ class AgentState(TypedDict, total=False):
     # 续跑用：沿用已保存的计划，不重新规划
     resume_plan: dict
     run_id: str
+    # ---------- 运行中补充输入（文档 harness-live-input） ----------
+    # 三个版本必须分别存在：lease_epoch 在 ExecutionContext 里（不进 state），
+    # 这里只放"用户要求版本"与"计划版本"。
+    original_goal: str
+    intent_version: int                 # 本次决策依据的要求版本（冻结）
+    processed_intent_version: int       # 已被计划覆盖的要求版本
+    pending_inputs: list[dict]          # 尚未纳入计划提交的补充（按 input_seq）
+    intent_changed: bool                # 边界上发现版本变化，需要重新规划
+    revision_count: int                 # 本次运行已经修订过几次计划
+    plan_version: int                   # 当前计划版本
+    # intake 节点的路由结果：plan / revise / run_step / finalize / stop
+    entry_route: str
+    # 修订计划时给校验器的"受信历史输出"（已成功步骤 + 其 step_id）
+    trusted_outputs: dict
     # 各节点耗时，由执行器写入（见 app/main.py）。
     timings: list[dict]
     elapsed_seconds: float

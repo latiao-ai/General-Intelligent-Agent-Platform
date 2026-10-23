@@ -330,6 +330,50 @@ CREATE TABLE IF NOT EXISTS run_snapshots (
     updated_at            TEXT NOT NULL
 );
 
+-- ---------- 运行中补充输入（文档 harness-live-input §4） ----------
+-- 三个版本必须分开存：lease_epoch（谁有权推进）、intent_version（用户要求更新到
+-- 哪一版）、plan_version（当前采用哪份计划）。混用任何一个都会让"旧要求产生的
+-- 操作"重新获得准入资格。
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS intent_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS processed_intent_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS intent_version INTEGER NOT NULL DEFAULT 1;
+-- 这份计划替代了哪一版计划（0 表示首版），审计"谁被谁取代"用
+ALTER TABLE plans ADD COLUMN IF NOT EXISTS base_plan_version INTEGER NOT NULL DEFAULT 0;
+-- 每个动作依据的要求版本：审计"这次写入是按哪一版要求做的"
+ALTER TABLE actions ADD COLUMN IF NOT EXISTS decision_intent_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE run_snapshots ADD COLUMN IF NOT EXISTS intent_version INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE run_snapshots ADD COLUMN IF NOT EXISTS processed_intent_version INTEGER NOT NULL DEFAULT 0;
+
+-- 补充输入的**不可变日志**：真实来源是这里，不是 messages 表。
+-- (run_id, request_id) 唯一 → 客户端重试不会重复加版本；
+-- (run_id, input_seq) 唯一 → 顺序由服务端在锁住 run 之后分配，不用 MAX+1 猜。
+CREATE TABLE IF NOT EXISTS run_inputs (
+    input_id        TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL,
+    input_seq       INTEGER NOT NULL,
+    request_id      TEXT NOT NULL,
+    message         TEXT NOT NULL,
+    payload_hash    TEXT NOT NULL DEFAULT '',
+    intent_version  INTEGER NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_run_inputs_request
+    ON run_inputs(run_id, request_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_run_inputs_seq
+    ON run_inputs(run_id, input_seq);
+
+-- 处理投影：可以从 run_inputs + plans 重建，因此允许任何新执行者继续处理，
+-- 不用一个永久的 processing 标记把崩溃的任务锁死。
+CREATE TABLE IF NOT EXISTS run_input_processing (
+    input_id              TEXT PRIMARY KEY,
+    status                TEXT NOT NULL DEFAULT 'accepted',
+    processed_plan_version INTEGER NOT NULL DEFAULT 0,
+    error_code            TEXT NOT NULL DEFAULT '',
+    updated_at            TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_input_processing_status
+    ON run_input_processing(status);
+
 -- 中台自己的登录会话。凭证原文只在浏览器，这里只存摘要。
 CREATE TABLE IF NOT EXISTS auth_sessions (
     auth_session_id  TEXT PRIMARY KEY,
@@ -851,6 +895,36 @@ class PostgresStore:
 
     # ---------- 事件日志 ----------
 
+    async def _append_event_in_tx(self, conn, task_id: str, event: dict) -> int:
+        """在**调用方的事务里**追加一条事件，返回序号。
+
+        为什么要这一版：补充输入必须在"插入日志 + 升版本 + 追加事件"的同一个事务里
+        完成（要么全有、要么全无）。直接调 `append_event()` 会自己借连接、自己提交，
+        在外层事务里调用它等于把原子性交给运气。
+
+        锁顺序固定为 **run → 输入/计划/动作 → 事件**：先 `pg_advisory_xact_lock`
+        再 INSERT，跨表写法保持一致，避免出现新的死锁顺序。
+        """
+        payload = json.dumps(event, ensure_ascii=False)
+        statement = (
+            'INSERT INTO events (task_id, seq, payload, created_at) '
+            'SELECT %s, COALESCE(MAX(seq), 0) + 1, %s, %s FROM events '
+            'WHERE task_id=%s RETURNING seq')
+        for _ in range(8):
+            try:
+                # 已在外层事务里 → `conn.transaction()` 是 SAVEPOINT：
+                # 序号冲突只回滚这一小段，不会连带丢掉调用方的输入日志。
+                async with conn.transaction():
+                    await self._run(conn,
+                                    'SELECT pg_advisory_xact_lock(hashtext(%s))',
+                                    (task_id,))
+                    row = await self._one(conn, statement,
+                                          (task_id, payload, now(), task_id))
+                    return int(row['seq'])
+            except psycopg.errors.UniqueViolation:
+                continue
+        raise RuntimeError('事件序号竞争失败')
+
     async def append_event(self, task_id: str, event: dict) -> int:
         """追加一条事件并返回它的序号（每任务内自增，用于订阅去重）。
 
@@ -927,7 +1001,8 @@ class PostgresStore:
         return _decode_run(dict(row)) if row else None
 
     async def update_run(self, run_id: str, **fields) -> None:
-        allowed = {'status', 'plan_version', 'budget_json', 'consumed_json',
+        allowed = {'status', 'plan_version', 'intent_version',
+                   'processed_intent_version', 'budget_json', 'consumed_json',
                    'cancel_requested_at', 'pause_requested', 'lease_owner',
                    'lease_expires_at', 'lease_epoch', 'error', 'compensated_at'}
         updates = {k: v for k, v in fields.items() if k in allowed}
@@ -1009,32 +1084,44 @@ class PostgresStore:
         return data
 
     async def control_state(self, run_id: str) -> dict:
-        '''读控制意图（暂停/取消）+ 状态。准入动作前必须看它。'''
+        '''读控制意图（暂停/取消/要求版本）+ 状态。准入动作前必须看它。
+
+        要求版本也要在这里读：执行者的边界检查靠它判断"计划是不是已经过期"。
+        少读这一列，边界检查就会永远认为"版本是 1"，从而把所有动作都拦下。
+        '''
         async with self._lease() as conn:
             row = await self._one(
                 conn,
                 'SELECT status, pause_requested, cancel_requested_at, lease_owner, '
-                'lease_epoch, lease_expires_at FROM runs WHERE run_id=%s',
+                'lease_epoch, lease_expires_at, intent_version, '
+                'processed_intent_version FROM runs WHERE run_id=%s',
                 (run_id,))
         return dict(row) if row else {}
 
     async def save_snapshot(self, run_id: str, *, plan_version: int, state: dict,
                             next_step_id: str = '', artifact_namespace: str = '',
-                            conn=None) -> None:
+                            conn=None, intent_version: int | None = None,
+                            processed_intent_version: int | None = None) -> None:
         '''写运行快照（恢复所需的最小完整状态）。
 
         长正文与文件不进快照：它们走产物引用，快照里只留引用与索引。
+        快照里的版本字段只用于**排障与核对**：恢复时以 `runs` 的版本为准，
+        因为补充输入会改变 `runs.intent_version`，而快照可能还没来得及更新。
         '''
         payload = json.dumps(state, ensure_ascii=False, default=str)
         sql = ('INSERT INTO run_snapshots (run_id, plan_version, snapshot_schema, '
-               'state_json, next_step_id, artifact_namespace, updated_at) '
-               'VALUES (%s, %s, %s, %s, %s, %s, %s) '
+               'state_json, next_step_id, artifact_namespace, updated_at, '
+               'intent_version, processed_intent_version) '
+               'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) '
                'ON CONFLICT (run_id) DO UPDATE SET plan_version=EXCLUDED.plan_version, '
                'state_json=EXCLUDED.state_json, next_step_id=EXCLUDED.next_step_id, '
                'artifact_namespace=EXCLUDED.artifact_namespace, '
-               'updated_at=EXCLUDED.updated_at')
+               'updated_at=EXCLUDED.updated_at, '
+               'intent_version=EXCLUDED.intent_version, '
+               'processed_intent_version=EXCLUDED.processed_intent_version')
         args = (run_id, int(plan_version or 1), 1, payload, next_step_id,
-                artifact_namespace, now())
+                artifact_namespace, now(), int(intent_version or 0),
+                int(processed_intent_version or 0))
         if conn is not None:
             await self._run(conn, sql, args)
             return
@@ -1053,6 +1140,204 @@ class PostgresStore:
         except ValueError:
             data['state'] = {}
         return data
+
+    # ---------- 运行中补充输入（文档 harness-live-input §4） ----------
+    # 这里的核心不是"存一条消息"，而是**一次事务**里完成五件事：
+    # 校验状态 → 幂等查原回执 → 分配序号插日志 → 升 intent_version → 追加事件。
+    # 少任何一步都会出现"版本涨了但没有日志"或"日志在、版本没涨"的分叉状态，
+    # 而这两种状态都没法安全恢复。
+
+    # 可以接受补充的状态（文档 §2.2）。已收尾/已取消的 run 一律拒绝：
+    # 否则"补充"就成了绕过 resume 门禁复活旧任务的旁路。
+    INPUT_ACCEPTING_STATUSES = ('queued', 'running', 'reconciling', 'paused',
+                               'waiting_input', 'waiting_approval',
+                               'needs_reconcile')
+
+    async def append_run_input(self, *, run_id: str, request_id: str,
+                               message: str, payload_hash: str = '',
+                               task_id: str = '', max_pending: int = 20,
+                               max_chars: int = 4000) -> dict:
+        """原子接受一条补充输入。
+
+        返回 `{input_id, run_id, task_id, input_seq, intent_version,
+        processed_intent_version, status, replayed, duplicate_message}`。
+
+        抛出的异常都是**可映射的业务错误**，由接口层翻译成 404/409/422/429：
+
+        - `InputRejected`：状态不接受（已结束/已取消/不是 current_run）
+        - `InputConflict`：同一个 request_id 换了内容
+        - `InputBacklog`：待处理输入超限
+        """
+        from app import run_inputs as run_inputs_module
+
+        text = (message or '').strip()
+        if not text:
+            raise run_inputs_module.InputRejected('input_empty', '补充内容不能为空')
+        if len(text) > max_chars:
+            raise run_inputs_module.InputRejected(
+                'input_too_long', f'补充内容过长（上限 {max_chars} 字符）')
+        digest = payload_hash or run_inputs_module.payload_hash(text)
+
+        async with self._lease() as conn:
+            # 锁 run 行：与"动作准入/计划提交/最终结算"争用的是同一把行锁，
+            # 因此"补充先提交还是旧动作先准入"有唯一裁决者（文档 §5 第九步）。
+            row = await self._one(
+                conn, 'SELECT * FROM runs WHERE run_id=%s FOR UPDATE', (run_id,))
+            if row is None:
+                raise run_inputs_module.InputRejected('run_missing', '运行不存在')
+            run = dict(row)
+            owner_task = run['task_id']
+            if task_id and task_id != owner_task:
+                # 客户端拿着别的任务的 run_id 来发补充：不能转发到新 run
+                raise run_inputs_module.InputRejected(
+                    'run_not_current', '该运行不属于这个任务')
+            meta = await self._one(
+                conn, 'SELECT current_run_id FROM tasks_meta WHERE task_id=%s',
+                (owner_task,))
+            if meta is not None and meta.get('current_run_id'):
+                if str(meta['current_run_id']) != str(run_id):
+                    raise run_inputs_module.InputRejected(
+                        'run_not_current', '该运行已被同一任务的新运行取代')
+            status = str(run.get('status') or '')
+
+            # 幂等先行：**先查原回执，再看状态**。否则"响应丢失后重试"会因为任务
+            # 刚好收尾而被误报成"未接收"（文档 §3 第二步）。
+            previous = await self._one(
+                conn, 'SELECT * FROM run_inputs WHERE run_id=%s AND request_id=%s',
+                (run_id, request_id))
+            if previous is not None:
+                item = dict(previous)
+                if item.get('payload_hash') and item['payload_hash'] != digest:
+                    raise run_inputs_module.InputConflict(
+                        '同一个 request_id 提交了不同内容')
+                processing = await self._one(
+                    conn, 'SELECT * FROM run_input_processing WHERE input_id=%s',
+                    (item['input_id'],))
+                latest = await self._one(
+                    conn, 'SELECT intent_version, processed_intent_version '
+                    'FROM runs WHERE run_id=%s', (run_id,))
+                return {
+                    'input_id': item['input_id'], 'run_id': run_id,
+                    'task_id': owner_task, 'input_seq': int(item['input_seq']),
+                    'message': item['message'],
+                    # 重放不能把"接受版本"改成最新值（文档 §3 第一步）
+                    'intent_version': int(item['intent_version']),
+                    'processed_intent_version': int(
+                        (latest or {}).get('processed_intent_version') or 0),
+                    'status': (processing or {}).get('status') or 'accepted',
+                    'replayed': True, 'duplicate_message': False,
+                }
+
+            if status in ('succeeded', 'failed', 'cancelled', 'interrupted',
+                          'partially_succeeded'):
+                code = 'run_cancelled' if status == 'cancelled' else 'run_finished'
+                raise run_inputs_module.InputRejected(
+                    code, f'该运行已经结束（{status}），请另开一轮')
+            if status not in self.INPUT_ACCEPTING_STATUSES:
+                raise run_inputs_module.InputRejected(
+                    'run_not_accepting', f'该运行当前状态为 {status}，不能接受补充')
+
+            pending = await self._one(
+                conn, 'SELECT COUNT(*) AS n FROM run_input_processing p '
+                'JOIN run_inputs i ON i.input_id=p.input_id '
+                "WHERE i.run_id=%s AND p.status='accepted'", (run_id,))
+            if int((pending or {}).get('n') or 0) >= max_pending:
+                raise run_inputs_module.InputBacklog(
+                    f'待处理补充已达上限（{max_pending} 条），等这批处理完再发')
+
+            seq_row = await self._one(
+                conn, 'SELECT COALESCE(MAX(input_seq), 0) + 1 AS next_seq '
+                'FROM run_inputs WHERE run_id=%s', (run_id,))
+            input_seq = int(seq_row['next_seq'])
+            version_row = await self._one(
+                conn, 'SELECT COALESCE(intent_version, 1) AS v, '
+                'COALESCE(processed_intent_version, 0) AS pv '
+                'FROM runs WHERE run_id=%s', (run_id,))
+            intent_version = int(version_row['v']) + 1
+            input_id = 'inp_' + uuid.uuid4().hex[:16]
+            stamp = now()
+            await self._run(
+                conn, 'INSERT INTO run_inputs (input_id, run_id, input_seq, '
+                'request_id, message, payload_hash, intent_version, created_at) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
+                (input_id, run_id, input_seq, request_id, text, digest,
+                 intent_version, stamp))
+            await self._run(
+                conn, 'INSERT INTO run_input_processing (input_id, status, '
+                "processed_plan_version, error_code, updated_at) "
+                "VALUES (%s, 'accepted', 0, '', %s)", (input_id, stamp))
+            await self._run(
+                conn, 'UPDATE runs SET intent_version=%s, updated_at=%s '
+                'WHERE run_id=%s', (intent_version, stamp, run_id))
+            await self._append_event_in_tx(conn, owner_task, {
+                'type': 'action', 'icon': '📝', 'label': '收到补充要求',
+                'detail': text[:120], 'input_received': True,
+                'input_id': input_id, 'input_seq': input_seq,
+                'intent_version': intent_version, 'run_id': run_id,
+            })
+            return {
+                'input_id': input_id, 'run_id': run_id, 'task_id': owner_task,
+                'input_seq': input_seq, 'message': text,
+                'intent_version': intent_version,
+                'processed_intent_version': int(version_row['pv']),
+                'status': 'accepted', 'replayed': False,
+                'duplicate_message': False,
+            }
+
+    async def run_inputs(self, run_id: str, *, after_seq: int = 0,
+                         limit: int = 50) -> list[dict]:
+        """按序号回读补充输入及其处理状态（已接受但还没有消费者的也要看到）。"""
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn, 'SELECT i.*, p.status AS processing_status, '
+                'p.processed_plan_version, p.error_code, p.updated_at AS processed_at '
+                'FROM run_inputs i '
+                'LEFT JOIN run_input_processing p ON p.input_id=i.input_id '
+                'WHERE i.run_id=%s AND i.input_seq > %s '
+                'ORDER BY i.input_seq LIMIT %s',
+                (run_id, int(after_seq or 0), int(limit or 50)))
+        return [dict(r) for r in rows]
+
+    async def pending_run_inputs(self, run_id: str) -> list[dict]:
+        """还没纳入任何计划提交的补充输入（新执行者据此继续处理）。"""
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn, 'SELECT i.* FROM run_inputs i '
+                'LEFT JOIN run_input_processing p ON p.input_id=i.input_id '
+                "WHERE i.run_id=%s AND COALESCE(p.status, 'accepted') = 'accepted' "
+                'ORDER BY i.input_seq', (run_id,))
+        return [dict(r) for r in rows]
+
+    async def run_intent(self, run_id: str) -> dict:
+        """run 的三个版本 + 待处理输入数（一次读，保证互相自洽）。"""
+        async with self._lease() as conn:
+            row = await self._one(
+                conn, 'SELECT COALESCE(intent_version, 1) AS intent_version, '
+                'COALESCE(processed_intent_version, 0) AS processed_intent_version, '
+                'COALESCE(plan_version, 0) AS plan_version, status '
+                'FROM runs WHERE run_id=%s', (run_id,))
+            pending = await self._one(
+                conn, 'SELECT COUNT(*) AS n FROM run_input_processing p '
+                'JOIN run_inputs i ON i.input_id=p.input_id '
+                "WHERE i.run_id=%s AND p.status='accepted'", (run_id,))
+        data = dict(row or {})
+        data['pending_input_count'] = int((pending or {}).get('n') or 0)
+        return data
+
+    async def mark_inputs_applied(self, conn, run_id: str, *, intent_version: int,
+                                  plan_version: int) -> int:
+        """把被这份计划覆盖的输入标成 applied（在计划提交事务里调用）。
+
+        `applied` 只表示"计划已纳入这条要求"，**不表示业务效果已完成**——
+        这两件事混用会让用户在计划刚提交时就看到"已完成"。
+        """
+        cur = await self._run(
+            conn, 'UPDATE run_input_processing p SET status=%s, '
+            'processed_plan_version=%s, updated_at=%s '
+            'FROM run_inputs i WHERE p.input_id=i.input_id AND i.run_id=%s '
+            "AND p.status='accepted' AND i.intent_version <= %s",
+            ('applied', int(plan_version), now(), run_id, int(intent_version)))
+        return int(getattr(cur, 'rowcount', 0) or 0)
 
     async def release_lease(self, run_id: str, worker_id: str,
                             epoch: int | None = None) -> None:
@@ -1214,24 +1499,59 @@ class PostgresStore:
 
     async def commit_plan(self, context, *, run_id: str, version: int, goal: str,
                           steps: list[dict], state: dict,
-                          artifact_namespace: str = '') -> dict:
-        """**在第一次工具调用之前**把计划、步骤、初始快照一起提交。
+                          artifact_namespace: str = '',
+                          expected_intent_version: int | None = None,
+                          intent_version: int | None = None,
+                          base_plan_version: int | None = None) -> dict:
+        """把计划、步骤、快照一起提交，并按**用户要求版本**做 CAS。
 
         一个事务里完成，失败就"零工具调用"：宁可任务失败，也不能出现"远端已经
         跑了两步、库里却没有计划"——那种状态根本没法恢复。
+
+        `expected_intent_version` 是**这份计划的依据版本**。提交时若用户又补了一句
+        要求（`runs.intent_version` 变了），这里抛 `IntentChanged`：旧候选计划直接
+        作废，绝不能拿"按 v2 生成的计划"去执行、再声称它覆盖了 v3。
+
+        `intent_version` 是这份计划**覆盖到**的版本，提交成功时同步写进
+        `runs.processed_intent_version`，并把被它覆盖的输入标成 applied。
         """
         from app import execution_control
 
         async with self._lease() as conn:
-            await self._owned(conn, context, run_id=run_id,
-                              require_status=('running', 'queued'))
+            row = await self._owned(conn, context, run_id=run_id,
+                                    require_status=('running', 'queued'))
+            if row is None:
+                raise execution_control.LeaseLost(run_id, '运行不存在')
+            current_intent = int(row.get('intent_version') or 1)
+            if (expected_intent_version is not None
+                    and int(expected_intent_version) != current_intent):
+                raise execution_control.IntentChanged(
+                    run_id, int(expected_intent_version), current_intent)
+            if (base_plan_version is not None
+                    and int(row.get('plan_version') or 0)
+                    and int(row.get('plan_version') or 0) != int(base_plan_version)):
+                # 计划已经被别人推进过：不能覆盖成更旧的版本
+                raise execution_control.IntentChanged(
+                    run_id, int(base_plan_version), current_intent)
+            covered = int(intent_version if intent_version is not None
+                          else current_intent)
             await self._run(
                 conn, 'INSERT INTO plans (run_id, version, goal, steps_json, reason, '
-                'created_at) VALUES (%s, %s, %s, %s, %s, %s) '
+                'created_at, intent_version, base_plan_version) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s) '
                 'ON CONFLICT (run_id, version) DO UPDATE SET goal=EXCLUDED.goal, '
-                'steps_json=EXCLUDED.steps_json, reason=EXCLUDED.reason',
+                'steps_json=EXCLUDED.steps_json, reason=EXCLUDED.reason, '
+                'intent_version=EXCLUDED.intent_version, '
+                'base_plan_version=EXCLUDED.base_plan_version',
                 (run_id, int(version), goal,
-                 json.dumps(steps, ensure_ascii=False), '', now()))
+                 json.dumps(steps, ensure_ascii=False), '', now(),
+                 covered, int(base_plan_version or 0)))
+            # 旧计划里没执行完的步骤标 superseded：审计要能看出"谁被谁取代了"
+            if int(version) > 1:
+                await self._run(
+                    conn, "UPDATE steps SET status='superseded' WHERE run_id=%s "
+                    "AND plan_version < %s AND status IN ('pending','running')",
+                    (run_id, int(version)))
             for seq, step in enumerate(steps, 1):
                 await self._run(
                     conn, 'INSERT INTO steps (run_id, plan_version, step_id, seq, '
@@ -1241,18 +1561,27 @@ class PostgresStore:
                     (run_id, int(version), step.get('step_id'), seq,
                      step.get('tool_key') or '',
                      json.dumps(step.get('args') or {}, ensure_ascii=False)))
-            await self._run(conn, 'UPDATE runs SET plan_version=%s, updated_at=%s '
-                            'WHERE run_id=%s', (int(version), now(), run_id))
+            await self._run(
+                conn, 'UPDATE runs SET plan_version=%s, '
+                'processed_intent_version=GREATEST(COALESCE(processed_intent_version,0), %s), '
+                'updated_at=%s WHERE run_id=%s',
+                (int(version), covered, now(), run_id))
+            applied = await self.mark_inputs_applied(
+                conn, run_id, intent_version=covered, plan_version=int(version))
             await self.save_snapshot(run_id, plan_version=version, state=state,
                                      next_step_id=(steps[0].get('step_id') if steps else ''),
-                                     artifact_namespace=artifact_namespace, conn=conn)
-            return {'plan_version': int(version)}
+                                     artifact_namespace=artifact_namespace, conn=conn,
+                                     intent_version=covered)
+            return {'plan_version': int(version), 'intent_version': covered,
+                    'applied_inputs': applied}
 
     async def admit_action(self, context, *, run_id: str, plan_version: int,
                            step_id: str, tool_key: str, args_hash: str,
                            idempotency_key: str, effect: str = 'unknown',
                            action_id: str, attempt_id: str,
-                           require_pause_free: bool = True) -> dict:
+                           require_pause_free: bool = True,
+                           expected_intent_version: int | None = None,
+                           decision_intent_version: int | None = None) -> dict:
         """**原子地**取得这次工具调用的准入资格。
 
         同一事务内按固定顺序做四件事：校验租约与控制请求 → 查/建 action →
@@ -1275,6 +1604,14 @@ class PostgresStore:
             if require_pause_free and row.get('pause_requested'):
                 raise execution_control.ControlStopped('已请求暂停，不再准入新动作',
                                                        'paused')
+            # 用户要求版本必须与这份计划的依据版本**相等**才准入（文档 §5 第九步）。
+            # 注意这是"新动作"的门禁：已准入动作的回执照样要能结算——
+            # 真实发生过的效果不能因为用户改主意就丢掉。
+            current_intent = int(row.get('intent_version') or 1)
+            if (expected_intent_version is not None
+                    and int(expected_intent_version) != current_intent):
+                raise execution_control.IntentChanged(
+                    run_id, int(expected_intent_version), current_intent)
 
             existing = await self._one(
                 conn, 'SELECT * FROM actions WHERE idempotency_key=%s',
@@ -1310,10 +1647,12 @@ class PostgresStore:
             await self._run(
                 conn, 'INSERT INTO actions (action_id, run_id, plan_version, step_id, '
                 'tool_key, args_hash, idempotency_key, effect, status, authorized_by, '
-                "created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, "
-                "'in_flight', '', %s, %s)",
+                'created_at, updated_at, decision_intent_version) '
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'in_flight', '', %s, %s, %s)",
                 (action_id, run_id, int(plan_version), step_id, tool_key, args_hash,
-                 idempotency_key, effect, stamp, stamp))
+                 idempotency_key, effect, stamp, stamp,
+                 int(decision_intent_version if decision_intent_version is not None
+                     else current_intent)))
             await self._run(
                 conn, 'INSERT INTO action_attempts (attempt_id, action_id, started_at) '
                 'VALUES (%s, %s, %s) ON CONFLICT (attempt_id) DO NOTHING',
@@ -1372,22 +1711,60 @@ class PostgresStore:
 
     async def finish_run_owned(self, context, *, run_id: str, status: str,
                                error: str | None = None,
-                               state: dict | None = None) -> bool:
-        """带租约条件地写 run 终态。返回 False = 已失去执行权(不写)。"""
+                               state: dict | None = None,
+                               expected_intent_version: int | None = None,
+                               plan_version: int | None = None,
+                               compensated_at: str | None = None,
+                               require_no_pending_inputs: bool = False) -> bool:
+        """带租约与**要求版本**条件地写 run 终态。返回 False = 已失去执行权(不写)。
+
+        收尾也必须过版本门禁（文档 §5 第十一步）：旧版本跑出来的"完成"不能
+        盖在新要求上面。若用户在收尾前补了一句要求，这里抛 `IntentChanged`——
+        调用方应当回到消费循环，而不是把这个 run 标成结束。
+        """
         from app import execution_control
 
         async with self._lease() as conn:
             try:
-                await self._owned(conn, context, run_id=run_id)
+                row = await self._owned(conn, context, run_id=run_id)
             except execution_control.LeaseLost:
                 return False
-            await self._run(
-                conn, 'UPDATE runs SET status=%s, error=%s, updated_at=%s, '
-                'lease_owner=NULL, lease_expires_at=NULL WHERE run_id=%s',
-                (status, error, now(), run_id))
+            if row is None:
+                return False
+            current_intent = int(row.get('intent_version') or 1)
+            if (expected_intent_version is not None
+                    and int(expected_intent_version) != current_intent):
+                raise execution_control.IntentChanged(
+                    run_id, int(expected_intent_version), current_intent)
+            if require_no_pending_inputs:
+                pending = await self._one(
+                    conn, 'SELECT COUNT(*) AS n FROM run_input_processing p '
+                    'JOIN run_inputs i ON i.input_id=p.input_id '
+                    "WHERE i.run_id=%s AND p.status='accepted'", (run_id,))
+                if int((pending or {}).get('n') or 0):
+                    # 有已接受却没人处理的补充：不许声称结束（否则它永远没人管）
+                    raise execution_control.IntentChanged(
+                        run_id, current_intent, current_intent + 1)
+            sets = ['status=%s', 'error=%s', 'updated_at=%s',
+                    'lease_owner=NULL', 'lease_expires_at=NULL']
+            args: list = [status, error, now()]
+            if compensated_at is not None:
+                sets.append('compensated_at=%s')
+                args.append(compensated_at)
+            if plan_version is not None:
+                sets.append('plan_version=%s')
+                args.append(int(plan_version))
+            args.append(run_id)
+            await self._run(conn, f'UPDATE runs SET {", ".join(sets)} '
+                            'WHERE run_id=%s', tuple(args))
             if state is not None:
-                await self.save_snapshot(run_id, plan_version=int(
-                    (context.plan_version if context else 1)), state=state, conn=conn)
+                await self.save_snapshot(
+                    run_id,
+                    plan_version=int(plan_version
+                                     or (context.plan_version if context else 1)),
+                    state=state, conn=conn, intent_version=current_intent,
+                    processed_intent_version=int(
+                        row.get('processed_intent_version') or 0))
             return True
 
     async def pause_at_boundary(self, context, *, run_id: str, plan_version: int,

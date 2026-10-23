@@ -81,19 +81,25 @@ class ActionLedger:
         return f'{self.run_id}:{self.plan_version}:{step_id}:{tool_key}:{args_hash(args)}'
 
     async def admit(self, *, step_id: str, tool_key: str, effect: str,
-                    args: dict, authorized_by: str = '') -> dict:
+                    args: dict, authorized_by: str = '',
+                    expected_intent_version: int | None = None) -> dict:
         """取得调用准入。返回：
 
         - `{'status': 'admitted', 'action_id', 'attempt_id'}` 可以调用；
         - `{'status': 'succeeded', 'replay': 回执}` 之前已成功，直接复用；
         - `{'status': 'in_flight'|'unknown', 'blocked': 状态}` 结果未定，必须核实。
+
+        `expected_intent_version` 必须来自**已提交的计划**（不是模型自报的版本）：
+        仓储层会拿它和 `runs.intent_version` 比较，不相等抛 `IntentChanged`。
+        这样"用户刚补了一句要求"与"旧计划要发下一个动作"由数据库裁决先后。
         """
         admitted = await self.store.admit_action(
             self.context, run_id=self.run_id, plan_version=self.plan_version,
             step_id=step_id, tool_key=tool_key,
             args_hash=args_hash(args), idempotency_key=self.key_of(step_id, tool_key, args),
             effect=effect, action_id='act_' + uuid.uuid4().hex[:16],
-            attempt_id='att_' + uuid.uuid4().hex[:12])
+            attempt_id='att_' + uuid.uuid4().hex[:12],
+            expected_intent_version=expected_intent_version)
         status = admitted.get('status')
         if status == 'admitted':
             return {'status': 'admitted',

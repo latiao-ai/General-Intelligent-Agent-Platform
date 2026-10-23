@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 
 from app import idempotency, memory as memory_module, outcome as outcome_module
 from app import auth, policies, profile
+from app import run_inputs as run_inputs_module
 from app import tools as tool_module
 from app.api_hub import CLOSE, Hub
 from app.config import settings
@@ -87,6 +88,21 @@ class MemoryRequest(BaseModel):
     summary: str = Field(default='', max_length=4000)
     # 关键事实用「键：值」多行文本编辑，与画像保持同一种手感
     facts: str = Field(default='', max_length=4000)
+
+
+class RunInputRequest(BaseModel):
+    """给**当前任务**的补充要求（文档 harness-live-input §3）。
+
+    `request_id` 由客户端生成并持久保存：响应丢失时用同一个 ID 重发，服务端会
+    返回原来那条输入（版本不再增长），而不是再加一版要求。
+    """
+    # 只限制"能安全当键用"的字符与长度上限：下限交给客户端自觉，不能因为
+    # 客户端用了短 ID 就把它判成非法请求（幂等才是这条约束的目的）。
+    request_id: str = Field(min_length=1, max_length=64,
+                            pattern=r'^[A-Za-z0-9_.:-]+$')
+    message: str = Field(min_length=1, max_length=10000)
+    # 可选：客户端拿着的 run_id/task_id。给了就校验归属，防止把输入转发到别的 run
+    task_id: str | None = Field(default=None, max_length=64)
 
 
 class TaskRequest(BaseModel):
@@ -512,6 +528,62 @@ async def resume_run(run_id: str,
     if record is None:
         raise HTTPException(status_code=409, detail='没有可续跑的计划')
     return {'resumed': True, 'task_id': record.task_id, 'run_id': record.run_id}
+
+
+def _input_error(exc) -> HTTPException:
+    """把补充输入的业务错误翻译成 HTTP 状态码（文档 §6 错误合同）。"""
+    code = getattr(exc, 'code', '')
+    status = {'input_request_conflict': 409, 'run_finished': 409,
+              'run_cancelled': 409, 'run_not_current': 409,
+              'run_not_accepting': 409,
+              'input_too_long': 422, 'input_empty': 422,
+              'input_backlog': 429}.get(code, 400)
+    headers = {'Retry-After': '2'} if status == 429 else None
+    return HTTPException(status_code=status,
+                         detail=f'{code}: {getattr(exc, "message", str(exc))}',
+                         headers=headers)
+
+
+def _inputs_enabled() -> None:
+    if not settings.run_inputs_enabled:
+        # 关掉时按"没有这个接口"处理，而不是 403：前端不需要区分"未开放/无权限"
+        raise HTTPException(status_code=404, detail='运行中补充输入未开放')
+
+
+@app.post('/api/runs/{run_id}/inputs', status_code=202)
+async def append_run_input(run_id: str, payload: RunInputRequest,
+                           principal=Depends(policies.current_principal)):
+    """给当前任务补一句要求。**接受**只代表已落库，不代表已纳入计划。
+
+    三种状态不能混用（文档 §2.2）：
+    - `accepted`：数据库已提交，等执行者在下一个边界读取；
+    - `applied`：基于新要求的计划已提交；
+    - 业务完成：那是另一件事，要等 run 真正结束。
+    """
+    _inputs_enabled()
+    await _owned_run(run_id, principal)
+    try:
+        result = await hub.append_run_input(
+            run_id, request_id=payload.request_id, message=payload.message,
+            principal=principal, task_id=payload.task_id or '')
+    except run_inputs_module.InputConflict as exc:
+        raise _input_error(exc) from None
+    except run_inputs_module.InputRejected as exc:
+        raise _input_error(exc) from None
+    return {'input_id': result['input_id'], 'task_id': result['task_id'],
+            'run_id': result['run_id'], 'input_seq': result['input_seq'],
+            'intent_version': result['intent_version'],
+            'processed_intent_version': result['processed_intent_version'],
+            'status': result['status'], 'replayed': result['replayed']}
+
+
+@app.get('/api/runs/{run_id}/inputs')
+async def read_run_inputs(run_id: str, after_seq: int = 0, limit: int = 50,
+                          principal=Depends(policies.current_principal)):
+    """按序号回读补充输入与处理状态（前端切回来/重连后补齐显示）。"""
+    _inputs_enabled()
+    await _owned_run(run_id, principal)
+    return await hub.run_inputs(run_id, after_seq=after_seq, limit=limit)
 
 
 @app.post('/api/runs/{run_id}/compensate')

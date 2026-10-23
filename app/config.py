@@ -67,6 +67,21 @@ class Settings:
     # 客户端某天重用旧键时拿到一个陈年任务。
     idempotency_ttl_seconds: float = max(60.0, float(
         os.getenv('IDEMPOTENCY_TTL_SECONDS', '86400')))
+    # ---------- 运行中补充输入（docs/harness-live-input-implementation-plan.md） ----------
+    # 功能开关：关掉时接口返回 404，前端维持"新消息=新任务"的旧行为。
+    # 默认开：本机单用户场景，补充要求比"打断重开"更符合直觉。
+    run_inputs_enabled: bool = (
+        os.getenv('RUN_INPUTS_ENABLED', 'true').strip().lower() == 'true')
+    # 一条补充的字符上限与待处理条数上限。上限在**接受事务内**检查：
+    # 事后限流没法阻止无限积压，只会让用户以为发出去了。
+    run_input_max_chars: int = max(200, int(os.getenv('RUN_INPUT_MAX_CHARS', '4000')))
+    run_input_max_pending: int = max(1, int(os.getenv('RUN_INPUT_MAX_PENDING', '20')))
+    # 一次运行最多因补充要求修订几次计划。超过就停下来等用户显式继续——
+    # 无限修订等于让一次任务永远不结束，而且每一次都要一次模型调用。
+    run_max_revisions: int = max(1, int(os.getenv('RUN_MAX_REVISIONS', '3')))
+    # 修订时随提示词带给模型的工具清单条数上限（工具很多时不必全塞进去）。
+    revision_catalog_limit: int = max(4, int(
+        os.getenv('REVISION_CATALOG_LIMIT', '24')))
 
     # ---------- 身份（app/auth.py / app/ticket_auth.py） ----------
     # off      = 不介入，保持单用户行为（默认，本地开发与既有测试不受影响）

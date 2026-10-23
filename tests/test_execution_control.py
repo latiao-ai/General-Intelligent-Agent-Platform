@@ -215,7 +215,8 @@ class PauseBoundaryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(resumed, '暂停的 run 必须能续跑')
             await asyncio.wait_for(resumed._task, timeout=20)
 
-        self.assertEqual(plan_calls, ['做个页面', '沿用已保存的计划'],
+        # 续跑连规划节点都不进：intake 直接从库里读计划并接着执行
+        self.assertEqual(plan_calls, ['做个页面'],
                          '续跑必须沿用库里的计划，不能再规划一次')
         self.assertEqual(remote.name_count('first'), 1, '已成功的步骤不能重发')
         self.assertEqual(remote.name_count('second'), 1)

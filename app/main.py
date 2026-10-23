@@ -5,6 +5,8 @@ import json
 import time
 import uuid
 from pathlib import Path
+import logging
+
 from app.config import settings, check_runtime_keys
 from app.events import STAGE_LABELS  # noqa: F401  (对外仍从 app.main 可用)
 from app import execution_control
@@ -13,6 +15,8 @@ from app import outcome as outcome_module
 from app.capabilities.publishing import deploy_once
 from app.graph import build_graph
 from app.files import save_json
+
+logger = logging.getLogger(__name__)
 
 
 async def deploy_task(task_id: str) -> dict:
@@ -32,32 +36,6 @@ async def deploy_task(task_id: str) -> dict:
     if actual != artifact['sha256']:
         raise ValueError('HTML 已修改，请重新生成 manifest 后再部署')
     return await deploy_once(artifact)
-
-
-async def _commit_plan(ledger, state: dict, folder: Path, run_id: str | None) -> None:
-    """把计划提交到数据库（同一事务里写 plan + steps + 初始快照）。
-
-    没有账本（CLI 直调、单测）时退化成写 state.json：那是最早的行为，
-    不影响本地使用，但**不能声称具备恢复能力**。
-    """
-    plan = state.get('plan') or {}
-    steps = plan.get('steps') or []
-    if not steps:
-        return
-    version = int(plan.get('plan_version') or (ledger.plan_version if ledger else 1))
-    if ledger is None or not run_id:
-        save_json(folder / 'plan.json', {'version': version, 'steps': steps})
-        return
-    await ledger.store.commit_plan(
-        ledger.context, run_id=run_id, version=version,
-        goal=state.get('user_input') or '', steps=steps,
-        state=_plan_snapshot(state), artifact_namespace=str(folder))
-
-
-def _plan_snapshot(state: dict) -> dict:
-    """提交计划时的初始快照：只留恢复要用的字段，正文与文件走产物引用。"""
-    from app.nodes import _snapshot_state
-    return _snapshot_state(state)
 
 
 async def run_task(text: str, progress=None, on_event=None, history=None,
@@ -81,10 +59,22 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     if on_start:
         # 早点把 task_id 交出去，外部才能在任务被取消后定位已生成的产物。
         await on_start(task_id)
+    resumed = resume_plan or {}
     state = {
         'task_id': task_id, 'user_input': text,
+        # 原目标：运行中补充要求时，"最初要做什么"不能被新要求顶掉——
+        # 修订计划要同时看到原目标和按序补充（文档 §5 第八步）。
+        'original_goal': text,
         'documents': [], 'mcp_calls': [], 'errors': [], 'usage': [],
-        'run_id': run_id or '', 'resume_plan': resume_plan or {},
+        'run_id': run_id or '', 'resume_plan': resumed,
+        # 三个版本分开：intent_version 是"用户要求版本"，plan_version 是"计划版本"；
+        # lease_epoch 不在这里（执行权凭证走 ExecutionContext，不进可落盘的状态）。
+        'intent_version': int(resumed.get('intent_version') or 0),
+        'plan_version': int(resumed.get('plan_version') or 0),
+        'processed_intent_version': int(resumed.get('processed_intent_version') or 0),
+        'pending_inputs': [], 'intent_changed': False, 'revision_count': 0,
+        # 产物目录：persist_plan 节点提交快照时要记下它（恢复后仍能找到文件）
+        'artifact_dir': str(folder),
         'step_index': 0, 'status': 'created',
         'timings': [], 'history': list(history or []),
         # 更早对话的压缩结果；context 装配时注入 system 与规划 payload
@@ -96,7 +86,6 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     }
     started = time.perf_counter()
     marked = started
-    plan_committed = False
     ledger_token = ledger_module.bind(ledger)
     try:
         async with asyncio.timeout(settings.task_timeout):
@@ -113,12 +102,10 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
                     now = time.perf_counter()
                     if isinstance(update, dict):
                         state.update(update)
-                    # **计划必须在第一次工具调用之前落库**（文档 §5.2）：
-                    # plan 节点一跑完就提交，失败则整轮零工具调用——绝不出现
-                    # "远端已经跑了两步、库里却没有计划"这种没法恢复的状态。
-                    if name == 'plan' and not plan_committed:
-                        plan_committed = True
-                        await _commit_plan(ledger, state, folder, run_id)
+                    # 计划的落库**不再依赖这里**：图里有一个显式的
+                    # `persist_plan` 节点，在第一处工具调用之前用 CAS 提交。
+                    # 以前用 `plan_committed` 布尔值兜在这里，只适合"一次规划"——
+                    # 一旦允许修订，第二份计划就可能没经过持久提交就开始执行。
                     # stream_mode='updates' 在该节点跑完后才产出事件，
                     # 所以相邻事件的时间差≈该节点耗时（含少量调度开销）。
                     # run_step 会自我循环多次，用 step_label 记具体是哪一步，
@@ -145,6 +132,8 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         # 但自写的、明确的提示（如单次尝试超时）会给异常挂 safe_message，这种可以透出。
         hint = getattr(exc, 'safe_message', None)
         detail = type(exc).__name__ + (f'（{hint}）' if hint else '')
+        # 堆栈只进服务端日志：给用户的那句话里不放路径与内部实现。
+        logger.exception('任务 %s 执行异常', task_id)
         raise RuntimeError(f'任务 {task_id} 失败：{detail}') from None
     finally:
         ledger_module.unbind(ledger_token)

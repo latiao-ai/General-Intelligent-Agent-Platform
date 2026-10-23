@@ -15,11 +15,12 @@ import re
 import time
 
 from app import (context, errors as errors_module, execution_control,
-                 ledger as ledger_module, outcome as outcome_module, profile)
+                 ledger as ledger_module, outcome as outcome_module, profile,
+                 run_inputs as run_inputs_module)
 from app.config import settings
 from app.events import action, emit, stage_end, stage_start, thought
 from app.capabilities.base import ToolError
-from app.schemas import ExecutionPlan
+from app.schemas import ExecutionPlan, RevisedPlan
 from app.services import is_small_talk, structured_call, urls_from_input
 from app import tools as tool_module
 
@@ -261,7 +262,11 @@ async def plan(state):
         if resumed.get('kind'):
             # kind=compensation 的计划走的是同一套执行器，但终态与回执不同
             plan['kind'] = resumed['kind']
+        plan['version'] = int(resumed.get('plan_version') or 1)
+        plan['intent_version'] = int(resumed.get('intent_version')
+                                     or state.get('intent_version') or 0)
         return {'plan': plan,
+                'plan_version': plan['version'],
                 'step_index': int(resumed.get('step_index') or 0),
                 'status': 'planned'}
 
@@ -275,7 +280,9 @@ async def plan(state):
                   'tool_key': 'local:answers:direct', 'effect': 'read'}]
         emit(action('跳过规划', '闲聊/确认，交给模型直接回答', '⚡'))
         emit(thought(describe_plan(steps, '直接回答')))
-        return {'plan': {'steps': steps, 'summary': '直接回答'},
+        return {'plan': {'steps': steps, 'summary': '直接回答', 'version': 1,
+                         'intent_version': int(state.get('intent_version') or 0)},
+                'plan_version': 1,
                 'step_index': 0, 'status': 'planned'}
 
     catalog = await tool_module.catalog()
@@ -390,8 +397,13 @@ async def plan(state):
         emit(action('已记住', profile.describe(changed), '🧠'))
     emit(thought(describe_plan(steps, summary)))
     result = {'plan': {'steps': steps, 'summary': summary,
+                       # 这份计划依据哪一版要求：准入与提交都用它做 CAS，
+                       # 拿不到版本号的计划一律不许执行
+                       'version': 1,
+                       'intent_version': int(state.get('intent_version') or 0),
                        **({'warnings': warnings} if warnings else {}),
                        **({'blocked': blocked_notes} if blocked_notes else {})},
+              'plan_version': 1,
               'step_index': 0, 'usage': usage, 'status': 'planned'}
     if blocked_notes:
         result['capability_blocked'] = blocked_notes
@@ -401,9 +413,325 @@ async def plan(state):
 
 
 def next_step(state) -> str:
-    """还有没跑完的步骤就继续，否则收尾。"""
+    """run_step 之后往哪走（文档 harness-live-input §5 第十步）。
+
+    - `run_step`：还有步骤；
+    - `revise`：用户补了新要求，先重新规划剩余部分；
+    - `finalize`：计划走完了，进收尾门禁；
+    - `stop`：已进入需要人介入的终态（暂停/待核实/失败），本次执行退出。
+    """
+    if state.get('intent_changed'):
+        return 'revise_plan'
+    status = outcome_module.normalize_status(state.get('status') or '')
+    if status in ('paused', 'needs_reconcile', 'failed', 'partially_succeeded',
+                  'cancelled', 'waiting_input', 'waiting_approval'):
+        return 'stop'
     steps = (state.get('plan') or {}).get('steps') or []
-    return 'run_step' if state.get('step_index', 0) < len(steps) else 'end'
+    if state.get('step_index', 0) < len(steps):
+        return 'run_step'
+    return 'finalize'
+
+
+# ---------- 运行中补充输入：入口路由 / 计划提交 / 修订 / 收尾门禁 ----------
+
+def _plan_intent(state: dict) -> int | None:
+    """这份计划的依据版本。**只取已提交计划里的值**，不取模型自报的版本。"""
+    value = (state.get('plan') or {}).get('intent_version')
+    return int(value) if value else None
+
+
+def _intent_changed_update(state: dict, exc) -> dict:
+    """发现要求版本变化时的状态更新：标记需要修订，游标**不动**。"""
+    return {'intent_changed': True, 'status': '',
+            'intent_version': int(getattr(exc, 'actual', 0) or 0)}
+
+
+def _recovery_inputs(state: dict) -> dict:
+    """从快照里取"已经发生的事实"（修订计划时要引用它们，不能重发）。"""
+    return {'step_outputs': dict(state.get('step_outputs') or {}),
+            'artifact': state.get('artifact') or {},
+            'deployment': state.get('deployment') or {},
+            'answer': state.get('answer') or ''}
+
+
+async def _store_and_run():
+    """当前执行上下文里的 (仓储, run_id)。没有账本时返回 (None, '')。"""
+    book = ledger_module.current_ledger()
+    context_ = execution_control.require()
+    if book is None or context_ is None:
+        return None, ''
+    return book.store, context_.run_id
+
+
+async def intake(state):
+    """图的第一站：读数据库里的**事实**，决定这次执行从哪里继续。
+
+    为什么需要这个节点：恢复、续跑、运行中补充是同一件事的三个入口——都要先
+    看"库里现在要求的是哪一版、计划是哪一份、还有哪些补充没人处理"。把它放进
+    图里，CLI 与 Worker 就都只有一条路径（以前这段逻辑只活在 Hub 里）。
+    """
+    store_, run_id = await _store_and_run()
+    goal = state.get('original_goal') or state.get('user_input') or ''
+    base = {'original_goal': goal}
+    if store_ is None or not run_id:
+        # 没有账本（CLI 直调、单测）：沿用旧行为，直接规划
+        resumed = state.get('resume_plan') or {}
+        if isinstance(resumed, dict) and resumed.get('steps'):
+            return {**base, 'entry_route': 'run_step',
+                    'plan': {'steps': resumed['steps'],
+                             'summary': resumed.get('summary') or '续跑',
+                             'intent_version': int(resumed.get('intent_version') or 0),
+                             'version': int(resumed.get('plan_version') or 1)},
+                    'step_index': int(resumed.get('step_index') or 0),
+                    'plan_version': int(resumed.get('plan_version') or 1)}
+        return {**base, 'entry_route': 'plan'}
+
+    info = await store_.run_intent(run_id)
+    pending = await store_.pending_run_inputs(run_id)
+    plan_row = await store_.plan(run_id) or {}
+    steps = plan_row.get('steps') or []
+    intent = int(info.get('intent_version') or 1)
+    processed = int(info.get('processed_intent_version') or 0)
+    current_plan_version = int(info.get('plan_version') or 0)
+    updates = {**base,
+               'intent_version': intent,
+               'processed_intent_version': processed,
+               'pending_inputs': pending,
+               'plan_version': current_plan_version,
+               # 修订预算按**已提交的计划版本**累计：每一轮执行都是新的
+               # run_task 调用，内存里的计数会归零，只有库能记住"改过几次"
+               'revision_count': max(int(state.get('revision_count') or 0),
+                                     max(0, current_plan_version - 1))}
+    if pending:
+        # 有已接受但没纳入计划的补充：先修订，再谈执行
+        if pending[0].get('input_seq'):
+            emit(action('读取补充要求',
+                        f'{len(pending)} 条待纳入的要求（第 {pending[0]["input_seq"]} 条起）',
+                        '📝'))
+        return {**updates, 'entry_route': 'revise_plan'}
+    if steps:
+        actions = await store_.actions_of(run_id)
+        index = _resume_point(steps, actions)
+        updates.update({
+            'entry_route': 'finalize' if index >= len(steps) else 'run_step',
+            'plan': {'steps': steps,
+                     'summary': plan_row.get('goal') or '续跑',
+                     'kind': plan_row.get('kind') or '',
+                     'intent_version': int(plan_row.get('intent_version') or intent),
+                     'version': int(plan_row.get('version') or 1)},
+            'step_index': index,
+        })
+        return updates
+    return {**updates, 'entry_route': 'plan'}
+
+
+def _resume_point(steps: list[dict], actions: list[dict]) -> int:
+    """按已落库的动作推断从第几步继续（`succeeded` 才算完成）。"""
+    done = {str(item.get('step_id') or '') for item in actions
+            if str(item.get('status')) == 'succeeded'}
+    for index, step in enumerate(steps):
+        if str(step.get('step_id') or '') not in done:
+            return index
+    return len(steps)
+
+
+def route_entry(state) -> str:
+    """intake / consume 之后的路由（供条件边使用）。"""
+    return state.get('entry_route') or 'plan'
+
+
+async def persist_plan(state):
+    """把计划提交到数据库（CAS：租约 + 要求版本 + 基计划版本）。
+
+    这一步是**显式节点**，不是"消费 stream 事件时顺手提交"：计划的提交必须在
+    任何工具调用之前完成，而 stream 事件到达顺序由运行时决定，靠它落库等于把
+    时序交给运气（文档 §5 第十步）。
+    """
+    plan_ = dict(state.get('plan') or {})
+    steps = plan_.get('steps') or []
+    book = ledger_module.current_ledger()
+    if book is None or not steps:
+        return {}
+    version = int(plan_.get('version') or book.plan_version or 1)
+    intent = int(plan_.get('intent_version') or state.get('intent_version') or 0)
+    plan_['version'] = version
+    merged = dict(state)
+    merged['plan'] = plan_
+    try:
+        result = await book.store.commit_plan(
+            book.context, run_id=book.run_id, version=version,
+            goal=state.get('original_goal') or state.get('user_input') or '',
+            steps=steps, state=_snapshot_state(merged),
+            artifact_namespace=str(state.get('artifact_dir') or ''),
+            expected_intent_version=intent or None,
+            intent_version=intent or None,
+            base_plan_version=int(plan_.get('base_plan_version') or 0) or None,
+        )
+    except execution_control.IntentChanged as exc:
+        # 规划期间用户又补充了：旧候选计划作废，回到消费循环重新修订
+        emit(action('计划作废', '规划期间收到新的要求，重新调整', '📝'))
+        return {'intent_changed': True, 'plan': {}, 'step_index': 0}
+    applied = int(result.get('applied_inputs') or 0)
+    if applied:
+        # "已纳入计划"≠"业务效果已完成"，所以文案只说调整完成
+        emit({'type': 'action', 'icon': '✅', 'label': '已按新要求调整',
+              'detail': f'纳入 {applied} 条补充（要求版本 {intent}）',
+              'plan_revised': True, 'intent_version': intent,
+              'plan_version': version})
+    return {'plan': plan_, 'plan_version': version,
+            'intent_version': int(result.get('intent_version') or intent),
+            'processed_intent_version': int(result.get('intent_version') or intent),
+            'pending_inputs': [], 'intent_changed': False}
+
+
+REVISION_SYSTEM = (
+    '你是任务编排器。用户在执行过程中补充了新的要求，你要在**不重做已完成工作**的'
+    '前提下，给出接下来还需要执行的步骤。规则：\n'
+    '{rules}\n'
+    '只输出接下来要做的步骤；如果新要求意味着"剩下的都不用做了"，steps 留空并把'
+    '被取消的旧步骤写进 superseded。如果补充内容缺少必要条件，把问题写进 questions，'
+    '不要瞎猜。最多 {max_steps} 步。'
+)
+
+
+async def revise_plan(state):
+    """按最新要求重写**剩余**计划（文档 §5 第十步）。
+
+    只处理"补充导致的剩余部分调整"，不扩展成任意自主重规划：已完成的事实来自
+    数据库与快照，模型只决定"接下来做什么"。
+    """
+    store_, run_id = await _store_and_run()
+    if store_ is None or not run_id:
+        return {'status': 'waiting_input',
+                'failure': '运行中补充要求需要数据库账本支持'}
+
+    info = await store_.run_intent(run_id)
+    pending = await store_.pending_run_inputs(run_id)
+    actions = await store_.actions_of(run_id)
+    plan_row = await store_.plan(run_id) or {}
+    old_steps = plan_row.get('steps') or []
+    intent = int(info.get('intent_version') or 1)
+    processed = int(info.get('processed_intent_version') or 0)
+    revisions = int(state.get('revision_count') or 0)
+
+    if revisions >= settings.run_max_revisions:
+        # 预算用尽：保存未消费的输入，明确等人显式继续，**不**标成 applied
+        emit(action('修订次数已达上限',
+                    f'已修订 {revisions} 次，仍有 {len(pending)} 条补充待处理', '⚠️'))
+        return {'status': 'waiting_input', 'intent_changed': False,
+                'pending_inputs': pending,
+                'failure': f'这次运行已经调整了 {revisions} 次计划，'
+                           f'请确认最新要求后再继续（要求版本 {intent}）。'}
+
+    outputs = dict(state.get('step_outputs') or {})
+    done_steps = {item['step_id'] for item in actions
+                  if str(item.get('status')) == 'succeeded'}
+    unknown_steps = [item for item in actions
+                     if str(item.get('status')) in ('in_flight', 'unknown')]
+    catalog = await tool_module.catalog()
+    decision = run_inputs_module.build_decision_input(
+        original_goal=state.get('original_goal') or state.get('user_input') or '',
+        inputs=pending, plan={'version': plan_row.get('version'),
+                              'intent_version': plan_row.get('intent_version'),
+                              'goal': plan_row.get('goal'),
+                              'steps': old_steps},
+        step_outputs=outputs, actions=actions, intent_version=intent,
+        processed_intent_version=processed,
+        tools=[{'name': tool.name, 'label': tool.label,
+                'effect': tool.effect, 'args': tool.args}
+               for tool in catalog][:_catalog_limit()],
+        budget={'revisions_used': revisions,
+                'revisions_left': settings.run_max_revisions - revisions})
+    payload = json.dumps(decision, ensure_ascii=False, default=str)
+
+    emit(action('正在按新要求调整', f'要求版本 {intent}', '🧭'))
+    usage = list(state.get('usage', []))
+    try:
+        revised, call_usage = await structured_call(
+            RevisedPlan, REVISION_SYSTEM.format(
+                rules=run_inputs_module.revision_rules(), max_steps=MAX_STEPS),
+            payload, disable_thinking=settings.llm_parse_disable_thinking)
+        usage.append({'stage': 'revise', 'model_name': settings.llm_model,
+                      'model': call_usage})
+    except Exception as exc:                            # noqa: BLE001
+        hint = getattr(exc, 'safe_message', None) or type(exc).__name__
+        emit(action('调整失败', f'{hint}，先停在这里', '⚠️'))
+        return {'status': 'waiting_input', 'usage': usage, 'intent_changed': False,
+                'pending_inputs': pending,
+                'failure': f'按新要求调整计划失败（{hint}），'
+                           f'原计划已作废、未继续执行。可以再发一次要求重试。'}
+
+    data = revised.model_dump()
+    raw_steps = data.get('steps') or []
+    questions = [str(q) for q in (data.get('questions') or []) if str(q).strip()]
+    next_version = int(plan_row.get('version') or 0) + 1
+    kept, issues = run_inputs_module.validate_revision(
+        raw_steps, plan_version=next_version, done_steps=done_steps,
+        unknown_steps=unknown_steps,
+        known_tools={tool.name for tool in catalog})
+    blocking = [item for item in issues if item.get('severity') != 'warning']
+    if questions:
+        detail = '；'.join(questions[:3])
+        emit({'type': 'action', 'icon': '❓', 'label': '需要你补充一句',
+              'detail': detail, 'input_needs_clarification': True,
+              'intent_version': intent})
+        return {'status': 'waiting_input', 'usage': usage, 'intent_changed': False,
+                'pending_inputs': pending, 'failure': detail}
+    if blocking:
+        detail = '；'.join(f'{i["code"]}:{i["detail"]}' for i in blocking)[:300]
+        emit(action('调整后的计划不合法', detail, '⛔'))
+        return {'status': 'waiting_input', 'usage': usage, 'intent_changed': False,
+                'pending_inputs': pending,
+                'failure': f'调整后的计划没有通过校验（{detail}）。'}
+
+    # 新步骤统一加上版本前缀，保证 run 内唯一、也不覆盖旧步骤的输出
+    normalized, issues2 = validate_plan(
+        [{**step, 'step_id': step.get('step_id') or f'p{next_version}_s{index}'}
+         for index, step in enumerate(kept, 1)], catalog)
+    # 已执行的步骤不能被"作废"：它真实发生过，账本里有记录
+    superseded = [str(item) for item in (data.get('superseded') or [])
+                  if str(item) not in done_steps]
+    summary = data.get('summary') or '按新要求调整'
+    emit(thought(describe_plan(normalized, summary)))
+    return {
+        'plan': {'steps': normalized, 'summary': summary,
+                 'version': next_version, 'intent_version': intent,
+                 'base_plan_version': int(plan_row.get('version') or 0),
+                 'superseded': superseded},
+        'plan_version': next_version,
+        'step_index': 0, 'intent_changed': False, 'pending_inputs': [],
+        'intent_version': intent,
+        'revision_count': revisions + 1,
+        'revision_issues': issues + issues2,
+        'usage': usage,
+    }
+
+
+def _catalog_limit() -> int:
+    """给模型的工具清单上限：工具很多时不必全塞进修订提示词。"""
+    return int(getattr(settings, 'revision_catalog_limit', 24) or 24)
+
+
+async def finalize(state):
+    """收尾门禁：**只在没有未处理补充时**才允许结束（文档 §5 第十一步）。
+
+    收尾的真正原子性在仓储层（`finish_run_owned` 带版本与待处理输入检查）；
+    这个节点负责"在结束前再问一次数据库"，把竞争窗口压到一次事务。
+    """
+    store_, run_id = await _store_and_run()
+    if store_ is not None and run_id:
+        pending = await store_.pending_run_inputs(run_id)
+        if pending:
+            emit(action('又有新的补充', f'{len(pending)} 条待纳入，先调整', '📝'))
+            return {'intent_changed': True, 'pending_inputs': pending}
+        info = await store_.run_intent(run_id)
+        current = int(info.get('intent_version') or 1)
+        if int(state.get('intent_version') or 0) not in (0, current):
+            return {'intent_changed': True, 'intent_version': current}
+    status = final_status(state)
+    merged = dict(state)
+    merged['status'] = status
+    return {'status': status, 'outcome': outcome_module.build(merged)}
 
 
 def final_status(state: dict) -> str:
@@ -508,6 +836,13 @@ async def _check_boundary(state: dict) -> str:
         raise execution_control.ControlStopped('运行已被取消', 'cancelled')
     if control.get('pause_requested'):
         raise execution_control.ControlStopped('已请求暂停', 'paused')
+    # 用户要求变化与暂停/取消是两件事：前者要"换计划继续"，后者要"停下来等人"。
+    # 这里只是**快速通道**，真正的裁决在 admit_action 的事务里（文档 §5 第九步）。
+    plan_version_intent = (state.get('plan') or {}).get('intent_version')
+    current = int(control.get('intent_version') or 1)
+    if plan_version_intent is not None and int(plan_version_intent) != current:
+        raise execution_control.IntentChanged(
+            context.run_id, int(plan_version_intent), current)
     return ''
 
 
@@ -548,8 +883,11 @@ async def run_step(state):
 
     outputs = dict(state.get('step_outputs') or {})
 
-    # 边界检查：暂停/取消在准入前先提交时，这一步不得获得调用资格
-    await _check_boundary(state)
+    # 边界检查：暂停/取消/要求版本变化在准入前先提交时，这一步不得获得调用资格
+    try:
+        await _check_boundary(state)
+    except execution_control.IntentChanged as exc:
+        return _intent_changed_update(state, exc)
 
     # 依赖必须真的成功，否则这一步的输入就是不可信的（文档 §6.3）
     for dep in step.get('depends_on') or []:
@@ -581,7 +919,12 @@ async def run_step(state):
         try:
             admitted = await book.admit(step_id=step_id,
                                         tool_key=tool.tool_key or name,
-                                        effect=tool.effect, args=args)
+                                        effect=tool.effect, args=args,
+                                        expected_intent_version=_plan_intent(state))
+        except execution_control.IntentChanged as exc:
+            # 用户的补充先提交了：这一步**零准入**，回到修订循环
+            emit(action('要求已更新', f'{tool.label} 尚未派发', '📝'))
+            return _intent_changed_update(state, exc)
         except execution_control.ControlStopped as exc:
             # 暂停/取消在准入前先提交：这一步不得获得调用资格
             emit(action('停止派发', exc.reason, '⏸️'))

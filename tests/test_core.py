@@ -23,6 +23,7 @@ from contextlib import ExitStack
 PG_DSN = os.getenv('PG_TEST_DSN', '')
 TEST_TABLES = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
                'action_attempts', 'actions', 'steps', 'plans', 'run_snapshots',
+               'run_inputs', 'run_input_processing',
                'runs', 'tasks_meta', 'events', 'tasks', 'session_memory',
                'session_summaries', 'messages', 'sessions', 'request_keys')
 
@@ -483,8 +484,27 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         plan = {'steps': [{'tool': 'web_search'}, {'tool': 'render_html'}]}
         self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 0}), 'run_step')
         self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 1}), 'run_step')
-        self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 2}), 'end')
-        self.assertEqual(nodes.next_step({}), 'end')
+        # 计划走完不是"直接结束"，而是进收尾门禁（那里还要问一次有没有新补充）
+        self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 2}),
+                         'finalize')
+        self.assertEqual(nodes.next_step({}), 'finalize')
+
+    async def test_next_step_stops_on_states_that_need_a_human(self):
+        """暂停/待核实/失败：本次执行直接退出，不要继续派发下一步。"""
+        from app import nodes
+        plan = {'steps': [{'tool': 'web_search'}, {'tool': 'render_html'}]}
+        for status in ('paused', 'needs_reconcile', 'failed',
+                       'partially_succeeded', 'cancelled', 'waiting_input'):
+            self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 0,
+                                              'status': status}), 'stop', status)
+
+    async def test_next_step_prefers_revision_when_intent_changed(self):
+        """用户补了要求：先去修订剩余计划，而不是把旧计划的下一步跑掉。"""
+        from app import nodes
+        plan = {'steps': [{'tool': 'web_search'}, {'tool': 'render_html'}]}
+        self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 0,
+                                          'intent_changed': True}),
+                         'revise_plan')
 
     async def test_final_status_is_generic_and_label_is_derived(self):
         """状态机只存通用状态；answered / local_ready 是**派生**出来的展示标签。"""
@@ -3150,7 +3170,7 @@ class KernelCorrectnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['plan']['steps'], [])
         self.assertIn('unknown_tool', result['failure'])
         # 图必须直接收尾，不能因为"计划为空"又走进 run_step
-        self.assertEqual(nodes.next_step(result), 'end')
+        self.assertEqual(nodes.next_step(result), 'stop')
         # 停下来的任务也要给用户一句人话
         from app.messages import reply_text
         self.assertIn('先停在这里', reply_text(result))
@@ -3789,7 +3809,7 @@ class McpBusinessFailureTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('E_RESOURCE_NOT_FOUND', result['failure'])
         self.assertIn('generate_script', result['failure'])
         self.assertEqual(result['step_index'], len(plan['steps']))
-        self.assertEqual(nodes.next_step({**result, 'plan': plan}), 'end')
+        self.assertEqual(nodes.next_step({**result, 'plan': plan}), 'stop')
 
     async def test_inner_tool_name_must_come_from_discovery(self):
         """run_tool.name 不在发现结果里 → 本地就挡住，并把真实名字给出来。"""
