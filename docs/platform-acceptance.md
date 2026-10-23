@@ -159,6 +159,55 @@
 - **暂停的响应时延没有 SLO**：执行者只在"下一步准入前"检查暂停，一个很长的工具
   调用期间不会被打断（这是有意的：中途打断会留下结果未定的写操作）。
 
+## 结果观察与自主决策（`harness-observe-decide-implementation-plan.md`）
+
+目标很具体：让"依赖未知结果"的步骤（挑素材、定区间、决定读哪份文件）不再要求
+第一份计划就猜对，同时**不把确定链路拖慢**。做法是把"看事实"和"下判断"分开：
+每个工具之后都跑程序观察（免费），只有片段结束或结果里有需要判断的新事实时才叫模型。
+
+图变成（`app/graph.py`）：
+
+```text
+plan → persist_plan → run_step → observe_result ─┬→ run_step
+                                                 ├→ decide_next
+                                                 ├→ revise_plan（用户补充，优先）
+                                                 ├→ verify_completion
+                                                 └→ wait_async / END
+decide_next → run_step | persist_plan | verify_completion | END
+verify_completion → decide_next（有限修复）| finalize（门禁）
+```
+
+| 机制 | 落点 | 验证 |
+|---|---|---|
+| 统一结果合同 | `app/observation.py::build_result`、`app/files.py::save_result/read_result`：完整结果落 `results/*.json`，摘要保留结构（总数/分页/嵌套） | `test_summary_keeps_structure_and_length`、`test_pagination_signals_are_reported`、`test_full_result_is_stored_and_readable_by_reference` |
+| 程序路由（不花模型请求） | `collect_observation` + `route_after_step`：控制/版本变化/未定写操作优先，其次确定步骤、片段观察点、完成核对 | `test_routing_prefers_control_and_unknown`、`test_deterministic_segment_does_not_need_a_model` |
+| 片段式规划 | `ExecutionPlan/RevisedPlan.after_segment + observation_goal`；首版计划可以只含确定步骤 | `test_observe_segment_lets_the_model_pick_from_real_results`（决策输入里能看到真实 ID 与总数） |
+| 受约束的模型决策 | `ObservationDecision`：六种结论 + 逐分支必备字段；候选走与用户修订同一条校验/CAS 提交（不伪造 `intent_changed`） | `test_empty_continue_is_rejected_instead_of_spinning`、`test_wait_input_stops_and_asks_the_user` |
+| 完成核对 | `verify_completion` + `completion_state`：有证据才算过，只能看内容判断的标"未检查" | `test_completion_requires_evidence`、`test_finish_without_evidence_is_not_reported_as_success` |
+| 决策台账与预算 | `run_decisions`（预留→模型→校验→CAS 提交）+ `runs.consumed_json`（跨重启累计，含结构化解析重试） | `test_decision_budget_stops_instead_of_spinning` |
+| 无进展保护 | `progress_pair`（同查询+同结果）→ 停下等人，而不是烧预算 | `test_repeated_fingerprint_stops_the_loop` |
+| 结果水位 | `runs.observation_seq` 与结果同事务 +1；`run_snapshots` 记 `next_route` | `test_decision_budget_stops_instead_of_spinning`、迁移后的实机快照 |
+
+**实机验证（2026-10-23，真实 HTTP + 真实模型 + 真实 PostgreSQL）**：
+
+| 观察点 | 实机结果 |
+|---|---|
+| 确定链路不多花模型请求 | 「检索并整理 PostgreSQL 连接池的要点，生成中文报告」真实跑完：`runs.consumed_json = {provider_requests: 1, tool_calls: 3}`、`run_decisions` **0 行**、`observation_seq = 3`、快照 `next_route=stop`——三处证据一致说明只有初始规划那一次模型请求 |
+| 完成核对真的在核对 | 修复前同一用法曾因"模型声明的 `tool_succeeded` 用了工具名而账本记的是 tool_key"被判未满足（`还有没满足的完成条件`）；修好后同一用法 `succeeded` |
+| 预算真的落库 | `consumed_json` 里 `provider_requests` 与 `tool_calls` 分开累计（此前两处互相覆盖，只留下最后一种） |
+
+未覆盖 / 有意留白的部分：
+
+- **没有真实 MCP 服务端提供 `phase: accepted/processing`**：异步等待路径（`wait_async`）
+  只在结果声明了阶段时触发；本环境的服务端不返回阶段，因此这条路径仅有单测覆盖。
+- **真实模型很少主动声明 `after_segment=observe`**：观察闭环的实机证据目前靠"确定链路
+  零额外请求"这条负向证据，正向路径（观察→补查→再判断）由受控模型的用例覆盖。
+- **没有做"观察模型返回时用户要求刚好变化"的跨进程竞争矩阵**：这条竞争由
+  `reserve_decision` 的版本 CAS + `test_*` 里的版本门禁覆盖，没有反复 kill 的模糊测试。
+- **人民币硬上限未实现**：只做请求数/工具数/时长这类可数预算，没有报价与结算合同。
+- **无进展判据是"同查询+同结果"**：同一查询在不同时刻拿回不同结果仍算有进展；
+  不排除"每次结果略有变化但语义重复"的慢速空转。
+
 ## 运行中补充输入（`harness-live-input-implementation-plan.md`）
 
 用户在三件事之间做的选择现在有了明确入口：**新目标**=`POST /api/tasks`，
@@ -207,7 +256,7 @@
 # PG_TEST_DSN 必须指向一次性测试库（库名含 test），用例会 TRUNCATE 全部业务表
 PG_TEST_DSN=postgresql://…/agent_platform_test \
   python -W error::RuntimeWarning -m unittest discover -s tests -v
-# 实测：Ran 366 tests, OK（21 秒）
+# 实测：Ran 381 tests, OK（29 秒）
 ```
 
 `-W error::RuntimeWarning` 是刻意的：漏 `await` 不会报错，只会静默失效（把协程

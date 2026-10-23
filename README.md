@@ -388,7 +388,7 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
 脚本会逐表搬数据并**校验行数一致**，完成后复位 `messages.id` 的序列。
 本地实测迁移了 21 会话 / 139 消息 / 71 任务 / 1069 事件，行数校验通过。
 
-### 表一览（24 张）
+### 表一览（25 张）
 
 | 分组 | 表 | 内容 |
 |---|---|---|
@@ -397,6 +397,7 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
 | 任务 | `tasks` / `tasks_meta` | 任务状态、产物 ID、完整 `state`（含 timings） |
 | 运行 | `runs` / `plans` / `steps` / `run_snapshots` | 每次执行尝试、计划版本、步骤状态、**逐步快照**（恢复的唯一依据） |
 | 补充 | `run_inputs` / `run_input_processing` | **不可变**的补充日志（一人一条、顺序由服务端分配）与可重建的处理投影 |
+| 决策 | `run_decisions` | 每次自主决策的台账：预留/模型请求数/候选哈希/已提交计划版本/结果水位 |
 | 身份 | `app_users` / `identities` / `auth_sessions` / `ticket_redemptions` | 中台用户、外部身份绑定、登录会话（只存摘要）、一次性票据登记 |
 | 幂等 | `request_keys` | 建任务幂等键（按主体+接口作用域） |
 | 账本 | `actions` / `action_attempts` | 动作身份（幂等键）与每一次真实调用 |
@@ -419,6 +420,49 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
 因此设计是**先落库再投递**：`publish()` 先把事件写入数据库拿到序号，再推给内存订阅者。
 正在跑的客户端拿到零延迟事件；晚连上来的、甚至服务重启后再连的，从库里补发——两者用
 `seq` 去重。
+
+### 结果驱动的观察与决策（不必提前猜未知参数）
+
+计划里最尴尬的一类步骤是"依赖还不知道的结果"：素材 ID、片段区间、要读哪个文件。
+以前只能让模型在第一份计划里猜，猜错就整轮失败。现在分两段执行：
+
+```text
+plan → persist_plan → run_step → observe_result ─┬→ run_step（参数能直接绑定）
+                                                 ├→ decide_next（需要判断）
+                                                 ├→ revise_plan（用户补了要求）
+                                                 ├→ verify_completion（都跑完了）
+                                                 └→ wait_async / 结束（控制/未定）
+decide_next → run_step | persist_plan | verify_completion | 结束
+verify_completion → decide_next（可有限修复）| finalize（核对通过）
+```
+
+**每个工具之后都跑一次程序观察**（不花模型请求），只有真正需要语义判断时才问模型。
+确定链路（读已知产物 → 打包 → 导出）因此一次模型请求都不多花。
+
+三条合同写在 `app/observation.py` 与 `app/schemas.py`：
+
+| 合同 | 内容 |
+|---|---|
+| `ToolResult` | 每次调用归一成 `{execution_status, phase, data_ref, summary, artifact_refs, external_receipt_refs, evidence_refs, complete, error}`。**完整结果落 `results/*.json`**，模型只看有界摘要 + 引用（`totals`/`has_more`/`next_cursor` 都会保留，不会把"前 3 项"当"全部"） |
+| 片段策略 | 计划声明 `after_segment: observe/verify` + `observation_goal`：首版计划可以只包含"能确定的事"，剩下的交给观察之后决定 |
+| `ObservationDecision` | 观察后模型只能说六件事：`continue` / `revise` / `wait_input` / `wait_approval` / `finish` / `stop`，每种都有必备字段（空 `revise`、无问题的 `wait_input` 直接校验失败） |
+
+两条纪律值得单独说：
+
+- **完成由程序核对，不由模型宣布**。`verify_completion` 逐条检查完成条件：
+  `artifact_exists` / `file_written` / `deployment_receipt` / `answer_present` /
+  `tool_succeeded` 有证据才算过；`content_quality` 这类只能看内容判断的，一律标
+  **未检查**——文件存在不等于画面合格。缺证据就报"还没满足什么"，不会因为模型说了
+  `finish` 就成功。
+- **结果未定不许猜**。写操作 `in_flight/unknown` 直接转 `needs_reconcile`，
+  观察层根本不会走到模型决策；权限拒绝、暂停、失租同样优先走既有门禁。
+
+预算与无进展保护落在库里（`runs.consumed_json`，跨重启累计）：
+`RUN_MAX_PROVIDER_REQUESTS`（含结构化解析重试）、`RUN_MAX_TOOL_CALLS`、
+`RUN_MAX_DECISIONS`、`RUN_MAX_REPAIRS`、`RUN_MAX_NO_PROGRESS`。
+"没有进展"按**同查询 + 同结果**判定并停下，不靠文字摘要猜。
+决策本身有台账（`run_decisions`：预留 → 调模型 → 校验 → CAS 提交），
+同一观察的重复执行按稳定 `decision_key` 去重，换 ID 绕不过预算。
 
 ### 运行中补充要求（不打断、不新建任务）
 
@@ -781,7 +825,7 @@ PG_TEST_DSN=postgresql://…/agent_platform_test \
   python -W error::RuntimeWarning -m unittest discover -s tests -v
 ```
 
-**366 条用例，全绿**。项目只支持 PostgreSQL，用例也直接跑真实 PG：
+**381 条用例，全绿**。项目只支持 PostgreSQL，用例也直接跑真实 PG：
 
 | 文件 | 条数 | 覆盖 |
 |---|---|---|
@@ -790,6 +834,7 @@ PG_TEST_DSN=postgresql://…/agent_platform_test \
 | `tests/test_execution_control.py` | 9 | 旧代次四件事全被拒、续租失败停派、暂停三种时序、续跑不重发、取消、工具消失 |
 | `tests/test_execution_recovery.py` | 7 | 计划先于调用提交、提交失败零调用、prepared 重做、unknown 阻断、succeeded 复用、结算失败不推进 |
 | `tests/test_mcp_uncertainty.py` | 6 | 业务失败=failed_confirmed、超时=unknown、连接失败=not_executed、包装后确定性不丢 |
+| `tests/test_observation.py` | 15 | 摘要保留结构、路由优先级、结果完整可追溯、空 continue 拒绝、缺证据不成功、无进展停止、预算耗尽、观察开关 |
 | `tests/test_run_inputs.py` | 28 | 补充接受/幂等/背压、旧版本动作零准入、计划 CAS、修订校验、收尾门禁、暂停期间补充、HTTP 202/409/404/422 |
 | `tests/test_ticket_auth.py` 等 | 56 | 票据验证、兑换、退出、跨平台隔离 |
 | `tests/test_local_video.py` | 3 | 本地解说视频能力包 |

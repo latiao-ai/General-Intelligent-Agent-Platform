@@ -872,6 +872,27 @@ async function startNewTask(text) {
 }
 
 // 补充要求相关的三类事件（文档 §6）。它们不改任务身份，只改变"接下来做什么"。
+// 观察与自主决策事件（文档 observe-decide §13）。
+// 关键是让用户知道"系统正在自己判断下一步"，**不需要补一句"继续"**。
+function onDecisionEvent(ev) {
+  const title = $('processTitle');
+  if (ev.decision_reserved) {
+    if (title && S.running) title.textContent = '智能体执行过程（正在根据结果判断下一步）';
+    addEvent({type: 'action', icon: '🔎', label: '正在根据结果判断下一步',
+              detail: ev.detail || ''});
+    return;
+  }
+  if (ev.decision_kind) {
+    if (title && S.running) title.textContent = '智能体执行过程';
+    addEvent({type: 'action', icon: '🧭', label: '判断结果：' + ev.decision_kind,
+              detail: ev.detail || ''});
+    if (ev.decision_kind === 'wait_input' || ev.decision_kind === 'wait_approval') {
+      // 这是**唯一**需要用户动手的情况：其余时候不必输入"继续"
+      addMessage('assistant', '需要你确认一下：' + (ev.detail || '补充必要信息后继续。'));
+    }
+  }
+}
+
 function onIntentEvent(ev) {
   if (ev.input_received) {
     // 服务端已落库：把对应的那条气泡标成"已收到"
@@ -923,6 +944,9 @@ function openStream(taskId) {
     if (ev.type === 'stage_end') { onStageEnd(ev); return; }
     if (ev.input_received || ev.plan_revised || ev.input_needs_clarification) {
       onIntentEvent(ev); return;
+    }
+    if (ev.decision_reserved || ev.decision_kind) {
+      onDecisionEvent(ev); return;
     }
     if (ev.type === 'result') { showDeployed(ev.public_url, ev.deployment_id); return; }
     if (ev.type === 'status') {
