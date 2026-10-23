@@ -734,12 +734,12 @@ PG_TEST_DSN=postgresql://…/agent_platform_test \
   python -W error::RuntimeWarning -m unittest discover -s tests -v
 ```
 
-**335 条用例，全绿**。项目只支持 PostgreSQL，用例也直接跑真实 PG：
+**336 条用例，全绿**。项目只支持 PostgreSQL，用例也直接跑真实 PG：
 
 | 文件 | 条数 | 覆盖 |
 |---|---|---|
 | `tests/test_core.py` | 249 | 能力包、计划校验、账本、状态词汇、MCP 识别、接口与 SSE、仓储一致性、连接池 |
-| `tests/test_worker_execution.py` | 5 | Worker 领取/执行一次、两 Worker 抢同一条、异常不带走循环、空计划、无未 await 协程 |
+| `tests/test_worker_execution.py` | 6 | Worker 领取/执行一次、两 Worker 抢同一条、异常不带走循环、空计划、无未 await 协程 |
 | `tests/test_execution_control.py` | 9 | 旧代次四件事全被拒、续租失败停派、暂停三种时序、续跑不重发、取消、工具消失 |
 | `tests/test_execution_recovery.py` | 7 | 计划先于调用提交、提交失败零调用、prepared 重做、unknown 阻断、succeeded 复用、结算失败不推进 |
 | `tests/test_mcp_uncertainty.py` | 6 | 业务失败=failed_confirmed、超时=unknown、连接失败=not_executed、包装后确定性不丢 |

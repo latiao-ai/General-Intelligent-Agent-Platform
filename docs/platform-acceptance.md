@@ -139,7 +139,7 @@
 
 | 阶段 | 交付 | 用例 |
 |---|---|---|
-| A Worker 解阻 | `execute_claimed_run` 单一入口；`run_once` 只领取 + 护栏；漏 await 的问题消灭 | `test_worker_execution.py`（5）：领取执行一次、两 Worker 抢同一条、异常不带走循环、空计划不是续跑、无未 await 协程 |
+| A Worker 解阻 | `execute_claimed_run` 单一入口；`run_once` 只领取 + 护栏；漏 await 的问题消灭 | `test_worker_execution.py`（6，含一条**子进程**启动/退出）：领取执行一次、两 Worker 抢同一条、异常不带走循环、空计划不是续跑、无未 await 协程 |
 | B 租约与控制底座 | `ExecutionContext`（run_id/plan_version/owner/epoch）+ `_owned()` 条件提交；续租/释放/终态都带 epoch | `test_execution_control.py`（9）：旧代次准入/结算/终态/续租全被拒、续租失败停派、暂停三种时序、取消、工具消失 |
 | C 数据库恢复 | 计划先于调用提交（`commit_plan` 一个事务）；`settle_action` 同事务写快照；恢复算法按动作推断起点；全部结算完只做收尾 | `test_execution_recovery.py`（7） |
 | D 未知结果 | `app/errors.py` 类型化确定性（`not_executed` / `failed_confirmed` / `unknown`），适配器在最了解现场的一层标注 | `test_mcp_uncertainty.py`（6） |
@@ -165,7 +165,7 @@
 # PG_TEST_DSN 必须指向一次性测试库（库名含 test），用例会 TRUNCATE 全部业务表
 PG_TEST_DSN=postgresql://…/agent_platform_test \
   python -W error::RuntimeWarning -m unittest discover -s tests -v
-# 实测：Ran 335 tests, OK（22 秒）
+# 实测：Ran 336 tests, OK（22 秒）
 ```
 
 `-W error::RuntimeWarning` 是刻意的：漏 `await` 不会报错，只会静默失效（把协程

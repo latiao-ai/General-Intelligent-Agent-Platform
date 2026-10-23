@@ -7,9 +7,11 @@
 的真实取值**。
 """
 import asyncio
+import os
 import tempfile
 import unittest
 
+from pathlib import Path
 from unittest.mock import patch
 
 from tests.exec_env import (Remote, install_main, install_plan, install_tools,
@@ -180,6 +182,33 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
                and 'never awaited' in str(w.message)]
         self.assertEqual(bad, [], '执行链路上有协程没有被 await')
         await store.close()
+
+
+    async def test_worker_process_starts_and_exits_cleanly(self):
+        """真的起一个 Worker 进程：启动对账、收尾退出，退出码必须是 0。
+
+        这条是本组唯一的**子进程**用例。它守的是一类很难在进程内发现的问题：
+        `asyncio.run(主循环)` 之后再 `asyncio.run(store.close())` —— 那是第二个
+        事件循环，池里的后台任务属于已关闭的第一个循环，close() 会抛
+        `CancelledError` 噪音，退出码变成非零。
+        """
+        import subprocess
+        import sys
+
+        from tests.exec_env import PG_DSN
+
+        root = Path(__file__).resolve().parents[1]
+        env = {**os.environ, 'PG_TEST_DSN': PG_DSN,
+               'PYTHONPATH': str(root)}
+        env.setdefault('HOME', str(root / '.conda-home'))
+        proc = subprocess.run(
+            [sys.executable, '-m', 'scripts.run_worker', '--jobs-only', '--once'],
+            cwd=str(root), env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual(proc.returncode, 0,
+                         f'Worker 退出码非零\nstdout:\n{proc.stdout[-2000:]}\n'
+                         f'stderr:\n{proc.stderr[-2000:]}')
+        self.assertNotIn('Traceback', proc.stderr, proc.stderr[-2000:])
+        self.assertIn('启动对账', proc.stdout)
 
 
 if __name__ == '__main__':

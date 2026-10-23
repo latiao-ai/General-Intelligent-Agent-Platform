@@ -147,6 +147,22 @@ async def main_loop(hub: Hub, worker_id: str, once: bool,
             await asyncio.sleep(interval)
 
 
+async def run_worker(worker_id: str, once: bool, jobs_only: bool,
+                     interval: float) -> None:
+    """Worker 的完整生命周期：建 Hub → 主循环 → **在同一个循环里**关连接池。
+
+    连接池必须跟它创建时的事件循环一起收尾。以前是 `asyncio.run(main_loop(...))`
+    之后再 `asyncio.run(store.close())`：那是第二个事件循环，池里的后台任务属于
+    已经关闭的第一个循环，close() 会抛一串 `CancelledError` 噪音（关闭本身其实
+    也没做成），退出码还可能是非零。
+    """
+    hub = Hub(owner_id=worker_id)
+    try:
+        await main_loop(hub, worker_id, once, jobs_only, interval)
+    finally:
+        await hub.store.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='中台执行 Worker')
     parser.add_argument('--once', action='store_true', help='领一次就退出')
@@ -156,15 +172,11 @@ def main() -> None:
 
     setup_logging('worker')
     worker_id = f'{os.uname().nodename}:{uuid.uuid4().hex[:6]}'
-    hub = Hub(owner_id=worker_id)
     try:
-        asyncio.run(main_loop(hub, worker_id, args.once, args.jobs_only,
-                              args.interval))
+        asyncio.run(run_worker(worker_id, args.once, args.jobs_only,
+                               args.interval))
     except KeyboardInterrupt:
         print('\n[worker] 退出')
-    finally:
-        # 收尾在事件循环之外：这里同步地把连接池关掉
-        asyncio.run(hub.store.close())
 
 
 if __name__ == '__main__':
