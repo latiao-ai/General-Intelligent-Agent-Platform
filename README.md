@@ -129,44 +129,15 @@ python --version             # Python 3.12.15
 
 ## 3. 运行
 
-### 零密钥中文动画解说视频
+### 视频类需求走 MCP（本地能力包已移除）
 
-主项目在 `demo` 环境运行，OpenMontage MCP 在 `openmontage` 环境运行。
-首次安装本地视频链路的依赖与中文语音模型：
+本地"动画解说视频"能力包（`make_local_explainer` + Remotion/Piper）已按需移除：
+它把一整套渲染依赖（FFmpeg、Piper 语音模型、Remotion、Chrome）焊在了中台进程里，
+而同样的能力本来就能由 MCP 服务端的内部工具完成。
 
-```bash
-conda activate demo
-python -m scripts.setup_local_video
-```
-
-该流程需要 FFmpeg/FFprobe、Piper 及 `zh_CN-huayan-medium` 模型和配套 JSON、
-Remotion 的 npm 依赖以及 Chrome（macOS 优先复用已安装的 Google Chrome）。
-模型默认保存到 `openmontage-zh-mcp/models/piper/`，也可通过
-`LOCAL_VIDEO_VOICE_MODEL` 指定完整的 `.onnx` 路径。
-
-重启网页服务后输入「制作一个 45 秒的动画解说视频，解释为什么天空是蓝色的」。
-客户端的 `make_local_explainer` 能力会先核对 MCP 的真实能力和参数，再按项目 Skills
-编写分镜，保持同一个 MCP 会话完成逐镜中文配音、动画渲染和成片检查。
-最终输出有中文旁白和字幕的 1280×720 MP4，并在网页提供播放器及下载按钮。
-当前这条本地路径不添加背景音乐，不调用付费图片或视频生成 API；
-编写剧本和分镜仍使用主项目已经配置的大模型。
-建议 `TASK_TIMEOUT=900`，为首次渲染保留足够时间。
-
-如果语音模型下载未完成，任务会在模型调用和配音前报告缺失，而不会把脚本文件当成视频交付。
-
-```bash
-conda activate demo
-cd webpage-agent-demo
-
-# 网页界面（推荐）：启动后在浏览器打开 http://127.0.0.1:8010
-python -m scripts.serve_api --port 8010
-python -m scripts.serve_api --reload        # 开发模式，改代码自动重启
-
-# 命令行模式
-python -m app.main '整理 SQLite 的适用场景和限制，生成中文报告'
-python -m app.main '整理 SQLite 的适用场景，生成中文报告，然后部署到服务器'
-python -m app.main '阅读 https://www.sqlite.org/whentouse.html ，整理适用场景'
-```
+需要这类能力时，按上一节接一个 MCP 服务端即可：工具会以
+`mcp__<server>__<tool>` 出现在模型面前，走同一份账本与"结果未定"判定；
+渲染依赖由那个服务端自己负责，中台只负责调度、记账与如实报告"缺什么"。
 
 产物在 `artifacts/<task_id>/`：`index.html`、`report.json`、`sources.json`、
 `manifest.json`、`state.json`、`deployment.json`。
@@ -753,7 +724,8 @@ async def save_note(args, state):
 
 再加两条硬规则（`MCP_PROMPT_RULES`）：
 
-- **创作内容（剧本/分镜/文案）由模型自己写**，用 `write_file` 落盘；不要假设服务端有
+- **创作内容（剧本/分镜/文案）由模型自己写**（`write_file` 已移除，需要落盘就交给
+  服务端的写入类工具）；不要假设服务端有
   "生成脚本/分镜"的接口——多数服务端只提供执行动作。
 - **封装型执行工具**（如 `render_video`）也依赖内部工具，调度前先看清单里它们是否可用。
 
@@ -825,19 +797,18 @@ PG_TEST_DSN=postgresql://…/agent_platform_test \
   python -W error::RuntimeWarning -m unittest discover -s tests -v
 ```
 
-**381 条用例，全绿**。项目只支持 PostgreSQL，用例也直接跑真实 PG：
+**376 条用例，全绿**。项目只支持 PostgreSQL，用例也直接跑真实 PG：
 
 | 文件 | 条数 | 覆盖 |
 |---|---|---|
-| `tests/test_core.py` | 249 | 能力包、计划校验、账本、状态词汇、MCP 识别、接口与 SSE、仓储一致性、连接池 |
+| `tests/test_core.py` | 243 | 能力包、计划校验、账本、状态词汇、MCP 识别、接口与 SSE、仓储一致性、连接池 |
 | `tests/test_worker_execution.py` | 6 | Worker 领取/执行一次、两 Worker 抢同一条、异常不带走循环、空计划、无未 await 协程 |
 | `tests/test_execution_control.py` | 9 | 旧代次四件事全被拒、续租失败停派、暂停三种时序、续跑不重发、取消、工具消失 |
 | `tests/test_execution_recovery.py` | 7 | 计划先于调用提交、提交失败零调用、prepared 重做、unknown 阻断、succeeded 复用、结算失败不推进 |
 | `tests/test_mcp_uncertainty.py` | 6 | 业务失败=failed_confirmed、超时=unknown、连接失败=not_executed、包装后确定性不丢 |
-| `tests/test_observation.py` | 15 | 摘要保留结构、路由优先级、结果完整可追溯、空 continue 拒绝、缺证据不成功、无进展停止、预算耗尽、观察开关 |
+| `tests/test_observation.py` | 16 | 摘要保留结构、路由优先级、结果完整可追溯、空 continue 拒绝、缺证据不成功、无进展停止、预算耗尽、观察开关 |
 | `tests/test_run_inputs.py` | 28 | 补充接受/幂等/背压、旧版本动作零准入、计划 CAS、修订校验、收尾门禁、暂停期间补充、HTTP 202/409/404/422 |
 | `tests/test_ticket_auth.py` 等 | 56 | 票据验证、兑换、退出、跨平台隔离 |
-| `tests/test_local_video.py` | 3 | 本地解说视频能力包 |
 
 `-W error::RuntimeWarning` 是刻意的：漏 `await` 的执行路径不会报错，只会静默失效，
 把它提升成错误才能守住"Worker 真的在等结果"这件事。

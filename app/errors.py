@@ -17,7 +17,7 @@
 默认值刻意选 **unknown**：底层说不清"请求到底发出去没有"时，宁可让人类核实，
 也不要自动重发一次可能有副作用的调用。
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 PHASES = ('validate', 'connect', 'dispatch', 'receive', 'decode')
 CERTAINTIES = ('not_executed', 'failed_confirmed', 'unknown')

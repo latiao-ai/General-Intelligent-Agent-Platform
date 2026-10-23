@@ -52,8 +52,7 @@ def reply_text(state: dict) -> str:
 
     if status == 'failed':
         reason = state.get('failure')
-        made = _produced_files(state)
-        tail = f'本次已产出：{made}。' if made else ''
+        tail = ''
         if reason:
             return f'本次未完成：{reason}。{tail}可换个更具体的说法再试。'
         return f'{tail}本次没有产出可用结果。可换个更具体的说法再试。'
@@ -74,26 +73,20 @@ def _artifact_reply(state: dict) -> str:
     """产出了东西（页面或文件）时的回执。"""
     blocked = ((state.get('plan') or {}).get('blocked') or [])
     note = f'！未完成的部分：{blocked[0]}。' if blocked else ''
-    files = _produced_files(state)
     if (state.get('artifact') or {}).get('html_path'):
         what = '资料页面' if (state.get('artifact') or {}).get('kind') == 'sources' \
             else '页面'
         tail = f'想发布就说一句「部署到服务器」。任务 ID：{state.get("task_id")}'
         return f'{what}已生成，保存在本地。{note}{tail}'
-    return (f'已产出 {files or "工作文件"}。{note}'
+    return (f'已产出 {_artifact_name(state) or "工作文件"}。{note}'
             f'任务 ID：{state.get("task_id")}')
 
-def _produced_files(state: dict) -> str:
-    """本轮写出来的文件（write_file 的产物），失败时也要说清楚做到哪了。"""
-    names = []
-    for output in (state.get('step_outputs') or {}).values():
-        if not isinstance(output, dict):
-            continue
-        written = output.get('written') or {}
-        if isinstance(written, dict) and written.get('relative'):
-            names.append(str(written['relative']))
-    return '、'.join(names[:5])
 
+def _artifact_name(state: dict) -> str:
+    """产物文件名（给回执用，没有就空串）。"""
+    artifact = state.get('artifact') or {}
+    path = artifact.get('path') or artifact.get('html_path') or ''
+    return str(path).rsplit('/', 1)[-1] if path else ''
 
 def cancel_note(artifact_id: str | None) -> str:
     """停止后提示已产生的副作用——取消不会撤销已发布的站点。"""

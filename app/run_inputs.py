@@ -21,7 +21,6 @@
 它们不能互相替代：补充不需要重新领取租约；新计划也不需要用户重新提需求。
 """
 import hashlib
-import json
 import logging
 
 logger = logging.getLogger(__name__)
@@ -100,6 +99,11 @@ def inputs_text(inputs, *, limit: int = MAX_INPUTS_IN_DECISION) -> str:
 
 
 def latest_intent_version(inputs, fallback: int = 0) -> int:
+    """这批补充里最高的要求版本（没有就用 fallback）。
+
+    注意：用它是为了**核对**"模型看到的补充是否对得上版本"，不是用来代替
+    `runs.intent_version` 做门禁——门禁永远以数据库为准。
+    """
     items = normalize_inputs(inputs)
     if not items:
         return int(fallback or 0)
@@ -217,12 +221,3 @@ def validate_revision(steps, *, plan_version: int, done_steps, unknown_steps,
     return kept, issues
 
 
-def summary_line(result: dict) -> str:
-    """给用户看的一句话（"已按新要求调整"），不承诺业务效果已完成。"""
-    version = result.get('intent_version') or 0
-    plan_version = result.get('plan_version') or 0
-    return f'已按新的要求调整计划（要求版本 {version} / 计划 v{plan_version}）'
-
-
-def dumps(value) -> str:
-    return json.dumps(value, ensure_ascii=False, default=str)

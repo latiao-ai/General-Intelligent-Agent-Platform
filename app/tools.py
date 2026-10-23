@@ -20,16 +20,16 @@ import time
 from app.integrations import mcp_adapter, mcp_servers
 from app.capabilities import publishing as publishing_capability
 from app.capabilities import registry
-from app.capabilities.base import (ToolError, error_entry, tool_results_text,
-                                   usable_documents, _select_sources, _with_text)
+# 这几个是既有调用点仍在用的：`nodes` 用 usable_documents 判断"手上有没有料"，
+# 测试用 _select_sources 校验预算截断。
+from app.capabilities.base import (ToolError, usable_documents,  # noqa: F401
+                                   _select_sources)
 # Tool 定义搬到了注册器里（内核与能力包共用一份）；这里重新导出，
 # 旧调用点与既有用例 `from app.tools import Tool` 继续可用。
 from app.capabilities.registry import Tool
 from app.config import settings
 
-# 旧代码里 tool_module.search_backend / chat_reply / emit 的引用保留
-from app.integrations import search as search_backend
-from app.events import action, answer_delta, emit
+from app.events import action, emit
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +57,6 @@ MCP_PROMPT_RULES = (
     'capabilities），先调它把真实能力读出来；通用调用类工具（如 run_tool）名字参数里的'
     '内部工具名**只能取自清单**，清单里没有就是没有，不要凭经验编。'
     '清单里标为不可用（缺依赖/缺 key/未安装）的工具不要调度。'
-    '【创作内容自己写】剧本、分镜、旁白、文案这类内容由你自己产出，再用 write_file'
-    '落盘；不要假设服务端有"生成脚本/生成分镜"的接口——多数服务端只提供执行动作。'
     '【封装工具也有依赖】像 render_video 这类"封装型"执行工具，内部还要用到清单里的'
     '工具（合成、字幕等）：调度前先确认它们可用；不可用就别调度，直接说清缺什么。'
     '【业务失败要认】工具返回 status: error / failed、或 code 以 E_ 开头，就是这一步'

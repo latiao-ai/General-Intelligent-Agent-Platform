@@ -14,7 +14,7 @@
 
 | 文档要求 | 状态 | 实现位置 | 验证方式 |
 |---|---|---|---|
-| 能力包拆分（web/reports/publishing/answers） | ✅ | `app/capabilities/` | `tools.py` 699→217 行；目录里 5 个包归属清晰 |
+| 能力包拆分（web/export/answers/publishing） | ✅ | `app/capabilities/` | 每个包自带 `@tool` 声明、提示词规则与 tool_key；内核只做汇总。**当前保留 4 个包**：`web`（检索/抓正文）、`export`（资料转 HTML）、`answers`（基础回答）、`publishing`（MCP 部署适配）；`files`（写文件）与 `video`（本地解说视频）已按需删除 |
 | 工具保留完整描述（§2 点名"应优先修复"） | ✅ | `mcp_adapter.list_server_tools` | 服务端 `title`/`description`/`annotations` 全保留 |
 | 工具稳定身份与动作性质 | ✅ | `Tool.tool_key` / `Tool.effect` | `delete_site→destructive`、`list_sites→read` |
 | task / run 分离 | ✅ | `tasks_meta` / `runs` | `test_finishing_a_run_persists_plan_and_steps` |
@@ -256,7 +256,7 @@ verify_completion → decide_next（有限修复）| finalize（门禁）
 # PG_TEST_DSN 必须指向一次性测试库（库名含 test），用例会 TRUNCATE 全部业务表
 PG_TEST_DSN=postgresql://…/agent_platform_test \
   python -W error::RuntimeWarning -m unittest discover -s tests -v
-# 实测：Ran 381 tests, OK（29 秒）
+# 实测：Ran 376 tests, OK（21 秒）
 ```
 
 `-W error::RuntimeWarning` 是刻意的：漏 `await` 不会报错，只会静默失效（把协程
@@ -322,3 +322,19 @@ PG_TEST_DSN=postgresql://…/agent_platform_test \
   接第 N 个能力时，差异应当体现在 `outcome`（数据）与 `tool_key`（身份）上。
 - **"结果待确认"不是失败**。写请求可能真的成功了、只是回执看不懂，所以
   `needs_reconcile` 是独立终态：既不谎称成功，也不报失败，而是要求核实。
+
+## 能力面收缩（2026-10-23）
+
+按"只留网页搜索、文档转 HTML、MCP，以及保留闲聊回答"的目标做的裁剪：
+
+| 删除项 | 原因 | 顺带清掉的东西 |
+|---|---|---|
+| `app/capabilities/files.py`（`write_file`） | 写文件属于"具体业务动作"，需要落盘时交给 MCP 服务端的写入类工具 | 规划器提示词里的"用 write_file 落盘"规则、`outcome._produced` 里的 `written` 分支、`messages._produced_files` |
+| `app/capabilities/video.py`（`make_local_explainer`） | 把 FFmpeg/Piper/Remotion/Chrome 一整套渲染依赖焊在中台进程里；同样的能力更适合由 MCP 服务端提供 | `app/video/Explainer.tsx`、`scripts/setup_local_video.py`、`tests/test_local_video.py`、README 里的本地视频安装/使用小节 |
+| 死代码 | 没有调用点的辅助函数与未采用的 schema | `profile.current_user`、`execution_control.lease_deadline`、`schemas.InputBinding`、`schemas.SegmentStrategy`、`nodes._recovery_inputs`；另外清掉 `app/`+`scripts/` 全部未使用 import 与未使用局部变量（`flake8 --select=F` 现在为 0 条） |
+
+保留并实测：`web_search`、`fetch_pages`、`render_sources_html`、`answer_directly`、
+`answer_with_sources`（闲聊与"基于资料作答"要保留），以及全部 MCP 工具通道
+（含 `deploy_site` 的平台适配器）。
+
+测试数从 381 → 376（删掉本地视频 3 条与 `WriteFileTests` 3 条），全绿。

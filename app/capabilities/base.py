@@ -5,7 +5,7 @@ web / reports / publishing / answers 只依赖这一层。
 """
 import json
 
-from app import context, sources
+from app import sources
 from app.config import settings
 
 

@@ -44,10 +44,6 @@ def reset(token: contextvars.Token) -> None:
     _CURRENT_USER.reset(token)
 
 
-def current_user() -> str:
-    return _CURRENT_USER.get()
-
-
 def _safe(user: str) -> str:
     """主体名进文件名前先净化，避免 `../` 之类的路径穿越。"""
     return re.sub(r'[^A-Za-z0-9_.-]', '_', user)[:64] or DEFAULT_USER

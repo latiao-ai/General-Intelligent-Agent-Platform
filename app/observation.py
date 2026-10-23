@@ -26,6 +26,7 @@
 import hashlib
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -331,17 +332,23 @@ def completion_state(criteria: list[dict], *, state: dict, results=None,
             unchecked.append(entry)
             continue
         if kind == 'artifact_exists':
+            # `target` 常常是**人话描述**（"HTML 页面"）而不是路径。以它为准去查
+            # 文件，就会把"其实已经产出了"判成未满足——比不检查更糟。
+            # 所以：路径形态才当路径用，否则回到本轮声明的产物引用。
             artifact = state.get('artifact') or {}
-            path = target or artifact.get('path') or artifact.get('html_path')
-            if not path:
+            declared = artifact.get('path') or artifact.get('html_path') or ''
+            candidates = [declared] if declared else []
+            if looks_like_path(target):
+                candidates.append(target)
+            if not candidates:
                 entry['reason'] = '没有声明产物'
                 unmet.append(entry)
-            elif files_exist is None or files_exist(path):
-                entry['evidence'] = [f'artifact:{path}']
-                verified.append(entry)
-            else:
+            elif files_exist is not None and not any(files_exist(p_) for p_ in candidates):
                 entry['reason'] = '产物路径不存在'
                 unmet.append(entry)
+            else:
+                entry['evidence'] = [f'artifact:{p_}' for p_ in candidates][:3]
+                verified.append(entry)
             continue
         if kind == 'file_written':
             written = _written_files(state)
@@ -399,6 +406,20 @@ def completion_state(criteria: list[dict], *, state: dict, results=None,
         unchecked.append(entry)
     return {'verified': verified, 'unmet': unmet, 'unchecked': unchecked,
             'ok': not unmet, 'complete_evidence': not unmet and not unchecked}
+
+
+def looks_like_path(value: str) -> bool:
+    """这段文本是在指一个文件路径，还是在描述一个东西？
+
+    完成条件是模型写的自然语言，`target` 可能是 `"HTML 页面"`。把它当路径去查
+    文件只会得到"不存在"，于是明明做完了也报未满足。
+    """
+    text = str(value or '').strip()
+    if not text or ' ' in text and '/' not in text:
+        return False
+    if '/' in text or text.startswith(('.', '~')):
+        return True
+    return bool(re.search(r'\.[A-Za-z0-9]{2,5}$', text))
 
 
 def _written_files(state: dict) -> list[str]:

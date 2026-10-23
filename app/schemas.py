@@ -1,17 +1,6 @@
-from typing import Any, ClassVar, Literal
+from typing import ClassVar
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
-
-class InputBinding(BaseModel):
-    """步骤输入的一种绑定方式（文档 §6.2）。
-
-    只支持两种明确形态，**不解析任意表达式**：
-    - literal：字面量，直接作为参数值
-    - ref：引用前序步骤的输出，按受限 JSON Pointer 取值
-    """
-    literal: Any = None
-    ref: dict | None = None          # {'step_id': 's1', 'pointer': '/artifact_id'}
-
 
 class PlanStep(BaseModel):
     """编排计划中的一步。
@@ -48,23 +37,6 @@ class CompletionCriterion(BaseModel):
     detail: str = ''
     # 明确标注"必须看内容才能判断"的条件，程序不会替它下结论
     requires_model: bool = False
-
-
-class SegmentStrategy(BaseModel):
-    """片段策略：一个执行片段结束时该做什么（文档 observe-decide §3.2）。
-
-    首版只支持两种，且**由候选计划自己声明**——执行器不靠工具名关键词猜。
-    """
-    after_segment: str = 'verify'          # observe / verify
-    observation_goal: str = ''             # after_segment=observe 时必填
-
-    def model_post_init(self, __context) -> None:      # noqa: D105
-        if self.after_segment not in ('observe', 'verify'):
-            raise ValueError('after_segment 只能是 observe 或 verify')
-        if self.after_segment == 'observe' and not self.observation_goal.strip():
-            raise ValueError('声明 observe 时必须写清 observation_goal')
-        if self.after_segment == 'verify':
-            self.observation_goal = ''
 
 
 class ExecutionPlan(BaseModel):

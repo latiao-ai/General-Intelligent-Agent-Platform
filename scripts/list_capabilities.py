@@ -57,7 +57,11 @@ async def main() -> int:
             print(f'    ✅ {name:26} {info.get("signature") or ""}')
         for name in unusable:
             info = capabilities[name]
-            hint = (info.get('install') or '').splitlines()[0][:70]
+            # install 可能只有空白（服务端给了空串），splitlines() 会返回空列表：
+            # 这里以前直接取 [0]，一条不可用工具就能把整个脚本打崩。
+            lines = [line for line in str(info.get('install') or '').splitlines()
+                     if line.strip()]
+            hint = lines[0][:70] if lines else ''
             print(f'    ⛔ {name:26} {info.get("status")}  {hint}')
     return 0
 

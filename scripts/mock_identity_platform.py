@@ -37,7 +37,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import urllib.error
 import urllib.parse
-from urllib.parse import urlencode
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in _sys.path:

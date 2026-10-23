@@ -86,6 +86,22 @@ class ObservationPureTests(unittest.TestCase):
         signals = {'segment_end': False, 'after_segment': 'verify'}
         self.assertEqual(obs.route_after_step(signals)[0], obs.ROUTE_STEP)
 
+    def test_artifact_criterion_accepts_a_human_description(self):
+        """完成条件的 target 常是人话（"HTML 页面"），不能拿它当路径去查文件。
+
+        踩过的坑：真实模型写 `{'kind':'artifact_exists','target':'HTML 页面'}`，
+        检查器把它当路径 → "产物路径不存在" → 明明产出了 HTML 却报部分完成。
+        """
+        state = {'artifact': {'html_path': 'artifacts/t1/sources.html'}}
+        result = obs.completion_state(
+            [{'kind': 'artifact_exists', 'target': 'HTML 页面'}],
+            state=state, files_exist=lambda p: p.endswith('sources.html'))
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['verified'][0]['evidence'],
+                         ['artifact:artifacts/t1/sources.html'])
+        self.assertFalse(obs.looks_like_path('HTML 页面'))
+        self.assertTrue(obs.looks_like_path('artifacts/t1/sources.html'))
+
     def test_completion_requires_evidence(self):
         state = {'artifact': {'html_path': '/tmp/not-exists.html'}}
         criteria = obs.criteria_of({}, state)

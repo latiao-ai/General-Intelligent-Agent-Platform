@@ -6,14 +6,12 @@ JSON 元信息 + Markdown 正文转成一份可部署的静态页面。
 （原先同包内还有"整理成结构化报告 → 渲染模板"的链路，已按需裁剪。）
 """
 import hashlib
-from pathlib import Path
 
 from app import md, sources
 from app.capabilities.base import ToolError, usable_documents
 from app.capabilities.registry import tool
 from app.config import settings
 from app.events import action, emit
-from app.files import save_json
 
 # 能力包名，也进 tool_key（local:export:<动作>）
 CAPABILITY = 'export'

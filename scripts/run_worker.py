@@ -57,11 +57,10 @@ async def run_once(hub: Hub, worker_id: str, lease_seconds: float | None = None,
     logger.info('领取 run=%s epoch=%s', run['run_id'], run['lease_epoch'])
     print(f'[worker] 领取 run={run["run_id"]} epoch={run["lease_epoch"]}')
 
-    record = None
     try:
         # execute_claimed_run 内部已 await 整次执行；这里只加"卡死永不返回"的护栏。
         # 租约由 _run 里的看守协程持续续期。
-        record = await asyncio.wait_for(hub.execute_claimed_run(run),
+        await asyncio.wait_for(hub.execute_claimed_run(run),
                                        timeout=settings.task_timeout * 2)
         return True
     except asyncio.TimeoutError:

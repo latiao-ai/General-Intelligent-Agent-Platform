@@ -160,11 +160,7 @@ def view(status, state: dict | None = None) -> dict:
 
 
 def _produced(state: dict) -> list[dict]:
-    """本轮真正产出的东西：页面产物 + write_file 写出来的文件。
-
-    write_file 的产物以前不算数，于是"写了三个脚本文件"的任务被判成 failed——
-    用户看到的却是"本次没有产出可用结果"，自相矛盾。
-    """
+    """本轮真正产出的东西：声明的产物（页面/文件）引用。"""
     produced = []
     artifact = state.get('artifact') or {}
     artifact_path = artifact.get('path') or artifact.get('html_path')
@@ -174,17 +170,6 @@ def _produced(state: dict) -> list[dict]:
                          'path': artifact_path,
                          'sha256': artifact.get('sha256') or '',
                          'size_bytes': artifact.get('size_bytes')})
-    for output in (state.get('step_outputs') or {}).values():
-        if not isinstance(output, dict):
-            continue
-        written = output.get('written')
-        if isinstance(written, dict) and written.get('path'):
-            produced.append({'kind': 'file',
-                             'artifact_id': '',
-                             'path': written['path'],
-                             'sha256': '',
-                             'size_bytes': written.get('size_bytes'),
-                             'relative': written.get('relative') or ''})
     return produced
 
 

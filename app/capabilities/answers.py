@@ -1,7 +1,6 @@
 """answers 能力包：在聊天里回答（直答 / 带来源作答）。"""
-import json
 
-from app import context, profile, sources
+from app import context, profile
 from app.capabilities.base import (ToolError, _select_sources,
                                    tool_results_text, usable_documents)
 from app.capabilities.registry import tool

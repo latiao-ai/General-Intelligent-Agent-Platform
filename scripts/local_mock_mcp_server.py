@@ -9,7 +9,6 @@
 只把 HTML 写到本地 artifacts/_mock_sites/ 下。
 """
 import hashlib
-import json
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP

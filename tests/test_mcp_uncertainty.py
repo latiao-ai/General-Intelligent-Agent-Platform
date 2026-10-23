@@ -111,6 +111,8 @@ class McpUncertaintyTests(unittest.IsolatedAsyncioTestCase):
     async def test_connect_error_means_not_executed(self):
         """连接都建不起来 → not_executed：这一步确实没发生，可以显式重试。"""
         import httpx
+        from app import nodes
+        from app.schemas import ObservationDecision
 
         store = new_store()
         await seed_run(store)
@@ -118,7 +120,15 @@ class McpUncertaintyTests(unittest.IsolatedAsyncioTestCase):
         async def call_tool(name, arguments, artifact=None, server=None):
             raise httpx.ConnectError('连不上')
 
-        await self.execute(store, call_tool)
+        async def stop_decision(schema, system, user, **kwargs):
+            # "确认未执行"的错误是**可修复**的，观察节点会去问模型；
+            # 这里让模型选择停下，测试才有确定的终态（否则会真的联网调模型）。
+            return ObservationDecision.model_validate(
+                {'kind': 'stop', 'reason': '连不上，先停',
+                 'stop_reason': '服务端不可达'}), None
+
+        with patch.object(nodes, 'structured_call', stop_decision):
+            await self.execute(store, call_tool)
 
         action = await self.action_of(store)
         self.assertEqual(action['status'], 'failed')

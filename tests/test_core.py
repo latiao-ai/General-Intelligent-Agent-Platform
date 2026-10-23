@@ -909,7 +909,7 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
     """基础回答能力：简单问题不该被拖去检索（对应用户指出的流程）。"""
 
     async def test_registry_has_the_local_capabilities(self):
-        """本地能力包含检索、页面、回答、文件写入及完整视频制作。
+        """本地能力只剩三件事：检索正文、把正文转成 HTML、以及基础回答。
 
         部署不在里面：它由 MCP 发现得到（身份 mcp:<server>:<tool>），
         见 `DeployGateTests`。本地身份只发给"纯计算/纯回答"的工具。
@@ -917,8 +917,7 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
         from app import tools as tool_module
         self.assertEqual(sorted(tool_module.BUILTIN_BY_NAME),
                          ['answer_directly', 'answer_with_sources',
-                          'fetch_pages', 'make_local_explainer', 'render_sources_html', 'web_search',
-                          'write_file'])
+                          'fetch_pages', 'render_sources_html', 'web_search'])
         keys = {name: tool.tool_key
                 for name, tool in tool_module.BUILTIN_BY_NAME.items()}
         self.assertEqual(keys['web_search'], 'local:web:search')
@@ -3885,44 +3884,6 @@ class McpBusinessFailureTests(unittest.IsolatedAsyncioTestCase):
         tool_module._MCP_CACHE['capabilities'] = {}
 
 
-class WriteFileTests(unittest.IsolatedAsyncioTestCase):
-    """write_file：创作内容自己写、自己落盘（需求 3）。"""
-
-    async def test_writes_into_the_task_workspace(self):
-        from app.capabilities import files as files_cap
-        with tempfile.TemporaryDirectory() as folder:
-            with patch.object(files_cap, 'settings',
-                              SimpleNamespace(artifact_dir=Path(folder))), \
-                    patch_all_emits(lambda e: None):
-                result = await files_cap._write_file(
-                    {'path': 'storyboard/scene-01.md', 'content': '# 场景一\n天空为什么是蓝的'},
-                    {'task_id': 't1'})
-            written = Path(result['written']['path'])
-            self.assertTrue(written.exists())
-            self.assertIn('场景一', written.read_text(encoding='utf-8'))
-            self.assertIn('workspace', str(written))
-            self.assertEqual(result['status'], 'written')
-
-    async def test_rejects_escaping_paths(self):
-        from app.capabilities import files as files_cap
-        from app.capabilities.base import ToolError
-        for bad in ('/etc/passwd', '../escape.md', 'a/../../b.md', '~/x.md'):
-            with self.subTest(path=bad), self.assertRaises(ToolError):
-                await files_cap._write_file({'path': bad, 'content': 'x'},
-                                            {'task_id': 't1'})
-
-    async def test_rejects_empty_content_and_huge_payloads(self):
-        from app.capabilities import files as files_cap
-        from app.capabilities.base import ToolError
-        with self.assertRaises(ToolError):
-            await files_cap._write_file({'path': 'a.md', 'content': '  '},
-                                        {'task_id': 't1'})
-        with self.assertRaises(ToolError):
-            await files_cap._write_file(
-                {'path': 'a.md', 'content': 'x' * (files_cap.MAX_CHARS + 1)},
-                {'task_id': 't1'})
-
-
 class SessionSwitchTests(unittest.IsolatedAsyncioTestCase):
     """切会话不能停任务，切回来还要能看到已经产出的视频（用户报的两个体验问题）。"""
 
@@ -4269,9 +4230,7 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
                           'fetch_pages': 'local:web:fetch',
                           'render_sources_html': 'local:export:sources_html',
                           'answer_with_sources': 'local:answers:with_sources',
-                          'answer_directly': 'local:answers:direct',
-                          'write_file': 'local:files:write',
-                          'make_local_explainer': 'local:video:explainer'})
+                          'answer_directly': 'local:answers:direct'})
 
     async def test_kernel_does_not_import_business_packages(self):
         """内核（app/tools.py）不许 import 具体业务能力包——那是一切耦合的源头。"""
@@ -4526,12 +4485,12 @@ class PlannerMistakeGuardTests(unittest.IsolatedAsyncioTestCase):
             called.append(args)
             return {}
 
-        tool = tool_module.Tool('write_file', '写文件', 'd', {}, fake,
-                                tool_key='local:files:write', effect='write')
-        plan = {'steps': [{'tool': 'write_file', 'step_id': 's1',
+        tool = tool_module.Tool('render_sources_html', '资料转 HTML', 'd', {}, fake,
+                                tool_key='local:export:sources_html', effect='write')
+        plan = {'steps': [{'tool': 'render_sources_html', 'step_id': 's1',
                            'args': {'path': 'a.md',
                                     'content': '{{s2.content}}'}}]}
-        with patch.dict(tool_module.BUILTIN_BY_NAME, {'write_file': tool}), \
+        with patch.dict(tool_module.BUILTIN_BY_NAME, {'render_sources_html': tool}), \
                 patch_all_emits(lambda e: None):
             result = await nodes.run_step({'plan': plan, 'step_index': 0,
                                            'user_input': '写个文件'})

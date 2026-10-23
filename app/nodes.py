@@ -463,14 +463,6 @@ def _intent_changed_update(state: dict, exc) -> dict:
             'intent_version': int(getattr(exc, 'actual', 0) or 0)}
 
 
-def _recovery_inputs(state: dict) -> dict:
-    """从快照里取"已经发生的事实"（修订计划时要引用它们，不能重发）。"""
-    return {'step_outputs': dict(state.get('step_outputs') or {}),
-            'artifact': state.get('artifact') or {},
-            'deployment': state.get('deployment') or {},
-            'answer': state.get('answer') or ''}
-
-
 async def _store_and_run():
     """当前执行上下文里的 (仓储, run_id)。没有账本时返回 (None, '')。"""
     book = ledger_module.current_ledger()
@@ -630,7 +622,7 @@ async def persist_plan(state):
             intent_version=intent or None,
             base_plan_version=int(plan_.get('base_plan_version') or 0) or None,
         )
-    except execution_control.IntentChanged as exc:
+    except execution_control.IntentChanged:
         # 规划期间用户又补充了：旧候选计划作废，回到消费循环重新修订
         emit(action('计划作废', '规划期间收到新的要求，重新调整', '📝'))
         return {'intent_changed': True, 'plan': {}, 'step_index': 0}
@@ -949,7 +941,6 @@ async def decide_next(state):
         # 没有账本（CLI 直调）：退化成"按计划跑完"，不假装有观察能力
         return {'next_route': observation_module.ROUTE_VERIFY}
 
-    book = ledger_module.current_ledger()
     context_ = execution_control.require()
     plan = dict(state.get('plan') or {})
     pending = await store_.pending_run_inputs(run_id)

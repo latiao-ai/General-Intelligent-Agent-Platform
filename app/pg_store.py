@@ -26,7 +26,6 @@ from psycopg_pool import AsyncConnectionPool
 import time
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
 
 from app.config import settings
 
@@ -1379,8 +1378,6 @@ class PostgresStore:
         为什么先预留：模型请求是有成本的外部调用。先记账再请求，才可能做到
         "超时的请求也算消耗"（文档 §12：不能靠只统计成功返回来漏掉超时请求）。
         """
-        from app import observation as observation_module
-
         async with self._lease() as conn:
             row = await self._owned(conn, context, run_id=run_id)
             if row is None:

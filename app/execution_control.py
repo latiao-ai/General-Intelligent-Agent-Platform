@@ -16,7 +16,6 @@
 把执行权凭证写进状态文件等于把"我可以写"这张通行证一起存下来。
 """
 import logging
-import time
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -125,5 +124,3 @@ def require() -> 'ExecutionContext | None':
     return _current.get()
 
 
-def lease_deadline(lease_seconds: float) -> float:
-    return time.time() + max(1.0, float(lease_seconds))

@@ -326,8 +326,7 @@ class Hub:
             await self._assert_session_owner(session_id, tenant, owner)
         if is_stop_command(message):
             return await self.stop_session(session_id, message, principal)
-        history = await self.history(session_id)
-        prior = await self.prior_context(session_id)
+        # 历史与上轮产物由 execute_claimed_run 统一装配，这里不预读
         await self.store.append_message(session_id, 'user', message,
                                   tenant_id=tenant, owner_user_id=owner)
         record = TaskRecord(task_id=uuid.uuid4().hex[:12], session_id=session_id,
