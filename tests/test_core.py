@@ -959,7 +959,7 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['status'], 'answered')
         self.assertIn('ACID', result['answer'])
 
-    async def test_answer_with_sources_cites_documents(self):
+    async def test_answer_with_sources_returns_the_reply_verbatim(self):
         from app import sources, tools as tool_module
         from app.capabilities import answers as answers_cap
         with tempfile.TemporaryDirectory() as folder:
@@ -976,8 +976,10 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
                     result = await answers_cap._answer_with_sources(
                         {'question': '问题'}, {'documents': [doc], 'usage': []})
         self.assertEqual(result['status'], 'answered')
-        self.assertIn('参考来源', result['answer'])
-        self.assertIn('https://a/1', result['answer'])
+        # 检索接口返回什么就呈现什么：平台**不再**追加"参考来源"清单，
+        # 也不要求模型打 [s1] 这类编号
+        self.assertEqual(result['answer'], '结论 [s1]。'.strip())
+        self.assertNotIn('参考来源', result['answer'])
 
     async def test_answer_with_sources_requires_material(self):
         from app.capabilities import answers as answers_cap

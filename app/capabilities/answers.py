@@ -73,27 +73,24 @@ async def _answer_directly(args: dict, state: dict) -> dict:
     return {'answer': answer, 'status': 'answered'}
 
 
+# 只依据资料作答，**不加任何引用标记**：检索接口返回什么就用什么，
+# 不再代它发明 [s1]/[s2] 编号，也不再在正文后面追加一份"参考来源"清单。
 ANSWER_WITH_SOURCES_SYSTEM = (
     '你是一个严谨的中文研究助手。只依据给定资料回答用户问题，不得使用资料之外的事实。'
-    '关键结论后面用 [s1]、[s2] 这样的编号标注它来自哪条资料，可一句多条。'
     '资料不足以回答的部分要明确说明；资料互相冲突时把差异讲出来，不要强行统一。'
-    '输出用自然的段落或短列表，不要写"根据资料"这类空话。'
+    '输出用自然的段落或短列表，不要写"根据资料"这类空话，也不要添加引用编号或来源清单。'
 )
-
-
-def _source_line(doc: dict) -> str:
-    return f'[{doc["source_id"]}] {doc.get("title") or doc["url"]} — {doc["url"]}'
 
 
 @tool(name='answer_with_sources', label='联网作答', effect='read',
       key='local:answers:with_sources',
-      description='基于已检索到的正文在聊天里回答问题，并附来源链接。'
+      description='基于已检索到的正文在聊天里回答问题（原样作答，不追加引用清单）。'
                   '用户想"问个明白"但没要文件时用它；'
                   '必须在 web_search / fetch_pages 之后调用。',
       args={'type': 'object',
             'properties': {'question': {'type': 'string'}}})
 async def _answer_with_sources(args: dict, state: dict) -> dict:
-    """联网检索后在聊天里作答，并附上来源。
+    """联网检索后在聊天里作答（原样输出，不追加引用清单）。
 
     这是"直接回答"和"出一份 HTML 报告"之间的那条路：用户只想问个明白、
     不想为了一份文档等上一分钟。
@@ -105,12 +102,13 @@ async def _answer_with_sources(args: dict, state: dict) -> dict:
     if origin:
         emit(action('沿用上一轮的正文', f'{len(documents)} 个来源', '♻️'))
     selected, _ = _select_sources(state, documents)
-    by_id = {d['source_id']: d for d in documents if d.get('source_id')}
     emit(action('正在依据资料作答',
                 f'{len(selected)} 个来源 · {sum(len(s["text"]) for s in selected)} 字符',
                 '📝'))
+    # 资料只按标题区分，**不编号**：给了 [s1] 这种标签，模型就会把它抄进回答，
+    # 而那正是本次要去掉的"额外引用来源"。
     material = '\n\n'.join(
-        f'[{item["source_id"]}] {item["title"]}\n{item["text"]}' for item in selected)
+        f'《{item["title"]}》\n{item["text"]}' for item in selected)
     results = tool_results_text(state)
     if results:
         material = f'{results}\n\n{material}'
@@ -118,7 +116,7 @@ async def _answer_with_sources(args: dict, state: dict) -> dict:
     # 原先是先建 messages、后往 material 追加——模型收到的还是"干净"的片段，
     # 于是把"前 3000 字"当全文，输出"资料已完整覆盖"。这正是文档 §11 点名
     # 要避免的失败模式，而验收清单里那条 ✅ 名不副实。
-    truncated_notes = [f'[{item["source_id"]}] 原文 {item["chars_full"]} 字，'
+    truncated_notes = [f'《{item["title"]}》原文 {item["chars_full"]} 字，'
                        f'仅取前 {len(item["text"])} 字'
                        for item in selected if item.get('truncated')]
     if truncated_notes:
@@ -134,9 +132,7 @@ async def _answer_with_sources(args: dict, state: dict) -> dict:
                                        state.get('session_memory'))),
         messages, on_delta=lambda text: emit(answer_delta(text)))
 
-    # 只列真正被引用的来源；一条都没引用时退回全部，免得"附来源"变成空话。
-    cited = [item for item in selected
-             if f'[{item["source_id"]}]' in body] or selected
-    lines = [_source_line(by_id.get(item['source_id'], item)) for item in cited]
-    answer = body.rstrip() + '\n\n参考来源：\n' + '\n'.join(f'- {line}' for line in lines)
-    return {'answer': answer, 'status': 'answered'}
+    # 原样返回模型的回答：不再追加"参考来源"清单。
+    # 来源本身仍是真实回执（documents 里的 url），只是不再由平台代贴一遍——
+    # 检索接口返回什么内容，这里就呈现什么内容。
+    return {'answer': body.strip(), 'status': 'answered'}

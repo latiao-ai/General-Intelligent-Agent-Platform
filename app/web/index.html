@@ -212,7 +212,7 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
-// 助手回答里常有来源链接（联网作答会附「参考来源」）。
+// 回答/事件里可能出现裸 URL（检索回执里的链接），把它变可点。
 // 先整体转义、再把裸 URL 包成 <a>，这样既点得动又不会被注入 HTML。
 function linkify(text) {
   return esc(text).replace(/(https?:\/\/[^\s<）)】」>"']+)/g,

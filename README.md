@@ -12,7 +12,7 @@
 | `fetch_pages` | 读取**本轮输入里给出的 URL** 正文（Markdown） | DeepSeek 官方 Fetch API | `local:web:fetch` |
 | `render_sources_html` | 把资料原样排版成 HTML，不调用模型 | 本地能力包 | `local:export:sources_html` |
 | `answer_directly` | 用模型自身知识直接回答，不检索 | 本地能力包 | `local:answers:direct` |
-| `answer_with_sources` | 基于已抓到的正文作答并附来源 | 本地能力包 | `local:answers:with_sources` |
+| `answer_with_sources` | 基于已抓到的正文作答（原样输出，不追加引用清单） | 本地能力包 | `local:answers:with_sources` |
 | `deploy_site` | 发布产物到服务器 | **MCP 服务端**（带平台适配器） | `mcp:<server>:<tool>` |
 | `mcp__*` | 服务端动态发现的工具（含查询/删除/更新站点） | MCP 服务端 | `mcp:<server>:<tool>` |
 
