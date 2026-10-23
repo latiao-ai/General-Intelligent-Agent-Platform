@@ -1,20 +1,28 @@
-"""Planner-Executor 执行图。
+"""Planner-Executor 执行图（含结果观察与自主决策）。
 
-控制流（文档 harness-live-input §5 第十步）：
+控制流（`harness-observe-decide` §7 + `harness-live-input` §5）：
 
     START → intake
-    intake → plan | revise_plan | run_step | finalize
+    intake → plan | revise_plan | run_step | verify_completion
     plan → persist_plan
     revise_plan → persist_plan
-    persist_plan → run_step | finalize | END
-    run_step ↺ → run_step | revise_plan | finalize | END
+    persist_plan → run_step | verify_completion
+    run_step ↺ → observe_result
+    observe_result → run_step                     参数能直接绑定，继续
+    observe_result → revise_plan                  用户要求变了（优先）
+    observe_result → decide_next                  片段结束/需要语义判断
+    observe_result → verify_completion            全部片段结束，先程序核对
+    observe_result → wait_async | END             外部任务未完成 / 控制 / 待核实
+    decide_next → run_step | persist_plan | verify_completion | END
+    verify_completion → decide_next | finalize
     finalize → revise_plan（又有新补充）| END
 
-`run_step` 每次只执行**一步**，所以每一步都有独立的阶段事件与耗时。
+要点：**每个工具之后都跑程序观察**（便宜、无模型请求），只有需要判断时才付出
+一次模型调用。`run_step` 每次只执行一步，所以每一步都有独立阶段事件与耗时。
 
-`intake` 放在最前面是有意的：恢复、续跑、运行中补充是同一件事的三个入口，
-它们都要先看"库里现在要求的是哪一版、计划是哪一份、还有哪些补充没人处理"。
-把这段逻辑放进图里，CLI 与 Worker 才真的只有一条路径。
+`intake` 放在最前面是有意的：恢复、续跑、运行中补充、待观察结果，都要先看
+"库里现在要求的是哪一版、计划是哪一份、结果看到哪一步"。把这段逻辑放进图里，
+CLI 与 Worker 才真的只有一条路径。
 """
 import inspect
 import time
@@ -29,9 +37,10 @@ from app import nodes
 # 这样它想发的是按工具名区分的阶段（"检索来源"/"整理报告"…），而不是笼统的
 # "执行步骤"，前端耗时表才看得出来每一步干了什么。
 NODE_NAMES = ['intake', 'plan', 'persist_plan', 'revise_plan', 'run_step',
+              'observe_result', 'decide_next', 'wait_async', 'verify_completion',
               'finalize']
-# 这几个节点很轻（只读写数据库/组装提示词），不需要自己的阶段行
-PLAIN_NODES = {'run_step', 'intake', 'persist_plan'}
+# 这几个节点很轻（只读写数据库/组装事实），不需要自己的阶段行
+PLAIN_NODES = {'run_step', 'intake', 'persist_plan', 'observe_result'}
 
 
 def _status_of(result) -> str:
@@ -80,12 +89,12 @@ def checkpointer():
 
 
 def _next_after_persist(state) -> str:
-    """计划提交之后：要求又变了就重新修订，否则继续执行（或直接收尾）。"""
+    """计划提交之后：要求又变了就重新修订，否则继续执行（或直接核对完成）。"""
     if state.get('intent_changed'):
         return 'revise_plan'
     if (state.get('plan') or {}).get('steps'):
         return 'run_step'
-    return 'finalize'
+    return 'verify_completion'
 
 
 def _next_after_revise(state) -> str:
@@ -93,14 +102,24 @@ def _next_after_revise(state) -> str:
     steps = (state.get('plan') or {}).get('steps') or []
     if steps and not state.get('intent_changed'):
         return 'persist_plan'
-    if state.get('status') in ('waiting_input', 'failed', 'paused'):
+    if state.get('status') in ('waiting_input', 'waiting_approval', 'failed',
+                               'paused'):
         return 'end'
-    return 'finalize'
+    return 'verify_completion'
 
 
 def _next_after_finalize(state) -> str:
     """收尾门禁发现"又有新补充"时回到修订，否则结束。"""
     return 'revise_plan' if state.get('intent_changed') else 'end'
+
+
+def _next_after_verify(state) -> str:
+    """完成核对之后：条件没满足且还有修复机会就再判断一次，否则收尾。"""
+    route = state.get('next_route') or 'stop'
+    if route == nodes.observation_module.ROUTE_DECIDE:
+        return 'decide_next'
+    return 'finalize' if not state.get('status') or state.get('status') in (
+        'succeeded', 'partially_succeeded') else 'end'
 
 
 def _map(*targets):
@@ -112,22 +131,30 @@ def _map(*targets):
 
 
 def build_graph(checkpointer_=None):
-    """Planner-Executor + 受控修订：先规划，再逐步执行，中途可纳入补充要求。"""
+    """规划 → 执行 → 观察 → （决策）→ 核对：中途可纳入补充、也可按结果调整。"""
     graph = StateGraph(AgentState)
     for name in NODE_NAMES:
         node = getattr(nodes, name)
         graph.add_node(name, node if name in PLAIN_NODES
                        else instrument(name, node))
     graph.add_edge(START, 'intake')
-    graph.add_conditional_edges('intake', nodes.route_entry,
-                                _map('plan', 'revise_plan', 'run_step', 'finalize'))
+    graph.add_conditional_edges('intake', nodes.route_entry, _map(
+        'plan', 'revise_plan', 'run_step', 'verify_completion'))
     graph.add_edge('plan', 'persist_plan')
     graph.add_conditional_edges('persist_plan', _next_after_persist,
-                                _map('revise_plan', 'run_step', 'finalize'))
+                                _map('revise_plan', 'run_step', 'verify_completion'))
     graph.add_conditional_edges('revise_plan', _next_after_revise,
-                                _map('persist_plan', 'finalize'))
-    graph.add_conditional_edges('run_step', nodes.next_step,
-                                _map('run_step', 'revise_plan', 'finalize'))
+                                _map('persist_plan', 'verify_completion'))
+    # 每个工具之后都做程序观察：便宜、无模型请求；要不要叫模型由观察决定
+    graph.add_edge('run_step', 'observe_result')
+    graph.add_conditional_edges('observe_result', nodes.route_after_observation,
+                                _map('run_step', 'revise_plan', 'decide_next',
+                                     'verify_completion', 'wait_async'))
+    graph.add_conditional_edges('decide_next', nodes.route_after_decision,
+                                _map('run_step', 'persist_plan',
+                                     'verify_completion'))
+    graph.add_conditional_edges('verify_completion', _next_after_verify,
+                                _map('decide_next', 'finalize'))
     graph.add_conditional_edges('finalize', _next_after_finalize,
                                 _map('revise_plan'))
     return graph.compile(checkpointer=checkpointer_)

@@ -362,6 +362,38 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_run_inputs_request
 CREATE UNIQUE INDEX IF NOT EXISTS uq_run_inputs_seq
     ON run_inputs(run_id, input_seq);
 
+-- ---------- 结果观察与决策（文档 harness-observe-decide §9） ----------
+-- 结果水位：每次"相关结果落库"在同一事务 +1。判断决策覆盖到哪一步只能用它，
+-- 不能用墙钟时间（跨进程、跨副本的时钟没有可比性）。
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS observation_seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE run_snapshots ADD COLUMN IF NOT EXISTS observation_seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE run_snapshots ADD COLUMN IF NOT EXISTS next_route TEXT NOT NULL DEFAULT '';
+
+-- 一次自主决策的完整台账：预留 → 调模型 → 校验 → CAS 提交。
+-- 崩溃语义（文档 §9）靠它区分"没请求 / 请求了没响应 / 候选未提交 / 已提交"。
+CREATE TABLE IF NOT EXISTS run_decisions (
+    decision_id            TEXT PRIMARY KEY,
+    run_id                 TEXT NOT NULL,
+    decision_key           TEXT NOT NULL,       -- 稳定身份：去重靠它，不靠时间
+    reason                 TEXT NOT NULL DEFAULT 'observation',
+    status                 TEXT NOT NULL DEFAULT 'reserved',
+    intent_version         INTEGER NOT NULL DEFAULT 0,
+    base_plan_version      INTEGER NOT NULL DEFAULT 0,
+    observation_seq        INTEGER NOT NULL DEFAULT 0,
+    decision_kind          TEXT NOT NULL DEFAULT '',
+    candidate_plan_hash    TEXT NOT NULL DEFAULT '',
+    committed_plan_version INTEGER NOT NULL DEFAULT 0,
+    input_snapshot         TEXT NOT NULL DEFAULT '',   -- 给模型看的输入（有界）
+    provider_requests      INTEGER NOT NULL DEFAULT 0,
+    usage_json             TEXT NOT NULL DEFAULT '{}',
+    error_code             TEXT NOT NULL DEFAULT '',
+    created_at             TEXT NOT NULL,
+    updated_at             TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_run_decisions_key
+    ON run_decisions(run_id, decision_key);
+CREATE INDEX IF NOT EXISTS idx_run_decisions_run ON run_decisions(run_id);
+
 -- 处理投影：可以从 run_inputs + plans 重建，因此允许任何新执行者继续处理，
 -- 不用一个永久的 processing 标记把崩溃的任务锁死。
 CREATE TABLE IF NOT EXISTS run_input_processing (
@@ -1101,7 +1133,9 @@ class PostgresStore:
     async def save_snapshot(self, run_id: str, *, plan_version: int, state: dict,
                             next_step_id: str = '', artifact_namespace: str = '',
                             conn=None, intent_version: int | None = None,
-                            processed_intent_version: int | None = None) -> None:
+                            processed_intent_version: int | None = None,
+                            observation_seq: int | None = None,
+                            next_route: str = '') -> None:
         '''写运行快照（恢复所需的最小完整状态）。
 
         长正文与文件不进快照：它们走产物引用，快照里只留引用与索引。
@@ -1111,17 +1145,20 @@ class PostgresStore:
         payload = json.dumps(state, ensure_ascii=False, default=str)
         sql = ('INSERT INTO run_snapshots (run_id, plan_version, snapshot_schema, '
                'state_json, next_step_id, artifact_namespace, updated_at, '
-               'intent_version, processed_intent_version) '
-               'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) '
+               'intent_version, processed_intent_version, observation_seq, next_route) '
+               'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) '
                'ON CONFLICT (run_id) DO UPDATE SET plan_version=EXCLUDED.plan_version, '
                'state_json=EXCLUDED.state_json, next_step_id=EXCLUDED.next_step_id, '
                'artifact_namespace=EXCLUDED.artifact_namespace, '
                'updated_at=EXCLUDED.updated_at, '
                'intent_version=EXCLUDED.intent_version, '
-               'processed_intent_version=EXCLUDED.processed_intent_version')
+               'processed_intent_version=EXCLUDED.processed_intent_version, '
+               'observation_seq=EXCLUDED.observation_seq, '
+               'next_route=EXCLUDED.next_route')
         args = (run_id, int(plan_version or 1), 1, payload, next_step_id,
                 artifact_namespace, now(), int(intent_version or 0),
-                int(processed_intent_version or 0))
+                int(processed_intent_version or 0), int(observation_seq or 0),
+                str(next_route or ''))
         if conn is not None:
             await self._run(conn, sql, args)
             return
@@ -1323,6 +1360,162 @@ class PostgresStore:
         data = dict(row or {})
         data['pending_input_count'] = int((pending or {}).get('n') or 0)
         return data
+
+    # ---------- 自主决策与预算（文档 harness-observe-decide §9、§12） ----------
+
+    async def reserve_decision(self, context, *, run_id: str, decision_key: str,
+                               reason: str = 'observation', intent_version: int = 0,
+                               base_plan_version: int = 0, observation_seq: int = 0,
+                               input_snapshot: str = '',
+                               max_decisions: int = 12) -> dict:
+        """**发请求之前**预留一次决策（含预算检查）。
+
+        返回 `{decision_id, replay: bool, status, ...}`：
+
+        - `replay=True`：同一个 decision_key 已经预留过（进程重启/重试），
+          调用方要么复用它的候选，要么按已有状态收尾——不能靠换 ID 绕过预算；
+        - 预算不足时抛 `DecisionBudgetExceeded`：保存已完成事实，等人显式继续。
+
+        为什么先预留：模型请求是有成本的外部调用。先记账再请求，才可能做到
+        "超时的请求也算消耗"（文档 §12：不能靠只统计成功返回来漏掉超时请求）。
+        """
+        from app import observation as observation_module
+
+        async with self._lease() as conn:
+            row = await self._owned(conn, context, run_id=run_id)
+            if row is None:
+                raise DecisionBudgetExceeded('运行不存在')
+            current_intent = int(row.get('intent_version') or 1)
+            if intent_version and int(intent_version) != current_intent:
+                # 用户要求变了：旧候选直接作废，不预留
+                from app import execution_control
+                raise execution_control.IntentChanged(
+                    run_id, int(intent_version), current_intent)
+            existing = await self._one(
+                conn, 'SELECT * FROM run_decisions WHERE run_id=%s AND decision_key=%s',
+                (run_id, decision_key))
+            if existing is not None:
+                data = dict(existing)
+                return {'decision_id': data['decision_id'], 'replay': True,
+                        'status': data['status'],
+                        'decision_kind': data['decision_kind'],
+                        'committed_plan_version': int(
+                            data.get('committed_plan_version') or 0),
+                        'observation_seq': int(data.get('observation_seq') or 0)}
+            used = await self._one(
+                conn, 'SELECT COUNT(*) AS n FROM run_decisions WHERE run_id=%s',
+                (run_id,))
+            if int((used or {}).get('n') or 0) >= int(max_decisions or 0):
+                raise DecisionBudgetExceeded(
+                    f'本次运行已用完 {max_decisions} 次自主决策预算')
+            decision_id = 'dec_' + uuid.uuid4().hex[:16]
+            stamp = now()
+            await self._run(
+                conn, 'INSERT INTO run_decisions (decision_id, run_id, decision_key, '
+                'reason, status, intent_version, base_plan_version, observation_seq, '
+                'input_snapshot, created_at, updated_at) '
+                "VALUES (%s, %s, %s, %s, 'reserved', %s, %s, %s, %s, %s, %s)",
+                (decision_id, run_id, decision_key, reason, int(intent_version or 0),
+                 int(base_plan_version or 0), int(observation_seq or 0),
+                 str(input_snapshot or '')[:8000], stamp, stamp))
+            # 决策也进事件流：前端要知道"系统在看结果、不是卡住了"
+            await self._append_event_in_tx(conn, row['task_id'], {
+                'type': 'action', 'icon': '🔎', 'label': '正在根据结果决定下一步',
+                'detail': reason, 'decision_reserved': True,
+                'decision_id': decision_id, 'run_id': run_id,
+                'observation_seq': int(observation_seq or 0),
+            })
+            return {'decision_id': decision_id, 'replay': False,
+                    'status': 'reserved', 'decision_kind': '',
+                    'committed_plan_version': 0,
+                    'observation_seq': int(observation_seq or 0)}
+
+    async def finish_decision(self, decision_id: str, *, status: str,
+                              decision_kind: str = '',
+                              candidate_plan_hash: str = '',
+                              committed_plan_version: int = 0,
+                              provider_requests: int = 0,
+                              usage: dict | None = None,
+                              error_code: str = '') -> None:
+        """记录决策结局（候选保存/提交成功/等待/失败）。"""
+        async with self._lease() as conn:
+            await self._run(
+                conn, 'UPDATE run_decisions SET status=%s, decision_kind=%s, '
+                'candidate_plan_hash=%s, committed_plan_version=%s, '
+                'provider_requests=provider_requests+%s, usage_json=%s, '
+                'error_code=%s, updated_at=%s WHERE decision_id=%s',
+                (status, decision_kind, candidate_plan_hash,
+                 int(committed_plan_version or 0), int(provider_requests or 0),
+                 json.dumps(usage or {}, ensure_ascii=False, default=str),
+                 error_code, now(), decision_id))
+
+    async def run_decisions(self, run_id: str, limit: int = 20) -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn, 'SELECT * FROM run_decisions WHERE run_id=%s '
+                'ORDER BY created_at DESC LIMIT %s', (run_id, int(limit)))
+        out = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item['usage'] = json.loads(item.pop('usage_json') or '{}')
+            except ValueError:
+                item['usage'] = {}
+            out.append(item)
+        return out
+
+    async def observation_state(self, run_id: str) -> dict:
+        """恢复入口要的那几个数：水位、下一路由、待观察结果数。"""
+        async with self._lease() as conn:
+            run = await self._one(
+                conn, 'SELECT COALESCE(observation_seq,0) AS observation_seq, '
+                'COALESCE(plan_version,0) AS plan_version, '
+                'COALESCE(intent_version,1) AS intent_version, status, lease_owner '
+                'FROM runs WHERE run_id=%s', (run_id,))
+            snapshot = await self._one(
+                conn, 'SELECT next_route, observation_seq FROM run_snapshots '
+                'WHERE run_id=%s', (run_id,))
+            pending = await self._one(
+                conn, "SELECT COUNT(*) AS n FROM run_decisions WHERE run_id=%s "
+                "AND status='reserved'", (run_id,))
+        data = dict(run or {})
+        data['next_route'] = (snapshot or {}).get('next_route') or ''
+        data['pending_decisions'] = int((pending or {}).get('n') or 0)
+        return data
+
+    async def consume_budget(self, context, *, run_id: str, key: str,
+                             amount: int = 1, limit: int | None = None) -> int:
+        """原子累加运行级用量，超过上限抛 `BudgetExceeded`。
+
+        为什么要落库：`state.usage` 只是展示统计，进程重启就没了；而"这次运行
+        到底用掉了多少预算"必须跨重启、跨执行者累计（文档 §12）。
+        """
+        async with self._lease() as conn:
+            row = await self._owned(conn, context, run_id=run_id)
+            if row is None:
+                raise BudgetExceeded('运行不存在')
+            # `_owned` 返回的是**原始行**（列名是 *_json），不是解码后的字典：
+            # 这里按列名解析，否则每次累加都会把上一种用量覆盖掉（看起来像"只记录了最后一次"）。
+            try:
+                consumed = json.loads(row.get('consumed_json') or '{}')
+            except ValueError:
+                consumed = {}
+            try:
+                budget = json.loads(row.get('budget_json') or '{}')
+            except ValueError:
+                budget = {}
+            used = int(consumed.get(key) or 0)
+            cap = limit
+            if cap is None:
+                cap = budget.get(key)
+            if cap is not None and used + int(amount) > int(cap):
+                raise BudgetExceeded(
+                    f'运行预算用尽（{key}: {used}/{cap}）')
+            consumed[key] = used + int(amount)
+            await self._run(
+                conn, 'UPDATE runs SET consumed_json=%s, updated_at=%s WHERE run_id=%s',
+                (json.dumps(consumed, ensure_ascii=False), now(), run_id))
+            return consumed[key]
 
     async def mark_inputs_applied(self, conn, run_id: str, *, intent_version: int,
                                   plan_version: int) -> int:
@@ -1704,10 +1897,17 @@ class PostgresStore:
                      json.dumps(receipt, ensure_ascii=False, default=str)
                      if receipt else None,
                      run_id, int(plan_version), step_id))
+            # 结果水位与结果同事务推进：判断"决策覆盖到哪一步"只能看它，
+            # 用墙钟时间会在跨进程时给出错误的新旧关系（文档 §9）。
+            water = await self._one(
+                conn, 'UPDATE runs SET observation_seq=COALESCE(observation_seq,0)+1 '
+                'WHERE run_id=%s RETURNING observation_seq', (run_id,))
             if state is not None:
                 await self.save_snapshot(run_id, plan_version=plan_version, state=state,
-                                         next_step_id=next_step_id, conn=conn)
-            return {'action_id': action_id, 'status': status}
+                                         next_step_id=next_step_id, conn=conn,
+                                         observation_seq=int((water or {}).get('observation_seq') or 0))
+            return {'action_id': action_id, 'status': status,
+                    'observation_seq': int((water or {}).get('observation_seq') or 0)}
 
     async def finish_run_owned(self, context, *, run_id: str, status: str,
                                error: str | None = None,
@@ -1715,6 +1915,8 @@ class PostgresStore:
                                expected_intent_version: int | None = None,
                                plan_version: int | None = None,
                                compensated_at: str | None = None,
+                               observation_seq: int | None = None,
+                               next_route: str = '',
                                require_no_pending_inputs: bool = False) -> bool:
         """带租约与**要求版本**条件地写 run 终态。返回 False = 已失去执行权(不写)。
 
@@ -1764,7 +1966,8 @@ class PostgresStore:
                                      or (context.plan_version if context else 1)),
                     state=state, conn=conn, intent_version=current_intent,
                     processed_intent_version=int(
-                        row.get('processed_intent_version') or 0))
+                        row.get('processed_intent_version') or 0),
+                    observation_seq=observation_seq, next_route=next_route)
             return True
 
     async def pause_at_boundary(self, context, *, run_id: str, plan_version: int,
@@ -2117,6 +2320,22 @@ class PostgresStore:
     @property
     def path(self) -> str:
         return self.dsn
+
+
+class DecisionBudgetExceeded(RuntimeError):
+    """自主决策预算用尽：保存已完成事实，等人显式继续（不是失败）。"""
+
+    def __init__(self, message: str = '决策预算用尽') -> None:
+        super().__init__(message)
+        self.safe_message = message
+
+
+class BudgetExceeded(RuntimeError):
+    """运行级预算（provider 请求数 / 工具调用数 …）用尽。"""
+
+    def __init__(self, message: str = '运行预算用尽') -> None:
+        super().__init__(message)
+        self.safe_message = message
 
 
 def _decode_run(row: dict) -> dict:

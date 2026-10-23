@@ -82,6 +82,25 @@ class Settings:
     # 修订时随提示词带给模型的工具清单条数上限（工具很多时不必全塞进去）。
     revision_catalog_limit: int = max(4, int(
         os.getenv('REVISION_CATALOG_LIMIT', '24')))
+    # ---------- 结果观察与自主决策（docs/harness-observe-decide-implementation-plan.md） ----------
+    # 功能开关：关掉时观察节点只做程序事实采集，不调用模型（等价于"按计划跑完"）。
+    observe_enabled: bool = (
+        os.getenv('OBSERVE_ENABLED', 'true').strip().lower() == 'true')
+    # 一次运行最多做几次自主决策（模型判断下一步）。与用户补充修订**共享**运行预算，
+    # 但分开计数：观察烧的是"想", 修订烧的是"改主意"，两者不能互相顶账。
+    run_max_decisions: int = max(1, int(os.getenv('RUN_MAX_DECISIONS', '8')))
+    # 有限修复次数：只对"确认未执行"的本地错误开放，避免把写失败也变成自动重试。
+    run_max_repairs: int = max(0, int(os.getenv('RUN_MAX_REPAIRS', '2')))
+    # 运行级 provider 请求上限：初始规划、观察决策、用户修订、结构化修复、最终回答
+    # 全部计入（`structured_call` 的内部重试也算一次真实请求）。
+    run_max_provider_requests: int = max(4, int(
+        os.getenv('RUN_MAX_PROVIDER_REQUESTS', '24')))
+    # 工具调用次数上限（含查询）。外部写操作另有账本与授权，不靠这个数管。
+    run_max_tool_calls: int = max(4, int(
+        os.getenv('RUN_MAX_TOOL_CALLS', '40')))
+    # 连续"没有新进展"的容忍次数：相同指纹重复出现就停，而不是继续烧预算。
+    run_max_no_progress: int = max(1, int(
+        os.getenv('RUN_MAX_NO_PROGRESS', '2')))
 
     # ---------- 身份（app/auth.py / app/ticket_auth.py） ----------
     # off      = 不介入，保持单用户行为（默认，本地开发与既有测试不受影响）

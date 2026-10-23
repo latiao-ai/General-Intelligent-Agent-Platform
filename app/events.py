@@ -15,6 +15,10 @@ STAGE_LABELS = {
     'persist_plan': '保存计划',
     'revise_plan': '按新要求调整',
     'finalize': '收尾检查',
+    'observe_result': '观察结果',
+    'decide_next': '决定下一步',
+    'wait_async': '等待外部任务',
+    'verify_completion': '核对完成条件',
     'run_step': '执行步骤',
     # 工具（与 app/tools.py 的 Tool.label 对应）
     'web_search': '检索来源',

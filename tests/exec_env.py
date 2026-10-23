@@ -12,6 +12,7 @@
 """
 import asyncio
 import os
+import sys
 
 from contextlib import ExitStack
 from pathlib import Path
@@ -22,7 +23,7 @@ PG_DSN = os.getenv('PG_TEST_DSN', '')
 
 TEST_TABLES = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
                'action_attempts', 'actions', 'steps', 'plans', 'run_snapshots',
-               'run_inputs', 'run_input_processing',
+               'run_inputs', 'run_input_processing', 'run_decisions',
                'runs', 'tasks_meta', 'events', 'tasks', 'session_memory',
                'session_summaries', 'messages', 'sessions', 'request_keys')
 
@@ -177,3 +178,31 @@ def one_step_plan(tool: str = 'deploy', tool_key: str = '',
     if effect:
         step['effect'] = effect
     return [step]
+
+
+def override_settings(**changes):
+    """临时改配置，**对所有直接 import 了 settings 的模块都生效**。
+
+    踩过的坑：`from app.config import settings` 在模块里是持有引用的，只
+    `patch('app.config.settings')` 对它们完全没用——测试会"改了个寂寞"，
+    然后拿着默认值跑出个看似合理的错误结论。
+    """
+    from dataclasses import replace
+    from unittest.mock import patch
+    from app.config import settings as real_settings
+
+    fake = replace(real_settings, **changes)
+    modules = ('app.api', 'app.api_hub', 'app.main', 'app.nodes', 'app.services',
+               'app.tools', 'app.context', 'app.memory', 'app.capabilities.base',
+               'app.capabilities.web', 'app.capabilities.export',
+               'app.capabilities.answers', 'app.capabilities.publishing',
+               'app.sources', 'app.auth', 'app.policies', 'app.files',
+               'app.observation', 'app.run_inputs', 'app.integrations.mcp_servers',
+               'app.integrations.mcp_adapter', 'app.profile', 'app.idempotency')
+    stack = ExitStack()
+    stack.enter_context(patch('app.config.settings', fake))
+    for name in modules:
+        module = sys.modules.get(name)
+        if module is not None and hasattr(module, 'settings'):
+            stack.enter_context(patch.object(module, 'settings', fake))
+    return stack

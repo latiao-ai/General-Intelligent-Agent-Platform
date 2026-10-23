@@ -1,6 +1,7 @@
 import asyncio
 import re
 import json
+from contextvars import ContextVar
 import time
 import ipaddress
 from urllib.parse import urlsplit, urlunsplit
@@ -184,6 +185,29 @@ class AttemptTimeout(RuntimeError):
         self.safe_message = f'模型单次尝试超时，上限 {seconds:.0f}s'
 
 
+# ---------- provider 请求计数（文档 observe-decide §12） ----------
+# 为什么放在这一层：`structured_call` 内部有"解析失败就重试"的逻辑，
+# 一次调用可能是两次真实请求。只在业务层计数必然漏掉重试，于是"预算"形同虚设。
+# 钩子是协程，由执行入口（Hub._run）绑定到当前运行的预算上。
+_budget_hook: ContextVar = ContextVar('llm_budget_hook', default=None)
+
+
+def bind_budget(hook):
+    """绑定一个"每次真实请求前调用一次"的协程钩子。"""
+    return _budget_hook.set(hook)
+
+
+def unbind_budget(token) -> None:
+    _budget_hook.reset(token)
+
+
+async def _note_provider_request() -> None:
+    hook = _budget_hook.get()
+    if hook is None:
+        return
+    await hook()
+
+
 async def structured_call(
     schema, system: str, user: str, model: str | None = None, attempts: int = 2,
     disable_thinking: bool = False, on_draft=None, draft_interval: float = 1.0,
@@ -210,6 +234,8 @@ async def structured_call(
     usages = []
     messages = [('system', system), ('human', user)]
     for _ in range(max(1, attempts)):
+        # 每次真实请求都先记账：超时/失败也算消耗，否则预算永远算不准
+        await _note_provider_request()
         if on_draft:
             on_draft(None)
         llm = new_llm(model, disable_thinking=disable_thinking).bind_tools(

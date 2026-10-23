@@ -1,4 +1,4 @@
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 
@@ -32,6 +32,41 @@ class PlanStep(BaseModel):
     compensate: dict | None = None
 
 
+class CompletionCriterion(BaseModel):
+    """一条"任务算不算做完"的可验证条件（文档 observe-decide §3.2、§11）。
+
+    分成两类，永远不要混：
+    - **程序可核对**（`artifact_exists` / `file_written` / `deployment_receipt` /
+      `answer_present` / `tool_succeeded`）：证据来自真实回执与文件系统；
+    - **需要模型评价**（`content_quality` / `semantic_match` / …）：程序只标
+      "未检查"，不允许因为文件存在就宣称合格。
+
+    模型可以"提出"条件，但**核对**由执行器的验证器做，模型自述不算证据。
+    """
+    kind: str = Field(min_length=1)
+    target: str = ''
+    detail: str = ''
+    # 明确标注"必须看内容才能判断"的条件，程序不会替它下结论
+    requires_model: bool = False
+
+
+class SegmentStrategy(BaseModel):
+    """片段策略：一个执行片段结束时该做什么（文档 observe-decide §3.2）。
+
+    首版只支持两种，且**由候选计划自己声明**——执行器不靠工具名关键词猜。
+    """
+    after_segment: str = 'verify'          # observe / verify
+    observation_goal: str = ''             # after_segment=observe 时必填
+
+    def model_post_init(self, __context) -> None:      # noqa: D105
+        if self.after_segment not in ('observe', 'verify'):
+            raise ValueError('after_segment 只能是 observe 或 verify')
+        if self.after_segment == 'observe' and not self.observation_goal.strip():
+            raise ValueError('声明 observe 时必须写清 observation_goal')
+        if self.after_segment == 'verify':
+            self.observation_goal = ''
+
+
 class ExecutionPlan(BaseModel):
     """规划器输出：按顺序执行的步骤序列。
 
@@ -40,6 +75,12 @@ class ExecutionPlan(BaseModel):
     """
     steps: list[PlanStep] = Field(min_length=1, max_length=8)
     summary: str = ''
+    # 片段策略（文档 observe-decide §3.2）：默认 verify = 直接执行到底；
+    # observe = 这一小段跑完先让系统看结果再决定下面做什么。
+    # 首次计划可以只包含"能确定的事"，把依赖未知结果的步骤留给观察之后。
+    after_segment: str = 'verify'
+    observation_goal: str = ''
+    completion_criteria: list[CompletionCriterion] = Field(default_factory=list)
     # 本轮用户透露的个人信息，没有就留空。与旧版解析阶段的行为保持一致。
     profile_updates: dict[str, str] = Field(default_factory=dict)
 
@@ -56,6 +97,56 @@ class RevisedPlan(BaseModel):
     superseded: list[str] = Field(default_factory=list)
     # 需要用户先澄清的问题；非空表示这一轮不产生可执行计划
     questions: list[str] = Field(default_factory=list)
+    # 与 ExecutionPlan 相同：新片段要不要在结束时观察
+    after_segment: str = 'verify'
+    observation_goal: str = ''
+    completion_criteria: list[CompletionCriterion] = Field(default_factory=list)
+
+
+class ObservationDecision(BaseModel):
+    """观察之后模型能做的**唯一**几件事（文档 observe-decide §5）。
+
+    用判别字段 `kind` + 逐分支必备字段，而不是自由文本"反思"：
+    自由文本没法校验、没法记账、也没法保证"模型没读到的东西不算看过"。
+    """
+    kind: str = Field(min_length=1)     # continue/revise/wait_input/wait_approval/finish/stop
+    reason: str = ''                    # 简短依据（不索取隐藏推理）
+    # revise：接下来这一段要执行的步骤（非空）、作废范围、片段策略
+    steps: list[PlanStep] = Field(default_factory=list, max_length=8)
+    superseded: list[str] = Field(default_factory=list)
+    after_segment: str = 'verify'
+    observation_goal: str = ''
+    # wait_input：需要用户补什么
+    questions: list[str] = Field(default_factory=list)
+    # wait_approval：要批准的动作与范围
+    approval_scope: str = ''
+    # finish：逐条完成条件 + 证据引用
+    criteria_evidence: dict[str, str] = Field(default_factory=dict)
+    # stop：具体原因
+    stop_reason: str = ''
+    completion_criteria: list[CompletionCriterion] = Field(default_factory=list)
+
+    DECISIONS: ClassVar[tuple[str, ...]] = (
+        'continue', 'revise', 'wait_input', 'wait_approval', 'finish', 'stop')
+
+    def model_post_init(self, __context) -> None:      # noqa: D105
+        kind = (self.kind or '').strip()
+        if kind not in self.DECISIONS:
+            raise ValueError(f'未知决策 {kind!r}：只能是 {", ".join(self.DECISIONS)}')
+        if kind == 'revise':
+            if not self.steps:
+                # 空 continue / 空 revise 都属于"无效决策"：不能靠提交空计划表示结束
+                raise ValueError('revise 必须给出至少一个要执行的步骤')
+            if self.after_segment not in ('observe', 'verify'):
+                raise ValueError('after_segment 只能是 observe 或 verify')
+            if self.after_segment == 'observe' and not self.observation_goal.strip():
+                raise ValueError('after_segment=observe 时必须写 observation_goal')
+        if kind == 'wait_input' and not [q for q in self.questions if q.strip()]:
+            raise ValueError('wait_input 必须说明需要用户补充什么')
+        if kind == 'wait_approval' and not self.approval_scope.strip():
+            raise ValueError('wait_approval 必须说明要批准的动作与范围')
+        if kind == 'stop' and not self.stop_reason.strip():
+            raise ValueError('stop 必须给出具体原因')
 
 
 class SessionMemory(BaseModel):
@@ -124,6 +215,35 @@ class AgentState(TypedDict, total=False):
     entry_route: str
     # 修订计划时给校验器的"受信历史输出"（已成功步骤 + 其 step_id）
     trusted_outputs: dict
+    # ---------- 结果观察与决策（文档 harness-observe-decide） ----------
+    # 每次工具调用归一后的结果（含完整结果引用与有界摘要）
+    tool_results: list[dict]
+    # 程序观察到的信号与它选出的路由（程序判断，不调模型）
+    observation: dict
+    next_route: str
+    # 结果水位：每次结果落库在同事务 +1，用来判断"决策覆盖到哪一步"
+    observation_seq: int
+    # 当前决策记录（持久在 run_decisions；state 里只留 id 与版本）
+    decision_id: str
+    decision_kind: str
+    # 这次决策的触发原因：observation（结果观察）/ recovery_repair（有限修复）
+    decision_reason: str
+    # 模型提出的完成条件与证据（仍需程序核对）
+    criteria_proposed: list[dict]
+    criteria_evidence: dict
+    # 观察时用到的动作快照（由 observe_result 从库里读，不靠状态猜）
+    actions_snapshot: list[dict]
+    # 本任务的产物目录（结果的完整 JSON 与产物文件都在它下面）
+    artifact_dir: str
+    # 完成条件的核对现状
+    criteria_state: dict
+    # 同类决策/修订的计数：user_input / observation / recovery_repair 分开记
+    revision_reasons: dict
+    # 连续无进展的次数（相同指纹重复出现就停）
+    no_progress: int
+    no_progress_limit: int
+    # 无进展检测：最近几次"查询+结果"签名
+    progress_seen: list[str]
     # 各节点耗时，由执行器写入（见 app/main.py）。
     timings: list[dict]
     elapsed_seconds: float

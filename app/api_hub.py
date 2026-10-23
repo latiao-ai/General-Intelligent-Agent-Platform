@@ -29,6 +29,7 @@ from app import ledger as ledger_module
 from app import memory as memory_module
 from app import outcome as outcome_module
 from app import policies
+from app import services
 from app import run_inputs as run_inputs_module
 from app import profile as profile_module
 from app.capabilities import publishing as publishing_capability
@@ -447,7 +448,8 @@ class Hub:
         # 所有步骤都已结算、但 run 没来得及收尾（进程在"最后一次结算"与
         # "写终态"之间消失）：这里只剩收尾，**不能**再跑一遍图——图拿不到
         # 上一次的 step_outputs，只会得出"什么都没有产出"（文档 §5.4）。
-        if resume_plan and resume_plan['step_index'] >= len(resume_plan['steps']):
+        if resume_plan and resume_plan['step_index'] >= len(resume_plan['steps']) \
+                and not self._needs_observation():
             snapshot = await self._recovery_state(run_id)
             if not snapshot.get('step_outputs'):
                 # 没有快照（旧数据，或崩溃在"结算已提交但快照没写全"）：
@@ -487,6 +489,18 @@ class Hub:
             state['step_outputs'] = outputs
             state['step_index'] = len(steps)
         return state
+
+    @staticmethod
+    def _needs_observation() -> bool:
+        """所有步骤都结算完之后，还要不要过观察/核对？
+
+        **计划步骤跑完不等于任务完成**（文档 observe-decide §2 第 5 条）：
+        片段可能声明了 observe，也可能还有没核对的完成条件。所以只要观察能力
+        开着，就一律让图跑完 `observe_result → verify_completion`，不按快照
+        直接收尾；只有观察关闭时才走"看快照收尾"的老捷径。
+        """
+        from app.config import settings as cfg
+        return bool(getattr(cfg, 'observe_enabled', True))
 
     async def _finish_recovered(self, record: TaskRecord, state: dict,
                                 context) -> TaskRecord:
@@ -650,6 +664,18 @@ class Hub:
                                           context=context)
         context_token = execution_control.bind(context)
 
+        async def bill_provider_request() -> None:
+            """每次真实的模型请求前扣一次预算（重试也算）。
+
+            预算落在 `runs.consumed_json` 而不是内存里的 state.usage：
+            进程重启后要接着累计，否则"重启就重置预算"等于没有预算。
+            """
+            await self.store.consume_budget(
+                context, run_id=record.run_id, key='provider_requests',
+                limit=settings.run_max_provider_requests)
+
+        budget_token = services.bind_budget(bill_provider_request)
+
         async def execute_round(plan_hint: dict | None) -> dict:
             """跑一轮图。要求版本变化时会被调用多次（**不是**重试同一个计划）。"""
             return await run_task(
@@ -755,7 +781,8 @@ class Hub:
             await close_open_stage('已失败')
             # 堆栈进服务端日志：状态里只留类型与一句安全文案
             logger.exception('run %s 执行异常', record.run_id)
-            record.error = f'{type(exc).__name__}: {exc}'
+            hint = getattr(exc, 'safe_message', '') or ''
+            record.error = f'{type(exc).__name__}: {hint or exc}'
             record.status = 'failed'
             await self.store.finish_run_owned(context, run_id=record.run_id,
                                              status='failed', error=record.error)
@@ -765,6 +792,7 @@ class Hub:
         else:
             pass
         finally:
+            services.unbind_budget(budget_token)
             execution_control.unbind(context_token)
             profile_module.reset(profile_token)
             if guard is not None:
@@ -938,6 +966,8 @@ class Hub:
                 await self.store.finish_run_owned(
                     context, run_id=record.run_id, status=run_status,
                     error=fields.get('error'), state=state,
+                    observation_seq=int(state.get('observation_seq') or 0),
+                    next_route=str(state.get('next_route') or ''),
                     expected_intent_version=expected_intent_version,
                     plan_version=fields['plan_version'],
                     compensated_at=fields.get('compensated_at'),
