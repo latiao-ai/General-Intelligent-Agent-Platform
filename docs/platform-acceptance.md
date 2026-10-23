@@ -159,13 +159,55 @@
 - **暂停的响应时延没有 SLO**：执行者只在"下一步准入前"检查暂停，一个很长的工具
   调用期间不会被打断（这是有意的：中途打断会留下结果未定的写操作）。
 
+## 运行中补充输入（`harness-live-input-implementation-plan.md`）
+
+用户在三件事之间做的选择现在有了明确入口：**新目标**=`POST /api/tasks`，
+**给当前任务补充**=`POST /api/runs/{id}/inputs`，**暂停/取消**=既有控制入口。
+首版不靠模型或关键词自动判断"这是补充还是新任务"：任务在跑时默认按补充处理，
+要另开一轮必须显式点「新任务」。
+
+| 机制 | 落点 | 验证 |
+|---|---|---|
+| 区分补充与新任务 | `Hub.append_run_input`（**不**进 `Hub.start`、不建 task/run）+ `POST/GET /api/runs/{id}/inputs` | `test_accepting_an_input_raises_the_intent_version_once`、`RunInputApiTests`（202/409/404/422/429、功能开关） |
+| 补充先持久化 | 一次事务：`run_inputs` 日志 + `intent_version += 1` + `run_input_processing(accepted)` + `input_received` 事件（`_append_event_in_tx` 复用序号锁规则） | `test_sequences_follow_commit_order`、`test_same_request_id_is_replayed_not_counted_twice`、`test_concurrent_retries_of_one_request_grow_the_version_once` |
+| 旧要求的新动作不准入 | `admit_action(expected_intent_version=)` 与计划提交的 CAS，失败抛 `IntentChanged`（**不是** ToolError、不触发补偿） | `test_admission_rejects_a_stale_intent_version`、`test_input_committed_before_admission_means_zero_remote_calls` |
+| 已发生的效果不丢账 | 结算只校验租约等执行条件；动作记 `decision_intent_version` | `test_settlement_still_records_a_real_effect` |
+| 受控修订闭环 | 图变成 `intake → plan/revise_plan → persist_plan → run_step ↺ → finalize`；`revise_plan` 只重写剩余步骤，旧步骤标 `superseded`，新步骤 ID 形如 `p2_s1` | `test_revision_rejects_rewriting_executed_steps`、`test_input_while_paused_does_not_resume_automatically` |
+| 收尾门禁 | `finish_run_owned(expected_intent_version, require_no_pending_inputs)`；拒绝时 `_run` 回到消费循环 | `test_finish_gate_refuses_while_an_input_is_unprocessed` |
+
+三个版本必须分开，且各自有独立测试：`lease_epoch`（谁有权推进）、`intent_version`
+（要求更新到哪一版）、`plan_version`（当前采用哪份计划）。修订预算按**已提交的计划
+版本**累计（`revision_count = plan_version - 1`），超限进 `waiting_input` 而不是
+无限重规划。
+
+**实机验证（2026-10-23，真实 HTTP + 真实模型 + 真实 PostgreSQL）**：
+
+| 动作 | 实机结果 |
+|---|---|
+| 任务运行中 `POST /api/runs/{id}/inputs` | 202，`intent_version` 1→2，`input_seq=1`；**task/run 不变**、没有 `cancel_requested_at` |
+| 收尾前的那一轮 | 计划 v1 的 `s1` 已成功、`s2/s3` 标 `superseded`（未派发）；计划 v2 以 `base_plan_version=1, intent_version=2` 提交，新步骤 `p2_s1…p2_s3`；输入投影变 `applied(processed_plan_version=2)` |
+| 修订后继续执行 | 该轮因模型挑了一个不在用户输入里的 URL 而失败（`fetch_pages` 的既有约束），失败原因如实写进 `runs.error`——不是"假装成功" |
+| 补充内容不够明确时 | 修订节点输出澄清问题 → run 落 `waiting_input`，事件 `input_needs_clarification`，而不是瞎猜着执行 |
+
+未覆盖 / 有意留白的部分：
+
+- **跨副本即时通知未实现**：接受事务提交后，其它进程里的执行者在自己的下一个边界
+  读到新版本（最终一致）。正确性不依赖通知，但"已收到"到"已调整"的延迟不受控。
+- **没有做"补充与最终结算真并发"的子进程级矩阵**：竞争窗口用"库里已提交的行 +
+  同一条行锁"验证（`test_finish_gate_refuses_while_an_input_is_unprocessed`），
+  没有反复 kill 的模糊测试。
+- **修订不改总预算**：`task_timeout` 是整轮的上限，不会因为修订重置；但也没有
+  "每次修订单独限额"的细粒度计费。
+- **流式回答的版本分段是界面级的**：旧回答打"调整前的输出"标记，不重写历史消息；
+  没有做"按决策分段回放"的存储格式。
+
 ## 测试
 
 ```bash
 # PG_TEST_DSN 必须指向一次性测试库（库名含 test），用例会 TRUNCATE 全部业务表
 PG_TEST_DSN=postgresql://…/agent_platform_test \
   python -W error::RuntimeWarning -m unittest discover -s tests -v
-# 实测：Ran 336 tests, OK（22 秒）
+# 实测：Ran 366 tests, OK（21 秒）
 ```
 
 `-W error::RuntimeWarning` 是刻意的：漏 `await` 不会报错，只会静默失效（把协程

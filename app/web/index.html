@@ -42,6 +42,8 @@ h1{font-size:20px;margin:0 0 4px}
 .msg.user .bubble{background:var(--user)}
 .msg.assistant .bubble{background:var(--card);border:1px solid var(--line)}
 .msg.assistant .bubble a{color:var(--accent);word-break:break-all}
+.input-note{margin-top:6px;font-size:12px}
+#spawn{margin-left:6px}
 #process .row{display:flex;gap:8px;align-items:flex-start;padding:3px 0;
                overflow-wrap:anywhere}
 #process .ico{flex:0 0 18px;text-align:center}
@@ -147,6 +149,7 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
 
     <div class="bar"><div class="inner">
       <textarea id="msg" placeholder="直接说你要什么，例如：整理 SQLite 的适用场景和限制，生成中文报告并部署到服务器（Enter 发送，Shift+Enter 换行）"></textarea>
+      <button id="spawn" class="ghost" title="结束当前任务，用这句话另开一轮">新任务</button>
       <button id="send">发送</button>
     </div></div>
   </main>
@@ -196,9 +199,14 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
 </div>
 
 <script>
-const S = { sessionId: null, taskId: null, es: null,
+const S = { sessionId: null, taskId: null, runId: null, es: null,
             running: false, status: null, stages: [], stageSeq: 0, skew: 0,
-            turn: 0, streamBubble: null, sessions: [], lastEventAt: 0 };
+            turn: 0, streamBubble: null, sessions: [], lastEventAt: 0,
+            // 正在跑的这条 run 的补充要求：requestId → {text, status, inputSeq}
+            // 同一个 requestId 会在重试时复用，服务端据此保证"只有一条输入"。
+            inputs: new Map(),
+            // 本轮最新一次回答的版本；旧版本的回答只作为过程记录保留
+            answerIntent: 0, answerPlan: 0 };
 
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
@@ -280,6 +288,10 @@ async function openSession(id) {
     renderHistory((data.turns || []).filter(t => t.task_id !== liveTask));
     if (liveTask) {
       S.taskId = liveTask;
+      // 正在跑的那一轮也要拿到 run_id：否则切回来之后再发一句，前端不知道
+      // 该往哪条 run 上补要求，只能新建任务（用户会看到"任务被打断"）
+      S.runId = data.live_run_id || null;
+      S.inputs.clear();
       setRunning(true);
       startNewTurn();              // 先建好这一轮的容器，补发的事件才有地方落
       openStream(liveTask);        // 重新接上：先补发历史事件，再继续实时
@@ -692,15 +704,154 @@ async function postTask(text, key) {
   }
 }
 
+// 给**当前任务**补一句要求（文档 harness-live-input §3 第三步）。
+// 关键：不打断、不新建任务、不换 EventSource——原任务继续跑，只是下个边界改计划。
+// requestId 会跟着这一条消息走到最后：网络失败重试时必须复用同一个 ID，
+// 否则服务端会当成两条不同的补充、把要求版本推高两版。
+async function postRunInput(text, requestId) {
+  const options = {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({request_id: requestId, message: text,
+                          task_id: S.taskId, run_id: S.runId}),
+  };
+  const url = `${API_PREFIX}/runs/${S.runId}/inputs`;
+  try {
+    return await checkAuth(await fetch(url, options));
+  } catch (err) {
+    // 网络层失败：请求可能已经到了服务端，用同一个 requestId 再试一次
+    return await fetch(url, options);
+  }
+}
+
+function setInputStatus(requestId, status, detail) {
+  const item = S.inputs.get(requestId);
+  if (!item) return;
+  item.status = status;
+  if (detail) item.detail = detail;
+  renderInputNote(requestId);
+}
+
+// 每条补充下面挂一行状态：已收到 / 已纳入 / 接收待确认。
+// 「已收到」只是数据库提交，「已按新要求调整」才代表计划纳入了它。
+function renderInputNote(requestId) {
+  const item = S.inputs.get(requestId);
+  const el = item && item.el;
+  if (!el) return;
+  const text = {
+    sent: '⏳ 正在提交…',
+    accepted: '📝 已收到，执行到边界时按新要求调整',
+    applied: '✅ 已按新要求调整计划',
+    uncertain: '⚠️ 接收待确认（网络异常，重发会用同一条记录）',
+    finished: '任务已结束，这条没有生效',
+    failed: '提交失败',
+  }[item.status] || '';
+  el.textContent = item.detail || text;
+}
+
+async function sendRunInput(text, requestId) {
+  const existing = S.inputs.get(requestId);
+  if (existing && ['accepted', 'applied'].includes(existing.status)) return true;
+  if (existing) { existing.status = 'sent'; renderInputNote(requestId); }
+  let res;
+  try {
+    res = await postRunInput(text, requestId);
+  } catch (err) {
+    setInputStatus(requestId, 'uncertain', '⚠️ 接收待确认：' + err.message);
+    return false;
+  }
+  let data = {};
+  try { data = await res.json(); } catch { data = {}; }
+  if (res.status === 202 || res.ok) {
+    if (data.input_seq) {
+      const item = S.inputs.get(requestId);
+      if (item) item.inputSeq = data.input_seq;
+    }
+    setInputStatus(requestId, 'accepted');
+    NudgeInputVersions(data.intent_version);
+    return true;
+  }
+  const detail = data.detail || ('HTTP ' + res.status);
+  if (res.status === 409) {
+    // 任务已经结束：这是唯一需要提示"要不要另开一轮"的情况，且**不自动**开
+    setInputStatus(requestId, 'finished', '任务已结束：' + detail);
+    addMessage('assistant',
+      '这条补充没生效：上一轮任务已经结束。要接着改的话，点「新任务」另开一轮，' +
+      '我会带上刚才那句。');
+    return false;
+  }
+  setInputStatus(requestId, 'failed', '提交失败：' + detail);
+  return false;
+}
+
+// 补一条"补充要求"气泡：它属于当前这一轮，不新起一轮。
+function addInputBubble(text) {
+  const requestId = newIdempotencyKey();
+  const el = document.createElement('div');
+  el.className = 'msg user';
+  el.innerHTML = `<div class="bubble">${esc(text)}<div class="input-note hint"></div></div>`;
+  $('messages').appendChild(el);
+  const note = el.querySelector('.input-note');
+  S.inputs.set(requestId, {text, status: 'sent', el: note});
+  return requestId;
+}
+
+function NudgeInputVersions(intentVersion) {
+  if (!intentVersion) return;
+  S.answerIntent = Math.max(S.answerIntent || 0, 0);
+  const title = $('processTitle');
+  if (title && S.running) {
+    title.textContent = `智能体执行过程（按新要求调整中 · 要求版本 ${intentVersion}）`;
+  }
+}
+
 async function send() {
   const text = $('msg').value.trim();
   if (!text) return;
   $('msg').value = '';
-  if (S.running) await interrupt();
+  // 任务在跑：默认把这句话当作**补充要求**；用户要点「新任务」才另开一轮。
+  if (S.running && S.runId) {
+    const requestId = addInputBubble(text);
+    $('send').disabled = true;
+    try {
+      const ok = await sendRunInput(text, requestId);
+      if (!ok) $('msg').value = text;      // 没提交成功就把草稿还回去
+    } finally {
+      $('send').disabled = false;
+      $('msg').focus();
+    }
+    return;
+  }
+  await startNewTask(text);
+}
+
+// 明确的"另开一轮"：按设计稿，首版是**新建独立会话**再建任务——
+// 原任务不被隐式取消，历史也不混进新目标（`docs/conversation-task-input-design.md`）。
+// 想沿用同一会话的上下文，就别点这个按钮，直接发（那是"补充"）。
+async function spawnNewTask() {
+  const text = $('msg').value.trim() || '继续';
+  $('msg').value = '';
+  detachStream();                 // 只解绑事件流：原任务在服务端继续跑
+  clearAll();
+  setRunning(false);
+  S.sessionId = null;
+  S.taskId = null;
+  S.runId = null;
+  S.status = null;
+  S.inputs.clear();
+  renderSessionList();
+  await startNewTask(text);       // sessionId=null → 服务端新建会话
+}
+
+async function startNewTask(text) {
   addMessage('user', text);
   startNewTurn();
   setRunning(true);
   $('send').disabled = true;
+  S.runId = null;
+  S.inputs.clear();
+  S.answerIntent = 0;
+  S.answerPlan = 0;
   const idempotencyKey = newIdempotencyKey();
   try {
     const res = await postTask(text, idempotencyKey);
@@ -708,6 +859,7 @@ async function send() {
     const data = await res.json();
     S.sessionId = data.session_id;
     S.taskId = data.task_id;
+    S.runId = data.run_id || null;      // 补充要求必须打到**这一条 run** 上
     S.status = null;
     loadSessions();            // 新会话或活跃时间变了，刷新侧边栏
     openStream(S.taskId);
@@ -716,6 +868,43 @@ async function send() {
     setRunning(false);
   } finally {
     $('send').disabled = false;
+  }
+}
+
+// 补充要求相关的三类事件（文档 §6）。它们不改任务身份，只改变"接下来做什么"。
+function onIntentEvent(ev) {
+  if (ev.input_received) {
+    // 服务端已落库：把对应的那条气泡标成"已收到"
+    for (const [requestId, item] of S.inputs.entries()) {
+      if (item.status === 'sent') { setInputStatus(requestId, 'accepted'); break; }
+    }
+    return;
+  }
+  if (ev.plan_revised) {
+    // 计划已纳入新要求：旧回答只作为过程记录，别让用户以为它就是最终答复
+    markStaleAnswer();
+    for (const [requestId, item] of S.inputs.entries()) {
+      if (item.status === 'accepted') { setInputStatus(requestId, 'applied'); }
+    }
+    return;
+  }
+  if (ev.input_needs_clarification) {
+    addMessage('assistant',
+      '这条要求我还需要一点信息才能接着做：' + (ev.detail || '请补充具体要求。'));
+  }
+}
+
+// 旧版本的回答不能被当成最终答复，但也不能假装没出现过：
+// 给它打一个"调整前"的标记，后续新回答另起一条。
+function markStaleAnswer() {
+  const bubbles = document.querySelectorAll('#messages .msg.assistant .bubble');
+  for (const bubble of bubbles) {
+    if (bubble.dataset.stale) continue;
+    bubble.dataset.stale = '1';
+    const tag = document.createElement('div');
+    tag.className = 'hint';
+    tag.textContent = '（以上是调整前的输出，已按新要求继续）';
+    bubble.appendChild(tag);
   }
 }
 
@@ -732,8 +921,16 @@ function openStream(taskId) {
     if (ev.type === 'answer_delta') { onAnswerDelta(ev); return; }
     if (ev.type === 'stage_start') { onStageStart(ev); return; }
     if (ev.type === 'stage_end') { onStageEnd(ev); return; }
+    if (ev.input_received || ev.plan_revised || ev.input_needs_clarification) {
+      onIntentEvent(ev); return;
+    }
     if (ev.type === 'result') { showDeployed(ev.public_url, ev.deployment_id); return; }
     if (ev.type === 'status') {
+      if (ev.intent_version) {
+        if (S.answerIntent && ev.intent_version > S.answerIntent) markStaleAnswer();
+        S.answerIntent = ev.intent_version;
+        S.answerPlan = ev.plan_version || S.answerPlan;
+      }
       if (ev.detail) {
         if (S.streamBubble) {
           // 流式时是纯文本（追加成本低），定稿再重绘一次，把来源变成可点链接
@@ -947,6 +1144,7 @@ document.addEventListener('keydown', e => {
 });
 
 $('send').onclick = send;
+$('spawn').onclick = spawnNewTask;
 $('newSession').onclick = newSession;
 // Enter 直接发送，Shift+Enter 换行。
 // isComposing 必须判：中文输入法用 Enter 选词时也会触发 keydown，

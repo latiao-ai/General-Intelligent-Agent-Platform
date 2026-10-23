@@ -388,7 +388,7 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
 脚本会逐表搬数据并**校验行数一致**，完成后复位 `messages.id` 的序列。
 本地实测迁移了 21 会话 / 139 消息 / 71 任务 / 1069 事件，行数校验通过。
 
-### 表一览（22 张）
+### 表一览（24 张）
 
 | 分组 | 表 | 内容 |
 |---|---|---|
@@ -396,6 +396,7 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
 | 记忆 | `session_memory` / `session_summaries` | 长会话滚动摘要与关键事实 |
 | 任务 | `tasks` / `tasks_meta` | 任务状态、产物 ID、完整 `state`（含 timings） |
 | 运行 | `runs` / `plans` / `steps` / `run_snapshots` | 每次执行尝试、计划版本、步骤状态、**逐步快照**（恢复的唯一依据） |
+| 补充 | `run_inputs` / `run_input_processing` | **不可变**的补充日志（一人一条、顺序由服务端分配）与可重建的处理投影 |
 | 身份 | `app_users` / `identities` / `auth_sessions` / `ticket_redemptions` | 中台用户、外部身份绑定、登录会话（只存摘要）、一次性票据登记 |
 | 幂等 | `request_keys` | 建任务幂等键（按主体+接口作用域） |
 | 账本 | `actions` / `action_attempts` | 动作身份（幂等键）与每一次真实调用 |
@@ -418,6 +419,47 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
 因此设计是**先落库再投递**：`publish()` 先把事件写入数据库拿到序号，再推给内存订阅者。
 正在跑的客户端拿到零延迟事件；晚连上来的、甚至服务重启后再连的，从库里补发——两者用
 `seq` 去重。
+
+### 运行中补充要求（不打断、不新建任务）
+
+任务跑着的时候再说一句，默认是**给当前任务的补充要求**：同一个 task/run、同一条
+事件流，只是"接下来做什么"变了。要另开一轮，点「新任务」。
+
+```bash
+# 补一句要求（202 = 已落库，不代表已经纳入计划）
+curl -X POST localhost:8010/api/runs/<run_id>/inputs \
+  -H 'Content-Type: application/json' \
+  -d '{"request_id":"6f1c…（客户端生成并保存）","message":"改成竖屏，结尾不要品牌名"}'
+
+# 回读补充与处理状态
+curl localhost:8010/api/runs/<run_id>/inputs?after_seq=0
+```
+
+**三个版本分开存**，混用任何一个都会让"旧要求产生的操作"重新获得资格：
+
+| 版本 | 代表什么 | 什么时候变 |
+|---|---|---|
+| `lease_epoch` | 哪个执行者有权推进 | 领取时 +1 |
+| `intent_version` | 用户要求更新到哪一版 | 接受一条补充时 +1 |
+| `plan_version` | 当前采用哪份计划 | 提交一份计划时 +1 |
+
+一次补充的完整生命周期（都在数据库里，可恢复）：
+
+1. **接受**（一次事务）：插 `run_inputs` 日志 → `intent_version += 1` → 写
+   `run_input_processing(accepted)` → 追加 `input_received` 事件。四件事同生共死。
+   同一个 `request_id` 重试只会返回原记录，**版本不再增长**。
+2. **阻断**：旧计划的下一步在 `admit_action` 里比较版本，不相等就抛
+   `IntentChanged`——这不是失败、不是 tool error、不触发补偿，只是"这一步没派发"。
+   已准入的动作照常结算：真实发生过的效果不能因为用户改主意就丢掉。
+3. **修订**：`revise_plan` 读"原目标 + 按序补充 + 已执行事实 + 在途动作"，
+   只重写**剩余**步骤（新步骤 ID 形如 `p2_s1`，旧计划的未执行步骤标
+   `superseded`），提交时用 `base_plan_version`/`intent_version` 做 CAS。
+4. **收尾门禁**：`finish_run_owned` 在同一个行锁里检查"最新版本已处理 + 没有未处理
+   补充"，否则拒绝结束——绝不出现"已接受但没人管"的悬空输入。
+
+状态文案要分清：`accepted`（已收到）/ `applied`（已纳入计划）/ 业务完成，
+三件事不一样，界面上也分开显示。修订有次数上限（`RUN_MAX_REVISIONS`），
+超限就进入 `waiting_input` 等用户显式继续，不假装已理解。
 
 ### 重启后的恢复
 
@@ -498,6 +540,11 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
   `running` 的只登记 `pause_requested`，由执行者在**下一处准入前**读到并退出。
   准入与暂停在同一行锁上裁决：暂停先提交 → 这一步不获得调用资格；准入在先 →
   只允许该步收尾，后续不再派发。快照随暂停一起提交，续跑从下一步继续。
+- **补充要求不是取消，也不是批准**。它不会撤销已经发生的外部效果（已发布的站点
+  仍然在线），也不会凭空扩大权限：一条"直接发布"的补充拿不到原来的计划里没有的
+  发布工具。要收回副作用走 `POST /api/runs/{id}/compensate`。
+- **跨进程的补充通知是"最终一致"的**：接受事务提交后，其它进程里的执行者在自己的
+  下一个边界读到新版本；进程内会额外发一条事件加速，但**正确性不依赖通知**。
 - **"结果未定"是独立结论**：超时/断流算 `unknown`（可能已经写到远端），业务失败
   算 `failed_confirmed`，连接都没建起来算 `not_executed`。确定性与效果类型一起决定
   要不要拦人：`unknown + 有副作用` 才要求核实，只读调用重发一次没有可重复后果。
@@ -734,7 +781,7 @@ PG_TEST_DSN=postgresql://…/agent_platform_test \
   python -W error::RuntimeWarning -m unittest discover -s tests -v
 ```
 
-**336 条用例，全绿**。项目只支持 PostgreSQL，用例也直接跑真实 PG：
+**366 条用例，全绿**。项目只支持 PostgreSQL，用例也直接跑真实 PG：
 
 | 文件 | 条数 | 覆盖 |
 |---|---|---|
@@ -743,6 +790,7 @@ PG_TEST_DSN=postgresql://…/agent_platform_test \
 | `tests/test_execution_control.py` | 9 | 旧代次四件事全被拒、续租失败停派、暂停三种时序、续跑不重发、取消、工具消失 |
 | `tests/test_execution_recovery.py` | 7 | 计划先于调用提交、提交失败零调用、prepared 重做、unknown 阻断、succeeded 复用、结算失败不推进 |
 | `tests/test_mcp_uncertainty.py` | 6 | 业务失败=failed_confirmed、超时=unknown、连接失败=not_executed、包装后确定性不丢 |
+| `tests/test_run_inputs.py` | 28 | 补充接受/幂等/背压、旧版本动作零准入、计划 CAS、修订校验、收尾门禁、暂停期间补充、HTTP 202/409/404/422 |
 | `tests/test_ticket_auth.py` 等 | 56 | 票据验证、兑换、退出、跨平台隔离 |
 | `tests/test_local_video.py` | 3 | 本地解说视频能力包 |
 
