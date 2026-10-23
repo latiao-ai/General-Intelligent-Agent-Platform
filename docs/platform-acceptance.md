@@ -4,7 +4,9 @@
 
 **图例**：✅ 已实现且验证 ／ ⚠️ 已实现但**本环境无法验证** ／ ⬜ 未做（文档明确后置）
 
-最后更新：随 `1a19e52` 之后的产物登记提交更新。
+最后更新：执行可靠性改造（`docs/harness-reliability-implementation-plan.md`
+阶段 A–E）落地之后。那一轮把 Worker 领取、租约代次、计划先行提交、
+逐步快照恢复、类型化执行确定性与暂停边界全部补齐，并新增 4 个测试文件。
 
 ---
 
@@ -32,16 +34,20 @@
 
 | 文档要求 | 状态 | 实现位置 | 验证方式 |
 |---|---|---|---|
-| 动作账本 + attempt | ✅ | `actions` / `action_attempts`、`app/ledger.py` | `test_succeeded_action_is_replayed_not_resent` |
-| 崩溃窗口一（prepared 未发送） | ✅ | `reconcile_orphan_runs` 只处理 in_flight | `test_reconcile_marks_inflight_actions_unknown`（prepared 保持可重试） |
-| 崩溃窗口二（已发送未回执） | ✅ | `ledger.begin` 返回 blocked | `test_unknown_action_blocks_instead_of_resending` |
-| 崩溃窗口三（已成功未推进） | ✅ | 账本复用回执 | `test_succeeded_action_is_replayed_not_resent` |
-| 暂停 / 取消 / 恢复 | ✅ | `Hub.pause` / `cancel_run` / `resume`、`/api/runs/{id}/*` | 取消落 `cancel_requested_at` 由执行者轮询处置；已结束的运行返回 409 而不是假装成功（`test_cross_process_cancel_writes_a_flag_and_is_honest`） |
+| 动作账本 + attempt | ✅ | `actions` / `action_attempts`、`app/ledger.py`（只有 `admit` / `settle` 两个写操作，各一个事务） | `ActionLedgerTests`（6 条）、`test_plan_is_committed_before_the_first_tool_call` |
+| 崩溃窗口一（prepared 未发送） | ✅ | `store.admit_action` 对已存在的 `prepared` 行**重新准入并新建 attempt** | `test_prepared_action_is_retried_with_the_same_identity`（沿同一 action_id 重做） |
+| 崩溃窗口二（已发送未回执） | ✅ | 账本 `admit` 返回 blocked → 步骤 `unknown`、run `needs_reconcile` | `test_unknown_action_blocks_a_blind_resend`、`test_timeout_is_unknown_and_blocks_a_resend` |
+| 崩溃窗口三（已成功未推进） | ✅ | 账本复用回执；全部步骤已结算时直接用快照/回执收尾，不跑图 | `test_succeeded_action_is_reused_after_a_crash`、`test_succeeded_action_is_replayed_not_resent` |
+| 计划先于执行提交 | ✅ | `main.run_task` 收到 `plan` 节点更新即 `commit_plan`（plan + steps + 初始快照，一个事务） | `test_plan_commit_failure_means_zero_remote_calls`（提交失败 → 远端调用计数为 0） |
+| 逐步快照 | ✅ | `run_snapshots` + `settle_action` 同事务写入（含 `next_step_id`） | `test_commit_failure_after_the_tool_returns_does_not_advance`（结算失败不推进游标） |
+| Worker 单一路径 | ✅ | `Hub.execute_claimed_run` 是唯一执行入口；`scripts/run_worker.run_once` 只负责领取与护栏 | `test_worker_claims_and_executes_a_run_once`（上下文 owner/epoch 是库里的真实值）、`test_worker_has_no_unawaited_coroutines`（`-W error::RuntimeWarning`） |
+| 执行权代次（fencing） | ✅ | `ExecutionContext` + `_owned()` 条件校验，`renew_lease(epoch=)` / `release_lease(epoch=)` / `finish_run_owned` | `test_stale_epoch_cannot_advance_the_run`（准入/结算/终态/续租全被拒）、`test_renewal_failure_stops_before_the_next_step` |
+| 暂停 / 取消 / 恢复 | ✅ | `Hub.pause` 返回 `{ok,status,pause_requested}`；`paused` 是独立终态；`resume` 只接受 `paused/interrupted/queued` 且存在未知动作时拒绝 | `test_pause_committed_before_admission_blocks_the_call`、`test_pause_after_admission_only_finishes_the_current_step`、`test_resume_after_pause_continues_from_the_saved_plan`、`test_resume_refuses_a_finished_run` |
 | 断点续跑沿用已存计划 | ✅ | `plan()` 的 `resume_plan` 分支 + `Hub.resume` 回库 | 重启后仍可续跑，且带历史/上轮产物/记忆（`test_resume_works_after_restart`） |
 | 补偿步骤（§8.4） | ✅ | `PlanStep.compensate` + `nodes._run_compensations` + `POST /api/runs/{id}/compensate` | 失败时逆序撤销已成功的写操作并记账（`test_failure_rolls_back_succeeded_writes_in_reverse`）；撤销失败报 `partially_succeeded`；结果未定的动作**不自动撤销**（`test_unknown_action_is_not_compensated_blindly`）；手工补偿新建独立 run，原 run 记 `compensated_at` |
 | 取消与撤销分离 | ✅ | 取消只停后续步骤；撤销走独立补偿运行 | `Hub.compensate` 拒绝在运行中/已补偿的运行上执行 |
 | 启动对账不误伤在跑的 run | ✅ | `reconcile_orphan_runs(owner=...)`、lifespan | 只处理自己名下或租约已过期的运行；无 in_flight 动作时回到 `queued` 等 Worker 续跑（`test_reconcile_spares_runs_held_by_another_instance`） |
-| LangGraph 持久化检查点 | ⚠️ | `graph.checkpointer()` | **未安装 `langgraph-checkpoint-sqlite`**，当前退回 `InMemorySaver`；恢复能力由账本承担，不依赖检查点 |
+| LangGraph 持久化检查点 | ✅（有意不用） | `graph.checkpointer()` 返回 `None` | 图重放会绕开动作账本、把远端调用再发一遍；恢复的唯一依据是 plan / run_snapshots / actions / steps |
 | 有限重新规划（replan 节点） | ⬜ | — | 当前用"校验失败回喂修复"两轮代替独立 replan 节点；修不好即停机等补充 |
 
 ## 阶段 C：多用户运行底座
@@ -52,14 +58,14 @@
 | 对象权限覆盖全部接口 | ✅ | `app/api.py` 的 `_owned_task/_owned_session/_owned_run` | 任务/事件/产物/会话/记忆/画像全部按主体校验，`sessions` 与 `tasks_meta` 落 `owner_user_id`（`test_other_user_cannot_read_a_session`） |
 | 创建任务请求幂等 | ✅ | `request_keys` 表 + `app/idempotency.py` + `Idempotency-Key` 头 | 同键同内容只建一个任务（`test_retry_with_same_key_returns_the_same_task`）；同键换内容 409；键按 主体+接口 作用域化、按 TTL 过期 |
 | 画像按用户作用域 | ✅ | `profile.use()` + `users/<user>.md` | 两个用户的画像互不覆盖（`test_profile_is_scoped_per_user`） |
-| 租约与 fencing | ✅ | `Store.claim_run`（`UPDATE … RETURNING`）／`PgStore.claim_run`（`FOR UPDATE SKIP LOCKED`） | `test_claim_is_exclusive_and_epoch_increments`；就地执行也占租约 |
-| 执行期间续租 | ✅ | `Hub._guard` | 长任务不会因租约过期被另一个执行者接手 |
-| 独立 Worker | ✅ | `scripts/run_worker.py` | 支持 `--once` / `--jobs-only`；SQLite 阶段限单 Worker |
+| 租约与 fencing | ✅ | `PgStore.claim_run`（`FOR UPDATE SKIP LOCKED`，`lease_epoch+1`） | `test_claim_is_exclusive_and_epoch_increments`、`test_two_workers_claiming_at_once_execute_once`；就地执行也占租约 |
+| 执行期间续租 | ✅ | `Hub._guard`（**带 epoch 续租**，续租失败即停派并标记失租） | `test_renewal_failure_stops_before_the_next_step` |
+| 独立 Worker | ✅ | `scripts/run_worker.py` | 支持 `--once` / `--jobs-only`；`test_execution_error_does_not_kill_the_worker`（一条失败不带走循环） |
 | SSE 游标 | ✅ | `Last-Event-ID` / `?after=` | 实测 `after=2` 正确跳发；事件帧带 `id:` 行 |
 | 事件序号原子自增 | ✅ | `append_event` 单语句 `INSERT … RETURNING seq`（PG 冲突回滚重算） | 多写入者不会再算出同一个 seq（旧实现会撞主键或被 SSE 去重静默丢弃） |
 | outbox 与后台任务 | ✅ | `background_jobs` + `dedupe_key`，`drain_jobs` 为 async | `test_jobs_drain_is_idempotent`、`test_summary_job_actually_compacts_memory`、`test_failed_job_is_requeued_with_backoff` |
-| 仓储接口层 | ✅ | `app/persistence.py`（Protocol） | `test_sqlite_store_satisfies_repository_protocol`；`check_repository` 能列出缺失方法 |
-| PostgreSQL 迁移 | ✅ | `scripts/migrate_to_postgres.py` | 已在本地 PostgreSQL 18.6 实测：21 会话 / 139 消息 / 71 任务 / 1069 事件全部搬入，行数校验一致 |
+| 仓储接口层 | ✅ | `app/persistence.py`（Protocol + 全 `async def`）；SQLite 实现已删除 | `AsyncDriverTests`（协议异步、实现是协程函数、PG 用异步池）、`check_repository()` |
+| PostgreSQL 迁移 | ✅ | `scripts/migrate_to_postgres.py`（历史 SQLite → PG 的一次性脚本，实现已删、脚本保留） | 已在本地 PostgreSQL 18.6 实测：21 会话 / 139 消息 / 71 任务 / 1069 事件全部搬入，行数校验一致 |
 | PostgresStore 实现 | ✅ | `app/pg_store.py` | 满足同一 Repository 接口；`PostgresParityTests` 在真实 PG 上跑通 6 组关键读写 |
 
 ## 阶段 D：上下文与长期记忆
@@ -93,14 +99,27 @@
 一次会话后数据库状态：`runs: {succeeded: 2}`、`outbox 作业: 2`、
 `GET /api/recovery → {"runs":0,"unknown_actions":0}`。
 
+### 执行可靠性改造的实机验证（2026-10-23）
+
+全部走真实 HTTP + 真实模型 + 真实 PostgreSQL（`agent_platform`），核对库里的行：
+
+| 动作 | 实机结果 |
+|---|---|
+| `POST /api/tasks`「你好」 | `answered` / `succeeded`；`runs.lease_owner` 已清空、`lease_epoch=1`；`plans` + `steps(s1 local:answers:direct succeeded)` + `actions(status=succeeded, effect=read, receipt 带回 answer)` + `run_snapshots(720 字节)` 齐备 |
+| 把该 run 置 `paused` 后 `POST /api/runs/{id}/resume` | 领取代次到 **2**；日志出现"按快照收尾（步骤已全部结算）"；状态回 `succeeded`，**动作数仍为 1**（没有重发任何调用） |
+| 研究类任务 `POST /api/runs/{id}/pause` | 接口如实返回 `{ok:true, status:"running", pause_requested:true}`（还在跑）；十余秒后 run 落 `paused`、租约交还、`run_snapshots.next_step_id=s1`、`step_index=0` |
+| 紧接 `POST /api/runs/{id}/resume` | 代次到 2，从第 1 步继续跑完：`steps(s1 web:search, s2 files:write)` 都 succeeded，终态 `succeeded`，产物是 `workspace/postgresql-连接池要点报告.md`（outcome.kind=artifact, effects.verified=true） |
+| 执行中 `POST /api/tasks/{id}/cancel` | run 落 `cancelled`、`cancel_requested_at` 有值、租约交还、**零动作**（取消发生在规划阶段，没有产生任何调用） |
+
 ## 明确未验证清单（不假装完成）
 
 1. ~~PostgreSQL 实机~~ **已补齐**：本机 PostgreSQL 18.6 上完成迁移与实测，
    见 `PostgresParityTests`（设置 `PG_TEST_DSN` 运行）。
 2. **真实多用户登录**：没有身份提供方。`current_principal()` 只读请求头且不
    校验签名；生产必须替换为经过验证的认证依赖。
-3. **LangGraph 检查点持久化**：缺 `langgraph-checkpoint-sqlite`，当前是内存实现。
-   图位置在进程重启后丢失，恢复依赖 `runs/steps/actions` 账本。
+3. ~~LangGraph 检查点持久化~~ **有意不做**：`checkpointer()` 明确返回 `None`。
+   图重放会绕开动作账本，把远端写请求再发一遍；恢复只认 plan / run_snapshots /
+   actions / steps。要用检查点，必须先证明它的恢复路径也走账本。
 4. **真实 MCP 服务端联调**：多 Server 的路由、命名、失败隔离都有用例覆盖，但
    本环境没有第二个真实 MCP 服务端，`deploy_tool` / 参数形态仍按原服务端契约。
 5. **补偿的远端语义**：补偿依赖"存在对应的撤销工具"。服务端没有撤销工具时，
@@ -112,16 +131,46 @@
 8. **执行中重规划 / 并行步骤**：未实现。现有设计是"一次只走一步"，账本顺序、
    补偿逆序、事件序号都建立在这个前提上；动它要先重设计这三条不变量。
 
+## 执行可靠性改造（计划 A–E）验收
+
+`docs/harness-reliability-implementation-plan.md` 的五个阶段与验收矩阵落点。
+用例全部跑在**真实 PostgreSQL** 上，远端与模型是受控假实现（不联网、不花钱），
+时点用 `asyncio.Event` 固定而不是 sleep 猜时序。
+
+| 阶段 | 交付 | 用例 |
+|---|---|---|
+| A Worker 解阻 | `execute_claimed_run` 单一入口；`run_once` 只领取 + 护栏；漏 await 的问题消灭 | `test_worker_execution.py`（5）：领取执行一次、两 Worker 抢同一条、异常不带走循环、空计划不是续跑、无未 await 协程 |
+| B 租约与控制底座 | `ExecutionContext`（run_id/plan_version/owner/epoch）+ `_owned()` 条件提交；续租/释放/终态都带 epoch | `test_execution_control.py`（9）：旧代次准入/结算/终态/续租全被拒、续租失败停派、暂停三种时序、取消、工具消失 |
+| C 数据库恢复 | 计划先于调用提交（`commit_plan` 一个事务）；`settle_action` 同事务写快照；恢复算法按动作推断起点；全部结算完只做收尾 | `test_execution_recovery.py`（7） |
+| D 未知结果 | `app/errors.py` 类型化确定性（`not_executed` / `failed_confirmed` / `unknown`），适配器在最了解现场的一层标注 | `test_mcp_uncertainty.py`（6） |
+| E 暂停与收尾 | `paused` 独立终态；`pause` 返回库里的真实结果；暂停快照可恢复；`resume` 只接受停下状态且拒绝未知动作 | `test_execution_control.py` 的暂停组、`test_mcp_uncertainty.py::test_resume_refuses_while_a_result_is_unknown` |
+
+**诚实说明本环境没覆盖到的**：
+
+- **没有做"子进程真被杀掉"的矩阵**。杀进程的每种窗口都用"往库里写它留下的行"
+  来构造（`prepared` / `in_flight` / `unknown` / `succeeded` 四种），走的仍是
+  真实执行入口。这能验证恢复逻辑，但**不能**证明"内核在任意指令处被 kill 之后
+  库状态一定落在这四种之一"——那需要反复 kill 的模糊测试。
+- **没有多进程多副本长时间混跑**。fencing 是被单进程内两个 Hub（各自的连接池）
+  验证的；跨机器时钟、网络分区不在覆盖范围。
+- **没有真实 MCP 服务端参与这组用例**，远端是假实现。业务失败/超时/连接错误的
+  判定走的是真实适配器代码路径（`_make_mcp_runner` → `MCPToolFailure` →
+  `ToolError` → 账本），但没有真实网络。
+- **暂停的响应时延没有 SLO**：执行者只在"下一步准入前"检查暂停，一个很长的工具
+  调用期间不会被打断（这是有意的：中途打断会留下结果未定的写操作）。
+
 ## 测试
 
 ```bash
-python -m unittest tests.test_core                       # 224 通过（无 PG 时跳过 11 条）
-
-# PG_TEST_DSN 必须指向一次性测试库（库名需含 test），用例会 TRUNCATE 全部表
-PG_TEST_DSN=postgresql://…/agent_platform_test python -m unittest \
-    tests.test_core.PostgresParityTests tests.test_core.PostgresPoolTests
-# 以上合计 235 通过：6 条仓储一致性 + 5 条连接池并发（含异步不阻塞）
+# PG_TEST_DSN 必须指向一次性测试库（库名含 test），用例会 TRUNCATE 全部业务表
+PG_TEST_DSN=postgresql://…/agent_platform_test \
+  python -W error::RuntimeWarning -m unittest discover -s tests -v
+# 实测：Ran 335 tests, OK（22 秒）
 ```
+
+`-W error::RuntimeWarning` 是刻意的：漏 `await` 不会报错，只会静默失效（把协程
+对象当值传下去，既不生效也不抛），只有把它提升成错误才能守住"Worker 真的在
+等结果"。这条检查从阶段 A 起进入验收命令。
 
 ## 本轮（2026-10-20 评审后）修复清单
 

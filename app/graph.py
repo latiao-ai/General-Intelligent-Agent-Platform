@@ -46,30 +46,17 @@ def instrument(name: str, fn):
 
 
 def checkpointer():
-    """图的检查点后端（文档 §8.1）。
+    """**本版本不接持久检查点**（文档 §2.1）。
 
-    LangGraph 的检查点负责"图跑到哪了"，我们的 runs/steps/actions 账本负责
-    "外部调用到底发生过没有"。两者职责不同，缺了检查点也能靠账本续跑——
-    已成功的动作会直接复用回执。所以这里做成软依赖：
+    恢复的唯一权威来源是 PostgreSQL 的 plan / step / action / attempt 与运行快照
+    （`run_snapshots`）。只给 `build_graph` 传一个 saver 并不能带来恢复能力：
+    它还要处理异步 saver 生命周期、thread_id、恢复调用方式与动作提交的协调，
+    而"图重放"绕过账本就会重复外部写操作。
 
-    - 装了 `langgraph-checkpoint-postgres` → 用同一个 PostgreSQL 持久化
-    - 否则退回内存实现（进程内可用，重启即丢，不静默假装持久）
-
-    以前这里会往 `settings.db_path`（SQLite 文件）里写检查点；SQLite 实现删掉
-    之后就没有那个文件了，检查点也跟着回到"要么 PG、要么内存"。
+    所以这里明确返回 None（LangGraph 用内存态）。以后接持久检查点时，恢复流程
+    仍然必须经过动作账本，不能由检查点直接重放远端调用。
     """
-    try:
-        from langgraph.checkpoint.postgres import PostgresSaver  # noqa: F401
-        from psycopg.rows import dict_row
-
-        from app.config import settings
-        return PostgresSaver.from_conn_string(settings.database_url).__enter__()
-    except Exception:
-        try:
-            from langgraph.checkpoint.memory import InMemorySaver
-            return InMemorySaver()
-        except Exception:
-            return None
+    return None
 
 
 def build_graph(checkpointer_=None):

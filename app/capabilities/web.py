@@ -44,7 +44,9 @@ async def _web_search(args: dict, state: dict) -> dict:
         response = await search_backend.search(query)
     except Exception as exc:
         errors.append(error_entry('search', exc))
-        raise ToolError('搜索失败，检查 DEEPSEEK_API_KEY 与网络') from exc
+        raise ToolError('搜索失败，检查 DEEPSEEK_API_KEY 与网络',
+                        certainty='not_executed', phase='connect',
+                        error_code='E_SEARCH_UNAVAILABLE') from exc
     usage.append({'stage': 'search', 'backend': response.get('usage')})
     added = 0
     for item in response.get('results', []):
@@ -137,7 +139,9 @@ async def _fetch_pages(args: dict, state: dict) -> dict:
             response = await search_backend.fetch(missing)
         except Exception as exc:
             errors.append(error_entry('extract', exc))
-            raise ToolError('正文提取失败，检查代理或链接可达性') from exc
+            raise ToolError('正文提取失败，检查代理或链接可达性',
+                            certainty='not_executed', phase='connect',
+                            error_code='E_FETCH_UNAVAILABLE') from exc
         usage.append({'stage': 'extract', 'backend': response.get('usage')})
         for result in response.get('results', []):
             try:

@@ -24,6 +24,7 @@ from app.config import settings
 from app.events import action, stage_end, stage_start
 from app.main import run_task
 from app.messages import cancel_note, reply_text
+from app import execution_control
 from app import ledger as ledger_module
 from app import memory as memory_module
 from app import outcome as outcome_module
@@ -65,8 +66,12 @@ class TaskRecord:
     # 谁在执行这个 run：持有租约的那一方。就地执行（API 进程）也必须写上，
     # 否则 Worker 会把"正在跑的 run"当孤儿再领一遍。
     lease_owner: str | None = None
+    # 本次领取的租约代次：所有推进都带它去库里做条件更新（fenced）。
+    # 内存里只用于展示与排障，判断依据永远是数据库。
+    lease_epoch: int = 0
     tenant_id: str = 'default'
     owner_user_id: str = 'default'
+    _lease_lost: bool = False
     _subscribers: set = field(default_factory=set)
     _task: asyncio.Task | None = None
 
@@ -131,6 +136,20 @@ class TaskRecord:
             'message': self.message, 'error': self.error,
             'artifact_id': self.artifact_id, 'state': self.state,
         }
+
+
+def _resume_index(steps: list[dict], actions: list[dict]) -> int:
+    """按已落库的动作推断"下一步从哪开始"。
+
+    只看 `succeeded` 的动作：`in_flight`/`unknown` 不能算完成（要核实），
+    `prepared` 可以重新准入。返回第一个还需要执行的步骤下标。
+    """
+    done = {str(item.get('step_id') or '') for item in actions
+            if str(item.get('status')) == 'succeeded'}
+    for index, step in enumerate(steps):
+        if str(step.get('step_id') or '') not in done:
+            return index
+    return len(steps)
 
 
 def _artifact_view(state: dict) -> dict | None:
@@ -326,7 +345,170 @@ class Hub:
             record.status = 'queued'
             return record
         record.lease_owner = claimed.get('lease_owner')
-        record._task = asyncio.create_task(self._run(record, history, prior))
+        record.lease_epoch = int(claimed.get('lease_epoch') or 0)
+        # 就地执行也必须走**同一个**执行入口：上下文、账本、恢复判定都不另写一份
+        loop = asyncio.get_running_loop()
+        record._task = loop.create_task(self.execute_claimed_run(claimed))
+        return record
+
+    async def execute_claimed_run(self, claimed: dict) -> TaskRecord | None:
+        """**唯一的执行入口**：拿到已领取的 run 之后，从建记录到执行全在这里。
+
+        以前 start / resume / Worker 三处各自拼装上下文、身份和计划，细节一旦
+        分叉就出错（Worker 那份连 await 都漏了）。现在只有一个入口：
+
+        1. 按领取结果构造/校验记录（owner + **epoch** 都记下来）；
+        2. 读取历史、上轮产物、会话记忆；
+        3. 有已提交计划就沿用它（不重新规划），没有才允许规划；
+        4. 建立带执行上下文的账本，交给图执行。
+        """
+        run = claimed
+        run_id = run['run_id']
+        task_id = run['task_id']
+        epoch = int(run.get('lease_epoch') or 0)
+        owner = str(run.get('lease_owner') or '')
+
+        task = await self.store.task(task_id)
+        if task is None:
+            await self.store.update_run(run_id, status='failed', error='任务不存在')
+            return None
+
+        record = self.tasks.get(task_id)
+        if record is not None and record.live and record.run_id != run_id:
+            # 本进程里有另一条 run 正在跑同一个任务：不能拿它充当本 run 的执行者
+            logger.warning('任务 %s 已有运行中的 run（%s），本次领取 %s 交给新执行者',
+                           task_id, record.run_id, run_id)
+            record = None
+        if record is None or record.run_id != run_id:
+            record = await self.get(task_id)
+            if record is None:
+                await self.store.update_run(run_id, status='failed',
+                                            error='无任务记录')
+                return None
+
+        record.run_id = run_id
+        record.status = 'running'
+        record.lease_owner = owner
+        record.lease_epoch = epoch
+        record._lease_lost = False
+
+        context = execution_control.ExecutionContext(
+            run_id=run_id, lease_owner=owner, lease_epoch=epoch)
+
+        # 计划：有就恢复，没有才规划。**空计划不等于"没有计划"**——
+        # `{'steps': []} or None` 会得到一个非空字典，正是旧代码的坑。
+        plan = await self.store.plan(run_id) or {}
+        steps = plan.get('steps') or []
+        actions = await self.store.actions_of(run_id)
+        if steps:
+            plan_version = int(plan.get('version') or 1)
+            context = context.with_plan_version(plan_version)
+            resume_plan = {'steps': steps, 'summary': plan.get('goal') or '续跑',
+                           'plan_version': plan_version,
+                           'step_index': _resume_index(steps, actions)}
+            if actions:
+                # 落库 + 投递都要 await：这里本来就在协程里，"同步投递"只会
+                # 得到一个没被 await 的协程（事件静默丢失）。
+                await record.publish(action(
+                    '沿用已提交的计划',
+                    f'{len(steps)} 步 · 第 {resume_plan["step_index"] + 1} 步继续',
+                    '↩️'))
+        elif actions:
+            # 有动作却没有计划：这不该发生。**不能拿新规划冒充恢复**——那会绕开
+            # 原有动作身份，可能重复副作用。
+            logger.error('run %s 有 %s 个动作但没有计划，转待核实',
+                         run_id, len(actions))
+            await self.store.update_run(run_id, status='needs_reconcile',
+                                        error='有动作但缺失计划，需人工核实')
+            record.status = 'needs_reconcile'
+            await record.persist(status='needs_reconcile', state=record.state)
+            return record
+        else:
+            resume_plan = None
+
+        history = await self.history(record.session_id)
+        prior = await self.prior_context(record.session_id)
+        memory = await self.store.memory(record.session_id)
+
+        # 让 live/done 这些判断仍然有效：当前协程就是这次执行
+        record._task = asyncio.current_task()
+
+        # 所有步骤都已结算、但 run 没来得及收尾（进程在"最后一次结算"与
+        # "写终态"之间消失）：这里只剩收尾，**不能**再跑一遍图——图拿不到
+        # 上一次的 step_outputs，只会得出"什么都没有产出"（文档 §5.4）。
+        if resume_plan and resume_plan['step_index'] >= len(resume_plan['steps']):
+            snapshot = await self._recovery_state(run_id)
+            if not snapshot.get('step_outputs'):
+                # 没有快照（旧数据，或崩溃在"结算已提交但快照没写全"）：
+                # 用动作回执重建——已成功的动作本来就把结果留在 receipt 里。
+                snapshot = self._state_from_actions(resume_plan['steps'], actions)
+            if snapshot.get('step_outputs'):
+                return await self._finish_recovered(record, snapshot, context)
+        try:
+            await self._run(record, history, prior, resume_plan=resume_plan,
+                            memory=memory, context=context)
+        except execution_control.LeaseLost as exc:
+            logger.warning('run %s 执行权丢失：%s', run_id, exc)
+        return record
+
+    @staticmethod
+    def _state_from_actions(steps: list[dict], actions: list[dict]) -> dict:
+        """用动作回执重建恢复所需的 state（没有快照时的兜底）。
+
+        只认 `succeeded` 的动作：在途/未知的动作不能当结果用。回执里的标量提到
+        顶层，与 `run_step` 写入 step_outputs 的规则保持一致——否则派生终态会
+        看不到"这一步产出了什么"。
+        """
+        outputs: dict = {}
+        state: dict = {'plan': {'steps': steps}}
+        for act in actions:
+            if str(act.get('status')) != 'succeeded':
+                continue
+            step_id = str(act.get('step_id') or '')
+            receipt = act.get('receipt') or {}
+            if not isinstance(receipt, dict):
+                receipt = {}
+            outputs[step_id] = {'__status__': 'succeeded', **receipt}
+            for key, value in receipt.items():
+                if isinstance(value, (str, int, float, bool, dict, list)):
+                    state.setdefault(key, value)
+        if outputs:
+            state['step_outputs'] = outputs
+            state['step_index'] = len(steps)
+        return state
+
+    async def _finish_recovered(self, record: TaskRecord, state: dict,
+                                context) -> TaskRecord:
+        """只用已提交的快照收尾（所有步骤都已结算的情形）。
+
+        **不重新执行、不重新规划**：结果已经从库里读回来了，再跑一遍就是重复
+        副作用。这里要做的只是把终态、回复与订阅者补齐，然后交还租约。
+        """
+        state = dict(state or {})
+        status = outcome_module.check_run_status(outcome_module.final_status(state))
+        state['status'] = status
+        state['outcome'] = outcome_module.build(state)
+        record.state = state
+        record.status = status
+        reply = reply_text(state)
+        try:
+            await record.persist(status=status, state=state)
+            await self.store.append_message(record.session_id, 'assistant', reply)
+            await self._finish_run(record, state, status)
+            await record.publish({'type': 'status', **outcome_module.view(status, state),
+                                  'detail': reply})
+            logger.info('run %s 按快照收尾（步骤已全部结算）status=%s',
+                        record.run_id, status)
+        finally:
+            if record.lease_owner and record.run_id:
+                try:
+                    await self.store.release_lease(
+                        record.run_id, record.lease_owner,
+                        epoch=getattr(context, 'lease_epoch', None) or None)
+                except Exception:                  # noqa: BLE001
+                    logger.warning('释放租约失败 run=%s', record.run_id,
+                                   exc_info=True)
+            record.close()
         return record
 
     async def _guard(self, record: TaskRecord) -> None:
@@ -346,9 +528,18 @@ class Hub:
             await asyncio.sleep(interval)
             try:
                 if time.monotonic() - last_renew >= renew_every:
-                    await self.store.renew_lease(record.run_id, record.lease_owner,
-                                           self.lease_seconds)
+                    # 必须带 epoch：旧执行者不能给"已被接手"的 run 续租，
+                    # 那等于自己又发了一张执行许可（文档 §4.3）。
+                    renewed = await self.store.renew_lease(
+                        record.run_id, record.lease_owner, self.lease_seconds,
+                        epoch=record.lease_epoch or None)
                     last_renew = time.monotonic()
+                    if not renewed:
+                        logger.warning('run %s 续租失败，停止推进', record.run_id)
+                        record._lease_lost = True
+                        if record._task is not None:
+                            record._task.cancel()
+                        return
                 run = await self.store.run(record.run_id)
                 if run and run.get('cancel_requested_at'):
                     logger.info('run %s 收到取消请求，停止执行', record.run_id)
@@ -365,7 +556,14 @@ class Hub:
     async def _run(self, record: TaskRecord, history: list,
                    prior: dict | None = None,
                    resume_plan: dict | None = None,
-                   memory: dict | None = None) -> None:
+                   memory: dict | None = None,
+                   context: 'execution_control.ExecutionContext | None' = None) -> None:
+        """执行一次运行。`context` 是本次领取的执行权凭证（owner + epoch）。"""
+        # 没有上下文时（兼容旧调用点）用记录上的字段兜一个
+        if context is None and record.lease_owner:
+            context = execution_control.ExecutionContext(
+                run_id=record.run_id, lease_owner=record.lease_owner,
+                lease_epoch=record.lease_epoch)
         guard = (asyncio.create_task(self._guard(record))
                  if record.lease_owner else None)
         # 把画像读写限定到这次任务的主体上：多用户时别人不该被写进我的画像
@@ -436,7 +634,10 @@ class Hub:
             except Exception:
                 memory = {}
 
-        book = ledger_module.ActionLedger(self.store, record.run_id, 1)
+        plan_version = int((resume_plan or {}).get('plan_version') or 1)
+        book = ledger_module.ActionLedger(self.store, record.run_id, plan_version,
+                                          context=context)
+        context_token = execution_control.bind(context)
         try:
             state = await run_task(
                 record.message, on_event=relay,
@@ -445,12 +646,65 @@ class Hub:
                 ledger=book, run_id=record.run_id,
                 resume_plan=resume_plan,
             )
+        except execution_control.LeaseLost as exc:
+            # 失租：**不写任何业务状态**。这一次执行已经没有资格推进 run，
+            # 由当前持租约的执行者或对账流程收尾。
+            record._lease_lost = True
+            logger.warning('run %s 失去执行权：%s', record.run_id, exc)
+            await close_open_stage('执行权已转移')
+            await record.publish({'type': 'action', 'icon': '⛔',
+                                  'label': '执行权已转移',
+                                  'detail': '另一个执行者接手了本次运行，本进程停止推进'})
+            return
+        except execution_control.ControlStopped as exc:
+            # 在安全边界停下。**停下来的原因决定状态**：用户取消写 cancelled，
+            # 暂停请求写 paused——把取消记成暂停会让它看起来"可以继续"。
+            stopped = getattr(exc, 'status', '') or 'paused'
+            label = '已取消' if stopped == 'cancelled' else '已暂停'
+            await close_instruction(label)
+            await close_open_stage(label)
+            # 暂停/取消的状态必须以**已提交的快照**为底：内存里的 record.state
+            # 只在成功收尾时被赋值，拿它写快照会得到一份几乎空的 state，
+            # 续跑时就等于什么都想不起来（文档 §5.3）。
+            state = await self._recovery_state(record.run_id)
+            state['status'] = stopped
+            if stopped == 'paused':
+                state['failure'] = ''
+            next_step_id = self._next_step_id(state)
+            if stopped == 'cancelled':
+                record.status = 'cancelled'
+                await record.persist(status='cancelled', state=state)
+                await self.store.update_run(record.run_id, status='cancelled',
+                                            cancel_requested_at=now())
+                await record.publish({'type': 'status', 'status': 'cancelled',
+                                      'run_status': 'cancelled',
+                                      'detail': '已按请求停止'})
+                return
+            paused = await self.store.pause_at_boundary(
+                context, run_id=record.run_id, plan_version=plan_version,
+                state=state, next_step_id=next_step_id)
+            record.status = 'paused' if paused else record.status
+            if paused:
+                await record.persist(status='paused', state=state)
+                await record.publish({'type': 'status', 'status': 'paused',
+                                      'run_status': 'paused',
+                                      'detail': '已暂停，可随时继续'})
+            return
         except asyncio.CancelledError:
             await close_instruction('已中断')
             await close_open_stage('已中断')
+            if record._lease_lost:
+                # 失租导致的取消：**不能写任何业务状态**。这条 run 已经不归本进程，
+                # 写 cancelled 会盖掉新执行者刚推进的状态。
+                logger.warning('run %s 因失租中断，不做业务收尾', record.run_id)
+                raise
             detail = cancel_note(record.artifact_id)
-            await record.persist(status='cancelled')
-            await self.store.update_run(record.run_id, status='cancelled',
+            # 取消**不能**把"可能已经发生的写操作"抹掉：有在途/未知动作时保留
+            # 待核实，不能声称远端也停了。
+            unknown = await self._has_uncertain_actions(record.run_id)
+            record.status = 'needs_reconcile' if unknown else 'cancelled'
+            await record.persist(status=record.status)
+            await self.store.update_run(record.run_id, status=record.status,
                                   cancel_requested_at=now())
             # 给会话补一条助手回复：否则下一轮上下文里会出现两条连续的用户消息，
             # 模型会看不出上一轮其实是被打断的。
@@ -461,9 +715,10 @@ class Hub:
             await close_instruction('已失败')
             await close_open_stage('已失败')
             record.error = f'{type(exc).__name__}: {exc}'
+            record.status = 'failed'
+            await self.store.finish_run_owned(context, run_id=record.run_id,
+                                             status='failed', error=record.error)
             await record.persist(status='failed', error=record.error)
-            await self.store.update_run(record.run_id, status='failed',
-                                  error=record.error)
             await record.publish({'type': 'status', 'status': 'failed',
                             'run_status': 'failed', 'detail': record.error})
         else:
@@ -480,12 +735,14 @@ class Hub:
                     'seconds': round(record.latency, 2),
                     'status': '解析完成，开始搜索',
                 })
+            # 先落记录（内存 + tasks 行），再收尾 run：两者都写、职责不同。
             await record.persist(status=status, state=state)
             await self._finish_run(record, state, status)
             # 状态事件里 `status` 仍是展示标签（前端认这套），另带 run_status
             await record.publish({'type': 'status', **outcome_module.view(status, state),
                             'detail': reply})
         finally:
+            execution_control.unbind(context_token)
             profile_module.reset(profile_token)
             if guard is not None:
                 guard.cancel()
@@ -493,7 +750,8 @@ class Hub:
             # release_lease 带 owner 条件，已被别人接手时不会误清。
             if record.lease_owner and record.run_id:
                 try:
-                    await self.store.release_lease(record.run_id, record.lease_owner)
+                    await self.store.release_lease(record.run_id, record.lease_owner,
+                                                   epoch=record.lease_epoch or None)
                 except Exception:                  # noqa: BLE001
                     logger.warning('释放租约失败 run=%s', record.run_id,
                                    exc_info=True)
@@ -503,6 +761,34 @@ class Hub:
             record.close()
 
     # ---------- run 生命周期（文档 §7、§8.4） ----------
+
+    async def _recovery_state(self, run_id: str) -> dict:
+        """恢复用的最新 state：坏数据/没快照时退回空 dict，绝不因此失败。"""
+        try:
+            snapshot = await self.store.run_snapshot(run_id)
+        except Exception:                          # noqa: BLE001
+            logger.warning('读取快照失败 run=%s', run_id, exc_info=True)
+            return {}
+        return dict((snapshot or {}).get('state') or {})
+
+    @staticmethod
+    def _next_step_id(state: dict, next_step_id: str = '') -> str:
+        """下一步的 step_id：优先用调用点给的，其次按游标从计划里取。"""
+        if next_step_id:
+            return next_step_id
+        steps = (state.get('plan') or {}).get('steps') or []
+        index = int(state.get('step_index') or 0)
+        if 0 <= index < len(steps):
+            return str(steps[index].get('step_id') or '')
+        return ''
+
+    async def _has_uncertain_actions(self, run_id: str) -> bool:
+        """有没有 in_flight / unknown 的动作：取消与超时要据此区分"停下了"和"结果未定"。"""
+        try:
+            actions = await self.store.actions_of(run_id)
+        except Exception:                          # noqa: BLE001
+            return True
+        return any(str(a.get('status')) in {'in_flight', 'unknown'} for a in actions)
 
     async def _finish_run(self, record: TaskRecord, state: dict, status: str) -> None:
         """把 run 收尾，并把计划与步骤落库，供续跑与界面查询。
@@ -517,9 +803,14 @@ class Hub:
         # waiting_input 的 run 不落计划：那份计划没过校验，存下来再续跑
         # 等于把坏计划喂回执行器。要恢复就重新规划。
         if steps and run_status != 'waiting_input':
-            await self.store.save_plan(record.run_id, 1, goal=record.message,
-                                 steps=steps, reason=plan.get('summary') or '')
-            await self.store.save_steps(record.run_id, 1, steps)
+            # 计划在**执行之前**就提交了（见 execute_claimed_run / main.run_task 的
+            # commit_plan）。这里只做兜底：真的没提交过才补写，避免覆盖更早的版本。
+            existing = await self.store.plan(record.run_id)
+            if not existing:
+                await self.store.save_plan(record.run_id, 1, goal=record.message,
+                                           steps=steps,
+                                           reason=plan.get('summary') or '')
+                await self.store.save_steps(record.run_id, 1, steps)
             outputs = state.get('step_outputs') or {}
             for step in steps:
                 step_id = step.get('step_id')
@@ -553,6 +844,10 @@ class Hub:
         if run_status == 'waiting_input':
             fields['error'] = (state.get('failure')
                                or '计划未通过校验，等待用户补充信息')
+        elif state.get('failure'):
+            # 失败原因必须落在 run 行上：Worker/运维只看库，不能只留在一份
+            # 内存 state 里——那等于"失败了但没人知道为什么"。
+            fields['error'] = state['failure']
         await self.store.update_run(record.run_id, **fields)
         # outbox：业务事件与派生作业在同一处写入，消费者按 dedupe_key 幂等
         await self.store.enqueue_job(
@@ -560,18 +855,45 @@ class Hub:
             f"{record.session_id}:{record.run_id}",
             {'session_id': record.session_id})
 
-    async def pause(self, run_id: str) -> bool:
-        """请求暂停：只停止派发新动作，在途动作尽量收结果（文档 §8.4）。"""
+    async def pause(self, run_id: str) -> dict:
+        """请求暂停。返回 `{ok, status, pause_requested}`。
+
+        两种情形必须分开（文档 §7.1）：
+
+        - **queued**：还没有执行者在跑，同一事务里直接置 `paused`，Worker 就领不到了；
+        - **running**：只登记 `pause_requested`，由执行者在下一步准入前读到并安全退出。
+          重复暂停是幂等的；已经结束的 run 返回当前状态而不是假装受理。
+        """
         run = await self.store.run(run_id)
-        if run is None or run['status'] not in {'running', 'queued'}:
-            return False
-        await self.store.update_run(run_id, pause_requested=1)
-        return True
+        if run is None:
+            return {'ok': False, 'status': '', 'pause_requested': False}
+        status = str(run.get('status') or '')
+        if status == 'queued':
+            await self.store.update_run(run_id, status='paused', pause_requested=1)
+            logger.info('run %s 在排队阶段直接暂停', run_id)
+            return {'ok': True, 'status': 'paused', 'pause_requested': True}
+        if status == 'running' or status == 'reconciling':
+            await self.store.update_run(run_id, pause_requested=1)
+            return {'ok': True, 'status': status, 'pause_requested': True}
+        if status == 'paused':
+            return {'ok': True, 'status': 'paused', 'pause_requested': True}
+        return {'ok': False, 'status': status,
+                'pause_requested': bool(run.get('pause_requested'))}
 
     async def resume(self, run_id: str) -> TaskRecord | None:
         """续跑：沿用已存计划重跑，账本会把已成功的步骤直接复用。"""
         run = await self.store.run(run_id)
         if run is None:
+            return None
+        status = str(run.get('status') or '')
+        # 只允许"停下来"的状态恢复。**不复活** succeeded/cancelled：
+        # 前者再跑一遍是重复副作用，后者是用户明确要求结束。
+        if status not in {'paused', 'interrupted', 'queued'}:
+            logger.info('run %s 状态为 %s，不恢复', run_id, status)
+            return None
+        if await self._has_uncertain_actions(run_id):
+            # 有在途/未知动作：必须先核实，不能靠 resume 把它清掉
+            logger.warning('run %s 存在结果未定的动作，拒绝恢复', run_id)
             return None
         # 必须回库：进程重启后 self.tasks 是空的，而"重启后续跑"正是它最需要
         # 工作的场景。以前这里只查内存，于是停掉进程就再也续不上（永远 409）。
@@ -599,15 +921,13 @@ class Hub:
         record.run_id = run_id
         record.status = 'running'
         record.lease_owner = claimed.get('lease_owner')
-        # 续跑不能"空手上路"：历史、上轮产物、会话记忆全都要带上，
-        # 否则续出来的报告接不上前文，也找不到上次渲染的 HTML。
-        record._task = asyncio.create_task(self._run(
-            record,
-            await self.history(record.session_id),
-            await self.prior_context(record.session_id),
-            resume_plan={'steps': steps},
-            memory=await self.store.memory(record.session_id),
-        ))
+        # **代次必须跟着新领取走**：漏掉这一行就会拿着旧代次去准入，
+        # 第一次动作就被仓储层判失租（文档 §4.2）。
+        record.lease_epoch = int(claimed.get('lease_epoch') or 0)
+        record._lease_lost = False
+        # 续跑与 Worker 走**同一条执行入口**：计划复用、按步骤恢复、快照收尾、
+        # 失租处理只有一份实现。这里只负责领取并返回记录（API 要立刻回 run_id）。
+        record._task = asyncio.create_task(self.execute_claimed_run(claimed))
         return record
 
     # ---------- 补偿（文档 §8.4） ----------
@@ -801,5 +1121,21 @@ class Hub:
         return state.get('deployment') or {}
 
     async def close(self) -> None:
-        """关闭仓储（PG 会连连接池一起收掉）。订阅者由各自的记录 close()。"""
+        """停掉本进程里还在跑的执行，再关闭仓储。
+
+        顺序很重要：先取消本地执行（**进程关停不是用户取消**，状态留给对账），
+        再关连接池。反过来的话，执行协程会在池关闭后继续要连接，栈里就只剩
+        "error connecting"，进程退出还会卡住。
+        """
+        running = [record for record in self.tasks.values() if record.live]
+        for record in running:
+            logger.info('shutdown: 取消本地执行 run=%s', record.run_id)
+            if record._task is not None:
+                record._task.cancel()
+        if running:
+            await asyncio.gather(*(record._task for record in running
+                                   if record._task is not None),
+                                 return_exceptions=True)
+        for record in self.tasks.values():
+            record.close()
         await self.store.close()

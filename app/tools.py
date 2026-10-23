@@ -545,6 +545,10 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
                     server=server)
         except Exception as exc:
             leaf = _unwrap_error(exc)
+            # 确定性必须在**这一层**标注：再往外包装就只剩 ToolError，类型名丢掉，
+            # 按异常类名猜必然猜错（文档 §6.1）。
+            certainty = mcp_adapter.certainty_of_error(leaf)
+            phase = 'connect' if certainty == 'not_executed' else 'receive'
             if isinstance(leaf, mcp_adapter.MCPToolFailure):
                 # 业务层失败（status: error / E_*）：必须当成失败停下，而且要把
                 # 服务端原话透出来，否则用户只看到"没有产出可用结果"。
@@ -554,10 +558,14 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
                 note = _dependency_note(detail)
                 raise ToolError(
                     f'MCP 工具 {server_tool_name} 失败：{detail[:240]}'
-                    + (f'｜{note}' if note else '')) from exc
+                    + (f'｜{note}' if note else ''),
+                    certainty=certainty, phase=phase,
+                    error_code=getattr(leaf, 'error_code', '') or 'E_MCP_TOOL_FAILURE',
+                ) from exc
             raise ToolError(
                 f'MCP 工具 {server_tool_name} 调用失败'
-                f'（{_describe_error(exc)}）') from exc
+                f'（{_describe_error(exc)}）',
+                certainty=certainty, phase=phase) from exc
         emit(action('MCP 工具返回', mcp_adapter.summarize(payload), '📦'))
         # 参数必须一起记：过滤类工具（如 list_sites 的 keyword）传不传参数，
         # 返回语义完全不同——不记下来就分不清"列表只有 1 个"和"只匹配到 1 个"。

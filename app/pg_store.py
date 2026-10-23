@@ -17,6 +17,7 @@
 """
 import asyncio
 import json
+import logging
 from contextlib import asynccontextmanager
 
 import psycopg
@@ -28,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.config import settings
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -315,6 +318,17 @@ CREATE TABLE IF NOT EXISTS ticket_redemptions (
 );
 CREATE INDEX IF NOT EXISTS idx_ticket_redemptions_used
     ON ticket_redemptions(used_at);
+
+-- 运行快照：崩溃恢复的权威依据（state.json 只是诊断旁文件）。
+CREATE TABLE IF NOT EXISTS run_snapshots (
+    run_id                TEXT PRIMARY KEY,
+    plan_version          INTEGER NOT NULL DEFAULT 1,
+    snapshot_schema       INTEGER NOT NULL DEFAULT 1,
+    state_json            TEXT NOT NULL DEFAULT '{}',
+    next_step_id          TEXT NOT NULL DEFAULT '',
+    artifact_namespace    TEXT NOT NULL DEFAULT '',
+    updated_at            TEXT NOT NULL
+);
 
 -- 中台自己的登录会话。凭证原文只在浏览器，这里只存摘要。
 CREATE TABLE IF NOT EXISTS auth_sessions (
@@ -965,21 +979,112 @@ class PostgresStore:
             await conn.commit()
         return _decode_run(dict(row)) if row else None
 
-    async def release_lease(self, run_id: str, worker_id: str) -> None:
-        """执行者主动交还租约。带 owner 条件，旧代次不能覆盖新持有者（fencing）。"""
+    async def _owned(self, conn, context, *, run_id: str,
+                     require_status: tuple | None = None) -> dict | None:
+        '''按执行上下文取 run 行并校验租约（owner + epoch + 未过期）。
+
+        返回 None 表示"没这个 run"；返回行表示执行权仍然有效。
+        **失去执行权抛 LeaseLost**，不给调用方"当作成功继续"的机会。
+        '''
+        from app import execution_control
+
+        row = await self._one(conn, 'SELECT * FROM runs WHERE run_id=%s FOR UPDATE',
+                              (run_id,))
+        if row is None:
+            return None
+        data = dict(row)
+        if context is None:
+            return data
+        owner = str(data.get('lease_owner') or '')
+        epoch = int(data.get('lease_epoch') or 0)
+        expires = float(data.get('lease_expires_at') or 0)
+        if owner != context.lease_owner or epoch != context.lease_epoch:
+            raise execution_control.LeaseLost(
+                run_id, f'持有者/代次已变更（库中 {owner or "空"}#{epoch}）')
+        if expires and expires < time.time():
+            raise execution_control.LeaseLost(run_id, '租约已过期')
+        if require_status and data.get('status') not in require_status:
+            raise execution_control.LeaseLost(
+                run_id, f"状态已变为 {data.get('status')}")
+        return data
+
+    async def control_state(self, run_id: str) -> dict:
+        '''读控制意图（暂停/取消）+ 状态。准入动作前必须看它。'''
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'SELECT status, pause_requested, cancel_requested_at, lease_owner, '
+                'lease_epoch, lease_expires_at FROM runs WHERE run_id=%s',
+                (run_id,))
+        return dict(row) if row else {}
+
+    async def save_snapshot(self, run_id: str, *, plan_version: int, state: dict,
+                            next_step_id: str = '', artifact_namespace: str = '',
+                            conn=None) -> None:
+        '''写运行快照（恢复所需的最小完整状态）。
+
+        长正文与文件不进快照：它们走产物引用，快照里只留引用与索引。
+        '''
+        payload = json.dumps(state, ensure_ascii=False, default=str)
+        sql = ('INSERT INTO run_snapshots (run_id, plan_version, snapshot_schema, '
+               'state_json, next_step_id, artifact_namespace, updated_at) '
+               'VALUES (%s, %s, %s, %s, %s, %s, %s) '
+               'ON CONFLICT (run_id) DO UPDATE SET plan_version=EXCLUDED.plan_version, '
+               'state_json=EXCLUDED.state_json, next_step_id=EXCLUDED.next_step_id, '
+               'artifact_namespace=EXCLUDED.artifact_namespace, '
+               'updated_at=EXCLUDED.updated_at')
+        args = (run_id, int(plan_version or 1), 1, payload, next_step_id,
+                artifact_namespace, now())
+        if conn is not None:
+            await self._run(conn, sql, args)
+            return
+        async with self._lease() as own:
+            await self._run(own, sql, args)
+
+    async def run_snapshot(self, run_id: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT * FROM run_snapshots WHERE run_id=%s',
+                                  (run_id,))
+        if row is None:
+            return None
+        data = dict(row)
+        try:
+            data['state'] = json.loads(data.get('state_json') or '{}')
+        except ValueError:
+            data['state'] = {}
+        return data
+
+    async def release_lease(self, run_id: str, worker_id: str,
+                            epoch: int | None = None) -> None:
+        """执行者主动交还租约。带 owner（可选 epoch）条件，旧代次不能覆盖新持有者。"""
+        condition = 'run_id=%s AND lease_owner=%s'
+        params: tuple = (now(), run_id, worker_id)
+        if epoch is not None:
+            condition += ' AND lease_epoch=%s'
+            params += (int(epoch),)
         async with self._lease() as conn:
             await self._run(conn, 'UPDATE runs SET lease_owner=NULL, lease_expires_at=NULL, '
-                'updated_at=%s WHERE run_id=%s AND lease_owner=%s',
-                (now(), run_id, worker_id))
+                            f'updated_at=%s WHERE {condition}', params)
             await conn.commit()
 
     async def renew_lease(self, run_id: str, worker_id: str, lease_seconds: float = 60.0,
-                    now_ts: float | None = None) -> bool:
+                    now_ts: float | None = None, epoch: int | None = None) -> bool:
+        """续租。返回 False = **这次执行已经不该继续了**。
+
+        两个条件缺一不可：epoch 与领取时一致（旧执行者不能续别人的租约）、
+        租约尚未过期（旧执行者不能把过期租约"复活"，那等于自己发一张新租约）。
+        """
         current = now_ts if now_ts is not None else time.time()
+        condition = ("run_id=%s AND lease_owner=%s AND status='running' "
+                     'AND lease_expires_at IS NOT NULL AND lease_expires_at > %s')
+        params: tuple = (current + lease_seconds, now(), run_id, worker_id, current)
+        if epoch is not None:
+            condition += ' AND lease_epoch=%s'
+            params += (int(epoch),)
         async with self._lease() as conn:
-            cur = await self._run(conn, 'UPDATE runs SET lease_expires_at=%s, updated_at=%s '
-                "WHERE run_id=%s AND lease_owner=%s AND status='running'",
-                (current + lease_seconds, now(), run_id, worker_id))
+            cur = await self._run(
+                conn, 'UPDATE runs SET lease_expires_at=%s, updated_at=%s '
+                f'WHERE {condition}', params)
             await conn.commit()
             return cur.rowcount > 0
 
@@ -1104,6 +1209,205 @@ class PostgresStore:
             await self._run(conn, f'UPDATE actions SET {columns}, updated_at=%s WHERE action_id=%s',
                 (*updates.values(), now(), action_id))
             await conn.commit()
+
+    # ---------- 执行推进（受租约保护，文档阶段 B/C） ----------
+
+    async def commit_plan(self, context, *, run_id: str, version: int, goal: str,
+                          steps: list[dict], state: dict,
+                          artifact_namespace: str = '') -> dict:
+        """**在第一次工具调用之前**把计划、步骤、初始快照一起提交。
+
+        一个事务里完成，失败就"零工具调用"：宁可任务失败，也不能出现"远端已经
+        跑了两步、库里却没有计划"——那种状态根本没法恢复。
+        """
+        from app import execution_control
+
+        async with self._lease() as conn:
+            await self._owned(conn, context, run_id=run_id,
+                              require_status=('running', 'queued'))
+            await self._run(
+                conn, 'INSERT INTO plans (run_id, version, goal, steps_json, reason, '
+                'created_at) VALUES (%s, %s, %s, %s, %s, %s) '
+                'ON CONFLICT (run_id, version) DO UPDATE SET goal=EXCLUDED.goal, '
+                'steps_json=EXCLUDED.steps_json, reason=EXCLUDED.reason',
+                (run_id, int(version), goal,
+                 json.dumps(steps, ensure_ascii=False), '', now()))
+            for seq, step in enumerate(steps, 1):
+                await self._run(
+                    conn, 'INSERT INTO steps (run_id, plan_version, step_id, seq, '
+                    'tool_key, status, inputs_json) '
+                    "VALUES (%s, %s, %s, %s, %s, 'pending', %s) "
+                    'ON CONFLICT (run_id, plan_version, step_id) DO NOTHING',
+                    (run_id, int(version), step.get('step_id'), seq,
+                     step.get('tool_key') or '',
+                     json.dumps(step.get('args') or {}, ensure_ascii=False)))
+            await self._run(conn, 'UPDATE runs SET plan_version=%s, updated_at=%s '
+                            'WHERE run_id=%s', (int(version), now(), run_id))
+            await self.save_snapshot(run_id, plan_version=version, state=state,
+                                     next_step_id=(steps[0].get('step_id') if steps else ''),
+                                     artifact_namespace=artifact_namespace, conn=conn)
+            return {'plan_version': int(version)}
+
+    async def admit_action(self, context, *, run_id: str, plan_version: int,
+                           step_id: str, tool_key: str, args_hash: str,
+                           idempotency_key: str, effect: str = 'unknown',
+                           action_id: str, attempt_id: str,
+                           require_pause_free: bool = True) -> dict:
+        """**原子地**取得这次工具调用的准入资格。
+
+        同一事务内按固定顺序做四件事：校验租约与控制请求 → 查/建 action →
+        建 attempt 并置 in_flight → 交还。锁顺序固定（run → action → attempt），
+        避免两个执行者在不同顺序上互等。
+
+        与 `pause` 的先后关系由同一行锁裁决（文档 §7.2）：
+        - pause 先提交 → 这里看到 `pause_requested`，**不授予调用资格**；
+        - 这里先准入 → 该步视为在途，pause 只禁止后续动作。
+        """
+        from app import execution_control
+
+        async with self._lease() as conn:
+            row = await self._owned(conn, context, run_id=run_id,
+                                    require_status=('running',))
+            if row is None:
+                return {'status': 'no_run'}
+            if row.get('cancel_requested_at'):
+                raise execution_control.ControlStopped('运行已被取消', 'cancelled')
+            if require_pause_free and row.get('pause_requested'):
+                raise execution_control.ControlStopped('已请求暂停，不再准入新动作',
+                                                       'paused')
+
+            existing = await self._one(
+                conn, 'SELECT * FROM actions WHERE idempotency_key=%s',
+                (idempotency_key,))
+            if existing is not None:
+                data = _decode_action(dict(existing))
+                # 同一个动作重复准入：已成功就复用回执；在途/未知则阻断；
+                # **只到 prepared 说明请求还没发出去**（旧版本留下的行，或有人在
+                # 准入与派发之间中断）：可以沿同一个动作身份重新准入。
+                if data['status'] == 'prepared':
+                    restamp = now()
+                    await self._run(
+                        conn, "UPDATE actions SET status='in_flight', updated_at=%s "
+                        'WHERE action_id=%s', (restamp, data['action_id']))
+                    await self._run(
+                        conn, 'INSERT INTO action_attempts (attempt_id, action_id, '
+                        'started_at) VALUES (%s, %s, %s) '
+                        'ON CONFLICT (attempt_id) DO NOTHING',
+                        (attempt_id, data['action_id'], restamp))
+                    await self._run(
+                        conn, "UPDATE steps SET status='running', "
+                        'started_at=COALESCE(started_at, %s), action_id=%s '
+                        'WHERE run_id=%s AND plan_version=%s AND step_id=%s',
+                        (restamp, data['action_id'], run_id, int(plan_version),
+                         step_id))
+                    return {'status': 'admitted', 'action_id': data['action_id'],
+                            'attempt_id': attempt_id}
+                return {'status': data['status'], 'action': data,
+                        'replay': data.get('receipt') if data['status'] == 'succeeded'
+                        else None}
+
+            stamp = now()
+            await self._run(
+                conn, 'INSERT INTO actions (action_id, run_id, plan_version, step_id, '
+                'tool_key, args_hash, idempotency_key, effect, status, authorized_by, '
+                "created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, "
+                "'in_flight', '', %s, %s)",
+                (action_id, run_id, int(plan_version), step_id, tool_key, args_hash,
+                 idempotency_key, effect, stamp, stamp))
+            await self._run(
+                conn, 'INSERT INTO action_attempts (attempt_id, action_id, started_at) '
+                'VALUES (%s, %s, %s) ON CONFLICT (attempt_id) DO NOTHING',
+                (attempt_id, action_id, stamp))
+            await self._run(
+                conn, "UPDATE steps SET status='running', "
+                'started_at=COALESCE(started_at, %s), action_id=%s '
+                'WHERE run_id=%s AND plan_version=%s AND step_id=%s',
+                (stamp, action_id, run_id, int(plan_version), step_id))
+            return {'status': 'admitted', 'action_id': action_id,
+                    'attempt_id': attempt_id}
+
+    async def settle_action(self, context, *, run_id: str, plan_version: int,
+                            step_id: str, action_id: str,
+                            attempt_id: str | None, status: str,
+                            receipt: dict | None = None,
+                            error_type: str | None = None,
+                            step_status: str | None = None,
+                            state: dict | None = None,
+                            next_step_id: str = '') -> dict:
+        """原子结算：动作 + attempt + 步骤 + 快照一次提交。
+
+        "工具已返回但提交失败"时**不能推进内存游标继续下一步**：调用方会收到
+        异常，任务停在这里，重放/核实时以库里为准。
+        """
+        stamp = now()
+        async with self._lease() as conn:
+            await self._owned(conn, context, run_id=run_id,
+                              require_status=('running', 'paused'))
+            await self._run(
+                conn, 'UPDATE actions SET status=%s, receipt_json=%s, updated_at=%s '
+                'WHERE action_id=%s',
+                (status,
+                 json.dumps(receipt or {}, ensure_ascii=False, default=str),
+                 stamp, action_id))
+            if attempt_id:
+                await self._run(
+                    conn, 'UPDATE action_attempts SET ended_at=%s, error_type=%s '
+                    'WHERE attempt_id=%s', (stamp, error_type, attempt_id))
+            if step_status:
+                terminal = ('succeeded', 'failed', 'blocked', 'unknown',
+                            'cancelled', 'superseded')
+                ended = stamp if step_status in terminal else None
+                await self._run(
+                    conn, 'UPDATE steps SET status=%s, '
+                    'ended_at=COALESCE(%s, ended_at), output_json=COALESCE(%s, output_json) '
+                    'WHERE run_id=%s AND plan_version=%s AND step_id=%s',
+                    (step_status, ended,
+                     json.dumps(receipt, ensure_ascii=False, default=str)
+                     if receipt else None,
+                     run_id, int(plan_version), step_id))
+            if state is not None:
+                await self.save_snapshot(run_id, plan_version=plan_version, state=state,
+                                         next_step_id=next_step_id, conn=conn)
+            return {'action_id': action_id, 'status': status}
+
+    async def finish_run_owned(self, context, *, run_id: str, status: str,
+                               error: str | None = None,
+                               state: dict | None = None) -> bool:
+        """带租约条件地写 run 终态。返回 False = 已失去执行权(不写)。"""
+        from app import execution_control
+
+        async with self._lease() as conn:
+            try:
+                await self._owned(conn, context, run_id=run_id)
+            except execution_control.LeaseLost:
+                return False
+            await self._run(
+                conn, 'UPDATE runs SET status=%s, error=%s, updated_at=%s, '
+                'lease_owner=NULL, lease_expires_at=NULL WHERE run_id=%s',
+                (status, error, now(), run_id))
+            if state is not None:
+                await self.save_snapshot(run_id, plan_version=int(
+                    (context.plan_version if context else 1)), state=state, conn=conn)
+            return True
+
+    async def pause_at_boundary(self, context, *, run_id: str, plan_version: int,
+                                state: dict, next_step_id: str = '') -> bool:
+        """在安全边界暂停：写 paused + 快照，交还租约。返回 False = 已失租。"""
+        from app import execution_control
+
+        async with self._lease() as conn:
+            try:
+                await self._owned(conn, context, run_id=run_id,
+                                  require_status=('running',))
+            except execution_control.LeaseLost:
+                return False
+            await self._run(
+                conn, 'UPDATE runs SET status=%s, lease_owner=NULL, '
+                'lease_expires_at=NULL, updated_at=%s WHERE run_id=%s',
+                ('paused', now(), run_id))
+            await self.save_snapshot(run_id, plan_version=plan_version, state=state,
+                                     next_step_id=next_step_id, conn=conn)
+            return True
 
     async def actions_of(self, run_id: str) -> list[dict]:
         async with self._lease() as conn:
@@ -1425,9 +1729,10 @@ class PostgresStore:
         if pool is None or not self._opened:
             return
         try:
-            await pool.close()
-        except Exception:                           # noqa: BLE001
-            pass
+            # 有界等待：池的 worker 可能正在退避重连，无限等会卡住进程退出
+            await asyncio.wait_for(pool.close(), timeout=5)
+        except (asyncio.TimeoutError, Exception):   # noqa: BLE001
+            logger.warning('关闭连接池超时/失败，已强制标记关闭')
         self._opened = False
 
     # ---------- 兼容接口（SQLite 实现里有、PG 侧不需要的） ----------

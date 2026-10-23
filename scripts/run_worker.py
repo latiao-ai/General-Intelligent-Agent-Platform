@@ -10,8 +10,8 @@ lease_epoch）保证"同一运行只有一个有效执行者"。
     python -m scripts.run_worker --once          # 领一个就退出（测试/排障）
     python -m scripts.run_worker --jobs-only     # 只处理后台任务（摘要等）
 
-本机开发用 SQLite，**只允许单 Worker**（SQLite 没有 SKIP LOCKED，多进程
-领取靠租约串行化，并发能力有限）。生产换 PostgreSQL 后同一份代码可以多开。
+仓储只有 PostgreSQL：`claim_run` 用 `FOR UPDATE SKIP LOCKED` 原子领取，
+`lease_owner + lease_epoch` 做 fencing，所以可以放心多开 Worker。
 """
 import argparse
 import asyncio
@@ -25,6 +25,7 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from app import execution_control                # noqa: E402
 from app.api_hub import Hub                      # noqa: E402
 from app.config import settings                  # noqa: E402
 from app.logging_setup import setup_logging      # noqa: E402
@@ -37,63 +38,57 @@ MAX_JOB_ATTEMPTS = 5
 
 async def run_once(hub: Hub, worker_id: str, lease_seconds: float | None = None,
                    run_id: str | None = None) -> bool:
-    """领取并执行一个运行。返回是否真的领到了东西。"""
+    """领取并执行一个运行。返回是否真的领到了东西。
+
+    以前这里有三个会让"独立 Worker"完全跑不起来的问题（文档阶段 A）：
+
+    1. `hub.get(...)` / `history(...)` / `prior_context(...)` 漏了 await，传下去的
+       是协程对象；
+    2. 组装 Record 的那几行在 try 之外，一次初始化异常就把整个 Worker 循环带走；
+    3. `resume_plan={'steps': steps} or None` —— 空列表也是真值，于是"没有计划"
+       被当成"有计划的续跑"。
+
+    现在：领取 → 交给 `hub.execute_claimed_run()` 这一个入口，异常只影响本条 run。
+    """
     lease = lease_seconds or settings.run_lease_seconds
     run = await hub.store.claim_run(worker_id, lease, run_id=run_id)
     if run is None:
         return False
-    run_id = run['run_id']
-    logger.info('领取 run=%s epoch=%s', run_id, run['lease_epoch'])
-    print(f'[worker] 领取 run={run_id} epoch={run["lease_epoch"]}')
+    logger.info('领取 run=%s epoch=%s', run['run_id'], run['lease_epoch'])
+    print(f'[worker] 领取 run={run["run_id"]} epoch={run["lease_epoch"]}')
 
-    task = await hub.store.task(run['task_id'])
-    if task is None:
-        await hub.store.update_run(run_id, status='failed', error='任务不存在')
-        return True
-
-    plan = await hub.store.plan(run_id) or {}
-    steps = plan.get('steps') or []
-    record = hub.tasks.get(run['task_id'])
-    if record is None or not record.live:
-        # 没有内存记录时，按"续跑"处理：沿用已存计划重跑，
-        # 已成功的动作由账本复用回执，不会重复调用远端。
-        record = hub.get(run['task_id'])
-        if record is None:
-            await hub.store.update_run(run_id, status='failed', error='无任务记录')
-            return True
-        record.run_id = run_id
-        record.status = 'running'
-        # 租约归属必须记在记录上：_run 里的看守协程靠它续租、靠它判断
-        # "我才是执行者"。漏了这一步，续租和跨进程取消都会失效。
-        record.lease_owner = run['lease_owner']
-        record._task = asyncio.create_task(hub._run(
-            record,
-            hub.history(record.session_id),
-            hub.prior_context(record.session_id),
-            resume_plan={'steps': steps} or None,
-            memory=await hub.store.memory(record.session_id),
-        ))
+    record = None
     try:
-        # 租约由 _run 里的看守协程持续续期，这里只防"卡死永不返回"。
-        await asyncio.wait_for(record._task, timeout=settings.task_timeout * 2)
+        # execute_claimed_run 内部已 await 整次执行；这里只加"卡死永不返回"的护栏。
+        # 租约由 _run 里的看守协程持续续期。
+        record = await asyncio.wait_for(hub.execute_claimed_run(run),
+                                       timeout=settings.task_timeout * 2)
+        return True
     except asyncio.TimeoutError:
-        await hub.store.update_run(run_id, status='reconciling',
-                             error='执行超过预算窗口')
-        logger.warning('run %s 执行超过预算窗口', run_id)
+        await hub.store.update_run(run['run_id'], status='reconciling',
+                                   error='执行超过预算窗口')
+        logger.warning('run %s 执行超过预算窗口', run['run_id'])
+        return True
     except asyncio.CancelledError:
-        # 跨进程取消是通过 cancel_requested_at 传话的：_guard 看到标记后会取消
-        # 这个任务，CancelledError 随之冒到这里。**不能**让它把整个 Worker 循环
-        # 带走——只取消了一个 run，不是要停进程。
-        current = await hub.store.run(run_id) or {}
+        # 跨进程取消靠 cancel_requested_at 传话；只取消一个 run，不该带走 Worker
+        current = await hub.store.run(run['run_id']) or {}
         if current.get('cancel_requested_at'):
-            logger.info('run %s 已按请求取消', run_id)
+            logger.info('run %s 已按请求取消', run['run_id'])
             return True
         raise
-    except Exception as exc:                      # noqa: BLE001
-        await hub.store.update_run(run_id, status='failed',
-                             error=type(exc).__name__)
-        logger.exception('run %s 执行异常', run_id)
-    return True
+    except execution_control.LeaseLost as exc:
+        # 被别人接手了：本条 run 的收尾由新执行者负责，Worker 继续领下一条
+        logger.warning('run %s 执行权已转移：%s', run['run_id'], exc)
+        return True
+    except Exception as exc:                       # noqa: BLE001
+        logger.exception('run %s 执行异常', run['run_id'])
+        try:
+            await hub.store.update_run(run['run_id'], status='failed',
+                                       error=type(exc).__name__)
+        except Exception:                          # noqa: BLE001
+            logger.warning('run %s 失败状态写入也失败', run['run_id'],
+                           exc_info=True)
+        return True
 
 
 async def drain_jobs(hub: Hub, worker_id: str, limit: int = 5) -> int:

@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from app.config import settings, check_runtime_keys
 from app.events import STAGE_LABELS  # noqa: F401  (对外仍从 app.main 可用)
+from app import execution_control
 from app import ledger as ledger_module
 from app import outcome as outcome_module
 from app.capabilities.publishing import deploy_once
@@ -31,6 +32,32 @@ async def deploy_task(task_id: str) -> dict:
     if actual != artifact['sha256']:
         raise ValueError('HTML 已修改，请重新生成 manifest 后再部署')
     return await deploy_once(artifact)
+
+
+async def _commit_plan(ledger, state: dict, folder: Path, run_id: str | None) -> None:
+    """把计划提交到数据库（同一事务里写 plan + steps + 初始快照）。
+
+    没有账本（CLI 直调、单测）时退化成写 state.json：那是最早的行为，
+    不影响本地使用，但**不能声称具备恢复能力**。
+    """
+    plan = state.get('plan') or {}
+    steps = plan.get('steps') or []
+    if not steps:
+        return
+    version = int(plan.get('plan_version') or (ledger.plan_version if ledger else 1))
+    if ledger is None or not run_id:
+        save_json(folder / 'plan.json', {'version': version, 'steps': steps})
+        return
+    await ledger.store.commit_plan(
+        ledger.context, run_id=run_id, version=version,
+        goal=state.get('user_input') or '', steps=steps,
+        state=_plan_snapshot(state), artifact_namespace=str(folder))
+
+
+def _plan_snapshot(state: dict) -> dict:
+    """提交计划时的初始快照：只留恢复要用的字段，正文与文件走产物引用。"""
+    from app.nodes import _snapshot_state
+    return _snapshot_state(state)
 
 
 async def run_task(text: str, progress=None, on_event=None, history=None,
@@ -69,6 +96,7 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     }
     started = time.perf_counter()
     marked = started
+    plan_committed = False
     ledger_token = ledger_module.bind(ledger)
     try:
         async with asyncio.timeout(settings.task_timeout):
@@ -85,6 +113,12 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
                     now = time.perf_counter()
                     if isinstance(update, dict):
                         state.update(update)
+                    # **计划必须在第一次工具调用之前落库**（文档 §5.2）：
+                    # plan 节点一跑完就提交，失败则整轮零工具调用——绝不出现
+                    # "远端已经跑了两步、库里却没有计划"这种没法恢复的状态。
+                    if name == 'plan' and not plan_committed:
+                        plan_committed = True
+                        await _commit_plan(ledger, state, folder, run_id)
                     # stream_mode='updates' 在该节点跑完后才产出事件，
                     # 所以相邻事件的时间差≈该节点耗时（含少量调度开销）。
                     # run_step 会自我循环多次，用 step_label 记具体是哪一步，
@@ -100,6 +134,10 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
                     if progress:
                         progress(label, state.get('status'), round(now - started, 2))
                     save_json(folder / 'state.json', state)
+    except (execution_control.LeaseLost, execution_control.ControlStopped):
+        # 控制流异常必须**原样穿过**这一层：把它们包成 RuntimeError 会让
+        # "失租"和"暂停"退化成普通失败，中枢再也没法区分该由谁收尾（§4.3、§7.2）。
+        raise
     except Exception as exc:
         state['status'] = 'failed'
         state['errors'].append({'stage': 'runtime', 'type': type(exc).__name__})
@@ -117,8 +155,12 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         #   按"到底产出了什么"补一个；
         # - outcome 是记录，展示标签由它在读取时派生（app/outcome.py）。
         status = outcome_module.normalize_status(state.get('status'))
+        # 控制状态优先：**有部分产物也不能把 paused / cancelled / needs_reconcile
+        # 重算成 succeeded**（文档 §7.3）。只有"中途退出、没有任何终态"时才按产出补。
         if status not in outcome_module.TERMINAL_RUN_STATUSES:
             status = outcome_module.final_status(state)
+        elif status in {'paused', 'cancelled', 'needs_reconcile', 'interrupted'}:
+            status = status
         state['status'] = outcome_module.check_run_status(status)
         state['outcome'] = outcome_module.build(state)
         save_json(folder / 'state.json', state)

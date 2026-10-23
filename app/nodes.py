@@ -14,7 +14,8 @@ import json
 import re
 import time
 
-from app import context, ledger as ledger_module, outcome as outcome_module, profile
+from app import (context, errors as errors_module, execution_control,
+                 ledger as ledger_module, outcome as outcome_module, profile)
 from app.config import settings
 from app.events import action, emit, stage_end, stage_start, thought
 from app.capabilities.base import ToolError
@@ -448,9 +449,9 @@ async def _run_compensations(state: dict, steps: list[dict], outputs: dict,
         started = time.perf_counter()
         action_id, attempt_id = None, None
         if book is not None:
-            prepared = await book.begin(step_id=step_id, tool_key=tool.tool_key or name,
-                                  effect=tool.effect, args=args,
-                                  authorized_by='compensation')
+            prepared = await book.admit(step_id=step_id, tool_key=tool.tool_key or name,
+                                        effect=tool.effect, args=args,
+                                        authorized_by='compensation')
             if prepared.get('replay') is not None:
                 # 已经撤过一次：再撤一次可能报错，也可能误删新建的东西
                 results.append({'step_id': step['step_id'], 'tool': name,
@@ -463,21 +464,26 @@ async def _run_compensations(state: dict, steps: list[dict], outputs: dict,
                                 'error': f'上次补偿结果未定（{prepared["blocked"]}）'})
                 emit(stage_end(step_id, 0, '结果未定', tool.label))
                 continue
-            action_id = prepared['action_id']
-            attempt_id = await book.in_flight(action_id)
+            action_id = prepared.get('action_id')
+            attempt_id = prepared.get('attempt_id')
         try:
             await tool.run(args, state)
         except Exception as exc:                      # noqa: BLE001
             hint = getattr(exc, 'safe_message', None) or type(exc).__name__
             if book is not None and action_id:
-                await book.fail(action_id, attempt_id, type(exc).__name__)
+                await book.fail_from_exception(
+                    step_id=step_id, action_id=action_id,
+                    attempt_id=attempt_id, exc=exc, effect=tool.effect)
             results.append({'step_id': step['step_id'], 'tool': name,
                             'status': 'failed', 'error': hint})
             emit(stage_end(step_id, time.perf_counter() - started, '失败', tool.label))
             emit(action('回滚失败', f'{tool.label}：{hint}', '⚠️'))
             continue
         if book is not None and action_id:
-            await book.succeed(action_id, attempt_id, {'compensated': step['step_id']})
+            await book.settle(step_id=step_id, action_id=action_id,
+                              attempt_id=attempt_id, status='succeeded',
+                              receipt={'compensated': step['step_id']},
+                              step_status='succeeded')
         results.append({'step_id': step['step_id'], 'tool': name,
                         'status': 'succeeded'})
         emit(stage_end(step_id, time.perf_counter() - started, '已回滚', tool.label))
@@ -485,8 +491,36 @@ async def _run_compensations(state: dict, steps: list[dict], outputs: dict,
     return results
 
 
+async def _check_boundary(state: dict) -> str:
+    '''每步准入前的控制检查：暂停/取消优先于继续执行（文档 §7.2）。
+
+    返回空串表示可以继续；返回状态名表示应当就此停下（由 Hub 收尾）。
+    '''
+    context = execution_control.require()
+    book = ledger_module.current_ledger()
+    if context is None or book is None:
+        return ''
+    try:
+        control = await book.store.control_state(context.run_id)
+    except Exception:                                  # noqa: BLE001
+        return ''
+    if control.get('cancel_requested_at'):
+        raise execution_control.ControlStopped('运行已被取消', 'cancelled')
+    if control.get('pause_requested'):
+        raise execution_control.ControlStopped('已请求暂停', 'paused')
+    return ''
+
+
 async def run_step(state):
-    """执行计划中的一步。每次只走一步，便于逐步计时与取消。"""
+    """执行计划中的一步。每次只走一步，便于逐步计时与取消。
+
+    本轮改造的三个要点（对应文档阶段 B/C/D/E）：
+
+    1. **准入在动远程之前**：`store.admit_action` 一次事务完成"校验租约与控制请求 +
+       建 action + 建 attempt + 置 in_flight"；
+    2. **结算是原子推进**：动作、attempt、步骤、快照一次提交；提交失败不推进游标；
+    3. **确定性来自显式标注**（`app/errors.py`），不再按异常类名猜"结果未定"。
+    """
     steps = (state.get('plan') or {}).get('steps') or []
     index = state.get('step_index', 0)
     if index >= len(steps):
@@ -494,19 +528,28 @@ async def run_step(state):
 
     step = steps[index]
     name = step['tool']
+    step_id = step.get('step_id') or f's{index + 1}'
     tool = await _tool_by_name(name)
     last = index + 1 >= len(steps)
 
     if tool is None:
-        # 计划里出现了执行时不存在的工具（比如 MCP 掉线）：跳过，别让整轮失败。
-        emit(action('跳过未知工具', name, '⚠️'))
-        result = {'step_index': index + 1, 'step_label': name}
-        if last:
-            result['status'] = final_status(state)
-        return result
+        # 计划里出现了执行时不存在的工具（MCP 掉线、能力被下线）。**不能静默跳过**：
+        # 跳过会让后续步骤拿不到输入，最后却可能因为别的产物而"成功"。
+        emit(action('工具不可用', name, '⛔'))
+        outputs = dict(state.get('step_outputs') or {})
+        outputs[step_id] = {'__status__': 'blocked'}
+        return {'step_index': len(steps), 'step_label': name,
+                'step_outputs': outputs,
+                'tool_unavailable': name,
+                'status': 'needs_reconcile' if state.get('needs_reconciliation')
+                          else 'failed',
+                'failure': f'步骤 {step_id} 需要的工具 {name} 当前不可用，'
+                           f'后续依赖它的步骤没有执行'}
 
-    step_id = step.get('step_id') or f's{index + 1}'
     outputs = dict(state.get('step_outputs') or {})
+
+    # 边界检查：暂停/取消在准入前先提交时，这一步不得获得调用资格
+    await _check_boundary(state)
 
     # 依赖必须真的成功，否则这一步的输入就是不可信的（文档 §6.3）
     for dep in step.get('depends_on') or []:
@@ -514,6 +557,7 @@ async def run_step(state):
         if dep_status != 'succeeded':
             emit(action('依赖未完成', f'{tool.label} 依赖 {dep}（{dep_status or "缺失"}）', '⛔'))
             return {'step_index': len(steps), 'step_label': tool.label,
+                    'tool_unavailable': '' if tool else name,
                     'status': 'failed',
                     'failure': f'{tool.label}依赖的步骤 {dep} 没有成功完成'}
 
@@ -523,7 +567,6 @@ async def run_step(state):
     try:
         _check_placeholders(args, tool.label)
     except Exception as exc:                       # noqa: BLE001
-        # 参数本身就不成立：不必打扰远端，直接当这一步失败（后续依赖不再执行）
         emit(stage_end(name, time.perf_counter() - started, '失败', tool.label))
         hint = getattr(exc, 'safe_message', None) or type(exc).__name__
         emit(action(f'{tool.label}失败', hint, '⚠️'))
@@ -532,55 +575,66 @@ async def run_step(state):
                 'step_outputs': outputs, 'status': 'failed',
                 'failure': f'{tool.label}失败：{hint}'}
 
-    # 账本：调用之前先落 prepared / in_flight，回来再改。崩溃窗口才有据可查。
     book = ledger_module.current_ledger()
     action_id, attempt_id, reused = None, None, False
     if book is not None:
-        prepared = await book.begin(step_id=step_id, tool_key=tool.tool_key or name,
-                              effect=tool.effect, args=args)
-        if prepared.get('blocked'):
-            # 之前已发出但没拿到确定回执：不能重发，也不能当成功
+        try:
+            admitted = await book.admit(step_id=step_id,
+                                        tool_key=tool.tool_key or name,
+                                        effect=tool.effect, args=args)
+        except execution_control.ControlStopped as exc:
+            # 暂停/取消在准入前先提交：这一步不得获得调用资格
+            emit(action('停止派发', exc.reason, '⏸️'))
+            return {'step_index': index, 'step_label': tool.label,
+                    'status': exc.status, 'failure': exc.reason}
+        except execution_control.LeaseLost as exc:
+            emit(action('执行权已丢失', str(exc), '⛔'))
+            raise
+        if admitted.get('blocked'):
             emit(action('该步骤结果未定',
-                        f'{tool.label}（{prepared["blocked"]}），需核实后再继续', '❓'))
+                        f'{tool.label}（{admitted["blocked"]}），需核实后再继续', '❓'))
             outputs[step_id] = {'__status__': 'unknown'}
             return {'step_index': len(steps), 'step_label': tool.label,
-                    'step_outputs': outputs, 'status': 'failed',
+                    'step_outputs': outputs, 'status': 'needs_reconcile',
                     'needs_reconciliation': True,
-                    'failure': f'{tool.label}的结果未确定（{prepared["blocked"]}），'
+                    'failure': f'{tool.label}的结果未确定（{admitted["blocked"]}），'
                                f'为避免重复副作用已停止，请核实后重试'}
-        if prepared.get('replay') is not None:
-            # 这个动作之前已经成功：直接复用回执，不再调用远端
+        if admitted.get('replay') is not None:
             emit(action('复用已有结果', f'{tool.label}（该动作此前已成功）', '♻️'))
-            updates = dict(prepared['replay']) if isinstance(prepared['replay'], dict) else {}
+            updates = dict(admitted['replay']) if isinstance(admitted['replay'], dict) else {}
             reused = True
-        action_id = prepared['action_id']
-        if not reused:
-            attempt_id = await book.in_flight(action_id)
+        action_id = admitted.get('action_id')
+        attempt_id = admitted.get('attempt_id')
 
     try:
         if not reused:
             updates = await tool.run(args, state)
-    except Exception as exc:
+    except execution_control.LeaseLost:
+        raise
+    except Exception as exc:                      # noqa: BLE001
         emit(stage_end(name, time.perf_counter() - started, '失败', tool.label))
-        hint = getattr(exc, 'safe_message', None) or type(exc).__name__
+        outcome = errors_module.as_outcome(exc)
+        hint = outcome.safe_message or type(exc).__name__
         emit(action(f'{tool.label}失败', hint, '⚠️'))
+        # 只有"结果未定 + 有副作用"才拦人：只读调用重发一次没有可重复的后果
+        blocking = errors_module.is_blocking(outcome.certainty, tool.effect)
         if book is not None and action_id:
-            # 超时/连接中断属于"结果不确定"，不能当失败去重试
-            uncertain = type(exc).__name__ in {'TimeoutError', 'AttemptTimeout',
-                                               'ConnectError', 'ReadTimeout'}
-            if uncertain:
-                await book.mark_unknown(action_id, attempt_id, type(exc).__name__)
+            await book.fail_from_exception(
+                step_id=step_id, action_id=action_id, attempt_id=attempt_id,
+                exc=exc, effect=tool.effect)
+            if blocking:
                 emit(action('结果不确定', '远端可能已执行，需要核实', '❓'))
-            else:
-                await book.fail(action_id, attempt_id, type(exc).__name__)
         errors = list(state.get('errors', [])) + [
-            {'stage': name, 'type': type(exc).__name__}]
-        # 出错就中止剩余步骤：后面的多半依赖这一步的产物。
-        outputs[step_id] = {'__status__': 'failed'}
-        # 已经发生的写操作要收回来（文档 §8.4）。只回滚声明了 compensate 且
-        # 确实成功的步骤，逆序执行——先做的后撤。
-        compensations = await _run_compensations(state, steps[:index + 1],
-                                                 outputs, book)
+            {'stage': name, 'type': type(exc).__name__,
+             'error_code': outcome.error_code, 'certainty': outcome.certainty,
+             'effect': tool.effect}]
+        # 已经发生的写操作要收回来（文档 §8.4）：只回滚声明了 compensate 且确实
+        # 成功的步骤，逆序执行。**结果未定的步骤不自动补偿**——那是猜着再发一次。
+        outputs[step_id] = {'__status__': ('unknown' if blocking else 'failed')}
+        compensations = []
+        if not blocking:
+            compensations = await _run_compensations(state, steps[:index + 1],
+                                                     outputs, book)
         failed_undo = [r for r in compensations if r['status'] == 'failed']
         note = ''
         if compensations:
@@ -588,22 +642,19 @@ async def run_step(state):
             if failed_undo:
                 note += (f'，{len(failed_undo)} 步回滚失败'
                          f'（{failed_undo[0]["tool"]}：{failed_undo[0].get("error")}）')
+        status = ('needs_reconcile' if blocking
+                  else 'partially_succeeded' if failed_undo else 'failed')
         return {'step_index': len(steps), 'step_label': tool.label,
                 'errors': errors, 'step_outputs': outputs,
                 'compensations': compensations,
-                # 有副作用没撤干净时不能只说"失败"：线下可能留着一个站点。
-                'status': 'partially_succeeded' if failed_undo else 'failed',
+                'needs_reconciliation': blocking,
+                'status': status,
                 'failure': f'{tool.label}失败：{hint}{note}'}
 
     updates = dict(updates)
     # 工具返回的 `status` 是**阶段小结**（searched / fetched / rendered / deployed），
-    # 不是 run 终态。以前它直接落进 state['status']，于是任务状态里混进了业务词。
-    # 现在它只留在这一步的输出与耗时行上，run 终态由 outcome 统一判定。
+    # 不是 run 终态：run 终态由 outcome 统一判定。
     marker = str(updates.pop('status', '') or '')
-    if book is not None and action and not reused:
-        await book.succeed(action_id, attempt_id,
-                     {k: v for k, v in updates.items()
-                      if isinstance(v, (str, int, float, bool, dict, list))})
     record = {k: v for k, v in updates.items()
               if isinstance(v, (str, int, float, bool, dict, list))}
     record['__status__'] = 'succeeded'
@@ -613,10 +664,42 @@ async def run_step(state):
     updates['step_outputs'] = outputs
     updates['step_index'] = index + 1
     updates['step_label'] = tool.label
-    emit(stage_end(name, time.perf_counter() - started, marker, tool.label))
+
     if last:
         merged = dict(state)
         merged.update(updates)
         updates['status'] = final_status(merged)
         updates['outcome'] = outcome_module.build(merged)
+
+    # 结算：动作 + attempt + 步骤 + 快照一次提交。失败就抛出去，不推进游标——
+    # "工具已返回但提交失败"时绝不能当作完成继续下一步。
+    if book is not None and action_id and not reused:
+        next_step_id = ''
+        if index + 1 < len(steps):
+            next_step_id = steps[index + 1].get('step_id') or ''
+        merged = dict(state)
+        merged.update(updates)
+        await book.settle(step_id=step_id, action_id=action_id,
+                          attempt_id=attempt_id, status='succeeded',
+                          receipt={k: v for k, v in updates.items()
+                                   if isinstance(v, (str, int, float, bool))},
+                          step_status='succeeded', state=_snapshot_state(merged),
+                          next_step_id=next_step_id)
+
+    emit(stage_end(name, time.perf_counter() - started, marker, tool.label))
     return updates
+
+
+def _snapshot_state(state: dict) -> dict:
+    """快照只留**恢复要用的最小集合**：长正文与文件走产物引用，不进快照。"""
+    keep = ('task_id', 'run_id', 'user_input', 'plan', 'step_index',
+            'step_outputs', 'artifact', 'prior_artifact', 'documents',
+            'prior_documents', 'deployment', 'answer', 'errors', 'status',
+            'outcome', 'compensations', 'needs_reconciliation', 'failure')
+    snapshot = {key: state.get(key) for key in keep if key in state}
+    # documents 里不放大段正文（正文在 artifacts/<task>/sources/*.txt）
+    if isinstance(snapshot.get('documents'), list):
+        snapshot['documents'] = [
+            {k: v for k, v in doc.items() if k not in ('raw_content', 'snippet')}
+            for doc in snapshot['documents'] if isinstance(doc, dict)]
+    return snapshot

@@ -10,11 +10,26 @@ from app.config import settings
 
 
 class ToolError(RuntimeError):
-    """工具执行失败。safe_message 会被透出到用户可见的失败原因里。"""
+    """工具执行失败。safe_message 会被透出到用户可见的失败原因里。
 
-    def __init__(self, message: str) -> None:
+    **执行确定性必须显式带上**（`certainty`），不要靠异常类名去猜：
+
+    - `not_executed`：确认没调用到远端（本地校验失败、连不上时明确未发送）；
+    - `failed_confirmed`：远端明确回了失败；
+    - `unknown`（默认）：说不清请求有没有送达——按未定处理，交给人核实。
+
+    默认取 unknown 是刻意的：包装异常最容易丢信息，保守一点不会错。
+    """
+
+    def __init__(self, message: str, *, certainty: str = 'unknown',
+                 phase: str = '', error_code: str = '',
+                 receipt_ref: str = '') -> None:
         super().__init__(message)
         self.safe_message = message
+        self.certainty = certainty
+        self.phase = phase
+        self.error_code = error_code or type(self).__name__
+        self.receipt_ref = receipt_ref
 
 
 def error_entry(stage: str, exc: BaseException) -> dict:

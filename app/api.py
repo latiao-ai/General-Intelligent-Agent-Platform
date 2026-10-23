@@ -490,10 +490,18 @@ async def read_run(run_id: str,
 @app.post('/api/runs/{run_id}/pause')
 async def pause_run(run_id: str,
                     principal=Depends(policies.current_principal)):
+    """请求暂停。返回的是**库里的真实结果**，不是"已受理"。
+
+    queued 的 run 立刻变 paused；running 的只登记请求，由执行者在下一处安全
+    边界退出——所以这里回的 `status` 可能仍是 running（文档 §7.1）。
+    """
     await _owned_run(run_id, principal)
-    if not await hub.pause(run_id):
-        raise HTTPException(status_code=409, detail='该运行不在可暂停状态')
-    return {'paused': True}
+    result = await hub.pause(run_id)
+    if not result.get('ok'):
+        raise HTTPException(
+            status_code=409,
+            detail=f'该运行当前状态为 {result.get("status") or "未知"}，不能暂停')
+    return {'paused': True, **result}
 
 
 @app.post('/api/runs/{run_id}/resume')

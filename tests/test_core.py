@@ -22,8 +22,8 @@ from contextlib import ExitStack
 # 项目只支持 PostgreSQL，测试也跟着只跑 PG：没有 PG_TEST_DSN 就逐条跳过。
 PG_DSN = os.getenv('PG_TEST_DSN', '')
 TEST_TABLES = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
-               'action_attempts', 'actions', 'steps', 'plans', 'runs',
-               'tasks_meta', 'events', 'tasks', 'session_memory',
+               'action_attempts', 'actions', 'steps', 'plans', 'run_snapshots',
+               'runs', 'tasks_meta', 'events', 'tasks', 'session_memory',
                'session_summaries', 'messages', 'sessions', 'request_keys')
 
 
@@ -625,7 +625,9 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         from app.tools import Tool
 
         async def boom(args, state):
-            raise tool_module.ToolError('搜不到正文')
+            # 本地检索在派发前就失败：显式标注"确认没执行"（文档 §6.1）
+            raise tool_module.ToolError('搜不到正文', certainty='not_executed',
+                                        phase='dispatch')
 
         fake = Tool('web_search', '检索来源', 'd', {}, boom)
         plan = {'steps': [{'tool': 'web_search', 'args': {'query': 'q'}},
@@ -637,13 +639,30 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['step_index'], len(plan['steps']))  # 剩余步骤被跳过
         self.assertIn('搜不到正文', result['failure'])
         self.assertEqual(result['errors'][0]['stage'], 'web_search')
+        self.assertEqual(result['errors'][0]['certainty'], 'not_executed')
+        self.assertFalse(result['needs_reconciliation'])
 
-    async def test_run_step_skips_unknown_tool_without_failing(self):
+    async def test_unlabelled_failure_is_treated_as_unknown(self):
+        """没标注确定性的异常按 unknown 处理：宁可让人核实，也不猜着重发。"""
         from app import nodes
         from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
+        from app.tools import Tool
+
+        async def murky(args, state):
+            raise RuntimeError('连接被重置')
+
+        fake = Tool('web_search', '检索来源', 'd', {}, murky)
+        plan = {'steps': [{'tool': 'web_search', 'args': {'query': 'q'}}]}
+        with patch.dict(tool_module.BUILTIN_BY_NAME, {'web_search': fake}):
+            result = await nodes.run_step(
+                {'plan': plan, 'step_index': 0, 'user_input': 'q'})
+        self.assertEqual(result['status'], 'needs_reconcile')
+        self.assertTrue(result['needs_reconciliation'])
+        self.assertEqual(result['errors'][0]['certainty'], 'unknown')
+
+    async def test_run_step_fails_when_a_planned_tool_disappeared(self):
+        from app import nodes
+        from app import tools as tool_module
 
         async def no_mcp():
             return []
@@ -653,73 +672,115 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(tool_module, 'mcp_tools', no_mcp):
             result = await nodes.run_step(
                 {'plan': plan, 'step_index': 0, 'user_input': 'q'})
-        # 计划里点名的工具消失了（MCP 掉线）：跳过这一步继续，别让整轮失败
-        self.assertEqual(result['step_index'], 1)
-        self.assertNotEqual(result.get('status'), 'failed')
+        # 计划里点名的工具消失了（MCP 掉线）：**不能静默跳过**——后续步骤会
+        # 拿不到输入，最后却可能因为别的产物而"成功"（文档 §7.4）
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['tool_unavailable'], 'mcp__gone')
+        self.assertIn('后续依赖它的步骤没有执行', result['failure'])
+        self.assertEqual(result['step_index'], len(plan['steps']))
 
 
 class ActionLedgerTests(unittest.IsolatedAsyncioTestCase):
-    """动作账本：已成功不重发、结果不确定不重试（文档 §8）。"""
+    """动作账本：已成功不重发、结果不确定不重试（文档 §8）。
+
+    本轮改造后账本只有两个写操作：`admit()`（准入）与 `settle()`（结算），
+    各自一个事务；确定性由异常上的显式标注决定，不再按异常类名猜。
+    """
 
     async def asyncSetUp(self):
-        # 每个用例先清库：以前靠 SQLite :memory: 隔离
         await reset_db()
 
-    def ledger(self, store):
+    async def ledger(self, store):
+        """账本必须挂在真实的 run 上：准入要校验运行状态与租约。"""
         from app.ledger import ActionLedger
+        await store.create_task('task1', 'sess1', '测试')
+        await store.create_run('run1', 'task1', status='running')
         return ActionLedger(store, 'run1', 1)
 
     async def test_succeeded_action_is_replayed_not_resent(self):
         store = new_store()
-        book = self.ledger(store)
-        first = await book.begin(step_id='s1', tool_key='local:publishing:deploy',
-                           effect='write', args={'a': 1})
-        self.assertIsNone(first['replay'])
-        attempt = await book.in_flight(first['action_id'])
-        await book.succeed(first['action_id'], attempt, {'public_url': 'https://x/1'})
+        book = await self.ledger(store)
+        first = await book.admit(step_id='s1', tool_key='local:publishing:deploy',
+                                 effect='write', args={'a': 1})
+        self.assertEqual(first['status'], 'admitted')
+        await book.settle(step_id='s1', action_id=first['action_id'],
+                          attempt_id=first['attempt_id'], status='succeeded',
+                          receipt={'public_url': 'https://x/1'},
+                          step_status='succeeded')
 
-        # 同一个步骤、同样的参数再跑一次：必须直接复用回执
-        again = await book.begin(step_id='s1', tool_key='local:publishing:deploy',
-                           effect='write', args={'a': 1})
-        self.assertEqual(again['action_id'], first['action_id'])
+        # 同一个步骤、同样的参数再跑一次：必须直接复用回执，不再调用远端
+        again = await book.admit(step_id='s1', tool_key='local:publishing:deploy',
+                                 effect='write', args={'a': 1})
+        self.assertEqual(again['status'], 'succeeded')
         self.assertEqual(again['replay'], {'public_url': 'https://x/1'})
         # 只该有一次真实尝试
         self.assertEqual(len(await store.attempts_of(first['action_id'])), 1)
 
     async def test_changed_args_is_a_different_action(self):
         store = new_store()
-        book = self.ledger(store)
-        a = await book.begin(step_id='s1', tool_key='t', effect='write', args={'a': 1})
-        b = await book.begin(step_id='s1', tool_key='t', effect='write', args={'a': 2})
+        book = await self.ledger(store)
+        a = await book.admit(step_id='s1', tool_key='t', effect='write', args={'a': 1})
+        b = await book.admit(step_id='s1', tool_key='t', effect='write', args={'a': 2})
         self.assertNotEqual(a['action_id'], b['action_id'])
+
+    async def test_changed_tool_key_is_a_different_action(self):
+        """稳定身份必须包含 tool_key：同一个步骤换了工具就是另一个动作。"""
+        store = new_store()
+        book = await self.ledger(store)
+        a = await book.admit(step_id='s1', tool_key='local:web:search',
+                             effect='read', args={})
+        b = await book.admit(step_id='s1', tool_key='local:web:fetch',
+                             effect='read', args={})
+        self.assertNotEqual(a['action_id'], b['action_id'])
+        self.assertIn('local:web:search', book.key_of('s1', 'local:web:search', {}))
 
     async def test_unknown_result_blocks_blind_retry(self):
         """结果不确定时不能当成失败去重发，也不能当成功复用。"""
+        from app.capabilities.base import ToolError
         store = new_store()
-        book = self.ledger(store)
-        first = await book.begin(step_id='s1', tool_key='mcp:publishing:deploy_site',
-                           effect='write', args={})
-        attempt = await book.in_flight(first['action_id'])
-        await book.mark_unknown(first['action_id'], attempt, 'TimeoutError')
+        book = await self.ledger(store)
+        first = await book.admit(step_id='s1', tool_key='mcp:publishing:deploy_site',
+                                 effect='write', args={})
+        # 模拟"发出去之后超时"：异常上没有确定性标注 → 默认 unknown
+        status = await book.fail_from_exception(
+            step_id='s1', action_id=first['action_id'],
+            attempt_id=first['attempt_id'],
+            exc=ToolError('超时', certainty='unknown', phase='receive'))
+        self.assertEqual(status, 'unknown')
+        again = await book.admit(step_id='s1', tool_key='mcp:publishing:deploy_site',
+                                 effect='write', args={})
+        self.assertEqual(again['status'], 'unknown')
+        self.assertIn('blocked', again)
 
-        again = await book.begin(step_id='s1', tool_key='mcp:publishing:deploy_site',
-                           effect='write', args={})
-        self.assertIsNone(again['replay'])          # 没有可复用回执
-        self.assertEqual((await store.action(first['action_id']))['status'], 'unknown')
-
-    async def test_failure_records_error_type(self):
+    async def test_not_executed_is_recorded_as_failed_and_retryable(self):
+        """确认没执行 → 记为 failed（可显式重试），不能落成 unknown。"""
+        from app.capabilities.base import ToolError
         store = new_store()
-        book = self.ledger(store)
-        first = await book.begin(step_id='s1', tool_key='t', effect='read', args={})
-        attempt = await book.in_flight(first['action_id'])
-        await book.fail(first['action_id'], attempt, 'ValueError')
-        self.assertEqual((await store.action(first['action_id']))['status'], 'failed')
-        self.assertEqual((await store.attempts_of(first['action_id']))[0]['error_type'],
-                         'ValueError')
+        book = await self.ledger(store)
+        first = await book.admit(step_id='s1', tool_key='local:web:search',
+                                 effect='read', args={})
+        status = await book.fail_from_exception(
+            step_id='s1', action_id=first['action_id'],
+            attempt_id=first['attempt_id'],
+            exc=ToolError('连不上', certainty='not_executed', phase='connect'))
+        self.assertEqual(status, 'failed')
+        stored = await store.action(first['action_id'])
+        self.assertEqual(stored['status'], 'failed')
 
-    async def test_no_ledger_means_noop(self):
-        from app import ledger as ledger_module
-        self.assertIsNone(ledger_module.current_ledger())
+    async def test_failure_records_error_code_and_certainty(self):
+        from app.capabilities.base import ToolError
+        store = new_store()
+        book = await self.ledger(store)
+        first = await book.admit(step_id='s1', tool_key='t', effect='write', args={})
+        await book.fail_from_exception(
+            step_id='s1', action_id=first['action_id'],
+            attempt_id=first['attempt_id'],
+            exc=ToolError('服务端拒绝', certainty='failed_confirmed',
+                          phase='receive', error_code='E_INVALID_INPUT'))
+        stored = await store.action(first['action_id'])
+        self.assertEqual(stored['status'], 'failed')
+        self.assertEqual(stored['receipt']['error_code'], 'E_INVALID_INPUT')
+        self.assertEqual(stored['receipt']['certainty'], 'failed_confirmed')
 
 
 class RunLeaseTests(unittest.IsolatedAsyncioTestCase):
@@ -1681,11 +1742,33 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(hub_module, 'run_task', fake):
             record = await hub.start('第一次')
             await asyncio.wait_for(record._task, timeout=10)
+            # 只有"停下来"的 run 才能续跑：把这次运行置成暂停态
+            await hub.store.update_run(record.run_id, status='paused')
             resumed = await hub.resume(record.run_id)
             self.assertIsNotNone(resumed)
             await asyncio.wait_for(resumed._task, timeout=10)
         self.assertEqual([s['step_id'] for s in seen['resume_plan']['steps']],
                          ['s1'])
+
+    async def test_resume_refuses_a_finished_run(self):
+        """已成功的 run 不能"再跑一遍"：那是重复副作用（§7.3）。"""
+        import app.api_hub as hub_module
+        hub = self.hub()
+
+        async def fake(text, progress=None, on_event=None, history=None,
+                       on_start=None, prior=None, memory=None, ledger=None,
+                       run_id=None, resume_plan=None):
+            return {'task_id': 'a1', 'status': 'local_ready', 'timings': [],
+                    'deployment': {},
+                    'plan': {'steps': [{'tool': 'render_html', 'step_id': 's1',
+                                        'args': {}}], 'summary': 'x'}}
+
+        with patch.object(hub_module, 'run_task', fake):
+            record = await hub.start('第一次')
+            await asyncio.wait_for(record._task, timeout=10)
+        self.assertEqual((await hub.store.run(record.run_id))['status'],
+                         'succeeded')
+        self.assertIsNone(await hub.resume(record.run_id))
 
     async def test_reconcile_marks_inflight_actions_unknown(self):
         """重启时不能说"一律中断"——已发出未回执的调用必须保持 unknown。"""
@@ -1718,11 +1801,16 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         from app.tools import Tool
 
         store = new_store()
+        await store.create_task('task1', 'sess1', '测试')
+        await store.create_run('run1', 'task1', status='running')
         book = ActionLedger(store, 'run1', 1)
-        first = await book.begin(step_id='s1', tool_key='local:publishing:deploy',
-                           effect='write', args={})
-        attempt = await book.in_flight(first['action_id'])
-        await book.mark_unknown(first['action_id'], attempt, 'TimeoutError')
+        first = await book.admit(step_id='s1', tool_key='local:publishing:deploy',
+                                 effect='write', args={})
+        # 发出去了、回执没回来 → unknown（结果未定）
+        await book.fail_from_exception(step_id='s1',
+                                       action_id=first['action_id'],
+                                       attempt_id=first['attempt_id'],
+                                       exc=TimeoutError('回执超时'))
 
         async def should_not_run(args, state):
             raise AssertionError('结果未定的动作不能重发')
@@ -1735,15 +1823,27 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 result = await nodes.run_step(
                     {'plan': plan, 'step_index': 0, 'user_input': 'q'})
         self.assertIn('结果未确定', result['failure'])
+        self.assertEqual(result['status'], 'needs_reconcile')
 
     async def test_pause_only_affects_active_runs(self):
         hub = self.hub()
         await hub.store.ensure_task_meta('t1', session_id='s1', goal='g')
         await hub.store.create_run('r1', 't1', status='running')
-        self.assertTrue(await hub.pause('r1'))
+        # running：只登记请求，由执行者在下一处边界安全停下
+        paused = await hub.pause('r1')
+        self.assertEqual(paused, {'ok': True, 'status': 'running',
+                                  'pause_requested': True})
         self.assertEqual((await hub.store.run('r1'))['pause_requested'], 1)
+        # 排队中的 run 可以直接置 paused：没有执行者在跑，不用等边界
+        await hub.store.create_run('r2', 't1', status='queued')
+        self.assertEqual((await hub.pause('r2'))['status'], 'paused')
+        self.assertEqual((await hub.store.run('r2'))['status'], 'paused')
+        # 已结束的 run 不能被"暂停"：返回 ok=False，状态不变
         await hub.store.update_run('r1', status='succeeded')
-        self.assertFalse(await hub.pause('r1'))
+        settled = await hub.pause('r1')
+        self.assertFalse(settled['ok'])
+        self.assertEqual(settled['status'], 'succeeded')
+        self.assertEqual((await hub.store.run('r1'))['status'], 'succeeded')
 
 
 class PolicyTests(unittest.TestCase):
@@ -2947,12 +3047,12 @@ class ExecutionPathTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(hub_module, 'run_task', self.stub()):
                 record = await first.start('第一次')
                 await asyncio.wait_for(record._task, timeout=5)
-            # 模拟"计划已存、执行没跑完"
+            # 模拟"计划已存、执行被暂停后进程被杀"
             await first.store.save_plan(
                 record.run_id, 1, goal='g',
                 steps=[{'tool': 'render_html', 'step_id': 's1', 'args': {},
                         'tool_key': 'local:reports:render'}])
-            await first.store.update_run(record.run_id, status='failed')
+            await first.store.update_run(record.run_id, status='paused')
             task_id, run_id = record.task_id, record.run_id
             await first.store.close()
 
@@ -3292,8 +3392,16 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
             calls.append(('deploy', dict(args)))
             return {'deployment': {'site_id': 'site-1'}}
 
+        class _Rejected(RuntimeError):
+            # 业务明确拒绝：确认没有产生副作用（文档 §6.1 failed_confirmed）。
+            # 不标注的话默认是 unknown，默认值刻意保守——那时不允许自动回滚。
+            certainty = 'failed_confirmed'
+            phase = 'receive'
+            error_code = 'E_STEP_REJECTED'
+            safe_message = '第二步炸了'
+
         async def explode(args, state):
-            raise RuntimeError('第二步炸了')
+            raise _Rejected('第二步炸了')
 
         async def undo(args, state):
             calls.append(('undo', dict(args)))
@@ -3395,34 +3503,32 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
     async def test_unknown_action_is_not_compensated_blindly(self):
         """结果未定的写操作不能自动去撤：那是基于猜测再发一次写请求。"""
         from app import tools as tool_module
-        from app import ledger as ledger_module
         calls = []
         tools = self._tools(calls)
-        store = new_store()
-        book = ledger_module.ActionLedger(store, 'r1', 1)
-        prepared = await book.begin(step_id='s2', tool_key='local:x:boom',
-                              effect='write', args={})
-        await book.in_flight(prepared['action_id'])
-        await store.update_action(prepared['action_id'], status='unknown')
 
+        # 没有标注确定性的异常 → 默认 unknown（不确定远端究竟做没做）
+        async def ambiguous(args, state):
+            raise RuntimeError('连接被重置')
+
+        tools['explode'] = replace(tools['explode'], run=ambiguous)
         plan = {'steps': [
             {'tool': 'deploy', 'step_id': 's1', 'args': {},
              'compensate': {'tool': 'undo', 'args': {}}},
             {'tool': 'explode', 'step_id': 's2', 'args': {}},
         ]}
-        state = {'plan': plan, 'step_index': 1,
-                 'step_outputs': {'s1': {'__status__': 'succeeded'}},
+        state = {'plan': plan, 'step_index': 0, 'step_outputs': {},
                  'user_input': 'x'}
 
         async def fake_find(name):
             return tools.get(name)
 
         with patch.object(tool_module, 'find_tool', fake_find), \
-                patch.object(nodes, 'emit', lambda event: None), \
-                ledger_module.use_ledger(book):
+                patch.object(nodes, 'emit', lambda event: None):
+            state.update(await nodes.run_step(state))
             result = await nodes.run_step(state)
-        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['status'], 'needs_reconcile')
         self.assertTrue(result['needs_reconciliation'])
+        self.assertEqual(result['compensations'], [])
         self.assertFalse([c for c in calls if c[0] == 'undo'],
                          '结果未定时不能自动撤销')
 
@@ -3932,8 +4038,8 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
         # 冻结契约：要加状态值，就得连这份清单一起改，是有意识的决定
         self.assertEqual(sorted(outcome.RUN_STATUSES), [
             'cancelled', 'failed', 'interrupted', 'needs_reconcile',
-            'partially_succeeded', 'queued', 'reconciling', 'running',
-            'succeeded', 'waiting_approval', 'waiting_input'])
+            'partially_succeeded', 'paused', 'queued', 'reconciling',
+            'running', 'succeeded', 'waiting_approval', 'waiting_input'])
         for word in ('answered', 'local_ready', 'deployed', 'deploy_needs_check',
                      'compensated'):
             self.assertNotIn(word, outcome.RUN_STATUSES, word)
@@ -3953,6 +4059,7 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
             ('needs_reconcile', {}, 'needs_reconcile'),
             ('failed', {}, 'failed'),
             ('cancelled', {}, 'cancelled'),
+            ('paused', {}, 'paused'),
         ]
         for status, state, expected in cases:
             self.assertEqual(outcome.label(status, state), expected, status)

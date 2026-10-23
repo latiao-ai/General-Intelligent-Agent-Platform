@@ -171,6 +171,11 @@ class MCPToolFailure(RuntimeError):
         super().__init__(message)
         self.code = code
         self.safe_message = message
+        # 服务端**回了回执**并说这次失败：执行确定性是 failed_confirmed，
+        # 不是 unknown。这条标注决定了账本允许重试、也不需要人工核实（§6.1）。
+        self.certainty = 'failed_confirmed'
+        self.phase = 'decode'
+        self.error_code = code or 'E_MCP_TOOL_FAILURE'
 
 
 # 服务端用来表示"这次调用失败"的状态词（各家说法不一，都收）
@@ -241,6 +246,22 @@ def result_payload(result):
     if failed:
         raise MCPToolFailure(failed, str(payload.get('code') or ''))
     return payload
+
+
+def certainty_of_error(exc: BaseException) -> str:
+    '''本次失败的执行确定性。
+
+    - 服务端明确回了业务失败 → failed_confirmed（它执行了并拒绝/报错）；
+    - 连接都建立不起来 → not_executed；
+    - 其余（超时、断流、解析失败）→ unknown，因为请求可能已经送达并产生了副作用。
+    '''
+    if isinstance(exc, MCPToolFailure):
+        return 'failed_confirmed'
+    name = type(exc).__name__
+    if name in {'ConnectError', 'ConnectTimeout', 'ConnectionRefusedError',
+                'ClientConnectorError', 'LeaseLost'}:
+        return 'not_executed'
+    return 'unknown'
 
 
 def dotted_get(payload, key):

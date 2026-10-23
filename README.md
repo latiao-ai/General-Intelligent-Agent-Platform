@@ -181,7 +181,7 @@ python -m app.main '阅读 https://www.sqlite.org/whentouse.html ，整理适用
 | 实时推送 | 0.5 秒轮询 | 事件驱动，**到达即推** |
 | 计时刷新 | 0.5 秒一跳 | **100ms 平滑累加** |
 | 多客户端 | ❌ 单会话 | ✅ 可订阅同一任务 |
-| 状态持久化 | ❌ 纯内存 | ✅ PostgreSQL（可回落 SQLite） |
+| 状态持久化 | ❌ 纯内存 | ✅ PostgreSQL（唯一实现） |
 | 改代码生效 | 必须重启进程（模块不热重载） | `--reload` 自动 |
 
 ### 阶段耗时实时累加
@@ -371,15 +371,15 @@ curl -s -X POST localhost:8010/api/tasks -H 'Content-Type: application/json' \
 
 会话、任务状态、计划步骤、动作账本与事件日志都落在数据库里，服务重启后不丢。
 
-**默认后端是 PostgreSQL**：`.env` 里给 `DATABASE_URL` 一个连接串就走 PG；
-留空则退回本地 SQLite（`agent.db`，用 `DB_PATH` 改路径）。两者实现同一套仓储接口
-（`app/persistence.py` 的 `Repository`），业务代码不感知用的是哪个。
+**仓储只有 PostgreSQL 一种实现**：`.env` 里必须给 `DATABASE_URL`，留空直接报错。
+SQLite 实现已整体删除——两套实现意味着租约、代次、事务边界、动作准入这些
+**只有真库才能提供的语义**要在两边各写一遍，而其中一边永远测不充分。
 
 ```ini
 DATABASE_URL=postgresql://latiao@127.0.0.1:5432/agent_platform
 ```
 
-从 SQLite 迁到 PG：
+早期 SQLite 数据的迁移脚本仍保留（一次性用）：
 
 ```bash
 python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/agent_platform"
@@ -388,14 +388,16 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
 脚本会逐表搬数据并**校验行数一致**，完成后复位 `messages.id` 的序列。
 本地实测迁移了 21 会话 / 139 消息 / 71 任务 / 1069 事件，行数校验通过。
 
-### 表一览（16 张）
+### 表一览（22 张）
 
 | 分组 | 表 | 内容 |
 |---|---|---|
 | 会话 | `sessions` / `messages` | 多轮上下文的主体与消息 |
 | 记忆 | `session_memory` / `session_summaries` | 长会话滚动摘要与关键事实 |
 | 任务 | `tasks` / `tasks_meta` | 任务状态、产物 ID、完整 `state`（含 timings） |
-| 运行 | `runs` / `plans` / `steps` | 每次执行尝试、计划版本、步骤状态 |
+| 运行 | `runs` / `plans` / `steps` / `run_snapshots` | 每次执行尝试、计划版本、步骤状态、**逐步快照**（恢复的唯一依据） |
+| 身份 | `app_users` / `identities` / `auth_sessions` / `ticket_redemptions` | 中台用户、外部身份绑定、登录会话（只存摘要）、一次性票据登记 |
+| 幂等 | `request_keys` | 建任务幂等键（按主体+接口作用域） |
 | 账本 | `actions` / `action_attempts` | 动作身份（幂等键）与每一次真实调用 |
 | 产物 | `artifacts` | 产物引用：kind / 路径 / 大小 / sha256 |
 | 记忆库 | `memories` / `memory_tombstones` | 作用域化长期记忆与遗忘墓碑 |
@@ -419,14 +421,19 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
 
 ### 重启后的恢复
 
-启动时不会简单地把遗留的 `running` 一律标成中断，而是**按动作账本对账**：
+恢复**不靠图重放**，只靠库里的四样东西：已提交的计划、逐步快照、动作账本、
+步骤状态（`graph.checkpointer()` 明确返回 `None`——图重放会绕开账本，等于把
+远端调用再发一遍）。算法：
 
-- 已经成功的动作 → 复用回执，不重复调用远端；
-- 已发出但没拿到回执（`in_flight`）→ 标记 `unknown`，要求核实，**绝不盲目重发**；
-- 从未发出的动作（`prepared`）→ 可以安全重试。
+1. 用 `claim_run` 重新领取（代次 +1，旧执行者的写入全部被拒）；
+2. 读计划：有计划就**沿用**，没有才规划。空计划不等于"有计划的续跑"；
+3. 有动作却没有计划 → 转 `needs_reconcile`，**不允许**用新规划冒充恢复；
+4. 按动作推断起点：`succeeded` 的步骤直接复用回执（不重发），`prepared` 可以
+   沿同一动作身份重做，`in_flight`/`unknown` 一律阻断，等人工核实；
+5. 所有步骤都已结算、只差收尾 → 直接用快照（或动作回执）收尾，不再跑图。
 
-运行状态置为 `reconciling`，可通过 `GET /api/recovery` 查看统计。
-详见 `docs/platform-acceptance.md`。
+对账统计看 `GET /api/recovery`；"待核实"的 run 状态是 `needs_reconcile`，
+它既不是成功也不是失败。详见 `docs/platform-acceptance.md`。
 
 ### 实现取舍
 
@@ -440,9 +447,8 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
   （演进过程：单连接 + 线程锁 → 连接池 → 异步驱动。每一步都把上一步盖住的
   问题暴露出来：去掉进程锁才发现事件序号的真实竞争，改成异步之后同步调用卡住
   事件循环这件事也没了。）
-- **SQLite**：标准库 `sqlite3`，WAL 模式，零新增依赖，适合单机快速起步。
-  它没有官方异步驱动，所以对外同样是异步接口、内部用 `asyncio.to_thread`
-  把同步执行丢进线程池——**两种实现对调用方长得完全一样**。
+- **只留一种仓储实现**：SQLite 版已删除。它对"租约代次、`SKIP LOCKED` 领取、
+  单事务内动作准入"这些东西只能做近似，而近似恰恰是执行可靠性最不能接受的部分。
 - 仓储接口见 `app/persistence.py`（全部 `async def`），`check_repository()`
   会同时校验"方法齐备"和"实现确实是协程函数"（同步实现会在异步调用点返回一个
   没人 await 的协程，表现成"调了但什么都没发生"，最难查）。
@@ -484,9 +490,17 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
   协作（租约/账本对账），**跨实例实时事件推送**还没做：副本 A 上的客户端看不到
   副本 B 产生的实时事件（要靠重连 + `Last-Event-ID` 补发，事件本身不丢）。
 - **池大小是静态配置**，没有按负载自适应；借不到连接会直接报错而不是排队降级。
-- **SQLite 模式仍是"线程池 + 单写者"**：接口异步了，但底层还是一条写连接；
-  真要并发就换 PostgreSQL。
-- **SQLite 模式仍是单机单写**：多副本各写各的会冲突，只适合本地开发。
+- **执行权靠租约与代次，不靠"谁是最后一个写的"**：`runs.lease_owner` +
+  `lease_epoch` 做 fencing，准入/结算/终态/续租全部带条件提交；租约过期或代次
+  变化一律按失租处理（抛 `LeaseLost`，**不写任何业务状态**）。续租失败同理：
+  停下来，而不是继续派发下一步。
+- **暂停是"请求 + 边界确认"两段式**：`queued` 的 run 立刻变 `paused`（Worker 领不到）；
+  `running` 的只登记 `pause_requested`，由执行者在**下一处准入前**读到并退出。
+  准入与暂停在同一行锁上裁决：暂停先提交 → 这一步不获得调用资格；准入在先 →
+  只允许该步收尾，后续不再派发。快照随暂停一起提交，续跑从下一步继续。
+- **"结果未定"是独立结论**：超时/断流算 `unknown`（可能已经写到远端），业务失败
+  算 `failed_confirmed`，连接都没建起来算 `not_executed`。确定性与效果类型一起决定
+  要不要拦人：`unknown + 有副作用` 才要求核实，只读调用重发一次没有可重复后果。
 - **幂等只覆盖"创建任务"**。事件追加、部署、补偿各有更精确的机制（事件序号、
   账本 action、`compensated_at`），不共用这把钥匙。键按 `主体+接口+键` 作用域化，
   默认 24 小时过期（`IDEMPOTENCY_TTL_SECONDS`）。
@@ -715,29 +729,24 @@ python -m scripts.list_mcp_tools
 ## 9. 测试
 
 ```bash
-python -m unittest discover -s tests -v
+# PG_TEST_DSN 必须指向一次性测试库（库名含 test），用例会 TRUNCATE 全部业务表
+PG_TEST_DSN=postgresql://…/agent_platform_test \
+  python -W error::RuntimeWarning -m unittest discover -s tests -v
 ```
 
-**233 条用例**。项目只支持 PostgreSQL，用例也直接跑真实 PG（每个用例前 TRUNCATE）：
+**335 条用例，全绿**。项目只支持 PostgreSQL，用例也直接跑真实 PG：
 
-```bash
-PG_TEST_DSN=postgresql://…/agent_platform_test python -m unittest tests.test_core
-```
+| 文件 | 条数 | 覆盖 |
+|---|---|---|
+| `tests/test_core.py` | 249 | 能力包、计划校验、账本、状态词汇、MCP 识别、接口与 SSE、仓储一致性、连接池 |
+| `tests/test_worker_execution.py` | 5 | Worker 领取/执行一次、两 Worker 抢同一条、异常不带走循环、空计划、无未 await 协程 |
+| `tests/test_execution_control.py` | 9 | 旧代次四件事全被拒、续租失败停派、暂停三种时序、续跑不重发、取消、工具消失 |
+| `tests/test_execution_recovery.py` | 7 | 计划先于调用提交、提交失败零调用、prepared 重做、unknown 阻断、succeeded 复用、结算失败不推进 |
+| `tests/test_mcp_uncertainty.py` | 6 | 业务失败=failed_confirmed、超时=unknown、连接失败=not_executed、包装后确定性不丢 |
+| `tests/test_ticket_auth.py` 等 | 56 | 票据验证、兑换、退出、跨平台隔离 |
+| `tests/test_local_video.py` | 3 | 本地解说视频能力包 |
+
+`-W error::RuntimeWarning` 是刻意的：漏 `await` 的执行路径不会报错，只会静默失效，
+把它提升成错误才能守住"Worker 真的在等结果"这件事。
 
 没有 `PG_TEST_DSN` 时数据库相关用例会逐条跳过（不会静默退回 SQLite——已经没有那个实现）。
-
-覆盖：URL 安全校验、HTML 自动转义、无正文禁止导出、部署闸门与回执归一、结构化输出重试、
-MCP 参数组装（base64）、多服务端路由与失败隔离、**MCP 业务失败识别 / 内部工具名校验 /
-创作内容落盘 / 未解析占位符拦截**、阶段事件与实时计时、PostgreSQL 仓储一致性与连接池并发、
-任务中枢、HTTP 接口与 SSE 事件流、助手回执文案、状态机词汇封闭与 outcome 派生、能力包注册化。
-
-覆盖：URL 安全校验、引用存在性、HTML 自动转义、无正文禁止导出、部署闸门与回执归一、
-结构化输出重试、MCP 参数组装（base64）、多服务端路由与失败隔离、阶段事件与实时计时、
-SQLite 存储与重启恢复、任务中枢、HTTP 接口与 SSE 事件流、助手回执文案、
-**状态机词汇封闭 / outcome 记录 / 展示标签派生 / 历史数据迁移**。
-
-```bash
-# 真实 PostgreSQL 一致性（DSN 必须指向一次性测试库）
-PG_TEST_DSN=postgresql://…/agent_platform_test \
-  python -m unittest tests.test_core.PostgresParityTests
-```
