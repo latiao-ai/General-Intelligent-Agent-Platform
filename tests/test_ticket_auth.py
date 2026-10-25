@@ -241,6 +241,27 @@ class TicketAuthTests(unittest.TestCase):
             self.verify(sign(typ='JWT'))
         self.assertIn('票据类型', ctx.exception.reason)
 
+    def test_wrong_kid_is_rejected_even_with_one_key(self):
+        """只登记一把公钥时，kid 写错也不能验过。"""
+        with self.assertRaises(ticket_auth.TicketError) as ctx:
+            self.verify(sign(kid='not-the-registered-kid'))
+        self.assertIn('kid', ctx.exception.reason)
+
+    def test_missing_ticket_type_is_rejected(self):
+        """typ 必填。缺省头不能靠「没写就不检查」混进登录票据。"""
+        raw = sign()
+        header, payload, signature = raw.split('.')
+        import json
+        import base64
+        padded = header + '=' * (-len(header) % 4)
+        data = json.loads(base64.urlsafe_b64decode(padded))
+        data.pop('typ', None)
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(data, separators=(',', ':')).encode()).rstrip(b'=').decode()
+        with self.assertRaises(ticket_auth.TicketError) as ctx:
+            self.verify(f'{encoded}.{payload}.{signature}')
+        self.assertIn('票据类型', ctx.exception.reason)
+
     def test_oversized_ticket_is_rejected(self):
         with self.assertRaises(ticket_auth.TicketError):
             self.verify('x' * (ticket_auth.MAX_TICKET_BYTES + 10))

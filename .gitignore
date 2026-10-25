@@ -25,3 +25,6 @@ profile/
 
 # 模拟平台的私钥与接入配置（绝不入库）
 secrets/
+
+# 第三方 MCP 服务端（自带 .git 与 node_modules，本地检出即可，不入本仓库）
+openmontage-zh-mcp/

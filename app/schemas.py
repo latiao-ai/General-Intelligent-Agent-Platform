@@ -57,7 +57,7 @@ class ExecutionPlan(BaseModel):
     profile_updates: dict[str, str] = Field(default_factory=dict)
 
 class RevisedPlan(BaseModel):
-    """运行中补充要求后的**剩余计划**（文档 harness-live-input §5 第十步）。
+    """运行中补充要求后的**剩余计划**。
 
     与 `ExecutionPlan` 的差别：这里只描述"接下来还要做什么"，已经执行成功的
     步骤通过 `ref` 引用它们的输出，不重写、不删除。`superseded` 列出被这次
@@ -173,7 +173,7 @@ class AgentState(TypedDict, total=False):
     # 续跑用：沿用已保存的计划，不重新规划
     resume_plan: dict
     run_id: str
-    # ---------- 运行中补充输入（文档 harness-live-input） ----------
+    # ---------- 运行中补充输入 ----------
     # 三个版本必须分别存在：lease_epoch 在 ExecutionContext 里（不进 state），
     # 这里只放"用户要求版本"与"计划版本"。
     original_goal: str
@@ -187,7 +187,7 @@ class AgentState(TypedDict, total=False):
     entry_route: str
     # 修订计划时给校验器的"受信历史输出"（已成功步骤 + 其 step_id）
     trusted_outputs: dict
-    # ---------- 结果观察与决策（文档 harness-observe-decide） ----------
+    # ---------- 结果观察与决策 ----------
     # 每次工具调用归一后的结果（含完整结果引用与有界摘要）
     tool_results: list[dict]
     # 程序观察到的信号与它选出的路由（程序判断，不调模型）

@@ -1,6 +1,5 @@
 """FastAPI + SSE 服务：把智能体的执行过程以事件流推给前端。
 
-与 Streamlit 版的区别：那边是"后台线程 + 0.5 秒轮询"的准实时；这里是事件驱动，
 节点一发出事件就立刻推送，延迟只在网络往返量级，且天然支持多客户端同时订阅同
 一个任务。
 
@@ -11,6 +10,7 @@
 """
 import asyncio
 import json
+import os
 import mimetypes
 import logging
 import time
@@ -18,11 +18,14 @@ from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import (FileResponse, HTMLResponse, Response,
-                               StreamingResponse)
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               Response, StreamingResponse)
 from pydantic import BaseModel, Field
 
 from app import idempotency, memory as memory_module, outcome as outcome_module
+from app import runtime_check
+from app import scene_context as scene_context_module
+from app import task_notify
 from app import auth, policies, profile
 from app import run_inputs as run_inputs_module
 from app import tools as tool_module
@@ -34,7 +37,7 @@ logger = logging.getLogger(__name__)
 
 WEB_DIR = Path(__file__).resolve().parent / 'web'
 
-# 整理报告阶段可能在上百秒内没有任何事件，必须定期发心跳，
+# 模型调用或外部工具可能上百秒没有任何事件，必须定期发心跳，
 # 否则连接会被中间的代理/网关按空闲超时掐断。
 KEEPALIVE_SECONDS = 15
 
@@ -51,37 +54,51 @@ async def lifespan(app: FastAPI):
     现在只处理**自己名下的或租约已过期**的运行。
     """
     setup_logging('api')
+    problems = runtime_check.issues()
+    if problems:
+        raise RuntimeError('；'.join(problems))
     # 先确保仓储就绪（PG 会在这里打开连接池并建表）：连不上库应当在启动日志里
     # 直接失败，而不是等第一个请求到了才炸
     ready = getattr(hub.store, 'ready', None)
     if callable(ready):
         await ready()
-    # 认证依赖要在请求里拿仓储（token → 平台 userinfo → 本地 user_id），
-    # 但 auth 不能 import api（会成环），所以挂在 app.state 上按请求取。
+    # 认证依赖要在请求里拿仓储解析中台会话，但 auth 不能 import api（会成环），
+    # 所以挂在 app.state 上按请求取。
     app.state.store = hub.store
     stats = await hub.reconcile(owner=hub.owner_id)
     app.state.recovery = stats
     purged = await hub.store.purge_request_keys()
     logger.info('API 启动完成，对账结果 %s，清理过期幂等键 %s 条', stats, purged)
+    task_notify.start(settings.database_url)
     try:
         yield
     finally:
+        await task_notify.stop()
         await hub.close()
-        await auth.aclose()
         # 连接池也要显式关：否则退出时池里的连接靠 GC 收，日志里看不到
         # "到底关没关"，测速/压测反复起停还会在服务端堆出空闲连接。
         close_store = getattr(hub.store, 'close', None)
         if callable(close_store):
-            close_store()
+            closing = close_store()
+            if hasattr(closing, '__await__'):
+                await closing
         logger.info('API 已关闭，数据库连接池已收尾')
 
 
 app = FastAPI(title='通用 Agent 执行中台 API', version='2.0', lifespan=lifespan)
 
 
+@app.middleware('http')
+async def guard_origin(request: Request, call_next):
+    if runtime_check.origin_rejected(request.method, request.headers.get('origin', '')):
+        return JSONResponse(status_code=403, content={'detail': 'Origin 不在允许列表'})
+    return await call_next(request)
+
+
 class ProfileRequest(BaseModel):
     # 画像就是一份 Markdown，直接收原文：手改、粘贴、整段重写都走同一条路。
     text: str = Field(default='', max_length=20000)
+    version: int | None = None
 
 
 class MemoryRequest(BaseModel):
@@ -91,7 +108,7 @@ class MemoryRequest(BaseModel):
 
 
 class RunInputRequest(BaseModel):
-    """给**当前任务**的补充要求（文档 harness-live-input §3）。
+    """给**当前任务**的补充要求。
 
     `request_id` 由客户端生成并持久保存：响应丢失时用同一个 ID 重发，服务端会
     返回原来那条输入（版本不再增长），而不是再加一版要求。
@@ -110,16 +127,14 @@ class TaskRequest(BaseModel):
     session_id: str | None = None
     # 也可以放在 Idempotency-Key 头里；两处都给时以头为准。
     idempotency_key: str | None = Field(default=None, max_length=200)
+    # 平台后端签名过的当前项目 / 选中对象。ticket 模式下必须带 context_assertion。
+    context: dict | None = None
+    context_assertion: str | None = Field(default=None, max_length=8192)
 
 
 def sse(event: dict) -> str:
     """SSE 帧。事件类型放在 JSON 里，前端统一用 onmessage 处理。"""
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-
-
-class TokenRequest(BaseModel):
-    # 旧 token 模式的平台凭证。服务端会拿它去 userinfo 端点验证，不信任其中字段。
-    token: str = Field(min_length=1, max_length=8000)
 
 
 class ExchangeRequest(BaseModel):
@@ -210,33 +225,8 @@ async def drop_session(request: Request, response: Response):
     return {'ok': True, 'revoked': revoked}
 
 
-@app.post('/api/auth/session')
-async def create_session(payload: TokenRequest, request: Request,
-                        response: Response):
-    """旧 token 模式的登录（保留兼容，新接入请用 /api/auth/exchange）。"""
-    if settings.auth_mode == 'off':
-        raise HTTPException(status_code=400, detail='AUTH_MODE=off，未启用认证')
-    store = getattr(request.app.state, 'store', None)
-    if store is None:
-        raise HTTPException(status_code=503, detail='身份仓储未就绪')
-    try:
-        info = await auth.fetch_userinfo(payload.token)
-    except auth.AuthError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
-
-    row = await store.bind_identity(info.provider, info.subject,
-                                    email=info.email,
-                                    display_name=info.display_name)
-    response.set_cookie(
-        settings.auth_cookie_name, payload.token,
-        max_age=settings.auth_cookie_max_age,
-        httponly=True, samesite='lax', secure=settings.auth_cookie_secure,
-        path='/')
-    return {'user_id': row['user_id'], 'tenant_id': row['tenant_id']}
-
-
 # ---------- 对象权限 ----------
-# 文档 §10 要求"订阅 SSE、下载产物、读取画像全部执行对象权限"。
+# 订阅 SSE、下载产物、读取画像全部执行对象权限。
 # 以前只有 /api/runs 与 /api/artifacts 做了检查，其余接口知道 ID 就能读别人的
 # 会话——而 session_id 是客户端传入的 12 位十六进制，猜中即接管上下文。
 
@@ -308,7 +298,9 @@ async def create_task(payload: TaskRequest, request: Request,
             hub.store, principal=principal, endpoint='tasks.create',
             client_key=client_key,
             payload={'message': payload.message,
-                     'session_id': payload.session_id},
+                     'session_id': payload.session_id,
+                     'context_hash': scene_context_module.canonical_hash(payload.context)
+                     if payload.context else ''},
             ttl_seconds=settings.idempotency_ttl_seconds)
     except idempotency.IdempotencyConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
@@ -335,9 +327,27 @@ async def create_task(payload: TaskRequest, request: Request,
     return body
 
 
+def _scene_for(payload: TaskRequest, principal) -> dict | None:
+    """ticket 模式下，带了现场就必须有平台签名。没带现场则不注入。"""
+    if not payload.context:
+        return None
+    if settings.auth_mode == 'ticket' or payload.context_assertion:
+        try:
+            return scene_context_module.verify(
+                payload.context_assertion or '', payload.context,
+                tenant_id=principal.tenant_id)
+        except scene_context_module.SceneError as exc:
+            raise HTTPException(status_code=400, detail=exc.reason) from None
+    return {'verified': False,
+            'context_hash': scene_context_module.canonical_hash(payload.context),
+            'context': payload.context}
+
+
 async def _start_task(payload: TaskRequest, principal) -> dict:
+    scene = _scene_for(payload, principal)
     try:
-        record = await hub.start(payload.message, payload.session_id, principal)
+        record = await hub.start(payload.message, payload.session_id, principal,
+                                 scene=scene)
     except PermissionError:
         # 传入的 session_id 不属于当前主体：按项目约定回 404，不区分"不存在/无权限"
         raise HTTPException(status_code=404, detail='会话不存在') from None
@@ -392,26 +402,57 @@ async def task_events(task_id: str, request: Request,
                            **outcome_module.view(record.status, record.state or {})})
                 return
             last_auth_check = time.time()
-            while True:
+            last_ping = time.time()
+            wake = task_notify.subscribe(record.task_id)
+
+            async def replay_persisted() -> list[str]:
+                nonlocal last_seq
+                chunks = []
                 try:
-                    item = await asyncio.wait_for(queue.get(),
-                                                  timeout=KEEPALIVE_SECONDS)
-                except asyncio.TimeoutError:
-                    # 用真实事件而不是 SSE 注释（": keepalive"）做心跳：
-                    # 注释不会触发浏览器的 onmessage，前端就没法判断连接是否还活着，
-                    # 后端一死那一行就会永远停在"进行中"、耗时一路涨。
-                    # 长连接期间定期复查登录态：会话被撤销/过期后要**主动断开**，
-                    # 否则退出登录的人还能从已连上的流里继续看自己的任务过程。
-                    if time.time() - last_auth_check >= settings.auth_sse_recheck:
-                        last_auth_check = time.time()
-                        try:
-                            await policies.current_principal(request)
-                        except HTTPException:
-                            yield sse({'type': 'end', 'status': 'interrupted',
-                                       'detail': '登录已失效，请重新登录'})
-                            return
-                    yield sse({'type': 'ping'})
+                    for seq, event in await hub.store.events(record.task_id):
+                        if seq is None or seq <= last_seq:
+                            continue
+                        last_seq = seq
+                        chunks.append(f'id: {last_seq}\n' + sse(event))
+                except Exception:                   # noqa: BLE001
+                    logger.warning('补读持久事件失败 task=%s', task_id, exc_info=True)
+                return chunks
+
+            while True:
+                getter = asyncio.create_task(queue.get())
+                waiter = asyncio.create_task(wake.wait())
+                done, pending = await asyncio.wait(
+                    {getter, waiter}, timeout=KEEPALIVE_SECONDS,
+                    return_when=asyncio.FIRST_COMPLETED)
+                for pending_task in pending:
+                    pending_task.cancel()
+                    try:
+                        await pending_task
+                    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                        pass
+                notified = waiter in done
+                if notified:
+                    wake.clear()
+                got_item = getter in done and not getter.cancelled()
+                if notified or not got_item:
+                    for chunk in await replay_persisted():
+                        yield chunk
+                if not got_item:
+                    # 用真实事件而不是 SSE 注释做心跳，前端才能判断连接还在。
+                    # 通知只负责叫醒；序号仍以数据库为准。
+                    if time.time() - last_ping >= KEEPALIVE_SECONDS:
+                        last_ping = time.time()
+                        if time.time() - last_auth_check >= settings.auth_sse_recheck:
+                            last_auth_check = time.time()
+                            try:
+                                await policies.current_principal(request)
+                            except HTTPException:
+                                yield sse({'type': 'end', 'status': 'interrupted',
+                                           'detail': '登录已失效，请重新登录'})
+                                return
+                        yield sse({'type': 'ping'})
                     continue
+                item = getter.result()
                 if item is CLOSE:
                     yield sse({'type': 'end', 'status': outcome_module.label(
                         record.status, record.state or {}),
@@ -420,12 +461,12 @@ async def task_events(task_id: str, request: Request,
                 seq, event = item
                 if seq is not None:
                     if seq <= last_seq:
-                        # 订阅与读快照之间重复投递的事件，按序号丢弃。
                         continue
                     last_seq = seq
-                # seq 为 None 的是不落库的过程事件（如 draft），始终透传
                 yield (f'id: {last_seq}\n' if seq is not None else '') + sse(event)
         finally:
+            if 'wake' in locals():
+                task_notify.unsubscribe(record.task_id, wake)
             record.unsubscribe(queue)
 
     return StreamingResponse(stream(), media_type='text/event-stream', headers={
@@ -666,6 +707,23 @@ async def health():
     return body
 
 
+@app.get('/api/health/live')
+async def health_live():
+    """进程还在。不查数据库。"""
+    return {'ok': True}
+
+
+@app.get('/api/health/ready')
+async def health_ready():
+    """数据库能读才算就绪。"""
+    try:
+        await hub.store.stats()
+    except Exception as exc:                     # noqa: BLE001
+        raise HTTPException(status_code=503,
+                            detail=f'数据库不可用（{type(exc).__name__}）') from None
+    return {'ok': True}
+
+
 @app.get('/api/profile')
 async def read_profile(principal=Depends(policies.current_principal)):
     """当前的用户画像：原文 + 解析后的事实 + 版本号。"""
@@ -680,7 +738,10 @@ async def write_profile(payload: ProfileRequest,
     """整体覆盖画像。只解析"键：值"行，头部元信息由服务端重写。"""
     with _profile_scope(principal):
         facts = profile.parse(payload.text)
-        version = profile.save(facts)
+        try:
+            version = profile.save(facts, expected_version=payload.version)
+        except profile.ProfileConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from None
     return {'version': version, 'facts': facts, 'count': len(facts)}
 
 
@@ -743,3 +804,246 @@ async def session_timeline(session_id: str,
     """会话回放：消息气泡 + 每轮执行过程事件，供切换会话时重建步骤面板。"""
     await _owned_session(session_id, principal)
     return await hub.session_timeline(session_id)
+
+
+def _require_operator(principal) -> None:
+    """运维身份来自 AUTH_OPERATORS 或库里的 operator 角色，不来自票据自称。"""
+    raw = os.getenv('AUTH_OPERATORS', 'default')
+    allowed = {item.strip() for item in raw.split(',') if item.strip()}
+    if principal.user_id in allowed or principal.role == 'operator':
+        return
+    raise HTTPException(status_code=403, detail='需要运维身份（AUTH_OPERATORS）')
+
+
+def _own_tenant(principal, tenant_id: str) -> None:
+    if tenant_id != principal.tenant_id:
+        raise HTTPException(status_code=403, detail='只能管理本企业的接入')
+
+
+class ServerBindingRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=80)
+    server_id: str = Field(min_length=1, max_length=80)
+    transport: str = 'streamable_http'
+    config_ref: str = ''
+    enabled: bool = True
+
+
+class CredentialBindingRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=80)
+    server_id: str = Field(min_length=1, max_length=80)
+    subject_kind: str = 'tenant'
+    subject_id: str = ''
+    credential_ref: str = Field(min_length=1, max_length=500)
+
+
+class ToolPolicyRequest(BaseModel):
+    tenant_id: str = Field(min_length=1, max_length=80)
+    tool_key: str = Field(min_length=1, max_length=200)
+    role: str = ''
+    user_id: str = ''
+    approval_mode: str = 'auto'
+    enabled: bool = True
+
+
+class ApproveRequest(BaseModel):
+    manifest_hash: str = Field(min_length=16, max_length=128)
+
+
+def _public_approval(row: dict) -> dict:
+    manifest = row.get('manifest_json') or row.get('manifest') or ''
+    if isinstance(manifest, str) and manifest:
+        try:
+            manifest = json.loads(manifest)
+        except ValueError:
+            manifest = {}
+    return {'approval_id': row.get('approval_id'),
+            'run_id': row.get('run_id'),
+            'status': row.get('status'),
+            'manifest_hash': row.get('manifest_hash'),
+            'manifest': manifest,
+            'expires_at': row.get('expires_at')}
+
+
+@app.post('/api/admin/server-bindings')
+async def bind_server(payload: ServerBindingRequest,
+                      principal=Depends(policies.current_principal)):
+    _require_operator(principal)
+    _own_tenant(principal, payload.tenant_id)
+    row = await hub.store.upsert_server_binding(
+        tenant_id=payload.tenant_id, server_id=payload.server_id,
+        transport=payload.transport, config_ref=payload.config_ref,
+        enabled=payload.enabled)
+    return {'binding_id': row.get('binding_id'), 'server_id': row.get('server_id'),
+            'enabled': row.get('enabled'), 'revision': row.get('revision')}
+
+
+@app.post('/api/admin/credential-bindings')
+async def bind_credential(payload: CredentialBindingRequest,
+                          principal=Depends(policies.current_principal)):
+    """只保存 credential_ref。响应里不回显引用里的明文。"""
+    _require_operator(principal)
+    _own_tenant(principal, payload.tenant_id)
+    server = await hub.store.server_binding(payload.tenant_id, payload.server_id)
+    if not server:
+        raise HTTPException(status_code=404, detail='先登记服务端绑定')
+    subject = payload.subject_id or payload.tenant_id
+    row = await hub.store.upsert_credential_binding(
+        tenant_id=payload.tenant_id, subject_kind=payload.subject_kind,
+        subject_id=subject, server_binding_id=str(server.get('binding_id') or ''),
+        credential_ref=payload.credential_ref)
+    return {'binding_id': row.get('binding_id'),
+            'server_binding_id': row.get('server_binding_id'),
+            'subject_kind': row.get('subject_kind'),
+            'status': row.get('status')}
+
+
+@app.post('/api/admin/tool-policies')
+async def bind_policy(payload: ToolPolicyRequest,
+                      principal=Depends(policies.current_principal)):
+    _require_operator(principal)
+    _own_tenant(principal, payload.tenant_id)
+    row = await hub.store.upsert_tool_policy(
+        tenant_id=payload.tenant_id, tool_key=payload.tool_key,
+        role=payload.role, user_id=payload.user_id,
+        approval_mode=payload.approval_mode, enabled=payload.enabled)
+    return {'policy_id': row.get('policy_id'), 'tool_key': row.get('tool_key'),
+            'enabled': row.get('enabled'), 'approval_mode': row.get('approval_mode')}
+
+
+@app.get('/api/runs/{run_id}/approvals')
+async def list_run_approvals(run_id: str,
+                             principal=Depends(policies.current_principal)):
+    run = await hub.store.run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail='运行不存在')
+    await _owned_task(run['task_id'], principal)
+    rows = await hub.store.approvals_for(
+        tenant_id=principal.tenant_id, owner_user_id=principal.user_id)
+    mine = [row for row in rows if row.get('run_id') == run_id]
+    return {'approvals': [_public_approval(row) for row in mine]}
+
+
+@app.get('/api/runs/{run_id}/external-tasks')
+async def list_external_tasks(run_id: str,
+                              principal=Depends(policies.current_principal)):
+    run = await hub.store.run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail='运行不存在')
+    await _owned_task(run['task_id'], principal)
+    rows = await hub.store.external_tasks_of_run(run_id)
+    return {'external_tasks': [
+        {'external_task_id': row.get('external_task_id'),
+         'remote_task_id': row.get('remote_task_id'),
+         'state': row.get('state'),
+         'tool_key': row.get('tool_key')} for row in rows]}
+
+
+async def _owned_approval(approval_id: str, principal) -> dict:
+    row = await hub.store.approval(approval_id)
+    if not row or str(row.get('tenant_id') or '') != principal.tenant_id:
+        raise HTTPException(status_code=404, detail='批准不存在')
+    owner = str(row.get('owner_user_id') or '')
+    requester = str(row.get('requester_user_id') or '')
+    if principal.user_id not in {owner, requester}:
+        raise HTTPException(status_code=404, detail='批准不存在')
+    return row
+
+
+@app.post('/api/approvals/{approval_id}/approve')
+async def approve(approval_id: str, payload: ApproveRequest,
+                  principal=Depends(policies.current_principal)):
+    await _owned_approval(approval_id, principal)
+    from app import approvals as approvals_module
+    try:
+        updated = await hub.store.approve_approval(
+            approval_id, approver_user_id=principal.user_id,
+            expected_manifest_hash=payload.manifest_hash)
+    except approvals_module.ApprovalConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from None
+    body = _public_approval(updated)
+    body['resumed'] = bool(updated.get('resumed'))
+    return body
+
+
+@app.post('/api/approvals/{approval_id}/reject')
+async def reject_approval(approval_id: str,
+                          principal=Depends(policies.current_principal)):
+    await _owned_approval(approval_id, principal)
+    updated = await hub.store.revoke_approval(
+        approval_id, approver_user_id=principal.user_id, reject=True)
+    return _public_approval(updated)
+
+
+@app.get('/api/approvals/{approval_id}')
+async def read_approval(approval_id: str,
+                        principal=Depends(policies.current_principal)):
+    return _public_approval(await _owned_approval(approval_id, principal))
+
+
+@app.get('/api/ops/metrics')
+async def ops_metrics(principal=Depends(policies.current_principal)):
+    """队列、未知动作、批准积压、外部任务。不含费用。"""
+    _require_operator(principal)
+    try:
+        stats = await hub.store.stats()
+    except Exception as exc:                     # noqa: BLE001
+        raise HTTPException(status_code=503,
+                            detail=f'数据库不可用（{type(exc).__name__}）') from None
+    return stats
+
+
+@app.post('/api/ops/gc-results')
+async def gc_results(principal=Depends(policies.current_principal)):
+    """只删除超过宽限期、且没有 manifest 的结果目录。"""
+    _require_operator(principal)
+    from app import artifact_store
+    removed = artifact_store.gc_unregistered(
+        settings.artifact_dir, grace_seconds=settings.result_gc_grace_seconds)
+    return {'removed': removed}
+
+
+@app.get('/api/results/{result_id}')
+async def read_staged_result(result_id: str,
+                             principal=Depends(policies.current_principal)):
+    """按租户目录读取已落盘的结果。别的企业的 result_id 读不到。"""
+    from app import tool_results
+    folder = tool_results.result_dir(
+        settings.artifact_dir, principal.tenant_id, result_id)
+    structured_path = folder / 'structured.json'
+    if not structured_path.is_file():
+        raise HTTPException(status_code=404, detail='结果不存在')
+    try:
+        structured = json.loads(structured_path.read_text(encoding='utf-8'))
+    except ValueError:
+        structured = None
+    return {'result_id': result_id, 'tenant_id': principal.tenant_id,
+            'structured': structured}
+
+
+@app.get('/api/results/{result_id}/parts/{part_id}')
+async def read_result_part(result_id: str, part_id: str,
+                           offset: int = Query(default=0),
+                           limit: int = Query(default=0),
+                           principal=Depends(policies.current_principal)):
+    """按清单里的 part_id 读取。不接受文件路径。"""
+    from app import tool_results
+    folder = tool_results.result_dir(
+        settings.artifact_dir, principal.tenant_id, result_id)
+    manifest_path = folder / 'manifest.json'
+    if not manifest_path.is_file():
+        raise HTTPException(status_code=404, detail='结果不存在')
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
+    except ValueError:
+        raise HTTPException(status_code=404, detail='结果不存在') from None
+    part = next((item for item in (manifest.get('parts') or [])
+                 if str(item.get('part_id') or '') == part_id), None)
+    if not isinstance(part, dict):
+        raise HTTPException(status_code=404, detail='分块不存在')
+    page_limit = limit or settings.tool_result_page_limit
+    try:
+        return tool_results.read_part(
+            settings.artifact_dir, principal.tenant_id, part,
+            offset=offset, limit=page_limit)
+    except tool_results.ResultError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from None

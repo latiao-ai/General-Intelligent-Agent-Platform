@@ -329,7 +329,7 @@ CREATE TABLE IF NOT EXISTS run_snapshots (
     updated_at            TEXT NOT NULL
 );
 
--- ---------- 运行中补充输入（文档 harness-live-input §4） ----------
+-- ---------- 运行中补充输入 ----------
 -- 三个版本必须分开存：lease_epoch（谁有权推进）、intent_version（用户要求更新到
 -- 哪一版）、plan_version（当前采用哪份计划）。混用任何一个都会让"旧要求产生的
 -- 操作"重新获得准入资格。
@@ -361,7 +361,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_run_inputs_request
 CREATE UNIQUE INDEX IF NOT EXISTS uq_run_inputs_seq
     ON run_inputs(run_id, input_seq);
 
--- ---------- 结果观察与决策（文档 harness-observe-decide §9） ----------
+-- ---------- 结果观察与决策 ----------
 -- 结果水位：每次"相关结果落库"在同一事务 +1。判断决策覆盖到哪一步只能用它，
 -- 不能用墙钟时间（跨进程、跨副本的时钟没有可比性）。
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS observation_seq INTEGER NOT NULL DEFAULT 0;
@@ -424,7 +424,242 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_user ON auth_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_auth_sessions_expiry ON auth_sessions(expires_at);
+
+-- ============ 工具运行时（《智能体中台说明书》） ============
+-- 迁移编号：schema_version 记录已执行的迁移集合，迁移必须在同一发布代际只跑一次
+-- 或保证可重入。下面的语句都写成幂等形式，因此重复执行是安全的。
+
+-- ---------- M1：通用结果（信封 v2 + 分块） ----------
+-- 结果与它的分块是**受保护数据**：只存引用与元数据，原始内容落在受控存储。
+-- 全局内容 hash 去重**不**隐式共享跨租户读取权：读权限由 result_id 的归属决定。
+CREATE TABLE IF NOT EXISTS tool_result_manifests (
+    result_id           TEXT PRIMARY KEY,
+    tenant_id           TEXT NOT NULL DEFAULT 'default',
+    owner_user_id       TEXT NOT NULL DEFAULT 'default',
+    run_id              TEXT NOT NULL DEFAULT '',
+    step_id             TEXT NOT NULL DEFAULT '',
+    action_id           TEXT NOT NULL DEFAULT '',
+    attempt_id          TEXT NOT NULL DEFAULT '',
+    tool_key            TEXT NOT NULL DEFAULT '',
+    schema_hash         TEXT NOT NULL DEFAULT '',
+    contract_version    TEXT NOT NULL DEFAULT '',
+    transport_status    TEXT NOT NULL DEFAULT 'ok',
+    business_status     TEXT NOT NULL DEFAULT 'not_applicable',
+    verification_status TEXT NOT NULL DEFAULT 'not_applicable',
+    raw_ref             TEXT NOT NULL DEFAULT '',
+    structured_ref      TEXT NOT NULL DEFAULT '',
+    summary_json        TEXT NOT NULL DEFAULT '{}',
+    completeness_json   TEXT NOT NULL DEFAULT '{}',
+    schema_version      INTEGER NOT NULL DEFAULT 2,
+    size_bytes          BIGINT NOT NULL DEFAULT 0,
+    created_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_result_manifests_run ON tool_result_manifests(run_id);
+CREATE INDEX IF NOT EXISTS idx_result_manifests_owner
+    ON tool_result_manifests(tenant_id, owner_user_id);
+
+CREATE TABLE IF NOT EXISTS tool_result_parts (
+    part_id      TEXT PRIMARY KEY,
+    result_id    TEXT NOT NULL,
+    ordinal      INTEGER NOT NULL,
+    content_type TEXT NOT NULL DEFAULT 'application/json',
+    kind         TEXT NOT NULL DEFAULT 'json',
+    mime         TEXT NOT NULL DEFAULT '',
+    storage_key  TEXT NOT NULL DEFAULT '',
+    link_ref     TEXT NOT NULL DEFAULT '',
+    size_bytes   BIGINT NOT NULL DEFAULT 0,
+    sha256       TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    visibility   TEXT NOT NULL DEFAULT 'owner',
+    UNIQUE (result_id, ordinal)
+);
+CREATE INDEX IF NOT EXISTS idx_result_parts_result ON tool_result_parts(result_id);
+
+-- ---------- M2：工具治理（服务端绑定 / 凭据绑定 / 政策 / 准入授权） ----------
+CREATE TABLE IF NOT EXISTS mcp_server_bindings (
+    binding_id    TEXT PRIMARY KEY,
+    tenant_id     TEXT NOT NULL DEFAULT 'default',
+    server_id     TEXT NOT NULL,
+    transport     TEXT NOT NULL DEFAULT 'streamable_http',
+    config_ref    TEXT NOT NULL DEFAULT '',
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    revision      INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL,
+    UNIQUE (tenant_id, server_id)
+);
+
+-- 只存**密钥引用**，不存明文。明文由凭据解析器在传输层短时取出。
+CREATE TABLE IF NOT EXISTS credential_bindings (
+    binding_id        TEXT PRIMARY KEY,
+    tenant_id         TEXT NOT NULL DEFAULT 'default',
+    subject_kind      TEXT NOT NULL DEFAULT 'tenant',
+    subject_id        TEXT NOT NULL DEFAULT 'default',
+    server_binding_id TEXT NOT NULL DEFAULT '',
+    credential_ref    TEXT NOT NULL DEFAULT '',
+    scope_json        TEXT NOT NULL DEFAULT '{}',
+    revision          INTEGER NOT NULL DEFAULT 1,
+    status            TEXT NOT NULL DEFAULT 'active',
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_credential_bindings_subject
+    ON credential_bindings(tenant_id, subject_kind, subject_id);
+
+-- 政策：scope 只用预定义字段/集合，不执行任意规则代码。
+CREATE TABLE IF NOT EXISTS tool_policies (
+    policy_id     TEXT PRIMARY KEY,
+    tenant_id     TEXT NOT NULL DEFAULT 'default',
+    tool_key      TEXT NOT NULL DEFAULT '',
+    role          TEXT NOT NULL DEFAULT '',
+    user_id       TEXT NOT NULL DEFAULT '',
+    resource_scope TEXT NOT NULL DEFAULT '',
+    effect        TEXT NOT NULL DEFAULT 'unknown',
+    approval_mode TEXT NOT NULL DEFAULT 'auto',
+    limits_json   TEXT NOT NULL DEFAULT '{}',
+    revision      INTEGER NOT NULL DEFAULT 1,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL,
+    UNIQUE (tenant_id, tool_key, role, user_id)
+);
+
+-- 准入授权：记录"这次调用凭什么被放行"。唯一 action + 有效准入身份，
+-- 保留审计历史（重试新增行，不覆盖旧行）。
+CREATE TABLE IF NOT EXISTS tool_authorizations (
+    authorization_id  TEXT PRIMARY KEY,
+    action_id         TEXT NOT NULL,
+    tenant_id         TEXT NOT NULL DEFAULT 'default',
+    user_id           TEXT NOT NULL DEFAULT 'default',
+    tool_key          TEXT NOT NULL DEFAULT '',
+    schema_hash       TEXT NOT NULL DEFAULT '',
+    args_hash         TEXT NOT NULL DEFAULT '',
+    resource_hash     TEXT NOT NULL DEFAULT '',
+    credential_binding TEXT NOT NULL DEFAULT '',
+    credential_subject TEXT NOT NULL DEFAULT '',
+    credential_revision INTEGER NOT NULL DEFAULT 0,
+    policy_revision   INTEGER NOT NULL DEFAULT 0,
+    approval_id       TEXT NOT NULL DEFAULT '',
+    expires_at        DOUBLE PRECISION NOT NULL DEFAULT 0,
+    status            TEXT NOT NULL DEFAULT 'admitted',
+    created_at        TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tool_auth_action ON tool_authorizations(action_id);
+CREATE INDEX IF NOT EXISTS idx_tool_auth_credential
+    ON tool_authorizations(tenant_id, credential_binding);
+
+-- ---------- M3：结构化批准 ----------
+CREATE TABLE IF NOT EXISTS approvals (
+    approval_id      TEXT PRIMARY KEY,
+    tenant_id        TEXT NOT NULL DEFAULT 'default',
+    owner_user_id    TEXT NOT NULL DEFAULT 'default',
+    requester_user_id TEXT NOT NULL DEFAULT 'default',
+    approver_user_id TEXT NOT NULL DEFAULT '',
+    run_id           TEXT NOT NULL DEFAULT '',
+    manifest_json    TEXT NOT NULL DEFAULT '{}',
+    manifest_hash    TEXT NOT NULL DEFAULT '',
+    policy_revision  INTEGER NOT NULL DEFAULT 0,
+    status           TEXT NOT NULL DEFAULT 'pending',
+    expires_at       DOUBLE PRECISION NOT NULL DEFAULT 0,
+    limits_json      TEXT NOT NULL DEFAULT '{}',
+    created_at       TEXT NOT NULL,
+    approved_at      TEXT,
+    revoked_at       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_approvals_pending
+    ON approvals(tenant_id, status);
+
+-- 预留：按 (approval_id, action_id, manifest_item_key) 唯一。
+-- 额度在锁住批准行之后原子计算并预留，两个并发动作不能超用同一份批准。
+CREATE TABLE IF NOT EXISTS approval_reservations (
+    reservation_id   TEXT PRIMARY KEY,
+    approval_id      TEXT NOT NULL,
+    action_id        TEXT NOT NULL,
+    manifest_item_key TEXT NOT NULL DEFAULT '',
+    units            INTEGER NOT NULL DEFAULT 1,
+    status           TEXT NOT NULL DEFAULT 'reserved',
+    created_at       TEXT NOT NULL,
+    released_at      TEXT,
+    UNIQUE (approval_id, action_id, manifest_item_key)
+);
+CREATE INDEX IF NOT EXISTS idx_approval_reservations_approval
+    ON approval_reservations(approval_id);
+
+-- ---------- M4：外部任务（异步长任务合同） ----------
+CREATE TABLE IF NOT EXISTS external_tasks (
+    external_task_id  TEXT PRIMARY KEY,
+    remote_task_id    TEXT NOT NULL DEFAULT '',
+    tenant_id         TEXT NOT NULL DEFAULT 'default',
+    owner_user_id     TEXT NOT NULL DEFAULT 'default',
+    server_binding_id TEXT NOT NULL DEFAULT '',
+    credential_binding TEXT NOT NULL DEFAULT '',
+    credential_subject TEXT NOT NULL DEFAULT '',
+    tool_key          TEXT NOT NULL DEFAULT '',
+    contract_id       TEXT NOT NULL DEFAULT '',
+    contract_version  INTEGER NOT NULL DEFAULT 1,
+    run_id            TEXT NOT NULL DEFAULT '',
+    step_id           TEXT NOT NULL DEFAULT '',
+    action_id         TEXT NOT NULL DEFAULT '',
+    accepted_result_id TEXT NOT NULL DEFAULT '',
+    submission_key    TEXT NOT NULL DEFAULT '',
+    item_key          TEXT NOT NULL DEFAULT '',
+    state             TEXT NOT NULL DEFAULT 'accepted',
+    version           INTEGER NOT NULL DEFAULT 1,
+    next_poll_at      DOUBLE PRECISION NOT NULL DEFAULT 0,
+    deadline_at       DOUBLE PRECISION NOT NULL DEFAULT 0,
+    last_observed_at  DOUBLE PRECISION NOT NULL DEFAULT 0,
+    last_result_id    TEXT NOT NULL DEFAULT '',
+    output_manifest_ref TEXT NOT NULL DEFAULT '',
+    error_code        TEXT NOT NULL DEFAULT '',
+    poll_owner        TEXT NOT NULL DEFAULT '',
+    poll_epoch        INTEGER NOT NULL DEFAULT 0,
+    poll_lease_expires_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_external_tasks_submission
+    ON external_tasks(run_id, action_id, item_key);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_external_tasks_remote
+    ON external_tasks(tenant_id, server_binding_id, credential_subject, remote_task_id)
+    WHERE remote_task_id <> '';
+CREATE INDEX IF NOT EXISTS idx_external_tasks_due
+    ON external_tasks(state, next_poll_at);
+
+-- ---------- M5：作业与状态扩展 ----------
+-- background_jobs 增加 due_at / lease_epoch：调度到期时间与领取代次必须分开，
+-- 退避的重试不能把到期时间塞进 lease_expires_at（那会让旧 Worker 与新 Worker
+-- 都以为对方还活着）。
+ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS due_at DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS lease_epoch INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE background_jobs ADD COLUMN IF NOT EXISTS consecutive_failures INTEGER NOT NULL DEFAULT 0;
+-- 领取作业要按 (status, due_at) 找候选行：没有这个索引时，作业一多就是全表扫，
+-- 而且 `FOR UPDATE SKIP LOCKED` 的候选集也会变慢。
+CREATE INDEX IF NOT EXISTS idx_jobs_claim ON background_jobs(status, due_at);
+
+-- run 增加 waiting_external 生命周期：外部任务已受理未完成，**不是**完成。
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS waiting_external INTEGER NOT NULL DEFAULT 0;
+-- run 记录**执行主体**：工具调用的授权按主体判定，主体必须来自库里已提交的
+-- 行，而不是请求头里的自报字段或模型输出。没有它时 Worker 无法知道
+-- "这次调用该用哪把钥匙"。
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS owner_user_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS owner_role TEXT NOT NULL DEFAULT 'member';
+-- step/action 增加受理阶段：提交拿到了回执，但该逻辑步骤尚未完成。
+ALTER TABLE steps ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT '';
+ALTER TABLE actions ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT '';
+ALTER TABLE actions ADD COLUMN IF NOT EXISTS external_task_id TEXT NOT NULL DEFAULT '';
+-- 已验证的现场上下文（当前项目 / 选中对象）。浏览器自报的 JSON 不能直接当它用。
+ALTER TABLE tasks_meta ADD COLUMN IF NOT EXISTS scene_context_json TEXT NOT NULL DEFAULT '';
+
+-- ---------- M6：迁移版本记录 ----------
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    migration_id  TEXT PRIMARY KEY,
+    applied_at    TEXT NOT NULL
+);
 """
+# 时间单位约定：
+# `background_jobs.due_at` / `lease_expires_at` 与 `external_tasks.*_at` 一律用
+# **Unix 秒（DOUBLE PRECISION）**，与既有 `runs.lease_expires_at` 同口径，
+# 因此可以直接和 `time.time()` 比较。**不要**把这些列拿去和 PG 的 `now()`
+# 比——那会把两种单位混在一起（本项目早年的坑就是这么来的）。
+# 新增的调度期限如果以后改用 TIMESTAMPTZ，必须先做显式转换再切换。
 
 
 class TicketAlreadyUsed(RuntimeError):
@@ -433,6 +668,19 @@ class TicketAlreadyUsed(RuntimeError):
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+# 迁移编号：
+# 每次改表结构都要在这里加一条，编号只增不改。写在这里是为了让"这个库到底
+# 应用了哪些迁移"能被查出来，而不是靠回忆 SCHEMA 里有没有某条 ALTER。
+MIGRATIONS = (
+    'm1_tool_result_manifests',
+    'm2_tool_governance',
+    'm3_approvals',
+    'm4_external_tasks',
+    'm5_job_and_state_extensions',
+    'm6_schema_migrations',
+)
 
 
 class PostgresStore:
@@ -558,6 +806,35 @@ class PostgresStore:
             async with conn.cursor() as cur:
                 await cur.execute(SCHEMA)
             await conn.commit()
+            await self._record_migrations(conn)
+
+    async def _record_migrations(self, conn) -> None:
+        """登记本次已应用的迁移编号。
+
+        `CREATE TABLE IF NOT EXISTS` **不是**旧库补列机制——所以每次升级都要
+        在 SCHEMA 里显式写 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`。这张表
+        只回答"哪些迁移已经应用过"，让排障时能看出某个环境的库是不是漏了某次
+        升级；**不**用它来跳过语句（跳过会让漏列的库永远补不上）。
+        """
+        stamp = now()
+        for migration_id in MIGRATIONS:
+            await self._run(
+                conn,
+                'INSERT INTO schema_migrations (migration_id, applied_at) '
+                'VALUES (%s, %s) ON CONFLICT (migration_id) DO NOTHING',
+                (migration_id, stamp))
+
+    async def applied_migrations(self) -> list[str]:
+        """已应用的迁移编号（排障用）。"""
+        try:
+            async with self._lease() as conn:
+                rows = await self._all(
+                    conn,
+                    'SELECT migration_id FROM schema_migrations '
+                    'ORDER BY migration_id')
+                return [str(row['migration_id']) for row in rows]
+        except Exception:                              # noqa: BLE001
+            return []
 
     # ---------- 身份（app/auth.py） ----------
 
@@ -980,6 +1257,8 @@ class PostgresStore:
                     await self._run(conn, 'SELECT pg_advisory_xact_lock(hashtext(%s))',
                                  (task_id,))
                     row = await self._one(conn, statement, (task_id, payload, now(), task_id))
+                    await self._run(conn, "SELECT pg_notify('agent_task_events', %s)",
+                                    (task_id,))
                     return int(row['seq'])
                 except psycopg.errors.UniqueViolation:
                     # 建议锁下不该再发生；真发生（哈希撞了别人的锁又抢到同一号）
@@ -1008,20 +1287,51 @@ class PostgresStore:
                 (task_id, tenant_id, owner_user_id, goal, now()))
             await conn.commit()
 
+    async def save_scene_context(self, task_id: str, scene: dict) -> None:
+        """保存已核对的现场上下文。明文密钥不该出现在这份 JSON 里。"""
+        payload = json.dumps(scene, ensure_ascii=False, default=str)
+        async with self._lease() as conn:
+            await self._run(
+                conn,
+                'UPDATE tasks_meta SET scene_context_json=%s WHERE task_id=%s',
+                (payload, task_id))
+            await conn.commit()
+
+    async def scene_context(self, task_id: str) -> dict:
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'SELECT scene_context_json FROM tasks_meta WHERE task_id=%s',
+                (task_id,))
+        if not row:
+            return {}
+        raw = row.get('scene_context_json') or ''
+        if not raw:
+            return {}
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
     async def task_meta(self, task_id: str) -> dict | None:
         async with self._lease() as conn:
             row = await self._one(conn, 'SELECT * FROM tasks_meta WHERE task_id=%s', (task_id,))
         return dict(row) if row else None
 
     async def create_run(self, run_id: str, task_id: str, *, budget: dict | None = None,
-                   tenant_id: str = 'default', status: str = 'queued') -> None:
+                   tenant_id: str = 'default', status: str = 'queued',
+                   owner_user_id: str = 'default', owner_role: str = 'member') -> None:
         stamp = now()
         async with self._lease() as conn:
             await self._run(conn, 'INSERT INTO runs (run_id, task_id, tenant_id, status, '
-                'budget_json, consumed_json, created_at, updated_at) '
-                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s)',
+                'budget_json, consumed_json, owner_user_id, owner_role, '
+                'created_at, updated_at) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
                 (run_id, task_id, tenant_id, status,
-                 json.dumps(budget or {}, ensure_ascii=False), '{}', stamp, stamp))
+                 json.dumps(budget or {}, ensure_ascii=False), '{}',
+                 str(owner_user_id or 'default'), str(owner_role or 'member'),
+                 stamp, stamp))
             await self._run(conn, 'UPDATE tasks_meta SET current_run_id=%s WHERE task_id=%s',
                 (run_id, task_id))
             await conn.commit()
@@ -1035,7 +1345,8 @@ class PostgresStore:
         allowed = {'status', 'plan_version', 'intent_version',
                    'processed_intent_version', 'budget_json', 'consumed_json',
                    'cancel_requested_at', 'pause_requested', 'lease_owner',
-                   'lease_expires_at', 'lease_epoch', 'error', 'compensated_at'}
+                   'lease_expires_at', 'lease_epoch', 'error', 'compensated_at',
+                   'waiting_external', 'owner_user_id', 'owner_role'}
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:
             return
@@ -1047,6 +1358,23 @@ class PostgresStore:
             await self._run(conn, f'UPDATE runs SET {columns}, updated_at=%s WHERE run_id=%s',
                 (*updates.values(), now(), run_id))
             await conn.commit()
+
+    async def update_run_owned(self, run_id: str, *, lease_owner: str,
+                               lease_epoch: int, **fields) -> bool:
+        """只在租约仍属于这个执行者时改 run。旧 Worker 不能盖住新执行者。"""
+        allowed = {'status', 'error', 'waiting_external', 'pause_requested',
+                   'cancel_requested_at'}
+        updates = {key: value for key, value in fields.items() if key in allowed}
+        if not updates:
+            return False
+        columns = ', '.join(f'{key}=%s' for key in updates)
+        async with self._lease() as conn:
+            cur = await self._run(
+                conn, f'UPDATE runs SET {columns}, updated_at=%s '
+                'WHERE run_id=%s AND lease_owner=%s AND lease_epoch=%s',
+                (*updates.values(), now(), run_id, lease_owner, int(lease_epoch)))
+            await conn.commit()
+            return cur.rowcount > 0
 
     async def runs_of(self, task_id: str) -> list[dict]:
         async with self._lease() as conn:
@@ -1177,7 +1505,7 @@ class PostgresStore:
             data['state'] = {}
         return data
 
-    # ---------- 运行中补充输入（文档 harness-live-input §4） ----------
+    # ---------- 运行中补充输入 ----------
     # 这里的核心不是"存一条消息"，而是**一次事务**里完成五件事：
     # 校验状态 → 幂等查原回执 → 分配序号插日志 → 升 intent_version → 追加事件。
     # 少任何一步都会出现"版本涨了但没有日志"或"日志在、版本没涨"的分叉状态，
@@ -1360,7 +1688,7 @@ class PostgresStore:
         data['pending_input_count'] = int((pending or {}).get('n') or 0)
         return data
 
-    # ---------- 自主决策与预算（文档 harness-observe-decide §9、§12） ----------
+    # ---------- 自主决策与预算 ----------
 
     async def reserve_decision(self, context, *, run_id: str, decision_key: str,
                                reason: str = 'observation', intent_version: int = 0,
@@ -1771,7 +2099,8 @@ class PostgresStore:
                            action_id: str, attempt_id: str,
                            require_pause_free: bool = True,
                            expected_intent_version: int | None = None,
-                           decision_intent_version: int | None = None) -> dict:
+                           decision_intent_version: int | None = None,
+                           authorization: dict | None = None) -> dict:
         """**原子地**取得这次工具调用的准入资格。
 
         同一事务内按固定顺序做四件事：校验租约与控制请求 → 查/建 action →
@@ -1827,6 +2156,7 @@ class PostgresStore:
                         'WHERE run_id=%s AND plan_version=%s AND step_id=%s',
                         (restamp, data['action_id'], run_id, int(plan_version),
                          step_id))
+                    await self._attach_grant(conn, data['action_id'], authorization)
                     return {'status': 'admitted', 'action_id': data['action_id'],
                             'attempt_id': attempt_id}
                 return {'status': data['status'], 'action': data,
@@ -1852,8 +2182,70 @@ class PostgresStore:
                 'started_at=COALESCE(started_at, %s), action_id=%s '
                 'WHERE run_id=%s AND plan_version=%s AND step_id=%s',
                 (stamp, action_id, run_id, int(plan_version), step_id))
+            await self._attach_grant(conn, action_id, authorization)
             return {'status': 'admitted', 'action_id': action_id,
                     'attempt_id': attempt_id}
+
+    async def _attach_grant(self, conn, action_id: str,
+                            authorization: dict | None) -> None:
+        """在准入事务里写下放行依据，并预留批准。失败则整笔准入回滚。"""
+        if not authorization:
+            return
+        from app import approvals as approvals_module
+        await self._run(
+            conn,
+            'INSERT INTO tool_authorizations '
+            '(authorization_id, action_id, tenant_id, user_id, tool_key, '
+            ' schema_hash, args_hash, resource_hash, credential_binding, '
+            ' credential_subject, credential_revision, policy_revision, '
+            ' approval_id, expires_at, status, created_at) '
+            'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+            ('auth_' + uuid.uuid4().hex[:16], action_id,
+             str(authorization.get('tenant_id') or ''),
+             str(authorization.get('user_id') or ''),
+             str(authorization.get('tool_key') or ''),
+             str(authorization.get('schema_hash') or ''),
+             str(authorization.get('args_hash') or ''),
+             str(authorization.get('resource_hash') or ''),
+             str(authorization.get('credential_binding') or ''),
+             str(authorization.get('credential_subject') or ''),
+             int(authorization.get('credential_revision') or 0),
+             int(authorization.get('policy_revision') or 0),
+             str(authorization.get('approval_id') or ''),
+             0.0, 'admitted', now()))
+        approval_id = str(authorization.get('approval_id') or '')
+        if not approval_id:
+            return
+        item_key = str(authorization.get('approval_item_key') or 'call')
+        row = await self._one(
+            conn, 'SELECT * FROM approvals WHERE approval_id=%s FOR UPDATE',
+            (approval_id,))
+        if row is None or not approvals_module.is_valid(dict(row), now_ts=time.time()):
+            raise approvals_module.ApprovalMissing('批准不可用，拒绝发送')
+        existing = await self._one(
+            conn,
+            'SELECT * FROM approval_reservations WHERE approval_id=%s '
+            'AND action_id=%s AND manifest_item_key=%s',
+            (approval_id, action_id, item_key))
+        if existing is not None:
+            return
+        manifest = approvals_module.parse_manifest(dict(row))
+        used = await self._one(
+            conn,
+            'SELECT COALESCE(SUM(units),0) AS used FROM approval_reservations '
+            "WHERE approval_id=%s AND status IN ('reserved','consumed')",
+            (approval_id,))
+        used_units = int((used['used'] if used else 0) or 0)
+        limit = int(manifest.limits.get('max_units') or manifest.max_actions or 0)
+        if limit and used_units + 1 > limit:
+            raise approvals_module.ApprovalConflict('批准次数已用完')
+        await self._run(
+            conn,
+            'INSERT INTO approval_reservations '
+            '(reservation_id, approval_id, action_id, manifest_item_key, units, '
+            ' status, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s)',
+            ('res_' + uuid.uuid4().hex[:16], approval_id, action_id, item_key,
+             1, approvals_module.RESERVED, now()))
 
     async def settle_action(self, context, *, run_id: str, plan_version: int,
                             step_id: str, action_id: str,
@@ -2110,33 +2502,122 @@ class PostgresStore:
     # ---------- 后台任务（outbox） ----------
 
     async def enqueue_job(self, job_id: str, kind: str, dedupe_key: str,
-                    payload: dict | None = None) -> bool:
-        """按 (kind, dedupe_key) 幂等入队；返回是否真的新入队。"""
+                    payload: dict | None = None,
+                    due_at: float | None = None) -> bool:
+        """按 (kind, dedupe_key) 幂等入队；返回是否真的新入队。
+
+        `due_at` 是**调度到期时间**（Unix 秒），与租约期限分开：
+        退避的重试要占住"什么时候再轮"，而不是"谁的租约"——把两者塞进同一列，
+        旧 Worker 与新 Worker 都会以为对方还活着。
+        """
         async with self._lease() as conn:
             cur = await self._run(conn, 'INSERT INTO background_jobs '
-                '(job_id, kind, dedupe_key, payload_json, created_at, updated_at) '
-                'VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
+                '(job_id, kind, dedupe_key, payload_json, due_at, created_at, updated_at) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
                 (job_id, kind, dedupe_key,
-                 json.dumps(payload or {}, ensure_ascii=False), now(), now()))
+                 json.dumps(payload or {}, ensure_ascii=False),
+                 float(due_at if due_at is not None else 0.0), now(), now()))
             await conn.commit()
             return cur.rowcount > 0
 
     async def claim_job(self, worker_id: str, lease_seconds: float = 60.0,
-                  now_ts: float | None = None) -> dict | None:
+                  now_ts: float | None = None,
+                  kind: str = '') -> dict | None:
+        """**原子**领取一个到期作业。
+
+        旧实现是「SELECT 一行 → UPDATE 那一行」：两个 Worker 同时跑这段时，
+        第二个会拿到**同一条**作业（第一个还没提交，第二个就选中了它），
+        于是同一个作业被做两遍——对「给这个会话压缩摘要」这种幂等作业还好，
+        对「轮询一次外部任务」就是**重复查询**，对「物化一次产物」就是**重复下载**。
+
+        现在用文档 §10 E2 要求的形状：`FOR UPDATE SKIP LOCKED` 选候选行，
+        同一事务里更新 owner/代次/期限并 RETURNING。第二个 Worker 会直接
+        **跳过**被锁住的行去领下一条，而不是等锁再抢同一条。
+
+        领取条件：到期（`due_at <= now`）且
+        - `queued`（还没人领）；或
+        - `running` 但**租约已过期**（领取它的 Worker 死了，作业要能被接手）。
+
+        `lease_epoch` 每次领取 +1：它是 fencing token。旧 Worker 醒来后带着
+        旧代次来收尾时，条件更新影响 0 行——**它不能覆盖新 Worker 的结果**。
+        """
         current = now_ts if now_ts is not None else time.time()
+        # 参数顺序必须与 SQL 里的占位符顺序**严格一致**：CTE 的占位符在前，
+        # UPDATE 的在后。（曾经把 kind 的参数追加到末尾，结果 CTE 拿到的是
+        #  worker_id —— 过滤条件整个错位。）
+        cte_params: list = [current, current]
+        kind_clause = ''
+        if kind:
+            kind_clause = ' AND j.kind=%s'
+            cte_params.append(kind)
+        update_params: list = [worker_id, current + lease_seconds, now()]
+        sql = (
+            "WITH candidate AS ("
+            "  SELECT job_id FROM background_jobs j"
+            "  WHERE j.due_at <= %s"
+            "    AND (j.status='queued'"
+            "         OR (j.status='running' AND j.lease_expires_at < %s))"
+            + kind_clause +
+            "  ORDER BY j.due_at, j.created_at"
+            "  FOR UPDATE SKIP LOCKED"
+            "  LIMIT 1"
+            ") "
+            "UPDATE background_jobs j SET status='running', lease_owner=%s, "
+            "  lease_epoch=j.lease_epoch+1, lease_expires_at=%s, "
+            "  attempts=j.attempts+1, updated_at=%s "
+            "FROM candidate c WHERE j.job_id=c.job_id RETURNING j.*"
+        )
         async with self._lease() as conn:
-            row = await self._one(conn, "SELECT job_id FROM background_jobs WHERE status='queued' "
-                "AND (lease_expires_at IS NULL OR lease_expires_at < %s) "
-                "ORDER BY created_at LIMIT 1", (current,))
-            if row is None:
-                return None
-            job_id = row['job_id']
-            await self._run(conn, "UPDATE background_jobs SET status='running', lease_owner=%s, "
-                'lease_expires_at=%s, attempts=attempts+1, updated_at=%s '
-                'WHERE job_id=%s',
-                (worker_id, current + lease_seconds, now(), job_id))
+            row = await self._one(conn, sql, tuple(cte_params + update_params))
             await conn.commit()
-        return await self.job(job_id)
+        if row is None:
+            return None
+        data = dict(row)
+        data['payload'] = json.loads(data.pop('payload_json') or '{}')
+        return data
+
+    async def renew_job_lease(self, job_id: str, worker_id: str,
+                              lease_seconds: float = 60.0,
+                              epoch: int | None = None) -> bool:
+        """续一个作业的租约。**带 owner + 代次条件**：旧 Worker 续不了新 Worker 的活。"""
+        condition = 'status=\'running\' AND lease_owner=%s'
+        params: list = [worker_id]
+        if epoch is not None:
+            condition += ' AND lease_epoch=%s'
+            params.append(int(epoch))
+        params.append(time.time() + lease_seconds)
+        params.append(now())
+        params.append(job_id)
+        async with self._lease() as conn:
+            cur = await self._run(
+                conn, f'UPDATE background_jobs SET lease_expires_at=%s, updated_at=%s '
+                f'WHERE {condition} AND job_id=%s',
+                tuple(params))
+            await conn.commit()
+            return bool(cur.rowcount)
+
+    async def reschedule_job(self, job_id: str, worker_id: str, *,
+                             due_at: float, epoch: int | None = None,
+                             error: str = '', status: str = 'queued') -> bool:
+        """把作业重新排到未来某个时刻（轮询退避）。
+
+        同样带 owner + 代次条件：被接手的作业不该由旧 Worker 改期。
+        返回 False 表示"已经不是我的了"，调用方应当安静退出。
+        """
+        condition = 'lease_owner=%s'
+        params: list = [worker_id]
+        if epoch is not None:
+            condition += ' AND lease_epoch=%s'
+            params.append(int(epoch))
+        params.extend([status, error, float(due_at), now(), job_id])
+        async with self._lease() as conn:
+            cur = await self._run(
+                conn, f'UPDATE background_jobs SET status=%s, last_error=%s, due_at=%s, '
+                f'lease_owner=NULL, lease_expires_at=NULL, updated_at=%s '
+                f'WHERE {condition} AND job_id=%s',
+                tuple(params))
+            await conn.commit()
+            return bool(cur.rowcount)
 
     async def job(self, job_id: str) -> dict | None:
         async with self._lease() as conn:
@@ -2148,27 +2629,46 @@ class PostgresStore:
         return data
 
     async def finish_job(self, job_id: str, *, error: str | None = None,
-                   retry: bool = False) -> None:
-        """收尾一个后台作业。
+                   retry: bool = False, worker_id: str = '',
+                   epoch: int | None = None) -> bool:
+        """收尾一个后台作业。返回 False = "已经不是我的了"。
 
         `retry=True`：退回 queued 并用退避时间占住租约，下一轮扫描再领。
         一次失败就写 failed 等于把偶发错误当终态，且没人会知道。
+
+        **带 owner + 代次条件**（给了 `worker_id` 时）：作业被接手后，旧 Worker
+        醒来时带着旧代次来收尾，必须**写不进去**。否则会出现"新 Worker 已经
+        成功收尾，旧 Worker 又把它标成 failed"的经典覆盖 bug——
+        文档 §10 E2 明确要求"旧 Worker 无法覆盖新结果"。
+
+        没给 `worker_id` 时不加条件（兼容既有调用点），但那时调用方自己
+        负责保证没有并发收尾。
         """
+        condition = ''
+        params: list = []
+        if worker_id:
+            condition = ' AND lease_owner=%s'
+            params.append(worker_id)
+            if epoch is not None:
+                condition += ' AND lease_epoch=%s'
+                params.append(int(epoch))
         async with self._lease() as conn:
             if error and retry:
                 row = await self._one(conn, 'SELECT attempts FROM background_jobs WHERE job_id=%s',
                     (job_id,))
                 attempts = int((row['attempts'] if row else 0) or 1)
                 delay = min(300.0, 5.0 * (2 ** min(attempts, 6)))
-                await self._run(conn, "UPDATE background_jobs SET status='queued', last_error=%s, "
-                    'lease_owner=NULL, lease_expires_at=%s, updated_at=%s '
-                    'WHERE job_id=%s',
-                    (error, time.time() + delay, now(), job_id))
+                cur = await self._run(conn, "UPDATE background_jobs SET status='queued', "
+                    'last_error=%s, due_at=%s, lease_owner=NULL, lease_expires_at=NULL, '
+                    f'updated_at=%s WHERE job_id=%s{condition}',
+                    (error, time.time() + delay, now(), job_id, *params))
             else:
-                await self._run(conn, "UPDATE background_jobs SET status=%s, last_error=%s, updated_at=%s "
-                    'WHERE job_id=%s',
-                    ('failed' if error else 'done', error, now(), job_id))
+                cur = await self._run(conn, "UPDATE background_jobs SET status=%s, last_error=%s, "
+                    f'lease_owner=NULL, lease_expires_at=NULL, updated_at=%s '
+                    f'WHERE job_id=%s{condition}',
+                    ('failed' if error else 'done', error, now(), job_id, *params))
             await conn.commit()
+            return bool(cur.rowcount)
 
     # ---------- 请求幂等（POST /api/tasks） ----------
 
@@ -2225,6 +2725,545 @@ class PostgresStore:
             await conn.commit()
             return cur.rowcount
 
+    # ---------- 工具运行时：治理（绑定 / 凭据 / 政策 / 准入授权） ----------
+
+    async def server_bindings(self, tenant_id: str = 'default') -> list[dict]:
+        """该租户接了哪些 MCP 服务端。"""
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn,
+                'SELECT * FROM mcp_server_bindings WHERE tenant_id=%s '
+                'ORDER BY server_id', (tenant_id,))
+            return [dict(row) for row in rows]
+
+    async def server_binding(self, tenant_id: str, server_id: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'SELECT * FROM mcp_server_bindings WHERE tenant_id=%s AND server_id=%s',
+                (tenant_id, server_id))
+            return dict(row) if row else None
+
+    async def upsert_server_binding(self, *, tenant_id: str, server_id: str,
+                                     transport: str = 'streamable_http',
+                                     config_ref: str = '', enabled: bool = True,
+                                     revision: int = 1) -> dict:
+        stamp = now()
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'INSERT INTO mcp_server_bindings '
+                '(binding_id, tenant_id, server_id, transport, config_ref, enabled, '
+                ' revision, created_at) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s) '
+                'ON CONFLICT (tenant_id, server_id) DO UPDATE SET '
+                '  transport=EXCLUDED.transport, config_ref=EXCLUDED.config_ref, '
+                '  enabled=EXCLUDED.enabled, revision=EXCLUDED.revision '
+                'RETURNING *',
+                (f'sb_{tenant_id}_{server_id}', tenant_id, server_id, transport,
+                 config_ref, 1 if enabled else 0, int(revision), stamp))
+            await conn.commit()
+            return dict(row)
+
+    async def credential_bindings(self, *, tenant_id: str,
+                                  server_binding_id: str = '',
+                                  subject_kind: str = '',
+                                  subject_id: str = '') -> list[dict]:
+        """凭据绑定列表（按主体与服务端过滤）。
+
+        返回的是**元信息**（没有明文密钥）：明文由
+        `app/credentials.py` 按 `credential_ref` 在传输层短时取出。
+        """
+        sql = 'SELECT * FROM credential_bindings WHERE tenant_id=%s'
+        params: list = [tenant_id]
+        if server_binding_id:
+            sql += ' AND server_binding_id=%s'
+            params.append(server_binding_id)
+        if subject_kind:
+            sql += ' AND subject_kind=%s'
+            params.append(subject_kind)
+        if subject_id:
+            sql += ' AND subject_id=%s'
+            params.append(subject_id)
+        sql += ' ORDER BY binding_id'
+        async with self._lease() as conn:
+            rows = await self._all(conn, sql, tuple(params))
+            return [_decode_credential(dict(row)) for row in rows]
+
+    async def upsert_credential_binding(self, *, tenant_id: str,
+                                         subject_kind: str, subject_id: str,
+                                         server_binding_id: str,
+                                         credential_ref: str,
+                                         scope: dict | None = None,
+                                         revision: int = 1,
+                                         status: str = 'active') -> dict:
+        stamp = now()
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'INSERT INTO credential_bindings '
+                '(binding_id, tenant_id, subject_kind, subject_id, '
+                ' server_binding_id, credential_ref, scope_json, revision, status, '
+                ' created_at, updated_at) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) '
+                'ON CONFLICT (binding_id) DO UPDATE SET '
+                '  credential_ref=EXCLUDED.credential_ref, '
+                '  scope_json=EXCLUDED.scope_json, revision=EXCLUDED.revision, '
+                '  status=EXCLUDED.status, updated_at=EXCLUDED.updated_at '
+                'RETURNING *',
+                (f'cb_{uuid.uuid4().hex[:16]}', tenant_id, subject_kind,
+                 subject_id, server_binding_id, credential_ref,
+                 json.dumps(scope or {}, ensure_ascii=False), int(revision),
+                 status, stamp, stamp))
+            await conn.commit()
+            return _decode_credential(dict(row))
+
+    async def tool_policies(self, tenant_id: str = 'default') -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn,
+                'SELECT * FROM tool_policies WHERE tenant_id=%s ORDER BY policy_id',
+                (tenant_id,))
+            return [_decode_policy(dict(row)) for row in rows]
+
+    async def upsert_tool_policy(self, *, tenant_id: str, tool_key: str = '',
+                                 role: str = '', user_id: str = '',
+                                 resource_scope: str = '', effect: str = 'unknown',
+                                 approval_mode: str = 'auto',
+                                 limits: dict | None = None, revision: int = 1,
+                                 enabled: bool = True) -> dict:
+        stamp = now()
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'INSERT INTO tool_policies '
+                '(policy_id, tenant_id, tool_key, role, user_id, resource_scope, '
+                ' effect, approval_mode, limits_json, revision, enabled, created_at) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) '
+                'ON CONFLICT (tenant_id, tool_key, role, user_id) DO UPDATE SET '
+                '  resource_scope=EXCLUDED.resource_scope, effect=EXCLUDED.effect, '
+                '  approval_mode=EXCLUDED.approval_mode, limits_json=EXCLUDED.limits_json, '
+                '  revision=EXCLUDED.revision, enabled=EXCLUDED.enabled '
+                'RETURNING *',
+                (f'pol_{uuid.uuid4().hex[:12]}', tenant_id, tool_key, role, user_id,
+                 resource_scope, effect, approval_mode,
+                 json.dumps(limits or {}, ensure_ascii=False), int(revision),
+                 1 if enabled else 0, stamp))
+            await conn.commit()
+            return _decode_policy(dict(row))
+
+    async def record_authorization(self, *, action_id: str, tenant_id: str,
+                                   user_id: str, tool_key: str, schema_hash: str,
+                                   args_hash: str, resource_hash: str,
+                                   credential_binding: str = '',
+                                   credential_subject: str = '',
+                                   credential_revision: int = 0,
+                                   policy_revision: int = 0,
+                                   approval_id: str = '',
+                                   expires_at: float = 0.0,
+                                   status: str = 'admitted') -> str:
+        """记录"这次调用凭什么被放行"。"""
+        authorization_id = 'auth_' + uuid.uuid4().hex[:16]
+        async with self._lease() as conn:
+            await self._run(
+                conn,
+                'INSERT INTO tool_authorizations '
+                '(authorization_id, action_id, tenant_id, user_id, tool_key, '
+                ' schema_hash, args_hash, resource_hash, credential_binding, '
+                ' credential_subject, credential_revision, policy_revision, '
+                ' approval_id, expires_at, status, created_at) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) '
+                'ON CONFLICT DO NOTHING',
+                (authorization_id, action_id, tenant_id, user_id, tool_key,
+                 schema_hash, args_hash, resource_hash, credential_binding,
+                 credential_subject, int(credential_revision),
+                 int(policy_revision), approval_id, float(expires_at), status,
+                 now()))
+            await conn.commit()
+        return authorization_id
+
+    async def authorization_of(self, action_id: str) -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn,
+                'SELECT * FROM tool_authorizations WHERE action_id=%s '
+                'ORDER BY created_at', (action_id,))
+            return [dict(row) for row in rows]
+
+    # ---------- 工具运行时：批准与预留 ----------
+
+    async def create_approval(self, *, tenant_id: str, owner_user_id: str,
+                              requester_user_id: str, run_id: str,
+                              manifest: dict, manifest_hash: str,
+                              policy_revision: int = 0, expires_at: float = 0.0,
+                              limits: dict | None = None) -> dict:
+        from app import approvals as approvals_module
+        approval_id = approvals_module.new_approval_id()
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'INSERT INTO approvals '
+                '(approval_id, tenant_id, owner_user_id, requester_user_id, '
+                ' approver_user_id, run_id, manifest_json, manifest_hash, '
+                ' policy_revision, status, expires_at, limits_json, created_at) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *',
+                (approval_id, tenant_id, owner_user_id, requester_user_id, '',
+                 run_id, json.dumps(manifest, ensure_ascii=False, default=str),
+                 manifest_hash, int(policy_revision),
+                 approvals_module.STATUS_PENDING, float(expires_at),
+                 json.dumps(limits or {}, ensure_ascii=False), now()))
+            await conn.commit()
+            return dict(row)
+
+    async def approval(self, approval_id: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn,
+                'SELECT * FROM approvals WHERE approval_id=%s', (approval_id,))
+            return dict(row) if row else None
+
+    async def approve_approval(self, approval_id: str, *, approver_user_id: str,
+                               expected_manifest_hash: str = '') -> dict:
+        """批准。**内容被改过就拒绝**（manifest_hash 不匹配）。"""
+        from app import approvals as approvals_module
+        stamp = now()
+        async with self._lease() as conn:
+            row = await self._one(conn,
+                'SELECT * FROM approvals WHERE approval_id=%s FOR UPDATE',
+                (approval_id,))
+            if row is None:
+                raise approvals_module.ApprovalMissing('批准不存在')
+            if expected_manifest_hash and \
+                    str(row['manifest_hash']) != expected_manifest_hash:
+                raise approvals_module.ApprovalConflict('批准内容已变更，需要重新请求')
+            status = str(row['status'])
+            if status == approvals_module.STATUS_APPROVED:
+                updated = row                 # 幂等：重复批准不重复记账
+            elif status != approvals_module.STATUS_PENDING:
+                raise approvals_module.ApprovalConflict(
+                    f'批准当前状态为 {status}，不能批准')
+            else:
+                updated = await self._one(
+                    conn,
+                    'UPDATE approvals SET status=%s, approver_user_id=%s, approved_at=%s '
+                    'WHERE approval_id=%s RETURNING *',
+                    (approvals_module.STATUS_APPROVED, approver_user_id, stamp,
+                     approval_id))
+            resumed = False
+            updated = dict(updated or row)
+            run_id = str(updated.get('run_id') or '')
+            if run_id:
+                run_row = await self._one(
+                    conn, 'SELECT status FROM runs WHERE run_id=%s FOR UPDATE',
+                    (run_id,))
+                if run_row and str(run_row['status']) == 'waiting_approval':
+                    await self._run(
+                        conn,
+                        "UPDATE runs SET status='queued', lease_owner=NULL, "
+                        'lease_expires_at=NULL, error=%s, waiting_external=0, '
+                        'updated_at=%s WHERE run_id=%s AND status=%s',
+                        ('', stamp, run_id, 'waiting_approval'))
+                    resumed = True
+            await conn.commit()
+            updated['resumed'] = resumed
+            return updated
+
+    async def revoke_approval(self, approval_id: str, *, approver_user_id: str = '',
+                              reject: bool = False) -> dict:
+        from app import approvals as approvals_module
+        stamp = now()
+        status = (approvals_module.STATUS_REJECTED if reject
+                  else approvals_module.STATUS_REVOKED)
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'UPDATE approvals SET status=%s, approver_user_id=COALESCE(NULLIF(%s, %s), '
+                ' approver_user_id), revoked_at=%s WHERE approval_id=%s RETURNING *',
+                (status, approver_user_id, '', stamp, approval_id))
+            if reject and row and row.get('run_id'):
+                await self._run(
+                    conn,
+                    "UPDATE runs SET status='failed', error=%s, lease_owner=NULL, "
+                    'lease_expires_at=NULL, updated_at=%s '
+                    "WHERE run_id=%s AND status='waiting_approval'",
+                    ('批准被拒绝', stamp, row['run_id']))
+            await conn.commit()
+            return dict(row) if row else {}
+
+    async def approvals_for(self, *, tenant_id: str, status: str = '',
+                            owner_user_id: str = '') -> list[dict]:
+        sql = 'SELECT * FROM approvals WHERE tenant_id=%s'
+        params: list = [tenant_id]
+        if status:
+            sql += ' AND status=%s'
+            params.append(status)
+        if owner_user_id:
+            sql += ' AND owner_user_id=%s'
+            params.append(owner_user_id)
+        sql += ' ORDER BY created_at DESC'
+        async with self._lease() as conn:
+            rows = await self._all(conn, sql, tuple(params))
+            return [dict(row) for row in rows]
+
+    async def reserve_approval(self, *, approval_id: str, action_id: str,
+                                manifest_item_key: str, units: int = 1) -> dict:
+        """按 (approval_id, action_id, manifest_item_key) 预留额度。
+
+        额度在**锁住批准行之后**原子计算：两个并发动作争同一份批准时，
+        只有额度够的那个能预留成功，另一个拿到 `insufficient`。
+
+        同一个 action 的重放**不重复扣**：唯一约束命中后直接返回既有预留。
+        """
+        from app import approvals as approvals_module
+        stamp = now()
+        async with self._lease() as conn:
+            row = await self._one(conn,
+                'SELECT * FROM approvals WHERE approval_id=%s FOR UPDATE',
+                (approval_id,))
+            if row is None:
+                raise approvals_module.ApprovalMissing('批准不存在')
+            existing = await self._one(
+                conn,
+                'SELECT * FROM approval_reservations '
+                'WHERE approval_id=%s AND action_id=%s AND manifest_item_key=%s',
+                (approval_id, action_id, manifest_item_key))
+            if existing is not None:
+                # 同 action 重放：沿用既有预留，不重复消费
+                return {'reservation': dict(existing), 'replayed': True,
+                        'insufficient': False}
+            if not approvals_module.is_valid(dict(row), now_ts=time.time()):
+                raise approvals_module.ApprovalMissing(
+                    f'批准 {approval_id} 当前不可用（{row["status"]}）')
+            manifest = approvals_module.parse_manifest(dict(row))
+            used = await self._one(
+                conn,
+                'SELECT COALESCE(SUM(units),0) AS used FROM approval_reservations '
+                "WHERE approval_id=%s AND status IN ('reserved','consumed')",
+                (approval_id,))
+            used_units = int((used['used'] if used else 0) or 0)
+            limit = int(manifest.limits.get('max_units')
+                        or (manifest.max_actions or 0) or 0)
+            if limit and used_units + int(units) > limit:
+                await conn.commit()
+                return {'reservation': {}, 'replayed': False, 'insufficient': True,
+                        'used': used_units, 'limit': limit}
+            reservation_id = 'res_' + uuid.uuid4().hex[:16]
+            inserted = await self._one(
+                conn,
+                'INSERT INTO approval_reservations '
+                '(reservation_id, approval_id, action_id, manifest_item_key, units, '
+                ' status, created_at) VALUES (%s,%s,%s,%s,%s,%s,%s) '
+                'ON CONFLICT (approval_id, action_id, manifest_item_key) DO NOTHING '
+                'RETURNING *',
+                (reservation_id, approval_id, action_id, manifest_item_key,
+                 int(units), approvals_module.RESERVED, stamp))
+            await conn.commit()
+            return {'reservation': dict(inserted) if inserted else {},
+                    'replayed': False, 'insufficient': False}
+
+    async def consume_approval_reservation(self, *, approval_id: str, action_id: str,
+                                           manifest_item_key: str = '') -> bool:
+        """确认消费：预留 → consumed。重复调用幂等。"""
+        from app import approvals as approvals_module
+        async with self._lease() as conn:
+            cur = await self._run(
+                conn,
+                'UPDATE approval_reservations SET status=%s '
+                'WHERE approval_id=%s AND action_id=%s AND manifest_item_key=%s '
+                "AND status <> 'consumed'",
+                (approvals_module.CONSUMED, approval_id, action_id,
+                 manifest_item_key))
+            await conn.commit()
+            return bool(cur.rowcount)
+
+    async def release_approval_reservation(self, *, approval_id: str, action_id: str,
+                                            manifest_item_key: str = '') -> bool:
+        """释放预留（**只允许在确认未执行时**调用）。
+
+        unknown 的动作**不允许**释放：把可能已经花掉的额度放给第二个动作，
+        等于让同一笔钱花两次。调用方必须自己判断确定性。
+        """
+        from app import approvals as approvals_module
+        async with self._lease() as conn:
+            cur = await self._run(
+                conn,
+                'UPDATE approval_reservations SET status=%s, released_at=%s '
+                'WHERE approval_id=%s AND action_id=%s AND manifest_item_key=%s '
+                "AND status = 'reserved'",
+                (approvals_module.RELEASED, now(), approval_id, action_id,
+                 manifest_item_key))
+            await conn.commit()
+            return bool(cur.rowcount)
+
+    async def approval_reservations(self, approval_id: str) -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn,
+                'SELECT * FROM approval_reservations WHERE approval_id=%s '
+                'ORDER BY created_at', (approval_id,))
+            return [dict(row) for row in rows]
+
+    # ---------- 工具运行时：通用结果 ----------
+
+    async def result_manifest(self, result_id: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn,
+                'SELECT * FROM tool_result_manifests WHERE result_id=%s',
+                (result_id,))
+            return _decode_manifest(dict(row)) if row else None
+
+    async def result_parts(self, result_id: str) -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn,
+                'SELECT * FROM tool_result_parts WHERE result_id=%s ORDER BY ordinal',
+                (result_id,))
+            return [dict(row) for row in rows]
+
+    async def results_of_run(self, run_id: str) -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn,
+                'SELECT * FROM tool_result_manifests WHERE run_id=%s '
+                'ORDER BY created_at', (run_id,))
+            return [_decode_manifest(dict(row)) for row in rows]
+
+    # ---------- 工具运行时：外部任务 ----------
+
+    async def register_external_task(self, *, external_task_id: str,
+                                     remote_task_id: str, tenant_id: str,
+                                     owner_user_id: str, server_binding_id: str,
+                                     credential_binding: str, credential_subject: str,
+                                     tool_key: str, contract_id: str,
+                                     contract_version: int, run_id: str,
+                                     step_id: str, action_id: str,
+                                     accepted_result_id: str, submission_key: str,
+                                     item_key: str = '', deadline_at: float = 0.0,
+                                     next_poll_at: float = 0.0) -> dict:
+        """登记一个已受理的外部任务。
+
+        唯一约束 `(run_id, action_id, item_key)` 保证**同一个动作只登记一次**：
+        重复提交不会变成两个任务（那意味着两份费用）。
+        """
+        stamp = now()
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'INSERT INTO external_tasks '
+                '(external_task_id, remote_task_id, tenant_id, owner_user_id, '
+                ' server_binding_id, credential_binding, credential_subject, '
+                ' tool_key, contract_id, contract_version, run_id, step_id, action_id, '
+                ' accepted_result_id, submission_key, item_key, state, version, '
+                ' next_poll_at, deadline_at, last_observed_at, created_at, updated_at) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) '
+                'ON CONFLICT (run_id, action_id, item_key) DO NOTHING RETURNING *',
+                (external_task_id, remote_task_id, tenant_id, owner_user_id,
+                 server_binding_id, credential_binding, credential_subject,
+                 tool_key, contract_id, int(contract_version), run_id, step_id,
+                 action_id, accepted_result_id, submission_key, item_key,
+                 'accepted', 1, float(next_poll_at), float(deadline_at),
+                 time.time(), stamp, stamp))
+            if row is None:
+                # 已经登记过：返回既有行（不新建）
+                existing = await self._one(
+                    conn,
+                    'SELECT * FROM external_tasks WHERE run_id=%s AND action_id=%s '
+                    'AND item_key=%s', (run_id, action_id, item_key))
+                await conn.commit()
+                return dict(existing) if existing else {}
+            await conn.commit()
+            return dict(row)
+
+    async def external_task(self, external_task_id: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn,
+                'SELECT * FROM external_tasks WHERE external_task_id=%s',
+                (external_task_id,))
+            return dict(row) if row else None
+
+    async def external_tasks_of_run(self, run_id: str) -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn,
+                'SELECT * FROM external_tasks WHERE run_id=%s ORDER BY created_at',
+                (run_id,))
+            return [dict(row) for row in rows]
+
+    async def due_external_tasks(self, now_ts: float | None = None,
+                                 limit: int = 10) -> list[dict]:
+        """到期的外部任务（该轮询了）。"""
+        current = now_ts if now_ts is not None else time.time()
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn,
+                "SELECT * FROM external_tasks WHERE state IN "
+                "('accepted','running','materializing') "
+                'AND next_poll_at <= %s ORDER BY next_poll_at LIMIT %s',
+                (current, int(limit)))
+            return [dict(row) for row in rows]
+
+    async def update_external_task(self, external_task_id: str, **fields) -> dict | None:
+        """更新外部任务状态。**版本号用于乐观并发**。"""
+        allowed = ('state', 'version', 'next_poll_at', 'deadline_at',
+                   'last_observed_at', 'last_result_id', 'output_manifest_ref',
+                   'error_code', 'poll_owner', 'poll_epoch',
+                   'poll_lease_expires_at', 'remote_task_id')
+        sets, params = [], []
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            sets.append(f'{key}=%s')
+            params.append(value)
+        if not sets:
+            return await self.external_task(external_task_id)
+        params.append(external_task_id)
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                f"UPDATE external_tasks SET {', '.join(sets)}, updated_at=%s "
+                'WHERE external_task_id=%s RETURNING *',
+                tuple(params) + (now(),))
+            await conn.commit()
+            return dict(row) if row else None
+
+    async def claim_external_task_poll(self, external_task_id: str, owner: str,
+                                       lease_seconds: float = 60.0) -> dict | None:
+        """领取一次轮询（带代次）。旧 Worker 不能覆盖新结果。"""
+        current = time.time()
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'UPDATE external_tasks SET poll_owner=%s, poll_epoch=poll_epoch+1, '
+                'poll_lease_expires_at=%s, updated_at=%s '
+                "WHERE external_task_id=%s AND (poll_owner IS NULL "
+                " OR poll_owner='' OR poll_lease_expires_at < %s) RETURNING *",
+                (owner, current + float(lease_seconds), now(), external_task_id,
+                 current))
+            await conn.commit()
+            return dict(row) if row else None
+
+    async def finish_external_poll(self, external_task_id: str, epoch: int,
+                                   **fields) -> dict | None:
+        """结束这一轮查询。代次对不上就什么都不写，避免旧轮询覆盖新结果。"""
+        allowed = ('state', 'version', 'next_poll_at', 'deadline_at',
+                   'last_observed_at', 'last_result_id', 'output_manifest_ref',
+                   'error_code', 'remote_task_id')
+        sets = ['poll_owner=%s', 'poll_lease_expires_at=%s']
+        params: list = ['', 0]
+        for key, value in fields.items():
+            if key not in allowed:
+                continue
+            sets.append(f'{key}=%s')
+            params.append(value)
+        params.extend([now(), external_task_id, int(epoch)])
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                f"UPDATE external_tasks SET {', '.join(sets)}, updated_at=%s "
+                'WHERE external_task_id=%s AND poll_epoch=%s RETURNING *',
+                tuple(params))
+            await conn.commit()
+            return dict(row) if row else None
+
     # ---------- 维护 ----------
 
     async def stats(self) -> dict:
@@ -2240,6 +3279,10 @@ class PostgresStore:
                            "WHERE status='queued'",
             'jobs_failed': "SELECT COUNT(*) AS n FROM background_jobs "
                            "WHERE status='failed'",
+            'approvals_pending': "SELECT COUNT(*) AS n FROM approvals "
+                                 "WHERE status='pending'",
+            'external_open': "SELECT COUNT(*) AS n FROM external_tasks "
+                             "WHERE state IN ('accepted','running','materializing')",
         }
         out = {}
         async with self._lease() as conn:
@@ -2348,4 +3391,24 @@ def _decode_action(row: dict) -> dict:
 
 def _decode_request_key(row: dict) -> dict:
     row['response'] = json.loads(row.pop('response_json') or 'null')
+    return row
+
+
+def _decode_credential(row: dict) -> dict:
+    """凭据绑定解码：scope_json → scope。**这里不出现明文密钥**。"""
+    row['scope'] = json.loads(row.pop('scope_json') or '{}')
+    return row
+
+
+def _decode_policy(row: dict) -> dict:
+    """政策解码：limits_json → limits，enabled → bool。"""
+    row['limits'] = json.loads(row.pop('limits_json') or '{}')
+    row['enabled'] = bool(row.get('enabled'))
+    return row
+
+
+def _decode_manifest(row: dict) -> dict:
+    """结果 manifest 解码：summary_json / completeness_json → dict。"""
+    row['summary'] = json.loads(row.pop('summary_json') or '{}')
+    row['completeness'] = json.loads(row.pop('completeness_json') or '{}')
     return row

@@ -209,17 +209,16 @@ def find(issuer: str, audience: str = DEFAULT_AUDIENCE) -> list[Connection]:
 
 
 def public_key(connection: Connection, kid: str = '') -> str:
-    """按 kid 取公钥；没给 kid 时，只有恰好一把钥匙才允许直接用。"""
+    """按 kid 取公钥。票据写了 kid 就必须命中登记表，不能因为只有一把钥匙就放行。
+
+    没写 kid 时，只有恰好一把钥匙才允许直接用。
+    """
     if kid:
         pem = connection.keys.get(kid)
-        if pem:
-            return pem
-        # 只登记了一把钥匙时，kid 写法不同（"default"/接入编号/文件名）也认
-        distinct = {value for value in connection.keys.values()}
-        if len(distinct) == 1:
-            return next(iter(distinct))
-        raise ConnectionError_(
-            f'接入 {connection.connection_id} 没有 kid={kid} 的公钥')
+        if not pem:
+            raise ConnectionError_(
+                f'接入 {connection.connection_id} 没有 kid={kid} 的公钥')
+        return pem
     distinct = {value for value in connection.keys.values()}
     if len(distinct) == 1:
         return next(iter(distinct))

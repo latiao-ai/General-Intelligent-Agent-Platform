@@ -1,4 +1,4 @@
-"""结果观察与自主决策（`harness-observe-decide` §15 的确定性用例）。
+"""结果观察与自主决策的确定性用例。
 
 边界很清楚：
 
@@ -101,6 +101,26 @@ class ObservationPureTests(unittest.TestCase):
                          ['artifact:artifacts/t1/sources.html'])
         self.assertFalse(obs.looks_like_path('HTML 页面'))
         self.assertTrue(obs.looks_like_path('artifacts/t1/sources.html'))
+
+    def test_web_search_name_satisfies_tool_succeeded(self):
+        """公开名 web_search 必须对上 local:web:search，末尾的 search 不算。"""
+        result = {'step_id': 's1', 'tool_key': 'local:web:search',
+                  'execution_status': 'succeeded'}
+        hit = obs.completion_state(
+            [{'kind': 'tool_succeeded', 'target': 'web_search'}],
+            state={}, results=[result])
+        self.assertEqual(hit['unmet'], [], hit)
+        self.assertEqual(len(hit['verified']), 1)
+        miss = obs.completion_state(
+            [{'kind': 'tool_succeeded', 'target': 'search'}],
+            state={}, results=[result])
+        self.assertEqual(len(miss['unmet']), 1, miss)
+        named = obs.completion_state(
+            [{'kind': 'tool_succeeded', 'target': 'web_search'}],
+            state={}, results=[{'step_id': 's1', 'tool_key': 'local:web:search',
+                                'tool_name': 'web_search',
+                                'execution_status': 'succeeded'}])
+        self.assertTrue(named['ok'], named)
 
     def test_completion_requires_evidence(self):
         state = {'artifact': {'html_path': '/tmp/not-exists.html'}}

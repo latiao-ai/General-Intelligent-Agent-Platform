@@ -52,10 +52,9 @@ def reply_text(state: dict) -> str:
 
     if status == 'failed':
         reason = state.get('failure')
-        tail = ''
         if reason:
-            return f'本次未完成：{reason}。{tail}可换个更具体的说法再试。'
-        return f'{tail}本次没有产出可用结果。可换个更具体的说法再试。'
+            return f'本次未完成：{reason}。'
+        return '本次没有产出可用结果。'
 
     if status in ('waiting_input', 'waiting_approval'):
         # 计划没过校验就停下来等人补信息——不能说"任务结束"了事

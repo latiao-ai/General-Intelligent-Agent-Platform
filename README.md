@@ -1,5 +1,7 @@
 # 通用智能体执行中台
 
+中台目标、边界与对接合同见仓库根目录 [`智能体中台运行机制说明.md`](../智能体中台运行机制说明.md)。
+
 按用户目标生成计划、从已接入的能力里选工具、逐步执行并记录每一次外部调用的中台。
 执行内核与业务解耦：**网页检索、资料转 HTML、发布到 MCP 服务器**只是当前接入的
 一个业务能力包，换成工单/文件/数据库查询只需增加能力包，不动内核。
@@ -83,7 +85,7 @@ python --version             # Python 3.12.15
 | `tool_name_arg` | 那个通用调用工具里承载内部工具名的参数名（如 `name`） |
 | `IDEMPOTENCY_TTL_SECONDS` | 创建任务幂等键的有效期，默认 86400（24 小时） |
 | `DATABASE_URL` | **必填**，PostgreSQL 连接串（`postgresql://…`）。SQLite 实现已删除，留空直接报错 |
-| `AUTH_MODE` | `off`（默认，本地单用户）/ `optional` / **`ticket`**（正式）/ `token`（旧） |
+| `AUTH_MODE` | `off`（默认，本地单用户）/ `optional` / **`ticket`**（正式） |
 | `AUTH_CONNECTIONS_FILE` | 可信平台登记表（公钥只用这里的） |
 | `AUTH_TICKET_MAX_LIFETIME` | 票据有效期上限，默认 60 秒 |
 | `AUTH_SESSION_TTL` | 中台登录会话有效期，默认 7200 秒 |
@@ -438,7 +440,7 @@ verify_completion → decide_next（可有限修复）| finalize（核对通过�
 ### 运行中补充要求（不打断、不新建任务）
 
 任务跑着的时候再说一句，默认是**给当前任务的补充要求**：同一个 task/run、同一条
-事件流，只是"接下来做什么"变了。要另开一轮，点「新任务」。
+事件流，只是"接下来做什么"变了。输入栏只有「发送」：目标还没结束时发送就是补充；已经结束再发送，会在当前会话开一轮。另开会话用侧栏「新建会话」。
 
 ```bash
 # 补一句要求（202 = 已落库，不代表已经纳入计划）
@@ -490,7 +492,7 @@ curl localhost:8010/api/runs/<run_id>/inputs?after_seq=0
 5. 所有步骤都已结算、只差收尾 → 直接用快照（或动作回执）收尾，不再跑图。
 
 对账统计看 `GET /api/recovery`；"待核实"的 run 状态是 `needs_reconcile`，
-它既不是成功也不是失败。详见 `docs/platform-acceptance.md`。
+它既不是成功也不是失败。详见 [`智能体中台运行机制说明.md`](../智能体中台运行机制说明.md)。
 
 ### 实现取舍
 
@@ -537,8 +539,7 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
   游标补发（`GET /api/tasks/{id}/events?after=<seq>` 或 `Last-Event-ID`）才能拿到，
   跨实例实时推送需要消息总线。
 - **执行只有一条路径**：就地执行（API 进程）与 Worker 都走 `claim_run` 并写租约，
-  同一 run 不会被领两次。领取在 SQLite 上是单条 `UPDATE … RETURNING`，在
-  PostgreSQL 上是 `… FOR UPDATE SKIP LOCKED`。执行期间由 `Hub._guard` 续租，
+  同一 run 不会被领两次。  领取是 `… FOR UPDATE SKIP LOCKED`。执行期间由 `Hub._guard` 续租，
   租约过期才会被判定为"执行者已死"并接手。
 - **跨进程取消是协作式的**：取消请求写 `runs.cancel_requested_at`，持有租约的执行者
   在 2 秒轮询里发现后自行停止；进程已经死了的 run 会由对账按账本处理（有 in_flight
@@ -605,8 +606,8 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
 - `AUTH_MODE=ticket` 时业务接口一律要求中台会话，**改 `X-DSH-User` 无效**；
 - 退出登录撤销数据库会话；已连上的 SSE 会按 `AUTH_SSE_RECHECK` 周期复查并断开。
 
-> **给客户平台研发的对接文档**：[`docs/platform-integration.md`](docs/platform-integration.md)
-> —— 签什么票、怎么调、错误码怎么处置、续期/退出、同源代理配置、验收表，都在这份里。
+> **给客户平台研发的对接合同**：[`智能体中台运行机制说明.md`](../智能体中台运行机制说明.md) 第 18 节。
+> —— 签什么票、怎么换会话、错误码、续期/退出，都在那份里。
 
 ### 本地跑通（两个模拟平台）
 

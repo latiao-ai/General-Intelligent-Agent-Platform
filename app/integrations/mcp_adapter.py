@@ -38,6 +38,14 @@ def _cfg(server, field: str, env: str, default: str = '') -> str:
     return os.getenv(env, default)
 
 
+def auth_headers(explicit: str | None, inherited: str) -> dict | None:
+    """`explicit is None` 才沿用服务端 / 环境 token。显式传入（含空串）不再回退。"""
+    token = inherited if explicit is None else explicit
+    if not token:
+        return None
+    return {'Authorization': 'Bearer ' + token}
+
+
 def _extra_args(server) -> dict:
     if server is not None and server.extra_args:
         return dict(server.extra_args)
@@ -49,10 +57,10 @@ def _extra_args(server) -> dict:
 
 
 @asynccontextmanager
-async def connect_session(server=None):
+async def connect_session(server=None, *, token: str | None = None):
+    """`token=None` 沿用服务端配置；传入字符串则只用它，不再读进程级 token。"""
     transport = _cfg(server, 'transport', 'MCP_TRANSPORT', 'streamable_http')
-    token = _cfg(server, 'token', 'MCP_BEARER_TOKEN', '')
-    headers = {'Authorization': 'Bearer ' + token} if token else None
+    headers = auth_headers(token, _cfg(server, 'token', 'MCP_BEARER_TOKEN', ''))
     if transport == 'stdio':
         command = _cfg(server, 'stdio_command', 'MCP_STDIO_COMMAND')
         if not command:
@@ -134,7 +142,7 @@ def effect_type(tool) -> str:
     return 'unknown'
 
 
-async def list_server_tools(server=None):
+async def list_server_tools(server=None, *, token: str | None = None):
     """发现服务端工具，尽量把能力信息完整带回。
 
     早先只保留 name 与 inputSchema，description/annotations 全被丢掉——
@@ -142,7 +150,7 @@ async def list_server_tools(server=None):
     这类就完全看不出）。能力描述必须在规划前就到手。
     """
     async with asyncio.timeout(30):
-        async with connect_session(server) as session:
+        async with connect_session(server, token=token) as session:
             tools = await all_tools(session)
             return [{
                 'name': t.name,
@@ -259,7 +267,8 @@ def certainty_of_error(exc: BaseException) -> str:
         return 'failed_confirmed'
     name = type(exc).__name__
     if name in {'ConnectError', 'ConnectTimeout', 'ConnectionRefusedError',
-                'ClientConnectorError', 'LeaseLost'}:
+                'ClientConnectorError', 'LeaseLost', 'CredentialMissing',
+                'AuthorizationDenied', 'ApprovalRequired'}:
         return 'not_executed'
     return 'unknown'
 
@@ -326,7 +335,7 @@ def result_url(payload, server=None) -> str:
 
 
 async def call_tool(tool_name: str, arguments: dict, artifact: dict | None = None,
-                    server=None):
+                    server=None, *, token: str | None = None):
     """按真实 inputSchema 调用任意 MCP 工具。
 
     供动态编排使用：模型自己挑工具、自己给业务参数，但它给不出文件字节，
@@ -341,7 +350,7 @@ async def call_tool(tool_name: str, arguments: dict, artifact: dict | None = Non
         server = routed or mcp_servers.deploy_server()
         tool_name = bare
     async with asyncio.timeout(90):
-        async with connect_session(server) as session:
+        async with connect_session(server, token=token) as session:
             tools = await all_tools(session)
             tool = next((t for t in tools if t.name == tool_name), None)
             if tool is None:

@@ -167,6 +167,8 @@ async def deploy_once(artifact: dict, server=None) -> dict:
     tool_name = configured_tool(server)
     if not tool_name:
         raise ToolError('未配置部署工具名（MCP_TOOL_NAME / deploy_tool）')
-    payload = await mcp_adapter.call_tool(tool_name, {}, artifact=artifact,
-                                          server=server)
+    from app import mcp_connections
+    payload = await mcp_adapter.call_tool(
+        tool_name, {}, artifact=artifact, server=server,
+        token=await mcp_connections.bearer_for_current(server))
     return interpret_deploy(payload, artifact, server)

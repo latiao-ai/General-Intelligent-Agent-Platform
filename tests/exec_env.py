@@ -112,10 +112,10 @@ def install_tools(tools_by_name: dict):
     """
     from app import tools as tool_module
 
-    async def fake_find(name):
+    async def fake_find(name, context=None):
         return tools_by_name.get(name)
 
-    async def fake_catalog():
+    async def fake_catalog(context=None):
         return list(tools_by_name.values())
 
     stack = ExitStack()

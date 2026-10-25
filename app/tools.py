@@ -20,6 +20,7 @@ import time
 from app.integrations import mcp_adapter, mcp_servers
 from app.capabilities import publishing as publishing_capability
 from app.capabilities import registry
+from app import tool_policy as tool_policy_module
 # 这几个是既有调用点仍在用的：`nodes` 用 usable_documents 判断"手上有没有料"，
 # 测试用 _select_sources 校验预算截断。
 from app.capabilities.base import (ToolError, usable_documents,  # noqa: F401
@@ -90,10 +91,21 @@ def _signature() -> tuple:
                   for s in mcp_servers.servers()))
 
 
+async def _subject_token(server):
+    """当前主体在这个服务端上的钥匙。None = 沿用服务端配置。"""
+    from app import mcp_connections
+    return await mcp_connections.bearer_for_current(server)
+
+
 async def _discover(server) -> tuple[list[dict], str]:
     """发现单个服务端的工具。**失败只影响它自己**，不拖垮其他服务端。"""
     try:
-        return await mcp_adapter.list_server_tools(server), ''
+        token = None
+        if getattr(settings, 'tool_policy_enforced', False):
+            token = await _subject_token(server)
+        if token is None:
+            return await mcp_adapter.list_server_tools(server), ''
+        return await mcp_adapter.list_server_tools(server, token=token), ''
     except Exception as exc:                       # noqa: BLE001
         logger.warning('MCP 服务端 %s 工具发现失败：%s', server.id,
                        type(exc).__name__, exc_info=True)
@@ -156,7 +168,11 @@ async def _discover_capabilities(server) -> dict:
     if not tool_name:
         return {}
     try:
-        payload = await mcp_adapter.call_tool(tool_name, {}, server=server)
+        token = None
+        if getattr(settings, 'tool_policy_enforced', False):
+            token = await _subject_token(server)
+        extra = {} if token is None else {'token': token}
+        payload = await mcp_adapter.call_tool(tool_name, {}, server=server, **extra)
     except Exception as exc:                       # noqa: BLE001
         logger.warning('MCP 服务端 %s 的能力清单读取失败：%s', server.id,
                        type(exc).__name__)
@@ -504,6 +520,32 @@ def _describe_error(exc: BaseException) -> str:
     return f'{type(leaf).__name__}: {text}'[:200]
 
 
+async def _stage_result(payload: dict) -> str:
+    """把 JSON 回执落到按租户分开的结果目录。登记失败不影响这次调用的回执。"""
+    try:
+        from app import execution_control
+        from app import ledger as ledger_module
+        from app import tool_results
+        tenant_id = 'default'
+        book = ledger_module.current_ledger()
+        context = execution_control.require()
+        store = getattr(book, 'store', None) if book is not None else None
+        if store is not None and context is not None:
+            run = await store.run(context.run_id)
+            tenant_id = str((run or {}).get('tenant_id') or 'default')
+        captured = tool_results.CapturedResult(
+            structured=payload,
+            parts=[tool_results.ResultPart(
+                ordinal=0, kind='json', content_type='application/json',
+                text=json.dumps(payload, ensure_ascii=False, default=str))])
+        staged = tool_results.stage_result(
+            settings.artifact_dir, captured, tenant_id=tenant_id)
+        return str(staged.get('result_id') or '')
+    except Exception:                              # noqa: BLE001
+        logger.warning('结果信封落盘失败', exc_info=True)
+        return ''
+
+
 def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
     """所有远端工具共用的一条调用通道。
 
@@ -532,15 +574,19 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
                  else server_tool_name)
         emit(action('调用 MCP 工具', label, '🔧'))
         try:
+            token = await _subject_token(server)
             # 不带 server 时保持旧调用形式：既兼容既有调用点，也让工具名自己
             # 带前缀时能走路由（mcp_servers.split_tool_name）。
+            # token 为 None 时不把这个参数传进去：沿用服务端自己的钥匙。
+            extra = {} if token is None else {'token': token}
             if server is None:
                 payload = await mcp_adapter.call_tool(
-                    server_tool_name, dict(args or {}), artifact=artifact)
+                    server_tool_name, dict(args or {}), artifact=artifact,
+                    **extra)
             else:
                 payload = await mcp_adapter.call_tool(
                     server_tool_name, dict(args or {}), artifact=artifact,
-                    server=server)
+                    server=server, **extra)
         except Exception as exc:
             leaf = _unwrap_error(exc)
             # 确定性必须在**这一层**标注：再往外包装就只剩 ToolError，类型名丢掉，
@@ -565,6 +611,15 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
                 f'（{_describe_error(exc)}）',
                 certainty=certainty, phase=phase) from exc
         emit(action('MCP 工具返回', mcp_adapter.summarize(payload), '📦'))
+        from app import async_contracts
+        server_id = getattr(server, 'id', '') if server is not None else ''
+        tool_key = (f'mcp:{server_id}:{server_tool_name}' if server_id
+                    else server_tool_name)
+        acceptance = async_contracts.acceptance(
+            tool_key, payload if isinstance(payload, dict) else None)
+        result_id = ''
+        if getattr(settings, 'result_envelope_v2', False) and isinstance(payload, dict):
+            result_id = await _stage_result(payload)
         # 参数必须一起记：过滤类工具（如 list_sites 的 keyword）传不传参数，
         # 返回语义完全不同——不记下来就分不清"列表只有 1 个"和"只匹配到 1 个"。
         # 服务端也要记：多服务端时同名工具的行为可能完全不同。
@@ -572,6 +627,9 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
             {'tool': server_tool_name, 'args': dict(args or {}),
              'server': getattr(server, 'id', '') or '',
              'payload': payload}]}
+        updates.update(acceptance)
+        if result_id:
+            updates['result_id'] = result_id
         # 回执里的标量也提到**步骤输出**上：下游要用
         # {"ref": {"step_id": "s1", "pointer": "/project_id"}} 取值，
         # 埋在 payload 里就取不到，只能编一个占位符。
@@ -587,18 +645,54 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
     return run
 
 
-async def catalog() -> list[Tool]:
-    """本轮可用的全部工具：本地能力包（注册来的）+ MCP 发现。"""
+async def catalog(context=None) -> list[Tool]:
+    """本轮可用的全部工具：本地能力包（注册来的）+ MCP 发现。
+
+    `context` 是**可信执行主体**（`app/tool_context.ToolCallContext`）。给了它，
+    就按主体过滤：模型**看不见**未授权的工具——不是"调用时被拒"，是连名字
+    都拿不到（文档 §7 P2：上游偷偷加一个 delete_*，规划器看到了就会用）。
+
+    没有 `context` 时行为与旧版一致（本地能力包 + 全部 MCP 工具），
+    以便单元测试与 CLI 直调继续可用。
+    """
     tools = list(registry.registered())
     tools.extend(await mcp_tools())
     if not settings.deploy_enabled:
         # 关掉部署时连占位工具都不给，免得计划里出现注定失败的一步。
         tools = [t for t in tools
                  if t.capability != publishing_capability.CAPABILITY]
-    return tools
+    if context is None:
+        return tools
+    return await visible_tools(tools, context)
 
 
-async def find_tool(name: str):
+async def visible_tools(tools, context) -> list[Tool]:
+    """按主体过滤工具清单。**被隐藏的工具连名字都不给模型**。"""
+    if context is None:
+        return list(tools)
+    from app import tool_authorization as authorization_module
+    store = _current_store()
+    policies = await authorization_module.load_policies(store, context.tenant_id)
+    visible, hidden = tool_policy_module.filter_catalog(
+        tools, policies, tenant_id=context.tenant_id,
+        role=context.role, user_id=context.user_id)
+    if hidden:
+        logger.info('按主体隐藏了 %s 个未授权工具（tenant=%s）',
+                    len(hidden), context.tenant_id)
+    return visible
+
+
+def _current_store():
+    """当前执行链上的仓储（账本持有）。没有账本时返回 None。"""
+    try:
+        from app import ledger as ledger_module
+        book = ledger_module.current_ledger()
+        return getattr(book, 'store', None) if book is not None else None
+    except Exception:                                # noqa: BLE001
+        return None
+
+
+async def find_tool(name: str, context=None):
     """按名字取工具：内置 → MCP 精确名 → 去掉服务端前缀后按**身份**再匹配。
 
     最后那步是为"续跑旧计划"服务的：工具名从 `mcp__delete_site` 变成了
@@ -606,6 +700,9 @@ async def find_tool(name: str):
     `deploy_site`，旧计划里的名字都不该直接失效。匹配不了名字就退到 tool_key
     的尾部——身份才是稳定的，名字只是对模型的展示形式。只有唯一命中才算数，
     两个服务端都有这个工具时不做猜测。
+
+    `context` 给了就按主体过滤：**无权使用的工具在执行点也取不到**，
+    这样"计划里写了但不该跑的"会走"工具不可用"分支，而不是绕过授权发出去。
     """
     # 先看模块级快照（既有用例会 patch 它注入假工具），再看注册表的实时视图：
     # 这样"新增一个能力包文件"不需要动任何清单，名字也能解析到。
@@ -620,7 +717,11 @@ async def find_tool(name: str):
     matches = [t for t in tools if t.name == f'{MCP_PREFIX}{bare}'
                or t.name.endswith(f'__{bare}')
                or t.tool_key.endswith(f':{bare}')]
-    return matches[0] if len(matches) == 1 else None
+    found = matches[0] if len(matches) == 1 else None
+    if found is None or context is None:
+        return found
+    visible = await visible_tools([found], context)
+    return visible[0] if visible else None
 
 
 def planner_rules(catalog_tools) -> list[str]:

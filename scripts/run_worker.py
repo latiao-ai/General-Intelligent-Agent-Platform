@@ -36,6 +36,17 @@ logger = logging.getLogger('worker')
 MAX_JOB_ATTEMPTS = 5
 
 
+async def _mark_owned(hub: Hub, run: dict, worker_id: str, **fields) -> None:
+    """超时或异常收尾必须带上领取时的 owner 和代次。"""
+    owner = str(run.get('lease_owner') or worker_id)
+    epoch = int(run.get('lease_epoch') or 0)
+    marker = getattr(hub.store, 'update_run_owned', None)
+    if callable(marker):
+        await marker(run['run_id'], lease_owner=owner, lease_epoch=epoch, **fields)
+        return
+    await hub.store.update_run(run['run_id'], **fields)
+
+
 async def run_once(hub: Hub, worker_id: str, lease_seconds: float | None = None,
                    run_id: str | None = None) -> bool:
     """领取并执行一个运行。返回是否真的领到了东西。
@@ -64,8 +75,8 @@ async def run_once(hub: Hub, worker_id: str, lease_seconds: float | None = None,
                                        timeout=settings.task_timeout * 2)
         return True
     except asyncio.TimeoutError:
-        await hub.store.update_run(run['run_id'], status='reconciling',
-                                   error='执行超过预算窗口')
+        await _mark_owned(hub, run, worker_id, status='reconciling',
+                          error='执行超过预算窗口')
         logger.warning('run %s 执行超过预算窗口', run['run_id'])
         return True
     except asyncio.CancelledError:
@@ -82,8 +93,8 @@ async def run_once(hub: Hub, worker_id: str, lease_seconds: float | None = None,
     except Exception as exc:                       # noqa: BLE001
         logger.exception('run %s 执行异常', run['run_id'])
         try:
-            await hub.store.update_run(run['run_id'], status='failed',
-                                       error=type(exc).__name__)
+            await _mark_owned(hub, run, worker_id, status='failed',
+                              error=type(exc).__name__)
         except Exception:                          # noqa: BLE001
             logger.warning('run %s 失败状态写入也失败', run['run_id'],
                            exc_info=True)
@@ -111,6 +122,8 @@ async def drain_jobs(hub: Hub, worker_id: str, limit: int = 5) -> int:
                 from app import memory as memory_module
                 await memory_module.compact(
                     hub.store, job['payload'].get('session_id', ''))
+            else:
+                raise RuntimeError(f'未知后台作业 {job["kind"]}')
             await hub.store.finish_job(job['job_id'])
             done += 1
         except Exception as exc:                  # noqa: BLE001
@@ -137,6 +150,13 @@ async def main_loop(hub: Hub, worker_id: str, once: bool,
     print(f'[worker] 启动对账: {stats}')
     while True:
         worked = await drain_jobs(hub, worker_id)
+        if settings.async_tool_runtime_enabled:
+            from app import external_tasks
+            try:
+                worked += await external_tasks.poll_due(
+                    hub.store, worker_id=worker_id)
+            except Exception:                      # noqa: BLE001
+                logger.exception('外部任务轮询失败')
         if not jobs_only:
             if await run_once(hub, worker_id):
                 worked += 1

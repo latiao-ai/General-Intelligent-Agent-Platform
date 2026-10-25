@@ -17,6 +17,7 @@
     偏好：回答简洁、多用表格
 """
 import contextvars
+import fcntl
 import os
 import re
 import uuid
@@ -105,21 +106,38 @@ def render(facts: dict, ver: int) -> str:
     return '\n'.join(lines)
 
 
-def save(facts: dict) -> int:
-    """原子写入，返回新版本号。"""
+class ProfileConflict(RuntimeError):
+    """别的进程已经写过更新的版本。"""
+
+
+def save(facts: dict, *, expected_version: int | None = None) -> int:
+    """原子写入，返回新版本号。
+
+    同一台机器上的多个进程用文件锁串行化。多台机器要共用同一个画像目录。
+    带了 expected_version 时，版本已经变过就拒绝覆盖。
+    """
     path = _path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    new_ver = version() + 1
-    if path.exists():
+    lock_path = path.with_name(path.name + '.lock')
+    with open(lock_path, 'a', encoding='utf-8') as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            (path.parent / (path.name + '.bak')).write_text(
-                path.read_text(encoding='utf-8'), encoding='utf-8')
-        except OSError:
-            pass
-    tmp = path.parent / f'.{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}'
-    tmp.write_text(render(facts, new_ver), encoding='utf-8')
-    os.replace(tmp, path)          # 原子替换，崩溃也不会留下半截
-    return new_ver
+            current = version()
+            if expected_version is not None and current != int(expected_version):
+                raise ProfileConflict('画像版本已变化，请重新读取后再保存')
+            new_ver = current + 1
+            if path.exists():
+                try:
+                    (path.parent / (path.name + '.bak')).write_text(
+                        path.read_text(encoding='utf-8'), encoding='utf-8')
+                except OSError:
+                    pass
+            tmp = path.parent / f'.{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}'
+            tmp.write_text(render(facts, new_ver), encoding='utf-8')
+            os.replace(tmp, path)
+            return new_ver
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def merge(updates: dict) -> dict:

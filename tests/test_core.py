@@ -568,7 +568,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         from app.capabilities import web as web_cap
         captured = {}
 
-        async def fake_catalog():
+        async def fake_catalog(context=None):
             return tool_module.BUILTIN_TOOLS
 
         async def fake_call(schema, system, user, **kw):
@@ -600,7 +600,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
 
-        async def fake_catalog():
+        async def fake_catalog(context=None):
             return tool_module.BUILTIN_TOOLS
 
         async def boom(*a, **k):
@@ -2065,7 +2065,7 @@ class RepositoryContractTests(unittest.TestCase):
         # 每个用例先清库：以前靠 SQLite :memory: 隔离
         await reset_db()
 
-    def test_sqlite_store_satisfies_repository_protocol(self):
+    def test_store_satisfies_repository_protocol(self):
         from app.persistence import Repository, check_repository
         store = new_store()
         self.assertEqual(check_repository(store), [])
@@ -2489,14 +2489,8 @@ class ModelOverrideTests(unittest.TestCase):
         from app.services import new_llm
         self.assertEqual(new_llm('some-fast-model').model_name, 'some-fast-model')
 
-    def test_compose_model_never_blank(self):
-        # 未配置 LLM_COMPOSE_MODEL 时必须回退到 LLM_MODEL，不能是空字符串。
-        from app.config import settings
-        self.assertTrue(settings.llm_compose_model)
-
-
 class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
-    """推理开关：只有解析/规划阶段可以关，整理报告必须保留。"""
+    """推理开关：解析/规划阶段可以关。"""
 
     async def test_disable_thinking_sets_thinking_disabled(self):
         import app.services as services
@@ -2522,7 +2516,7 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
         from app.capabilities import web as web_cap
         captured = {}
 
-        async def fake_catalog():
+        async def fake_catalog(context=None):
             return tool_module.BUILTIN_TOOLS
 
         async def fake_call(schema, system, user, **kw):
@@ -2635,7 +2629,7 @@ class PlannerProfileTests(unittest.IsolatedAsyncioTestCase):
         from app.capabilities import export as export_cap
         from app.capabilities import web as web_cap
 
-        async def fake_catalog():
+        async def fake_catalog(context=None):
             return tool_module.BUILTIN_TOOLS
 
         async def fake_call(schema, system, user, **kw):
@@ -2686,7 +2680,7 @@ class SmallTalkFilterTests(unittest.IsolatedAsyncioTestCase):
         from app.capabilities import web as web_cap
         called = {}
 
-        async def fake_catalog():
+        async def fake_catalog(context=None):
             return tool_module.BUILTIN_TOOLS
 
         async def fake_call(schema, system, user, **kw):
@@ -2725,7 +2719,7 @@ class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
         table['answer_directly'] = Tool('answer_directly', '直接回答', 'd', {}, fake_answer)
         table['web_search'] = Tool('web_search', '检索来源', 'd', {}, fake_search)
 
-        async def fake_catalog():
+        async def fake_catalog(context=None):
             return list(table.values())
 
         with patch.dict(tool_module.BUILTIN_BY_NAME, table), \
@@ -2758,7 +2752,7 @@ class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
         table = {'web_search': make('web_search', '检索来源'),
                  'render_html': make('render_html', '渲染 HTML')}
 
-        async def fake_catalog():
+        async def fake_catalog(context=None):
             return list(table.values())
 
         async def fake_plan(state):
@@ -3125,7 +3119,11 @@ class BackendJobTests(unittest.IsolatedAsyncioTestCase):
         job = await hub.store.job('j1')
         self.assertEqual(job['status'], 'queued', '一次失败不能当终态')
         self.assertEqual(job['last_error'], 'RuntimeError')
-        self.assertGreater(job['lease_expires_at'], time.time(), '应处于退避中')
+        # 退避时间放在 due_at（调度到期时间），不再占用租约期限：
+        # 文档 §5 M5 要求把这两列分开，否则退避中的作业会被租约回收误领。
+        self.assertGreater(job['due_at'], time.time(), '应处于退避中')
+        self.assertIsNone(job['lease_expires_at'],
+                          '退避中的作业不应持有租约')
 
     async def test_summary_job_actually_compacts_memory(self):
         """以前 asyncio.run() 在运行中的事件循环里必炸，摘要从来没成功过。"""
@@ -3157,7 +3155,7 @@ class KernelCorrectnessTests(unittest.IsolatedAsyncioTestCase):
         from app import nodes
         from app import tools as tool_module
 
-        async def fake_catalog():
+        async def fake_catalog(context=None):
             return tool_module.BUILTIN_TOOLS
 
         async def fake_call(schema, system, user, **kw):
@@ -3478,7 +3476,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
         state = {'plan': plan, 'step_index': 0, 'step_outputs': {},
                  'user_input': '做个页面并发布'}
 
-        async def fake_find(name):
+        async def fake_find(name, context=None):
             return tools.get(name)
 
         with patch.object(tool_module, 'find_tool', fake_find), \
@@ -3511,7 +3509,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
         state = {'plan': plan, 'step_index': 0, 'step_outputs': {},
                  'user_input': 'x'}
 
-        async def fake_find(name):
+        async def fake_find(name, context=None):
             return tools.get(name)
 
         with patch.object(tool_module, 'find_tool', fake_find), \
@@ -3540,7 +3538,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
         state = {'plan': plan, 'step_index': 0, 'step_outputs': {},
                  'user_input': 'x'}
 
-        async def fake_find(name):
+        async def fake_find(name, context=None):
             return tools.get(name)
 
         with patch.object(tool_module, 'find_tool', fake_find), \
@@ -4182,7 +4180,7 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
 
             # 迁移脚本现在只认 PostgreSQL（SQLite 实现已删除）
             with patch.object(migrate, 'settings',
-                              NS(database_url=PG_DSN, db_path=None)):
+                              NS(database_url=PG_DSN)):
                 self.assertEqual(migrate.main(['--apply']), 0)
 
             store = new_store()

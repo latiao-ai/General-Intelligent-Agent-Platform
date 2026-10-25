@@ -22,7 +22,6 @@
 | `off`（默认） | 不介入：单用户本地开发，`X-DSH-User` 仍可作为声明 |
 | `optional` | 有中台会话就按会话；没有就匿名（灰度期） |
 | `ticket` | 必须兑换拿到中台会话，否则 401。**正式环境用这个** |
-| `token` | 旧模式（外部 token 直连 userinfo），保留兼容 |
 
 会话凭证走 cookie：浏览器的 `EventSource` 与 `<a download>` 发不出自定义请求头，
 只认 header 的话 SSE 和产物下载会全部 401。
@@ -31,34 +30,13 @@ import hashlib
 import logging
 import secrets
 import time
-from dataclasses import dataclass, field
 
-import httpx
 from fastapi import HTTPException, Request
 
 from app import ticket_auth
 from app.config import settings
 
 logger = logging.getLogger(__name__)
-
-# 旧 token 模式的进程内缓存：token 摘要 → (过期时间戳, UserInfo)
-_CACHE: dict[str, tuple[float, 'UserInfo']] = {}
-_MAX_CACHE = 2000
-_client: httpx.AsyncClient | None = None
-
-
-@dataclass(frozen=True)
-class UserInfo:
-    """旧 token 模式下平台 userinfo 的归一化结果。"""
-    provider: str
-    subject: str
-    email: str = ''
-    display_name: str = ''
-    raw: dict = field(default_factory=dict)
-
-
-class AuthError(Exception):
-    """凭证无效或身份服务不可用。调用方统一转成 401。"""
 
 
 class ExchangeError(Exception):
@@ -212,109 +190,4 @@ async def resolve(request: Request):
         # optional：没会话就匿名。注意**不接受请求头声明**，那条口子只留给 off 模式，
         # 否则"改个 X-DSH-User 就换身份"会一直存在。
         return policies.Principal()
-    if mode == 'token':
-        return await resolve_legacy_token(request)
     raise HTTPException(status_code=500, detail=f'未知 AUTH_MODE：{mode}')
-
-
-# ---------- 旧模式：外部 token → userinfo（保留兼容） ----------
-
-def token_from_request(request: Request) -> str:
-    header = request.headers.get('authorization', '')
-    if header.lower().startswith('bearer '):
-        return header[7:].strip()
-    return (request.cookies.get(settings.auth_cookie_name) or '').strip()
-
-
-def _pick(payload: dict, path: str) -> str:
-    cur = payload
-    for part in path.split('.'):
-        if not isinstance(cur, dict):
-            return ''
-        cur = cur.get(part)
-    return '' if cur is None else str(cur)
-
-
-def http_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        _client = httpx.AsyncClient(timeout=settings.auth_timeout)
-    return _client
-
-
-async def aclose() -> None:
-    global _client
-    if _client is not None:
-        await _client.aclose()
-        _client = None
-
-
-async def fetch_userinfo(token: str) -> UserInfo:
-    """旧 `token` 模式：拿外部 token 调平台 userinfo。"""
-    if not token:
-        raise AuthError('缺少凭证')
-    digest = hashlib.sha256(token.encode('utf-8')).hexdigest()
-    stamp = time.monotonic()
-    hit = _CACHE.get(digest)
-    if hit and hit[0] > stamp:
-        return hit[1]
-
-    url = settings.auth_userinfo_url
-    if not url:
-        raise AuthError('未配置 AUTH_USERINFO_URL，无法校验凭证')
-    try:
-        if settings.auth_token_in == 'query':
-            resp = await http_client().get(url, params={'access_token': token})
-        else:
-            resp = await http_client().get(
-                url, headers={'Authorization': f'Bearer {token}'})
-    except httpx.HTTPError as exc:
-        raise AuthError(f'身份服务不可达：{exc.__class__.__name__}') from exc
-    if resp.status_code in (401, 403):
-        raise AuthError('凭证无效或已过期')
-    if resp.status_code >= 400:
-        raise AuthError(f'身份服务返回 {resp.status_code}')
-    try:
-        payload = resp.json()
-    except ValueError as exc:
-        raise AuthError('身份服务返回的不是 JSON') from exc
-    if not isinstance(payload, dict):
-        raise AuthError('身份服务返回结构不是对象')
-    subject = _pick(payload, settings.auth_subject_field).strip()
-    if not subject:
-        raise AuthError(f'身份服务未返回主体字段 {settings.auth_subject_field}')
-
-    info = UserInfo(provider=settings.auth_provider, subject=subject,
-                    email=_pick(payload, settings.auth_email_field),
-                    display_name=_pick(payload, settings.auth_name_field),
-                    raw=payload)
-    _CACHE[digest] = (stamp + settings.auth_cache_ttl, info)
-    if len(_CACHE) > _MAX_CACHE:
-        for key in [k for k, v in _CACHE.items() if v[0] <= stamp]:
-            _CACHE.pop(key, None)
-    return info
-
-
-async def resolve_legacy_token(request: Request):
-    """旧 `token` 模式解析：userinfo → 绑定身份 → Principal。"""
-    from app import policies
-
-    token = token_from_request(request)
-    if not token:
-        raise HTTPException(status_code=401, detail='未登录',
-                            headers={'WWW-Authenticate': 'Bearer'})
-    store = getattr(request.app.state, 'store', None)
-    if store is None:
-        raise HTTPException(status_code=503, detail='身份仓储未就绪')
-    try:
-        info = await fetch_userinfo(token)
-    except AuthError as exc:
-        raise HTTPException(status_code=401, detail=str(exc),
-                            headers={'WWW-Authenticate': 'Bearer'}) from exc
-    row = await store.bind_identity(info.provider, info.subject,
-                                    email=info.email,
-                                    display_name=info.display_name)
-    return policies.Principal(
-        tenant_id=row.get('tenant_id') or policies.DEFAULT_TENANT,
-        user_id=row['user_id'], role=row.get('role') or 'member',
-        authenticated=True)

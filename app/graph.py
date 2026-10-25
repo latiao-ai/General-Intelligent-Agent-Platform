@@ -1,6 +1,6 @@
 """Planner-Executor 执行图（含结果观察与自主决策）。
 
-控制流（`harness-observe-decide` §7 + `harness-live-input` §5）：
+控制流（观察决策 + 运行中补充）：
 
     START → intake
     intake → plan | revise_plan | run_step | verify_completion

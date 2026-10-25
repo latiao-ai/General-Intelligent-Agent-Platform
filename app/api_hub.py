@@ -309,7 +309,7 @@ class Hub:
         return record
 
     async def start(self, message: str, session_id: str | None = None,
-              principal=None) -> TaskRecord:
+              principal=None, scene: dict | None = None) -> TaskRecord:
         """建任务 + 建 run + **领取** + 就地执行。
 
         关键在"领取"这一步：API 进程要跑就地执行，也必须先按同一条 claim 路径
@@ -345,8 +345,11 @@ class Hub:
         await self.store.ensure_task_meta(record.task_id, session_id=session_id,
                                     goal=message, tenant_id=tenant,
                                     owner_user_id=owner)
+        if scene and hasattr(self.store, 'save_scene_context'):
+            await self.store.save_scene_context(record.task_id, scene)
         await self.store.create_run(record.run_id, record.task_id, status='queued',
-                              tenant_id=tenant)
+                              tenant_id=tenant, owner_user_id=owner,
+                              owner_role=str(getattr(principal, 'role', '') or 'member'))
         claimed = await self.store.claim_run(self.owner_id, self.lease_seconds,
                                        run_id=record.run_id)
         if claimed is None:
@@ -983,7 +986,7 @@ class Hub:
             f"{record.session_id}:{record.run_id}",
             {'session_id': record.session_id})
 
-    # ---------- 运行中补充输入（文档 harness-live-input §3） ----------
+    # ---------- 运行中补充输入 ----------
 
     async def append_run_input(self, run_id: str, *, request_id: str,
                                message: str, principal=None,
@@ -1178,7 +1181,8 @@ class Hub:
         before = dict(record.state or {})
         new_run_id = uuid.uuid4().hex[:12]
         await self.store.create_run(new_run_id, record.task_id, status='queued',
-                              tenant_id=run.get('tenant_id') or 'default')
+                              tenant_id=run.get('tenant_id') or 'default',
+                              owner_user_id=str(run.get('owner_user_id') or 'default'))
         claimed = await self.store.claim_run(self.owner_id, self.lease_seconds,
                                        run_id=new_run_id)
         if claimed is None:
@@ -1287,7 +1291,9 @@ class Hub:
         tenant = getattr(principal, 'tenant_id', record.tenant_id or 'default')
         run_id = uuid.uuid4().hex[:12]
         await self.store.create_run(run_id, record.task_id, status='queued',
-                              tenant_id=tenant)
+                              tenant_id=tenant,
+                              owner_user_id=str(getattr(principal, 'user_id', '')
+                                                or record.owner_user_id or 'default'))
         claimed = await self.store.claim_run(self.owner_id, self.lease_seconds,
                                        run_id=run_id)
         if claimed is None:

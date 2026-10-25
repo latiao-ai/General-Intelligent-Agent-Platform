@@ -21,6 +21,8 @@ from app import (context, errors as errors_module, execution_control,
                  observation as observation_module,
                  outcome as outcome_module, profile,
                  run_inputs as run_inputs_module)
+from app import tool_authorization as authorization_module
+from app import tool_context as tool_context_module
 from app.config import settings
 from app.events import action, emit, stage_end, stage_start, thought
 from app.capabilities.base import ToolError
@@ -291,7 +293,7 @@ async def plan(state):
                 'plan_version': 1,
                 'step_index': 0, 'status': 'planned'}
 
-    catalog = await tool_module.catalog()
+    catalog = await tool_module.catalog(await _tool_context())
     available, origin = tool_module.usable_documents(state)
     payload = json.dumps({
         '用户要求': question,
@@ -430,7 +432,7 @@ async def plan(state):
 
 
 def next_step(state) -> str:
-    """run_step 之后往哪走（文档 harness-live-input §5 第十步）。
+    """run_step 之后往哪走。
 
     - `run_step`：还有步骤；
     - `revise`：用户补了新要求，先重新规划剩余部分；
@@ -683,7 +685,7 @@ async def revise_plan(state):
                   if str(item.get('status')) == 'succeeded'}
     unknown_steps = [item for item in actions
                      if str(item.get('status')) in ('in_flight', 'unknown')]
-    catalog = await tool_module.catalog()
+    catalog = await tool_module.catalog(await _tool_context())
     decision = run_inputs_module.build_decision_input(
         original_goal=state.get('original_goal') or state.get('user_input') or '',
         inputs=pending, plan={'version': plan_row.get('version'),
@@ -905,7 +907,7 @@ def _observation_context(state: dict, plan: dict, criteria_state: dict,
         '有效补充要求': [
             {'seq': item.get('input_seq'), '要求': item.get('message'),
              'intent_version': item.get('intent_version')}
-            for item in (observation_module.normalize_inputs(pending_inputs)
+            for item in (run_inputs_module.normalize_inputs(pending_inputs)
                          if pending_inputs else [])],
         '版本': {'intent_version': int(state.get('intent_version') or 0),
                  'plan_version': int(state.get('plan_version') or 0),
@@ -1036,7 +1038,7 @@ async def decide_next(state):
                 'next_route': observation_module.ROUTE_STEP}
 
     if kind == 'revise':
-        catalog = await tool_module.catalog()
+        catalog = await tool_module.catalog(await _tool_context())
         kept, issues = run_inputs_module.validate_revision(
             [step for step in data.get('steps') or []],
             plan_version=int(plan.get('version') or 0) + 1,
@@ -1138,17 +1140,20 @@ def route_after_decision(state) -> str:
 
 
 async def wait_async(state):
-    """外部任务已受理但未完成：**程序**等待/查询，不请模型来"等一会儿"。
-
-    首版只做诚实处理：没有查询能力时明确等待人工核实，不假装有通用后台接续
-    （文档 §10：任务受理、执行完成、产物保存是不同阶段）。
-    """
+    """外部任务已受理但未完成：登记原任务，不请模型来等，也不当成要用户补充。"""
+    from app import external_tasks as external_tasks_module
     waiting = (state.get('observation') or {}).get('waiting_async') or []
-    detail = '；'.join(f'{item.get("step_id")}:{item.get("phase")}' for item in waiting)
+    detail = '；'.join(f'{item.get("step_id")}:{item.get("phase")}' for item in waiting
+                       if isinstance(item, dict))
+    tracked = await external_tasks_module.remember_waiting(state, waiting)
     emit(action('外部任务还在跑', detail or '已受理未完成', '⏳'))
+    if tracked:
+        return {'status': 'waiting_input',
+                'failure': '外部任务已受理并登记。Worker 会查询原任务号，不会重新提交。'
+                           + (f'（{detail}）' if detail else '')}
     return {'status': 'waiting_input',
             'failure': f'外部任务已受理但还没完成（{detail or "阶段未知"}）。'
-                       f'本平台暂未支持自动轮询该能力，请稍后确认结果后再继续。'}
+                       f'回执里没有可查询的远端任务号，需要人工核实，不能重新提交。'}
 
 
 async def verify_completion(state):
@@ -1248,8 +1253,55 @@ def final_status(state: dict) -> str:
 
 
 async def _tool_by_name(name: str):
-    """按名字取工具：先内置，再 MCP 动态清单（含旧名回退）。"""
-    return await tool_module.find_tool(name)
+    """按名字取工具：先内置，再 MCP 动态清单（含旧名回退）。
+
+    带主体过滤：没有授权的工具**取不到**，于是"计划里写了但不该跑的"
+    会走"工具不可用"分支，而不是绕过授权发到远端。
+    """
+    return await tool_module.find_tool(name, await _tool_context())
+
+
+def state_intent_version(run: dict) -> int:
+    """run 行上的要求版本。取不到就当 0（"没有版本约束"）。"""
+    try:
+        return int((run or {}).get('intent_version') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+async def _tool_context(step_id: str = '', action_id: str = ''):
+    """构造本次调用的**可信执行主体**。
+
+    主体来自**库里已提交的 run 行**（不是模型输出、不是请求头里的自报字段）：
+    租户、用户、要求版本、计划版本都在 run 上，Worker 与 API 就地执行
+    拿到的是同一份。
+
+    没有账本（CLI 直调、单元测试）时返回 None：调用点据此走兼容路径，
+    而不是伪造一个"看起来像真的"主体。
+    """
+    book = ledger_module.current_ledger()
+    context_ = execution_control.require()
+    if book is None or context_ is None:
+        return None
+    store = getattr(book, 'store', None)
+    if store is None:
+        return None
+    try:
+        run = await store.run(context_.run_id)
+    except Exception:                                # noqa: BLE001
+        logger.warning('读取 run 失败 run=%s', context_.run_id, exc_info=True)
+        return None
+    if not run:
+        return None
+    # 用户身份：run 行上没有 owner_user_id 时，用记账时的会话主体。
+    # 检索失败就退回 'default'——单用户部署的存量数据本来就是它。
+    user_id = str(run.get('owner_user_id') or '') or 'default'
+    role = str(run.get('owner_role') or '') or 'member'
+    return tool_context_module.from_run(
+        run, user_id=user_id, role=role, step_id=step_id, action_id=action_id,
+        intent_version=int(state_intent_version(run)),
+        plan_version=int(book.plan_version or 1),
+        authenticated=bool(run.get('tenant_id')) and user_id != 'default')
 
 
 async def _run_compensations(state: dict, steps: list[dict], outputs: dict,
@@ -1277,6 +1329,18 @@ async def _run_compensations(state: dict, steps: list[dict], outputs: dict,
             emit(action('补偿无法执行', f'{name} 不可用', '⚠️'))
             continue
         args = resolve_inputs({'args': comp.get('args') or {}}, outputs)
+        if settings.tool_policy_enforced:
+            tool_context = await _tool_context(step_id=step_id)
+            try:
+                await authorization_module.authorize_call(
+                    book.store if book is not None else None, tool_context,
+                    tool_key=tool.tool_key or name, effect=tool.effect, args=args,
+                    honor_approval=False)
+            except authorization_module.AuthorizationDenied as exc:
+                results.append({'step_id': step['step_id'], 'tool': name,
+                                'status': 'failed', 'error': exc.safe_message})
+                emit(action('补偿未获授权', exc.safe_message, '⛔'))
+                continue
         emit(stage_start(step_id, f'回滚·{tool.label}'))
         started = time.perf_counter()
         action_id, attempt_id = None, None
@@ -1350,6 +1414,38 @@ async def _check_boundary(state: dict) -> str:
     return ''
 
 
+async def _open_approval(book, tool_context, *, tool_key: str, args: dict) -> str:
+    """把待确认清单写入批准表。失败时返回空串，调用本身仍然停在等待批准。"""
+    if book is None or getattr(book, 'store', None) is None:
+        return ''
+    from app import approvals as approvals_module
+    from app import tool_policy as policy_module
+    context = tool_context
+    tenant_id = getattr(context, 'tenant_id', None) or 'default'
+    user_id = getattr(context, 'user_id', None) or 'default'
+    args_hash = policy_module.canonical_hash(args or {})
+    manifest = approvals_module.ApprovalManifest(items=[{
+        'key': 'call',
+        'tool_key': tool_key,
+        'args_hash': args_hash,
+        'resource_scope': '',
+        'units': 1,
+    }], expires_at=time.time() + settings.approval_ttl_seconds,
+        max_actions=1)
+    try:
+        row = await book.store.create_approval(
+            tenant_id=tenant_id, owner_user_id=user_id,
+            requester_user_id=user_id, run_id=book.run_id,
+            manifest={'items': manifest.items, 'max_actions': manifest.max_actions,
+                      'expires_at': manifest.expires_at, 'limits': manifest.limits},
+            manifest_hash=manifest.hash(),
+            expires_at=manifest.expires_at)
+    except Exception:                                  # noqa: BLE001
+        logger.warning('写入批准申请失败', exc_info=True)
+        return ''
+    return str(row.get('approval_id') or '')
+
+
 async def run_step(state):
     """执行计划中的一步。每次只走一步，便于逐步计时与取消。
 
@@ -1419,9 +1515,10 @@ async def run_step(state):
 
     book = ledger_module.current_ledger()
     action_id, attempt_id, reused = None, None, False
+    decision = None
+    tool_context = None
     if book is not None:
-        # 工具调用次数也进运行预算（文档 §12）：查询同样烧钱、同样会无进展地重复。
-        # 超出就明确停下，而不是靠"模型自己发现"。
+        # 工具调用次数也进运行预算：查询同样烧钱、同样会无进展地重复。
         try:
             await book.store.consume_budget(
                 book.context, run_id=book.run_id, key='tool_calls',
@@ -1433,23 +1530,72 @@ async def run_step(state):
                     'status': 'waiting_input', 'next_route': 'stop',
                     'failure': f'{hint}。已完成的步骤与产物都保留，'
                                f'可以补充要求后继续。'}
+        # 先授权，再准入。拒绝和等待批准都还没有 in_flight。
+        tool_context = await _tool_context(step_id=step_id, action_id='')
+        try:
+            decision = await authorization_module.authorize_call(
+                book.store, tool_context,
+                tool_key=tool.tool_key or name, effect=tool.effect, args=args)
+        except authorization_module.ApprovalRequired as exc:
+            approval_id = await _open_approval(
+                book, tool_context, tool_key=tool.tool_key or name, args=args)
+            emit(action('等待批准', exc.safe_message, '⏸️'))
+            outputs[step_id] = {'__status__': 'waiting_approval',
+                                'approval_id': approval_id}
+            return {'step_index': index, 'step_label': tool.label,
+                    'step_outputs': outputs, 'status': 'waiting_approval',
+                    'next_route': 'stop',
+                    'failure': exc.safe_message,
+                    'approval_id': approval_id}
+        except authorization_module.AuthorizationDenied as exc:
+            emit(action('没有调用资格', exc.safe_message, '⛔'))
+            errors = list(state.get('errors') or []) + [
+                {'stage': name, 'type': 'AuthorizationDenied',
+                 'error_code': getattr(exc, 'error_code', 'E_POLICY_DENIED'),
+                 'certainty': 'not_executed', 'effect': tool.effect}]
+            return {'step_index': len(steps), 'step_label': tool.label,
+                    'errors': errors, 'step_outputs': outputs,
+                    'status': 'failed',
+                    'failure': f'{tool.label}没有调用资格：{exc.safe_message}'}
+        from app import approvals as approvals_module
+        authorization = None
+        if settings.tool_policy_enforced and decision is not None and tool_context is not None:
+            from app import tool_policy as policy_module
+            credential = decision.credential
+            authorization = {
+                'tenant_id': tool_context.tenant_id,
+                'user_id': tool_context.user_id,
+                'tool_key': tool.tool_key or name,
+                'args_hash': policy_module.canonical_hash(args or {}),
+                'credential_binding': credential.binding_id if credential else '',
+                'credential_subject': credential.subject_id if credential else '',
+                'credential_revision': credential.revision if credential else 0,
+                'policy_revision': decision.policy.revision if decision.policy else 0,
+                'approval_id': decision.approval_id,
+                'approval_item_key': decision.approval_item_key or 'call',
+            }
         try:
             admitted = await book.admit(step_id=step_id,
                                         tool_key=tool.tool_key or name,
                                         effect=tool.effect, args=args,
-                                        expected_intent_version=_plan_intent(state))
+                                        expected_intent_version=_plan_intent(state),
+                                        authorization=authorization)
         except execution_control.IntentChanged as exc:
-            # 用户的补充先提交了：这一步**零准入**，回到修订循环
             emit(action('要求已更新', f'{tool.label} 尚未派发', '📝'))
             return _intent_changed_update(state, exc)
         except execution_control.ControlStopped as exc:
-            # 暂停/取消在准入前先提交：这一步不得获得调用资格
             emit(action('停止派发', exc.reason, '⏸️'))
             return {'step_index': index, 'step_label': tool.label,
                     'status': exc.status, 'failure': exc.reason}
         except execution_control.LeaseLost as exc:
             emit(action('执行权已丢失', str(exc), '⛔'))
             raise
+        except (approvals_module.ApprovalConflict,
+                approvals_module.ApprovalMissing) as exc:
+            emit(action('批准不可用', str(exc), '⛔'))
+            return {'step_index': len(steps), 'step_label': tool.label,
+                    'step_outputs': outputs, 'status': 'failed',
+                    'failure': f'{tool.label}的批准不可用：{exc}'}
         if admitted.get('blocked'):
             emit(action('该步骤结果未定',
                         f'{tool.label}（{admitted["blocked"]}），需核实后再继续', '❓'))
@@ -1465,6 +1611,35 @@ async def run_step(state):
             reused = True
         action_id = admitted.get('action_id')
         attempt_id = admitted.get('attempt_id')
+        if not reused and tool_context is not None and decision is not None:
+            try:
+                await authorization_module.check_revocations(
+                    book.store, decision,
+                    tool_key=tool.tool_key or name,
+                    tenant_id=tool_context.tenant_id, user_id=tool_context.user_id,
+                    role=tool_context.role)
+            except authorization_module.AuthorizationDenied as exc:
+                if action_id:
+                    await book.fail_from_exception(
+                        step_id=step_id, action_id=action_id,
+                        attempt_id=attempt_id, exc=exc, effect=tool.effect)
+                    if decision is not None and decision.approval_id:
+                        try:
+                            await book.store.release_approval_reservation(
+                                approval_id=decision.approval_id, action_id=action_id,
+                                manifest_item_key=decision.approval_item_key or 'call')
+                        except Exception:          # noqa: BLE001
+                            logger.warning('释放批准预留失败 action=%s', action_id,
+                                           exc_info=True)
+                emit(action('权限已撤销', exc.safe_message, '⛔'))
+                return {'step_index': len(steps), 'step_label': tool.label,
+                        'step_outputs': outputs, 'status': 'failed',
+                        'failure': f'{tool.label}没有调用资格：{exc.safe_message}'}
+        if not reused and tool_context is not None and action_id and authorization is None:
+            await authorization_module.record_authorization(
+                book.store, tool_context,
+                tool_key=tool.tool_key or name, action_id=action_id, args=args,
+                decision=decision)
 
     try:
         if not reused:
@@ -1482,6 +1657,14 @@ async def run_step(state):
             await book.fail_from_exception(
                 step_id=step_id, action_id=action_id, attempt_id=attempt_id,
                 exc=exc, effect=tool.effect)
+            if (decision is not None and decision.approval_id
+                    and outcome.certainty == 'not_executed'):
+                try:
+                    await book.store.release_approval_reservation(
+                        approval_id=decision.approval_id, action_id=action_id,
+                        manifest_item_key=decision.approval_item_key or 'call')
+                except Exception:                  # noqa: BLE001
+                    logger.warning('释放批准预留失败 action=%s', action_id, exc_info=True)
             if blocking:
                 emit(action('结果不确定', '远端可能已执行，需要核实', '❓'))
         errors = list(state.get('errors', [])) + [
@@ -1490,6 +1673,7 @@ async def run_step(state):
              'effect': tool.effect}]
         failed_result = _record_result(
             state, step_id=step_id, tool_key=tool.tool_key or name,
+            tool_name=name,
             action_id=action_id or '', attempt_id=attempt_id or '',
             payload=None, marker='failed',
             execution_status='unknown' if outcome.certainty == 'unknown' else 'failed',
@@ -1521,6 +1705,12 @@ async def run_step(state):
                 'failure': f'{tool.label}失败：{hint}{note}'}
 
     updates = dict(updates)
+    async_accepted = bool(updates.pop('async_accepted', False))
+    remote_task_id = str(updates.pop('remote_task_id', '') or '')
+    contract_id = str(updates.pop('contract_id', '') or '')
+    contract_version = updates.pop('contract_version', 1)
+    updates.pop('execution_status', None)
+    updates.pop('phase', None)
     # 工具返回的 `status` 是**阶段小结**（searched / fetched / rendered / deployed），
     # 不是 run 终态：run 终态由 outcome 统一判定。
     marker = str(updates.pop('status', '') or '')
@@ -1533,8 +1723,15 @@ async def run_step(state):
     # 这一步是"观察"的数据基础——结果只剩几个标量的话，后面根本没法判断。
     tool_result = _record_result(state, step_id=step_id,
                                 tool_key=tool.tool_key or name,
+                                tool_name=name,
                                 action_id=action_id or '', attempt_id=attempt_id or '',
-                                payload=_result_payload(updates), marker=marker)
+                                payload=_result_payload(updates), marker=marker,
+                                execution_status='accepted' if async_accepted else 'succeeded')
+    if async_accepted:
+        tool_result['phase'] = 'accepted'
+        tool_result['remote_task_id'] = remote_task_id
+        tool_result['contract_id'] = contract_id
+        tool_result['contract_version'] = contract_version
     record['tool_result'] = tool_result
     outputs[step_id] = record
     results_log = list(state.get('tool_results') or []) + [tool_result]
@@ -1565,6 +1762,13 @@ async def run_step(state):
             step_status='succeeded', state=_snapshot_state(merged),
             next_step_id=next_step_id)
         updates['observation_seq'] = int((settled or {}).get('observation_seq') or 0)
+        if decision is not None and decision.approval_id and action_id:
+            try:
+                await book.store.consume_approval_reservation(
+                    approval_id=decision.approval_id, action_id=action_id,
+                    manifest_item_key=decision.approval_item_key or 'call')
+            except Exception:                      # noqa: BLE001
+                logger.warning('消费批准预留失败 action=%s', action_id, exc_info=True)
 
     emit(stage_end(name, time.perf_counter() - started, marker, tool.label))
     return updates
@@ -1582,7 +1786,7 @@ def _result_payload(updates: dict):
 def _record_result(state: dict, *, step_id: str, tool_key: str, action_id: str = '',
                    attempt_id: str = '', payload=None, marker: str = '',
                    execution_status: str = 'succeeded',
-                   error: dict | None = None) -> dict:
+                   error: dict | None = None, tool_name: str = '') -> dict:
     """把一次调用归一成 `ToolResult`，并把完整结果落到本 run 的产物目录。
 
     完整结果落盘的理由：观察需要真实清单/嵌套结构，摘要只用来喂模型。
@@ -1609,7 +1813,8 @@ def _record_result(state: dict, *, step_id: str, tool_key: str, action_id: str =
     if deployment.get('site_id'):
         receipts.append(str(deployment['site_id']))
     return observation_module.build_result(
-        step_id=step_id, tool_key=tool_key, action_id=action_id,
+        step_id=step_id, tool_key=tool_key, tool_name=tool_name,
+        action_id=action_id,
         attempt_id=attempt_id, payload=payload,
         execution_status=execution_status, data_ref=data_ref,
         artifact_refs=artifact_refs, external_receipt_refs=receipts,

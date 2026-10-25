@@ -16,8 +16,7 @@ python -m scripts.migrate_status_vocabulary              # 只报告，不改数
 python -m scripts.migrate_status_vocabulary --apply      # 真的写库
 ```
 
-读的是 `.env` 里的 `DATABASE_URL`（PostgreSQL）或 `DB_PATH`（SQLite），
-与业务代码同一套配置，不需要另外传连接串。
+读的是 `.env` 里的 `DATABASE_URL`（只支持 PostgreSQL）。
 """
 import argparse
 import sys as _sys
@@ -36,36 +35,29 @@ TARGET_STATUSES = sorted(outcome_module.RUN_STATUSES)
 
 def connect():
     dsn = (settings.database_url or '').strip()
-    if dsn.startswith(('postgresql://', 'postgres://')):
-        import psycopg
-        return 'postgresql', psycopg.connect(dsn, autocommit=True)
-    import sqlite3
-    # isolation_level=None = 自动提交，与 PG 侧 autocommit=True 对齐：
-    # 否则 close() 会把没 commit 的改动回滚掉，"已更新 N 行"变成假话
-    return 'sqlite', sqlite3.connect(settings.db_path, isolation_level=None)
+    if not dsn.startswith(('postgresql://', 'postgres://')):
+        raise SystemExit('需要 DATABASE_URL=postgresql://…（SQLite 已删除）')
+    import psycopg
+    return psycopg.connect(dsn, autocommit=True)
 
 
-def placeholder(kind: str, sql: str) -> str:
-    """SQLite 用 ?、psycopg 用 %s。脚本里统一写 ?，按后端换一次。
-
-    只换占位符，不拼任何业务值进去——参数始终走驱动绑参。
-    """
-    return sql.replace('?', '%s') if kind == 'postgresql' else sql
+def _sql(sql: str) -> str:
+    return sql.replace('?', '%s')
 
 
-def _query(conn, sql, params=(), kind='sqlite'):
-    cur = conn.execute(placeholder(kind, sql), params)
+def _query(conn, sql, params=()):
+    cur = conn.execute(_sql(sql), params)
     return cur.fetchall()
 
 
-def _distinct(conn, table, kind='sqlite'):
+def _distinct(conn, table):
     rows = _query(conn, f'SELECT status, COUNT(*) FROM {table} '
-                        f'GROUP BY status ORDER BY COUNT(*) DESC', (), kind)
+                        f'GROUP BY status ORDER BY COUNT(*) DESC')
     return {row[0]: int(row[1]) for row in rows}
 
 
-def _apply(conn, sql, params=(), kind='sqlite'):
-    cur = conn.execute(placeholder(kind, sql), params)
+def _apply(conn, sql, params=()):
+    cur = conn.execute(_sql(sql), params)
     return cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
 
 
@@ -75,31 +67,27 @@ def main(argv=None) -> int:
                        help='真的写库；不加只做只读检查')
     args = parser.parse_args(argv)
 
-    kind, conn = connect()
+    conn = connect()
     try:
-        return _run(conn, kind, apply=args.apply)
+        return _run(conn, apply=args.apply)
     finally:
-        # SQLite 不关连接会留锁，后续进程（包括服务自己）打不开库
         try:
             conn.close()
         except Exception:                          # noqa: BLE001
             pass
 
 
-def _run(conn, kind: str, *, apply: bool) -> int:
-    print(f'数据源：{kind}'
-          + (f'（{settings.database_url}）' if kind == 'postgresql'
-             else f'（{settings.db_path}）'))
+def _run(conn, *, apply: bool) -> int:
+    print(f'数据源：postgresql（{settings.database_url}）')
 
-    tasks_before = _distinct(conn, 'tasks', kind)
-    runs_before = _distinct(conn, 'runs', kind)
+    tasks_before = _distinct(conn, 'tasks')
+    runs_before = _distinct(conn, 'runs')
     print('\n迁移前 tasks.status：', tasks_before)
     print('迁移前 runs.status ：', runs_before)
 
     # 1) 先记下"部署待确认"那批任务：它们的 run 当年被折成了 failed，要单独纠正
     rethink = [row[0] for row in _query(
-        conn, "SELECT task_id FROM tasks WHERE status='deploy_needs_check'",
-        (), kind)]
+        conn, "SELECT task_id FROM tasks WHERE status='deploy_needs_check'")]
 
     plan = []
     for legacy, target in outcome_module.LEGACY_STATUS.items():
@@ -134,19 +122,19 @@ def _run(conn, kind: str, *, apply: bool) -> int:
                           "UPDATE runs SET status='needs_reconcile' "
                           "WHERE status='failed' AND task_id IN "
                           "(SELECT task_id FROM tasks "
-                          " WHERE status='deploy_needs_check')", (), kind)
+                          " WHERE status='deploy_needs_check')")
     for legacy, target in outcome_module.LEGACY_STATUS.items():
         changed += _apply(conn, 'UPDATE tasks SET status=? WHERE status=?',
-                          (target, legacy), kind)
+                          (target, legacy))
         changed += _apply(conn, 'UPDATE runs SET status=? WHERE status=?',
-                          (target, legacy), kind)
+                          (target, legacy))
 
     print(f'\n已更新 {changed} 行。')
-    print('迁移后 tasks.status：', _distinct(conn, 'tasks', kind))
-    print('迁移后 runs.status ：', _distinct(conn, 'runs', kind))
+    print('迁移后 tasks.status：', _distinct(conn, 'tasks'))
+    print('迁移后 runs.status ：', _distinct(conn, 'runs'))
 
-    tasks_after = set(_distinct(conn, 'tasks', kind))
-    runs_after = set(_distinct(conn, 'runs', kind))
+    tasks_after = set(_distinct(conn, 'tasks'))
+    runs_after = set(_distinct(conn, 'runs'))
     left = (tasks_after | runs_after) - set(TARGET_STATUSES)
     if left:
         print(f'⚠️ 仍有非通用状态：{sorted(left)}（本脚本不猜它们该变成什么）')

@@ -1,0 +1,24 @@
+{
+  "contracts": [
+    {
+      "contract_id": "video-job-v1",
+      "version": 1,
+      "submit_tool_key": "mcp:video:create_video",
+      "remote_id_pointer": "/job/id",
+      "status_tool_key": "mcp:video:get_job",
+      "status_id_argument": "job_id",
+      "status_pointer": "/job/status",
+      "status_map": {
+        "queued": "accepted",
+        "processing": "running",
+        "done": "succeeded",
+        "error": "failed"
+      },
+      "output_pointer": "/job/outputs",
+      "cancel_tool_key": "mcp:video:cancel_job",
+      "recoverable": true,
+      "poll_interval_seconds": 5,
+      "deadline_seconds": 1800
+    }
+  ]
+}

@@ -10,9 +10,6 @@ load_dotenv(PROJECT_ROOT / '.env')
 class Settings:
     llm_key: str = os.getenv('LLM_API_KEY', '')
     llm_model: str = os.getenv('LLM_MODEL', '')
-    # 整理报告阶段的模型。空值时沿用 LLM_MODEL。
-    # 该阶段要读完整正文并产出结构化报告，往往是耗时大头，可单独换更快的模型。
-    llm_compose_model: str = os.getenv('LLM_COMPOSE_MODEL', '') or os.getenv('LLM_MODEL', '')
     # 解析阶段关闭模型推理。实测多轮场景 4.4s → 2.3s（约 2 倍），
     # 规划阶段的计划质量不受影响（5/5）。耗时几乎全在推理 token 上，与输入长度无关。
     llm_parse_disable_thinking: bool = (
@@ -22,20 +19,18 @@ class Settings:
     # 账号**不是一回事**：api.deepseek.com 只认平台自己的 key，不做兜底回退，
     # 否则配错了只会在第一次检索时 401。
     deepseek_api_key: str = os.getenv('DEEPSEEK_API_KEY', '').strip()
-    # 接入的 MCP Server 标识；工具身份用它组成 mcp:<server_id>:<name>。
-    # 目前只接一个 Server，字段先留出来，多 Server 时按配置注册即可。
+    # 单项 MCP_* 配置时的默认服务端 id；配了 MCP_SERVERS 后以数组里的 id 为准。
     mcp_server_id: str = os.getenv('MCP_SERVER_ID', 'publishing')
     deepseek_base_url: str = os.getenv('DEEPSEEK_BASE_URL',
                                        'https://api.deepseek.com').rstrip('/')
-    max_pages: int = min(5, max(1, int(os.getenv('MAX_PAGES', '5'))))
+    max_pages: int = min(3, max(1, int(os.getenv('MAX_PAGES', '3'))))
     # 单篇正文上限。必须和 max_total_chars 搭配看：总量 ÷ 单篇上限 = 能装下几个来源。
-    # 单篇设得和总量一样大时，第一个来源就把预算吃光，报告退化成单一来源。
+    # 单篇设得和总量一样大时，第一个来源就把预算吃光。
     max_source_chars: int = max(500, int(os.getenv('MAX_SOURCE_CHARS', '3000')))
-    # 送进整理报告阶段的总字符预算。它直接决定那次模型调用有多慢——输入越长，
-    # 产出结构化报告越久，超时与校验失败的概率也越高。
-    max_total_chars: int = max(1000, int(os.getenv('MAX_TOTAL_CHARS', '10000')))
-    # 单次模型调用的硬超时（秒）。整理报告一次尝试可能上百秒；没有上限时一旦卡住，
-    # 会一直耗到整个任务 300s 的预算。超时即失败、不重试（重试只会把耗时翻倍）。
+    # 送进模型的总字符预算。输入越长，调用越慢，超时与校验失败的概率也越高。
+    max_total_chars: int = max(1000, int(os.getenv('MAX_TOTAL_CHARS', '6000')))
+    # 单次模型调用的硬超时（秒）。没有上限时一旦卡住，会一直耗到整个任务
+    # 300s 的预算。超时即失败、不重试（重试只会把耗时翻倍）。
     llm_attempt_timeout: float = float(os.getenv('LLM_ATTEMPT_TIMEOUT', '180'))
     artifact_dir: Path = PROJECT_ROOT / os.getenv('ARTIFACT_DIR', 'artifacts')
     # 数据库：**只支持 PostgreSQL**（SQLite 实现已删除）。仓储接口见
@@ -50,7 +45,7 @@ class Settings:
     # 用户画像文件（Markdown，人可读可改）。含电话等敏感信息，已在 .gitignore 排除。
     profile_path: Path = PROJECT_ROOT / os.getenv('PROFILE_PATH', 'profile/USER.md')
     deploy_enabled: bool = os.getenv('DEPLOY_ENABLED', 'false').lower() == 'true'
-    # ---------- 执行预算（文档 §7：步数/时长/重规划次数必须可配） ----------
+    # ---------- 执行预算（步数/时长/重规划次数必须可配） ----------
     # 计划最多几步。以前是 nodes.py 里的常量，改一次要动代码、也没法按部署环境调。
     max_steps: int = max(1, int(os.getenv('MAX_STEPS', '8')))
     # 单次任务总预算（秒）。注意要 > llm_attempt_timeout × 重试次数，
@@ -67,7 +62,7 @@ class Settings:
     # 客户端某天重用旧键时拿到一个陈年任务。
     idempotency_ttl_seconds: float = max(60.0, float(
         os.getenv('IDEMPOTENCY_TTL_SECONDS', '86400')))
-    # ---------- 运行中补充输入（docs/harness-live-input-implementation-plan.md） ----------
+    # ---------- 运行中补充输入（《智能体中台说明书》） ----------
     # 功能开关：关掉时接口返回 404，前端维持"新消息=新任务"的旧行为。
     # 默认开：本机单用户场景，补充要求比"打断重开"更符合直觉。
     run_inputs_enabled: bool = (
@@ -82,7 +77,7 @@ class Settings:
     # 修订时随提示词带给模型的工具清单条数上限（工具很多时不必全塞进去）。
     revision_catalog_limit: int = max(4, int(
         os.getenv('REVISION_CATALOG_LIMIT', '24')))
-    # ---------- 结果观察与自主决策（docs/harness-observe-decide-implementation-plan.md） ----------
+    # ---------- 结果观察与自主决策（《智能体中台说明书》） ----------
     # 功能开关：关掉时观察节点只做程序事实采集，不调用模型（等价于"按计划跑完"）。
     observe_enabled: bool = (
         os.getenv('OBSERVE_ENABLED', 'true').strip().lower() == 'true')
@@ -106,14 +101,12 @@ class Settings:
     # off      = 不介入，保持单用户行为（默认，本地开发与既有测试不受影响）
     # optional = 有中台会话就按会话，没有就匿名（灰度期）
     # ticket   = **平台签票 → 中台换会话**。所有业务接口必须带有效会话，否则 401
-    # token    = 旧模式：拿平台 token 直连 userinfo（保留兼容，不建议新接入）
     auth_mode: str = os.getenv('AUTH_MODE', 'off').strip().lower()
     # 票据有效期上限（秒）。票据是"一次性短期凭证"，不该活很久。
     auth_ticket_max_lifetime: int = max(5, int(
         os.getenv('AUTH_TICKET_MAX_LIFETIME', '60')))
     # 中台登录会话有效期（秒）。到期后由平台重新申请票据续期。
     auth_session_ttl: int = max(60, int(os.getenv('AUTH_SESSION_TTL', '7200')))
-    # 中台会话 cookie 名（与旧 auth_cookie_name 分开，避免把外部 token 当会话）
     auth_session_cookie: str = os.getenv('AUTH_SESSION_COOKIE',
                                          'agent_session').strip() or 'agent_session'
     # SPA 与中台不同源时用它（例如平台前端经同源代理访问，可不设）
@@ -122,29 +115,9 @@ class Settings:
     # SSE 期间多久复查一次会话是否被撤销/过期（秒）
     auth_sse_recheck: float = max(5.0, float(
         os.getenv('AUTH_SSE_RECHECK', '20')))
-    # 只作标签，落 identities.provider。同一平台同一主体不会重复建号。
-    auth_provider: str = os.getenv('AUTH_PROVIDER', 'oidc').strip() or 'oidc'
-    # 平台 userinfo 端点。留空时 token 模式无法工作（会明确报 401 而不是静默放行）
-    auth_userinfo_url: str = os.getenv('AUTH_USERINFO_URL', '').strip()
-    # header = Authorization: Bearer；query = ?access_token=（部分平台只认这个）
-    auth_token_in: str = os.getenv('AUTH_TOKEN_IN', 'header').strip().lower()
-    # 平台返回字段的映射。支持 a.b 取值，适配把 uid 包在 data 里的平台。
-    auth_subject_field: str = os.getenv('AUTH_SUBJECT_FIELD', 'sub').strip() or 'sub'
-    auth_email_field: str = os.getenv('AUTH_EMAIL_FIELD', 'email').strip() or 'email'
-    auth_name_field: str = os.getenv('AUTH_NAME_FIELD', 'name').strip() or 'name'
-    # 凭证校验结果的进程内缓存（秒）。0 = 每次都问平台。
-    # 注意这是**性能必需**而不是优化：一次任务有几十个请求，全部打平台会被限流。
-    auth_cache_ttl: float = max(0.0, float(os.getenv('AUTH_CACHE_TTL', '60')))
-    auth_timeout: float = max(1.0, float(os.getenv('AUTH_TIMEOUT', '5')))
-    # 浏览器侧凭证：EventSource 与 <a download> 发不了自定义头，只能靠 cookie
-    auth_cookie_name: str = os.getenv('AUTH_COOKIE_NAME', 'agent_token').strip()
     # 本地 http 调试时浏览器会拒收 secure cookie，此时设 false；线上必须 true
     auth_cookie_secure: bool = (
         os.getenv('AUTH_COOKIE_SECURE', 'true').strip().lower() == 'true')
-    # cookie 存活时长（秒），默认 8 小时。**不要和 AUTH_CACHE_TTL 混用**：
-    # 缓存是"多久问一次平台"，cookie 是"浏览器多久带一次凭证"，两者量级差两个数量级。
-    auth_cookie_max_age: int = max(60, int(
-        os.getenv('AUTH_COOKIE_MAX_AGE', '28800')))
     # ---------- 对象权限 ----------
     # owner_user_id='default' 的存量数据是否对所有登录用户可见。
     # 单用户升级期必须为 true；有第二个真实用户后必须改成 false。
@@ -152,6 +125,75 @@ class Settings:
     # 公开。本地单用户（AUTH_MODE=off）想保留旧行为可显式设 true。
     policy_legacy_visible: bool = (
         os.getenv('POLICY_LEGACY_VISIBLE', 'false').strip().lower() == 'true')
+
+    # ---------- 工具运行时（《智能体中台说明书》） ----------
+    # 三个开关分别对应三个阶段，默认**全部关闭**：新能力必须先在关的状态下
+    # 验证兼容面，再逐项打开。任何一个都不允许"缺配置就静默回退到旧行为"。
+    #
+    # RESULT_ENVELOPE_V2：结果信封 v2（schema_version=2）。开启后结果以
+    # manifest + 分块的形式保存与受控读取，旧字段由兼容投影生成。
+    result_envelope_v2: bool = (
+        os.getenv('RESULT_ENVELOPE_V2', 'false').strip().lower() == 'true')
+    # TOOL_POLICY_ENFORCED：工具政策强制执行。开启后模型只看得到被授权的
+    # 工具，调用前重新校验主体/凭据/批准/额度，缺绑定直接拒绝。
+    tool_policy_enforced: bool = (
+        os.getenv('TOOL_POLICY_ENFORCED', 'false').strip().lower() == 'true')
+    # ASYNC_TOOL_RUNTIME_ENABLED：异步长任务受理与跟踪。**不能只开这一半**：
+    # 没有外部任务合同与跟踪作业时，受理的动作会永远停在等待态。
+    async_tool_runtime_enabled: bool = (
+        os.getenv('ASYNC_TOOL_RUNTIME_ENABLED', 'false').strip().lower() == 'true')
+
+    # 结果存储：单条结果的体积上限与单次读取的分页上限。超出时结果标记为
+    # incomplete 并给出原因——**不能无限扩容，也不能悄悄截断**。
+    tool_result_max_bytes: int = max(4096, int(
+        os.getenv('TOOL_RESULT_MAX_BYTES', str(4 * 1024 * 1024))))
+    tool_result_page_limit: int = max(256, int(
+        os.getenv('TOOL_RESULT_PAGE_LIMIT', '8192')))
+    # 凭据解析：按绑定取密钥时允许的缓存秒数。0 = 每次都查库。
+    credential_cache_ttl: float = max(0.0, float(
+        os.getenv('CREDENTIAL_CACHE_TTL', '30')))
+    # 外部任务：轮询退避（秒）、单次查询超时、等待总期限。
+    external_poll_base_seconds: float = max(1.0, float(
+        os.getenv('EXTERNAL_POLL_BASE_SECONDS', '5')))
+    external_poll_max_seconds: float = max(5.0, float(
+        os.getenv('EXTERNAL_POLL_MAX_SECONDS', '120')))
+    external_poll_timeout: float = max(5.0, float(
+        os.getenv('EXTERNAL_POLL_TIMEOUT', '30')))
+    external_wait_deadline: float = max(60.0, float(
+        os.getenv('EXTERNAL_WAIT_DEADLINE', '3600')))
+    # 轮询作业的并发上限：查询远端会占住连接，不能无限并发。
+    external_poll_concurrency: int = max(1, int(
+        os.getenv('EXTERNAL_POLL_CONCURRENCY', '4')))
+    # 批准：待确认批准的有效期（秒）与单次批准可覆盖的动作数。
+    approval_ttl_seconds: int = max(60, int(
+        os.getenv('APPROVAL_TTL_SECONDS', '900')))
+    approval_max_actions: int = max(1, int(
+        os.getenv('APPROVAL_MAX_ACTIONS', '20')))
+    # ticket 模式启动时要求三个治理开关都已打开。本地联调可显式关掉这道门。
+    auth_dev_compat: bool = (
+        os.getenv('AUTH_DEV_COMPAT', 'false').strip().lower() == 'true')
+    auth_allowed_origins: tuple = tuple(
+        item.strip() for item in os.getenv('AUTH_ALLOWED_ORIGINS', '').split(',')
+        if item.strip())
+    async_contracts_file: str = os.getenv('ASYNC_CONTRACTS_FILE', '').strip()
+    result_gc_grace_seconds: int = max(0, int(
+        os.getenv('RESULT_GC_GRACE_SECONDS', '86400')))
+
+    # ---------- 运维（评审 P2） ----------
+    # 单进程同时执行的运行数上限。超过时新任务留在 queued，不再无限起协程。
+    max_concurrent_runs: int = max(1, int(
+        os.getenv('MAX_CONCURRENT_RUNS', '8')))
+    # 事件与产物的保留天数。0 = 不自动清理（运维手动处理）。
+    retention_events_days: int = max(0, int(
+        os.getenv('RETENTION_EVENTS_DAYS', '30')))
+    retention_artifacts_days: int = max(0, int(
+        os.getenv('RETENTION_ARTIFACTS_DAYS', '30')))
+    # 对账：扫描孤儿运行的间隔（秒）。
+    reconcile_interval_seconds: float = max(30.0, float(
+        os.getenv('RECONCILE_INTERVAL_SECONDS', '300')))
+    # 指标输出格式：json（默认）或 prometheus。
+    metrics_format: str = (os.getenv('METRICS_FORMAT', 'json')
+                           .strip().lower() or 'json')
 
 settings = Settings()
 

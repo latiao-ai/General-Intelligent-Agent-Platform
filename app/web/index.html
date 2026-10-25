@@ -43,7 +43,6 @@ h1{font-size:20px;margin:0 0 4px}
 .msg.assistant .bubble{background:var(--card);border:1px solid var(--line)}
 .msg.assistant .bubble a{color:var(--accent);word-break:break-all}
 .input-note{margin-top:6px;font-size:12px}
-#spawn{margin-left:6px}
 #process .row{display:flex;gap:8px;align-items:flex-start;padding:3px 0;
                overflow-wrap:anywhere}
 #process .ico{flex:0 0 18px;text-align:center}
@@ -134,7 +133,7 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
       <h1>网页研究与 HTML 报告</h1>
       <div class="sub">
         输入主题或链接，智能体会实时展示执行过程，每个阶段后面跟着它已用的时间（秒）。
-        只有一个「发送」按钮：<b>运行中再发一条消息会自动打断当前任务</b>，带着上文改方向。
+        只有一个「发送」按钮：目标还在进行时，再发一条是补充；结束后再发，会在当前会话开一轮。
       </div>
 
       <div id="messages"></div>
@@ -149,7 +148,6 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
 
     <div class="bar"><div class="inner">
       <textarea id="msg" placeholder="直接说你要什么，例如：整理 SQLite 的适用场景和限制，生成中文报告并部署到服务器（Enter 发送，Shift+Enter 换行）"></textarea>
-      <button id="spawn" class="ghost" title="结束当前任务，用这句话另开一轮">新任务</button>
       <button id="send">发送</button>
     </div></div>
   </main>
@@ -212,18 +210,10 @@ const $ = id => document.getElementById(id);
 const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 
-// 回答/事件里可能出现裸 URL（检索回执里的链接），把它变可点。
-// 先整体转义、再把裸 URL 包成 <a>，这样既点得动又不会被注入 HTML。
-function linkify(text) {
-  return esc(text).replace(/(https?:\/\/[^\s<）)】」>"']+)/g,
-    url => `<a href="${url}" target="_blank" rel="noreferrer">${url}</a>`);
-}
-
 function addMessage(role, text) {
   const el = document.createElement('div');
   el.className = 'msg ' + role;
-  const body = role === 'assistant' ? linkify(text) : esc(text);
-  el.innerHTML = `<div class="bubble">${body}</div>`;
+  el.innerHTML = `<div class="bubble">${esc(text)}</div>`;
   $('messages').appendChild(el);
   el.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
@@ -704,7 +694,7 @@ async function postTask(text, key) {
   }
 }
 
-// 给**当前任务**补一句要求（文档 harness-live-input §3 第三步）。
+// 给**当前任务**补一句要求。
 // 关键：不打断、不新建任务、不换 EventSource——原任务继续跑，只是下个边界改计划。
 // requestId 会跟着这一条消息走到最后：网络失败重试时必须复用同一个 ID，
 // 否则服务端会当成两条不同的补充、把要求版本推高两版。
@@ -775,9 +765,10 @@ async function sendRunInput(text, requestId) {
   if (res.status === 409) {
     // 任务已经结束：这是唯一需要提示"要不要另开一轮"的情况，且**不自动**开
     setInputStatus(requestId, 'finished', '任务已结束：' + detail);
+    S.runId = null;
+    setRunning(false);
     addMessage('assistant',
-      '这条补充没生效：上一轮任务已经结束。要接着改的话，点「新任务」另开一轮，' +
-      '我会带上刚才那句。');
+      '这条补充没生效：上一轮任务已经结束。再按一次发送，会在当前会话里开一轮新任务。');
     return false;
   }
   setInputStatus(requestId, 'failed', '提交失败：' + detail);
@@ -809,7 +800,7 @@ async function send() {
   const text = $('msg').value.trim();
   if (!text) return;
   $('msg').value = '';
-  // 任务在跑：默认把这句话当作**补充要求**；用户要点「新任务」才另开一轮。
+  // 任务在跑：这句话是补充。任务已经结束：发送会在当前会话里开一轮。
   if (S.running && S.runId) {
     const requestId = addInputBubble(text);
     $('send').disabled = true;
@@ -823,24 +814,6 @@ async function send() {
     return;
   }
   await startNewTask(text);
-}
-
-// 明确的"另开一轮"：按设计稿，首版是**新建独立会话**再建任务——
-// 原任务不被隐式取消，历史也不混进新目标（`docs/conversation-task-input-design.md`）。
-// 想沿用同一会话的上下文，就别点这个按钮，直接发（那是"补充"）。
-async function spawnNewTask() {
-  const text = $('msg').value.trim() || '继续';
-  $('msg').value = '';
-  detachStream();                 // 只解绑事件流：原任务在服务端继续跑
-  clearAll();
-  setRunning(false);
-  S.sessionId = null;
-  S.taskId = null;
-  S.runId = null;
-  S.status = null;
-  S.inputs.clear();
-  renderSessionList();
-  await startNewTask(text);       // sessionId=null → 服务端新建会话
 }
 
 async function startNewTask(text) {
@@ -957,8 +930,7 @@ function openStream(taskId) {
       }
       if (ev.detail) {
         if (S.streamBubble) {
-          // 流式时是纯文本（追加成本低），定稿再重绘一次，把来源变成可点链接
-          S.streamBubble.innerHTML = linkify(ev.detail);
+          S.streamBubble.textContent = ev.detail;
           S.streamBubble = null;
         } else {
           addMessage('assistant', ev.detail);
@@ -1168,7 +1140,6 @@ document.addEventListener('keydown', e => {
 });
 
 $('send').onclick = send;
-$('spawn').onclick = spawnNewTask;
 $('newSession').onclick = newSession;
 // Enter 直接发送，Shift+Enter 换行。
 // isComposing 必须判：中文输入法用 Enter 选词时也会触发 keydown，

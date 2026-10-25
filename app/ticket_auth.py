@@ -122,7 +122,7 @@ def verify(ticket: str, *, now: int | None = None,
     alg = header.get('alg')
     typ = header.get('typ')
     kid = str(header.get('kid') or '')
-    if typ and typ != TICKET_TYPE:
+    if typ != TICKET_TYPE:
         raise TicketError(f'票据类型不对：{typ!r}，应为 {TICKET_TYPE!r}')
     if not alg:
         raise TicketError('头部缺少 alg')

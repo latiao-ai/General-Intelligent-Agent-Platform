@@ -131,7 +131,7 @@ def build_result(*, step_id: str, tool_key: str, action_id: str = '',
                  summary: dict | None = None, artifact_refs=None,
                  external_receipt_refs=None, data_ref: str = '',
                  evidence_refs=None, phase: str = '', error: dict | None = None,
-                 complete: bool | None = None) -> dict:
+                 complete: bool | None = None, tool_name: str = '') -> dict:
     """平台归一的 `ToolResult` 合同（文档 §4 第一步）。
 
     不要求所有 MCP 服务端原生返回同一 schema：缺的字段留空/留未知，
@@ -142,6 +142,7 @@ def build_result(*, step_id: str, tool_key: str, action_id: str = '',
     result = {
         'step_id': step_id,
         'tool_key': tool_key,
+        'tool_name': tool_name,
         'action_id': action_id,
         'attempt_id': attempt_id,
         'execution_status': execution_status,
@@ -314,6 +315,43 @@ def criteria_of(plan: dict | None, state: dict | None = None) -> list[dict]:
     return criteria
 
 
+def _identity_keys(item: dict) -> set[str]:
+    """一次成功调用能对上的名字：公开工具名、内部标识、步骤编号。
+
+    本地工具的公开名来自注册表（`local:web:search` → `web_search`），
+    不能用冒号最后一截代替。MCP 的规划名是 `mcp__工具` 或 `mcp__服务端__工具`，
+    那两段才是模型写进完成条件的名字。
+    """
+    tool_key = str(item.get('tool_key') or '')
+    keys = {
+        tool_key,
+        str(item.get('step_id') or ''),
+        str(item.get('tool_name') or ''),
+    }
+    if tool_key:
+        keys.update(_registered_names(tool_key))
+        parts = tool_key.split(':')
+        if len(parts) >= 3 and parts[0] == 'mcp' and parts[-1]:
+            bare = parts[-1]
+            server = parts[1]
+            keys.add(bare)
+            keys.add(f'mcp__{bare}')
+            if server:
+                keys.add(f'mcp__{server}__{bare}')
+    keys.discard('')
+    return keys
+
+
+def _registered_names(tool_key: str) -> set[str]:
+    try:
+        from app.capabilities import registry
+        registry.load()
+    except Exception:                                # noqa: BLE001
+        return set()
+    return {spec.name for spec in registry.registered()
+            if spec.tool_key == tool_key}
+
+
 def completion_state(criteria: list[dict], *, state: dict, results=None,
                      files_exist=None) -> dict:
     """逐条核对完成条件，返回 `verified / unmet / unchecked`。
@@ -384,15 +422,14 @@ def completion_state(criteria: list[dict], *, state: dict, results=None,
                 unmet.append(entry)
             continue
         if kind == 'tool_succeeded':
-            # 模型写的通常是工具名（`web_search`）或 step_id，而结果里记的是
-            # tool_key（`local:web:search`）。三种写法都要认，否则"明明成功了"
-            # 也会被判成未满足——那比不检查更糟：它会把好任务判死。
+            # 模型写的是规划时看到的工具名（`web_search`）或 step_id，结果里记的是
+            # tool_key（`local:web:search`）。对上注册名和这次调用的公开名，
+            # 不要拿冒号最后一截（`search`）凑合——那截不是工具名，对得上会放行，
+            # 对不上就会把已经成功的检索判死。
             def _matches(item: dict) -> bool:
                 if item.get('execution_status') != 'succeeded':
                     return False
-                keys = {str(item.get('tool_key') or ''), str(item.get('step_id') or '')}
-                keys.update(str(item.get('tool_key') or '').split(':')[-1:])
-                return bool(target) and target in keys
+                return bool(target) and target in _identity_keys(item)
             matched = [item for item in results if _matches(item)]
             if matched:
                 entry['evidence'] = evidence_of(matched[0]) or [

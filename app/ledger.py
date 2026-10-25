@@ -82,7 +82,8 @@ class ActionLedger:
 
     async def admit(self, *, step_id: str, tool_key: str, effect: str,
                     args: dict, authorized_by: str = '',
-                    expected_intent_version: int | None = None) -> dict:
+                    expected_intent_version: int | None = None,
+                    authorization: dict | None = None) -> dict:
         """取得调用准入。返回：
 
         - `{'status': 'admitted', 'action_id', 'attempt_id'}` 可以调用；
@@ -99,7 +100,8 @@ class ActionLedger:
             args_hash=args_hash(args), idempotency_key=self.key_of(step_id, tool_key, args),
             effect=effect, action_id='act_' + uuid.uuid4().hex[:16],
             attempt_id='att_' + uuid.uuid4().hex[:12],
-            expected_intent_version=expected_intent_version)
+            expected_intent_version=expected_intent_version,
+            authorization=authorization)
         status = admitted.get('status')
         if status == 'admitted':
             return {'status': 'admitted',
