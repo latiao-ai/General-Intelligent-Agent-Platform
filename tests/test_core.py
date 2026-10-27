@@ -577,7 +577,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
                 {'tool': 'web_search', 'args': {'query': 'sqlite'},
                  'why': '需要外部资料'},
                 {'tool': 'render_sources_html', 'args': {}, 'why': '产出网页'},
-            ], 'summary': '先搜再渲染'}), {'total_tokens': 3}
+            ], 'summary': '先搜再渲染', 'result_locus': 'chat'}), {'total_tokens': 3}
 
         with patch.object(tool_module, 'catalog', fake_catalog), \
                 patch.object(nodes, 'structured_call', fake_call):
@@ -592,6 +592,36 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('render_sources_html', captured['user'])
         # 必须告诉模型手上还有多少料，否则它会重复检索、或空手去整理
         self.assertIn('已有资料', captured['user'])
+        self.assertIn('上一轮已产出 HTML', captured['user'])
+        self.assertNotIn('部署已开启', captured['user'])
+        self.assertIn('现场', captured['user'])
+        self.assertEqual(result['plan']['result_locus'], 'chat')
+
+    async def test_planner_brief_omits_facts_from_absent_capabilities(self):
+        """网页资料和 HTML 不是内核的默认世界。清单里没有这些能力，简报里就没有这些字段。"""
+        from app import nodes
+        from app import tools as tool_module
+        from app.capabilities.registry import Tool
+        captured = {}
+
+        async def fake_catalog(context=None):
+            return [Tool('mcp__list_items', '列库存', '列出库存',
+                         {'type': 'object', 'properties': {}}, None,
+                         capability='mcp', server_id='inventory', effect='read')]
+
+        async def fake_call(schema, system, user, **kw):
+            captured['user'] = user
+            return ExecutionPlan.model_validate({'steps': [
+                {'tool': 'mcp__list_items', 'args': {}, 'why': '看库存'}],
+                'summary': '列库存'}), None
+
+        with patch.object(tool_module, 'catalog', fake_catalog), \
+                patch.object(nodes, 'structured_call', fake_call):
+            await nodes.plan({'user_input': '还有多少库存', 'usage': []})
+        for absent in ('已有资料', '上一轮已产出 HTML', '部署已开启'):
+            self.assertNotIn(absent, captured['user'], absent)
+        self.assertIn('现场', captured['user'])
+        self.assertIn('mcp__list_items', captured['user'])
 
     async def test_plan_falls_back_when_the_model_fails(self):
         from app import nodes
@@ -1044,6 +1074,106 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
             {'s1': {'a': 'ok'}})
         self.assertEqual(args['x'], 'ok')
 
+    async def test_binding_inside_nested_object_is_resolved(self):
+        """绑定落在里层参数也要解析。
+
+        真踩过：`canvas.node.configure` 的 `patch.model` 里写了
+        `{"ref": {"step_id": "s2", "pointer": "/models/0/id"}}`，只在最外层
+        找 ref 的实现把它原样发给服务端，换回一句 JSON Schema 校验失败
+        "`{'ref': ...}` is not of type 'string'"——看着像模型传错类型，
+        其实是调度器没解析。
+        """
+        from app import nodes
+        args = nodes.resolve_inputs(
+            {'step_id': 's4',
+             'args': {'canvasId': 'c1', 'kind': 'image',
+                      'patch': {'model': {'ref': {'step_id': 's2',
+                                                  'pointer': '/models/0/id'}},
+                                'size': '1024x1024'}}},
+            {'s2': {'models': [{'id': 'm-first'}, {'id': 'm-second'}]}})
+        self.assertEqual(args['patch']['model'], 'm-first')
+        self.assertEqual(args['patch']['size'], '1024x1024')
+        self.assertEqual(args['canvasId'], 'c1')
+
+    async def test_binding_inside_list_is_resolved(self):
+        """数组元素里的绑定同样要解析。"""
+        from app import nodes
+        args = nodes.resolve_inputs(
+            {'step_id': 's2',
+             'args': {'nodeIds': [{'ref': {'step_id': 's1', 'pointer': '/ids/1'}},
+                                  'literal-node']}},
+            {'s1': {'ids': ['a', 'b']}})
+        self.assertEqual(args['nodeIds'], ['b', 'literal-node'])
+
+    async def test_ref_supports_list_index_and_whole_output(self):
+        """指针要能下标取数组；空指针表示整份输出。"""
+        from app import nodes
+        outputs = {'s1': {'rows': [{'id': 'r0'}, {'id': 'r1'}]}}
+        args = nodes.resolve_inputs(
+            {'step_id': 's2',
+             'args': {'first': {'ref': {'step_id': 's1', 'pointer': '/rows/1/id'}},
+                      'all': {'ref': {'step_id': 's1'}}}},
+            outputs)
+        self.assertEqual(args['first'], 'r1')
+        self.assertEqual(args['all'], outputs['s1'])
+
+    async def test_nested_binding_failure_points_at_the_field(self):
+        """嵌套引用解析不到时报错要指到具体字段，别只说参数名。"""
+        from app import nodes
+        from app.capabilities.base import ToolError
+        with self.assertRaises(ToolError) as ctx:
+            nodes.resolve_inputs(
+                {'step_id': 's4',
+                 'args': {'patch': {'model': {'ref': {'step_id': 's2',
+                                                      'pointer': '/models/9/id'}}}}},
+                {'s2': {'models': [{'id': 'm'}]}})
+        self.assertIn('patch.model', ctx.exception.safe_message)
+        self.assertIn('不存在', ctx.exception.safe_message)
+
+    async def test_plain_object_with_ref_like_field_is_left_alone(self):
+        """普通参数里恰好有个 ref 字段（不是整份绑定）不能被改写。"""
+        from app import nodes
+        args = nodes.resolve_inputs(
+            {'step_id': 's1',
+             'args': {'filter': {'ref': 'inner-1', 'other': 2}}},
+            {})
+        self.assertEqual(args['filter'], {'ref': 'inner-1', 'other': 2})
+
+    async def test_binding_can_read_saved_full_result(self):
+        """嵌套结果没进步骤输出时，按落盘结果解析。
+
+        步骤输出只保留标量，`result.created[0].id` 这类结构在
+        `results/<step>.json` 里。模型写指针时对着的正是那层结构，所以解析
+        必须能落到它上面，否则 `/nodes/0/id` 永远"引用不到值"。
+        """
+        from app import nodes
+        with tempfile.TemporaryDirectory() as tmp:
+            results = Path(tmp) / 'results'
+            results.mkdir()
+            (results / 's3-act.json').write_text(json.dumps({
+                'payload': [{'tool': 'canvas_nodes_create',
+                             'payload': {'op': 'canvas.nodes.create',
+                                         'result': {
+                                             'canvasId': 'c1',
+                                             'created': [{'id': 'node-1'}],
+                                             'nodes': [{'id': 'node-1'}]}}}]}),
+                encoding='utf-8')
+            outputs = {'s3': {'__status__': 'succeeded', 'revision': 2,
+                              'tool_result': {'data_ref': 'results/s3-act.json'}}}
+            args = nodes.resolve_inputs(
+                {'step_id': 's4',
+                 'args': {'nodeId': {'ref': {'step_id': 's3',
+                                             'pointer': '/nodes/0/id'}}}},
+                outputs, tmp)
+            self.assertEqual(args['nodeId'], 'node-1')
+            # 给了目录才允许读回结果；不给时保持原样（旧行为）
+            with self.assertRaises(Exception):
+                nodes.resolve_inputs(
+                    {'step_id': 's4',
+                     'args': {'nodeId': {'ref': {'step_id': 's3',
+                                                 'pointer': '/nodes/0/id'}}}},
+                    outputs)
+
     async def test_run_step_blocks_when_dependency_not_succeeded(self):
         from app import nodes
         from app import tools as tool_module
@@ -1239,6 +1369,7 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
     async def test_discovered_deploy_tool_is_the_only_deploy_entry(self):
         """清单里只留一份部署工具：旧的内置那份已经没了，旧名字仍能解析。"""
         from app import tools as tool_module
+        from app.capabilities import publishing as publishing_cap
         server = self.server()
 
         async def fake_list(_server):
@@ -1262,7 +1393,9 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(await tool_module.find_tool('mcp__deploy_site'), deploy)
             # DEPLOY_ENABLED=false：连占位都不给，计划里不会出现注定失败的一步
             with patch.object(tool_module, 'settings',
-                              SimpleNamespace(deploy_enabled=False)):
+                              SimpleNamespace(deploy_enabled=False)), \
+                    patch.object(publishing_cap, 'settings',
+                                 SimpleNamespace(deploy_enabled=False)):
                 tool_module._MCP_CACHE.update(at=0.0, tools=[], signature=())
                 off = await tool_module.catalog()
         self.assertNotIn('deploy_site', [t.name for t in off])
@@ -2089,6 +2222,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         import app.api as api_module
         from app.api_hub import Hub
         # 每个测试用独立的内存库：互不污染，也不去碰真实的 agent.db
+        self._saved_hub = api_module.hub
         api_module.hub = Hub(new_store())
         self.api_module = api_module
         # 用 ASGITransport 在**当前**事件循环里发请求。TestClient 会为每个请求
@@ -2099,6 +2233,14 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.client.aclose()
+        replacement = self.api_module.hub
+        self.api_module.hub = self._saved_hub
+        close = getattr(replacement, 'close', None)
+        if callable(close) and replacement is not self._saved_hub:
+            try:
+                await close()
+            except Exception:
+                pass
 
     async def _wait_settled(self, task_id: str, timeout: float = 5.0):
         """等任务落定（完成/取消/失败都算）。
@@ -2636,6 +2778,7 @@ class PlannerProfileTests(unittest.IsolatedAsyncioTestCase):
             return ExecutionPlan.model_validate({
                 'steps': [{'tool': 'render_sources_html', 'args': {}}],
                 'profile_updates': {'电话': '13900000000'},
+                'result_locus': 'chat',
             }), None
 
         with tempfile.TemporaryDirectory() as folder:
@@ -2686,7 +2829,8 @@ class SmallTalkFilterTests(unittest.IsolatedAsyncioTestCase):
         async def fake_call(schema, system, user, **kw):
             called['hit'] = True
             return ExecutionPlan.model_validate({'steps': [
-                {'tool': 'fetch_pages', 'args': {'urls': ['https://example.com']}}]}), None
+                {'tool': 'fetch_pages', 'args': {'urls': ['https://example.com']}}],
+                'result_locus': 'chat'}), None
 
         with patch.object(tool_module, 'catalog', fake_catalog), \
                 patch.object(nodes, 'structured_call', fake_call):
@@ -3188,7 +3332,144 @@ class KernelCorrectnessTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(needle, text, needle)
         self.assertIn('step_id', text)
         without = [tool for tool in catalog if tool.name != 'deploy_site']
-        self.assertNotIn('【发布】', nodes.planner_system(without))
+        bare = nodes.planner_system(without)
+        self.assertNotIn('【发布】', bare)
+        self.assertIn('result_locus', text)
+        self.assertIn('platform_change', text)
+        self.assertIn('delete_site', text)
+        self.assertNotIn('delete_site', bare)
+        self.assertNotIn('video_generation', text)
+        self.assertNotIn('canvas_nodes_create', text)
+
+
+class McpPromptRuleTests(unittest.IsolatedAsyncioTestCase):
+    """MCP 规划规则不点名某一家的工具。业务说法随那一家的配置走。"""
+
+    async def test_kernel_rules_stay_generic_until_a_server_brings_its_own(self):
+        from app import nodes
+        from app import tools as tool_module
+        from app.capabilities.registry import Tool
+        from app.integrations import mcp_servers
+
+        plain = mcp_servers.Server(id='inventory', transport='streamable_http',
+                                   url='https://inventory.example/mcp')
+        montage = mcp_servers.Server(
+            id='openmontage', transport='streamable_http',
+            url='https://montage.example/mcp',
+            prompt_rules='生成视频用 video_generation，不要用 video_analyzer。')
+
+        async def fake_list(_server):
+            return [{'name': 'list_items', 'inputSchema': {'type': 'object'},
+                     'description': '列出库存'}]
+
+        with patch.object(tool_module.mcp_adapter, 'list_server_tools', fake_list), \
+                patch.object(tool_module.mcp_servers, 'servers', lambda: [plain]):
+            tool_module._MCP_CACHE.update(at=0.0, tools=[], signature=(),
+                                          capabilities={})
+            tools = await tool_module.mcp_tools(force=True)
+        listed = tools[0]
+        self.assertNotIn('站点', listed.description)
+        self.assertNotIn('delete_site', listed.prompt_rules)
+        self.assertNotIn('video_generation', listed.prompt_rules)
+        local = [tool for tool in tool_module.BUILTIN_TOOLS
+                 if tool.name != 'deploy_site']
+        plain_prompt = nodes.planner_system(local + [listed])
+        self.assertIn('远端产物不是本地文件', plain_prompt)
+        self.assertNotIn('video_generation', plain_prompt)
+        self.assertNotIn('delete_site', plain_prompt)
+        self.assertNotIn('canvas_nodes_create', plain_prompt)
+
+        video = Tool('mcp__run_tool', 'MCP·run_tool', '生成', {'type': 'object'},
+                     None, capability='mcp', server_id='openmontage',
+                     prompt_rules=montage.prompt_rules)
+        video_prompt = nodes.planner_system([video])
+        self.assertIn('video_generation', video_prompt)
+        self.assertIn('远端产物不是本地文件', video_prompt)
+        inventory_only = nodes.planner_system([listed])
+        self.assertNotIn('video_analyzer', inventory_only)
+
+    def test_prompt_rules_come_from_server_config(self):
+        from app.integrations import mcp_servers
+        raw = json.dumps([{
+            'id': 'openmontage', 'url': 'https://montage.example/mcp',
+            'prompt_rules': '  生成用 video_generation。  ',
+        }, {
+            'id': 'inventory', 'url': 'https://inventory.example/mcp',
+            'prompt_rules': {'not': 'a string'},
+        }])
+        with patch.dict(os.environ, {'MCP_SERVERS': raw, 'MCP_URL': ''},
+                        clear=False):
+            servers = {server.id: server for server in mcp_servers.servers()}
+        self.assertEqual(servers['openmontage'].prompt_rules, '生成用 video_generation。')
+        self.assertEqual(servers['inventory'].prompt_rules, '')
+
+
+class ResultLocusTests(unittest.TestCase):
+    """结果落点：公开网页、平台上的数据、平台上的修改，三条路不能混用。"""
+
+    def catalog(self):
+        from app.capabilities.registry import Tool
+        return [
+            Tool('web_search', '检索', 'd', {'type': 'object'}, None,
+                 scope='public', effect='read'),
+            Tool('answer_directly', '回答', 'd', {'type': 'object'}, None,
+                 effect='read'),
+            Tool('canvas_get', '读取画布', 'd', {'type': 'object'}, None,
+                 tool_key='mcp:inventory:canvas_get', effect='read',
+                 server_id='inventory'),
+            Tool('canvas_update', '修改画布', 'd', {'type': 'object'}, None,
+                 tool_key='mcp:inventory:canvas_update', effect='write',
+                 server_id='inventory'),
+        ]
+
+    def codes(self, locus, steps, criteria=None):
+        from app import nodes
+        return {item['code'] for item in nodes.check_result_locus(
+            locus, steps, self.catalog(), criteria or [])}
+
+    def test_chat_can_search_and_cannot_write_the_platform(self):
+        self.assertEqual(self.codes('chat', [{'tool': 'web_search'}]), set())
+        self.assertEqual(
+            self.codes('chat', [{'tool': 'canvas_update'}]),
+            {'locus_mismatch'})
+
+    def test_platform_state_cannot_use_the_public_web(self):
+        self.assertEqual(
+            self.codes('platform_state', [{'tool': 'web_search'}]),
+            {'public_web_for_platform_state', 'platform_state_needs_read'})
+        self.assertEqual(
+            self.codes('platform_state', [{'tool': 'canvas_get'}]), set())
+        self.assertEqual(
+            self.codes('platform_state', [{'tool': 'answer_directly'}]), set())
+
+    def test_platform_change_needs_a_write_and_its_receipt(self):
+        self.assertIn(
+            'platform_change_needs_write',
+            self.codes('platform_change', [{'tool': 'web_search'}]))
+        self.assertEqual(
+            self.codes('platform_change', [{'tool': 'answer_directly'}]), set())
+        self.assertEqual(
+            self.codes('platform_change', [{'tool': 'canvas_update'}],
+                       [{'kind': 'tool_succeeded', 'target': 'canvas_update'}]),
+            set())
+        self.assertEqual(
+            self.codes('platform_change', [{'tool': 'canvas_update'}]),
+            {'platform_change_needs_evidence'})
+
+    def test_public_web_without_a_locus_is_rejected(self):
+        self.assertEqual(self.codes('', [{'tool': 'web_search'}]),
+                         {'bad_result_locus'})
+        self.assertEqual(self.codes('', [{'tool': 'answer_directly'}]), set())
+
+    def test_scene_brief_uses_the_signed_context(self):
+        from app import nodes
+        self.assertEqual(nodes._scene_brief(None), '无')
+        self.assertEqual(nodes._scene_brief({'context': {}}), '无')
+        text = nodes._scene_brief({
+            'verified': True,
+            'context': {'project_id': 'p1', 'selected': 'shot-3'}})
+        self.assertIn('平台已签名', text)
+        self.assertIn('shot-3', text)
 
 
 class ApiOwnershipTests(unittest.IsolatedAsyncioTestCase):
@@ -3199,11 +3480,23 @@ class ApiOwnershipTests(unittest.IsolatedAsyncioTestCase):
         import httpx
         import app.api as api_module
         from app.api_hub import Hub
+        self._saved_hub = api_module.hub
         api_module.hub = Hub(new_store())
         self.api_module = api_module
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=api_module.app),
             base_url='http://test')
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+        replacement = self.api_module.hub
+        self.api_module.hub = self._saved_hub
+        close = getattr(replacement, 'close', None)
+        if callable(close) and replacement is not self._saved_hub:
+            try:
+                await close()
+            except Exception:
+                pass
 
     async def _create(self, message='你好'):
         import app.api_hub as hub_module
@@ -3215,8 +3508,13 @@ class ApiOwnershipTests(unittest.IsolatedAsyncioTestCase):
                     'deployment': {}, 'answer': '好的'}
 
         with patch.object(hub_module, 'run_task', fake):
-            return (await self.client.post('/api/tasks', json={'message': message},
-                                    headers={'X-DSH-User': 'u1'})).json()
+            response = await self.client.post('/api/tasks', json={'message': message},
+                                             headers={'X-DSH-User': 'u1'})
+            data = response.json()
+            record = await self.api_module.hub.get(data['task_id'])
+            if record is not None and record._task is not None:
+                await record._task
+            return data
 
     async def test_other_user_cannot_read_a_session(self):
         created = await self._create()
@@ -3353,11 +3651,23 @@ class ApiIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         import httpx
         import app.api as api_module
         from app.api_hub import Hub
+        self._saved_hub = api_module.hub
         api_module.hub = Hub(new_store())
         self.api_module = api_module
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=api_module.app),
             base_url='http://test')
+
+    async def asyncTearDown(self):
+        await self.client.aclose()
+        replacement = self.api_module.hub
+        self.api_module.hub = self._saved_hub
+        close = getattr(replacement, 'close', None)
+        if callable(close) and replacement is not self._saved_hub:
+            try:
+                await close()
+            except Exception:
+                pass
 
     async def _post(self, message='做个报告', key='k1', user='u1'):
         import app.api_hub as hub_module
@@ -3372,8 +3682,13 @@ class ApiIdempotencyTests(unittest.IsolatedAsyncioTestCase):
         if key:
             headers['Idempotency-Key'] = key
         with patch.object(hub_module, 'run_task', fake):
-            return await self.client.post('/api/tasks', json={'message': message},
-                                    headers=headers)
+            response = await self.client.post('/api/tasks', json={'message': message},
+                                              headers=headers)
+            if response.status_code == 200:
+                record = await self.api_module.hub.get(response.json()['task_id'])
+                if record is not None and record._task is not None:
+                    await record._task
+            return response
 
     async def test_retry_with_same_key_returns_the_same_task(self):
         first = (await self._post()).json()
@@ -4249,9 +4564,8 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
                 for alias in node.names:
                     if alias.name.startswith('app.capabilities.'):
                         imported.add(alias.name.split('.')[-1])
-        # 只允许：注册器、共享底座、以及提供部署适配器的 publishing
-        # （publishing 不注册本地工具，deploy_site 来自 MCP 发现）
-        self.assertEqual(imported, {'registry', 'base', 'publishing'})
+        # 只允许注册器与共享底座。具体能力包通过钩子接入，内核不 import 它们。
+        self.assertEqual(imported, {'registry', 'base'})
 
     async def test_a_new_capability_is_just_a_new_file(self):
         """模拟"加一个能力包"：只写一个文件，内核与清单一个字都不改。
@@ -4623,12 +4937,26 @@ class InnerToolParamGuardTests(unittest.IsolatedAsyncioTestCase):
         message = ctx.exception.safe_message
         self.assertIn('output_dir', message)
         self.assertIn('缺少必填参数', message)
+        self.assertEqual(ctx.exception.certainty, 'not_executed')
 
-        # 参数齐了就放行
         tool_module._check_inner_name(
             server, {'name': 'direct_clip_search',
                      'inputs': {'output_dir': 'clips', 'queries': ['city']}},
             capabilities)
+
+    def test_generation_tools_are_listed_before_analysis(self):
+        from app import tools as tool_module
+        capabilities = {
+            'video_analyzer': {'status': 'AVAILABLE', 'capability': 'analysis',
+                               'required': ['source']},
+            'grok_video': {'status': 'AVAILABLE', 'capability': 'video_generation',
+                           'required': ['prompt']},
+        }
+        line = tool_module._capability_line(capabilities, limit=1)
+        self.assertLess(line.find('grok_video'), line.find('video_analyzer')
+                        if 'video_analyzer' in line else len(line))
+        self.assertIn('grok_video', line)
+        self.assertIn('被省略的仍然可用', line)
 
     async def test_discovery_records_required_and_params(self):
         from app import tools as tool_module

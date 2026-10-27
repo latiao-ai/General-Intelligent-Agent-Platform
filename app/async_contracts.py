@@ -65,21 +65,35 @@ def load() -> list[AsyncContract]:
     for row in rows:
         if not isinstance(row, dict) or not str(row.get('contract_id') or '').strip():
             continue
+        remote_id_pointer = str(row.get('remote_id_pointer') or '')
+        status_tool_key = str(row.get('status_tool_key') or '')
+        status_id_argument = str(row.get('status_id_argument') or '')
+        # 没有持久任务号，或没有按这个号查询的工具，重启后接不上。
+        # 文件里写成 recoverable=true 也不能把这种合同算成可恢复。
+        recoverable = bool(row.get('recoverable', True)) and bool(
+            remote_id_pointer and status_tool_key and status_id_argument)
         found.append(AsyncContract(
             contract_id=str(row['contract_id']),
             version=int(row.get('version') or 1),
             submit_tool_key=str(row.get('submit_tool_key') or ''),
-            remote_id_pointer=str(row.get('remote_id_pointer') or ''),
-            status_tool_key=str(row.get('status_tool_key') or ''),
-            status_id_argument=str(row.get('status_id_argument') or ''),
+            remote_id_pointer=remote_id_pointer,
+            status_tool_key=status_tool_key,
+            status_id_argument=status_id_argument,
             status_pointer=str(row.get('status_pointer') or ''),
             status_map=dict(row.get('status_map') or {}),
             output_pointer=str(row.get('output_pointer') or ''),
             cancel_tool_key=str(row.get('cancel_tool_key') or ''),
             poll_interval_seconds=float(row.get('poll_interval_seconds') or 5),
             deadline_seconds=float(row.get('deadline_seconds') or 1800),
-            recoverable=bool(row.get('recoverable', True))))
+            recoverable=recoverable))
     return found
+
+
+def summary() -> dict:
+    """当前进程实际加载到的合同。示例文件不在这条路径上，所以不会被算进去。"""
+    rows = load()
+    return {'loaded': len(rows),
+            'recoverable': sum(1 for row in rows if row.recoverable)}
 
 
 def match_submit(tool_key: str) -> AsyncContract | None:

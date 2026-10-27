@@ -116,7 +116,9 @@ def build_decision_input(*, original_goal: str, inputs=None, plan: dict | None =
                          processed_intent_version: int = 0,
                          artifacts: list | None = None,
                          tools: list | None = None,
-                         budget: dict | None = None) -> dict:
+                         budget: dict | None = None,
+                         asked_questions=None,
+                         scene: str = '') -> dict:
     """组装一次模型决策的输入（**纯函数**，可单测）。
 
     关键在于"内容与版本相互对应"：`intent_version` 与 `inputs` 必须来自同一次
@@ -145,6 +147,12 @@ def build_decision_input(*, original_goal: str, inputs=None, plan: dict | None =
                       'intent_version': item['intent_version']}
                      for item in items],
         '补充文本': inputs_text(items),
+        # 合并后的一句完整要求：补充永远是对原目标的**增量**，不是新任务。
+        # 不写这一段，模型会把"最好是早上"当成一条无头无尾的新指令，
+        # 于是回头再问一遍"图片的主体是什么"。
+        '合并后的要求': merged_requirement(original_goal, items),
+        '已问过的问题': [str(q) for q in (asked_questions or []) if str(q).strip()],
+        '现场': scene or '',
         '决策依据版本': int(intent_version or 0),
         '已处理版本': int(processed_intent_version or 0),
         '当前计划': {
@@ -165,6 +173,22 @@ def build_decision_input(*, original_goal: str, inputs=None, plan: dict | None =
     }
 
 
+def merged_requirement(original_goal: str, inputs) -> str:
+    """把原目标与按序补充拼成一句可执行的完整要求。
+
+    只是**合并原文**，不做语义推断——推断是模型的事，但"这两句是同一件事"
+    这件事得由程序先说清楚，否则模型看不到它们之间的关系。
+    """
+    goal = ' '.join(str(original_goal or '').split())
+    items = normalize_inputs(inputs)
+    if not items:
+        return goal
+    extras = '；'.join(' '.join(item['message'].split()) for item in items)
+    if not goal:
+        return extras
+    return f'{goal}（在此基础上补充：{extras}）'
+
+
 def revision_rules() -> str:
     """修订计划时必须遵守的规则（喂给模型，也在本地校验里再查一遍）。"""
     return (
@@ -175,7 +199,18 @@ def revision_rules() -> str:
         '5) 依赖结果未定动作的新步骤不要排，先等核实；\n'
         '6) 补充要求不等于扩大权限：原来没有的工具/发布权限不会因为补充而获得；\n'
         '7) 已经完成的外部效果（例如已发布）要用 ref 指回原动作/产物，不要重发；\n'
-        '8) 如果确实要覆盖或重新发布，那是新的业务动作，按权限规则处理。'
+        '8) 如果确实要覆盖或重新发布，那是新的业务动作，按权限规则处理。\n'
+        '9) 沿用原计划的 result_locus。platform_state / platform_change '
+        '不能改成用网页搜索或资料转 HTML 来完成；缺工具时只留一步直接说明。\n'
+        '10) 补充是对原目标的**增量修改**，不是一条新任务：先看「合并后的要求」，'
+        '把原目标和所有补充当成同一件事来排计划。补充只说了细节（时间、风格、'
+        '数量、措辞）时，就是"在原目标上把这点改掉"，不要把它当成新的、缺主体的要求。\n'
+        '11) 「已问过的问题」里列出的问题**不要再问第二遍**。用户这次没有正面回答、'
+        '只补了别的细节时，就按"细节并入 + 其余取合理默认"直接出计划，'
+        '把假设写进 summary，让用户看到你替他定了什么。\n'
+        '12) 能用只读工具从现场读到的事实（画布里的提示词、对象字段、清单），'
+        '先读再决定，不要问用户「那个东西是什么」。只有"只有用户才知道、'
+        '且不问就会做错方向"的信息才值得停下来问。\n'
     )
 
 

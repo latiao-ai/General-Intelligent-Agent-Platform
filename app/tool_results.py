@@ -24,7 +24,7 @@
   需要细节时按引用受控读取；
 - **缺合同不默认完成**。没有业务适配器判断时，业务状态是 `unknown`，
   不是 `succeeded`；
-- **归属由 result_id 决定**，不由内容 hash 决定。跨租户相同内容不许共享读取权。
+- **归属由登记上的企业和用户决定**，不由内容 hash 或目录名决定。相同内容不许因此共享读取权。
 """
 import hashlib
 import json
@@ -221,12 +221,87 @@ def results_root(base_dir) -> Path:
     return Path(base_dir) / RESULTS_ROOT
 
 
-def result_dir(base_dir, tenant_id: str, result_id: str) -> Path:
-    safe_tenant = _SAFE.sub('-', str(tenant_id or 'default'))[:40] or 'default'
-    safe_result = _SAFE.sub('-', str(result_id or ''))[:64]
-    if not safe_result:
+def tenant_segment(tenant_id: str) -> str:
+    """租户目录名。哈希的是原始租户号，替换字符或截断之后再取名会把不同租户叠到一起。"""
+    return hashlib.sha256(str(tenant_id or 'default').encode('utf-8')).hexdigest()
+
+
+def result_segment(result_id: str) -> str:
+    text = str(result_id or '')
+    if not text:
         raise ResultError('result_id 非法')
-    return results_root(base_dir) / safe_tenant / safe_result
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def _legacy_tenant_segment(tenant_id: str) -> str:
+    """旧目录名：非安全字符换成 `-`，再截到 40。只用于认已有登记，新文件不再这么写。"""
+    return _SAFE.sub('-', str(tenant_id or 'default'))[:40] or 'default'
+
+
+def _legacy_result_segment(result_id: str) -> str:
+    return _SAFE.sub('-', str(result_id or ''))[:64]
+
+
+def _plain_segment(value: str) -> str:
+    """旧 storage_key 里的结果编号。含路径或替换字符的值不能当目录段。"""
+    text = str(value or '')
+    if not text or text in ('.', '..') or _SAFE.search(text):
+        return ''
+    return text
+
+
+def result_locations(tenant_id: str, result_id: str) -> set[tuple[str, str]]:
+    """这个结果可以出现的目录段。
+
+    新文件只用哈希。已经登记的旧 key 仍指向替换、截断后的目录，读取时认那一版，
+    不把字节搬进新目录。没登记的临时目录留给清理，不迁进可读位置。
+    """
+    pairs = {(tenant_segment(tenant_id), result_segment(result_id))}
+    legacy_tenant = _legacy_tenant_segment(tenant_id)
+    legacy_result = _legacy_result_segment(result_id)
+    if legacy_result and legacy_result not in ('.', '..'):
+        pairs.add((legacy_tenant, legacy_result))
+    raw = _plain_segment(result_id)
+    if raw:
+        pairs.add((legacy_tenant, raw))
+    return pairs
+
+
+def result_dir(base_dir, tenant_id: str, result_id: str) -> Path:
+    return (results_root(base_dir) / tenant_segment(tenant_id)
+            / result_segment(result_id))
+
+
+def relative_result_file(tenant_id: str, result_id: str, filename: str) -> str:
+    """登记进库的相对路径。文件名只能是这一层，不能带目录。"""
+    name = str(filename or '')
+    if not name or name in ('.', '..') or Path(name).name != name:
+        raise ResultError('结果文件名非法')
+    return (f'{RESULTS_ROOT}/{tenant_segment(tenant_id)}'
+            f'/{result_segment(result_id)}/{name}')
+
+
+def open_registered_file(base_dir, *, tenant_id: str, result_id: str,
+                         storage_key: str) -> Path:
+    """打开登记上的相对路径，并确认文件就在这个结果自己的目录里。
+
+    调用方传来的 result_id 只用来查登记。真正打开哪个文件，以登记里的 key 为准，
+    而且这个 key 必须落在该结果允许的目录段中。指到别的结果、别的租户，或带
+    `..` 的，都拒绝。
+    """
+    key = str(storage_key or '').strip().replace('\\', '/')
+    parts = key.split('/')
+    if (not key or len(parts) != 4
+            or any(part in ('', '.', '..') for part in parts)
+            or parts[0] != RESULTS_ROOT):
+        raise ResultError('结果引用无效')
+    if (parts[1], parts[2]) not in result_locations(tenant_id, result_id):
+        raise ResultError('结果引用越出结果目录')
+    root = (results_root(base_dir) / parts[1] / parts[2]).resolve()
+    path = (Path(base_dir) / key).resolve()
+    if root not in path.parents:
+        raise ResultError('结果引用越出结果目录')
+    return path
 
 
 def new_result_id() -> str:
@@ -270,7 +345,7 @@ def stage_result(base_dir, captured: CapturedResult, *, tenant_id: str = 'defaul
             'content_type': part.content_type,
             'kind': part.kind,
             'mime': part.mime,
-            'storage_key': f'{RESULTS_ROOT}/{_SAFE.sub("-", tenant_id)[:40] or "default"}/{result_id}/{filename}',
+            'storage_key': relative_result_file(tenant_id, result_id, filename),
             'link_ref': part.link_ref,
             'size_bytes': size,
             'sha256': _sha256(payload),
@@ -284,8 +359,7 @@ def stage_result(base_dir, captured: CapturedResult, *, tenant_id: str = 'defaul
                          default=str).encode('utf-8')
         if len(raw) <= max_bytes:
             (folder / 'structured.json').write_bytes(raw)
-            raw_ref = (f'{RESULTS_ROOT}/{_SAFE.sub("-", tenant_id)[:40] or "default"}'
-                       f'/{result_id}/structured.json')
+            raw_ref = relative_result_file(tenant_id, result_id, 'structured.json')
 
     completeness = {
         'complete': not truncated_reason,
@@ -447,24 +521,36 @@ def legacy_projection(envelope: dict) -> dict:
 
 # ---------- 读取（受控） ----------
 
-def _resolve_part(base_dir, tenant_id: str, part: dict) -> Path:
-    """把 storage_key 解析成真实路径，并确认它没越出结果目录。"""
-    root = results_root(base_dir).resolve()
-    path = (Path(base_dir) / part.get('storage_key', '')).resolve()
-    if root not in path.parents and path != root:
-        raise ResultError('结果引用越出结果目录')
-    return path
+def read_structured(base_dir, manifest: dict):
+    """读登记上的 structured/raw 引用。JSON 损坏时返回 None，路径不对则拒绝。"""
+    ref = str((manifest or {}).get('raw_ref') or '') or str(
+        (manifest or {}).get('structured_ref') or '')
+    if not ref:
+        raise ResultError('结果不存在')
+    path = open_registered_file(
+        base_dir, tenant_id=str(manifest.get('tenant_id') or 'default'),
+        result_id=str(manifest.get('result_id') or ''), storage_key=ref)
+    if not path.is_file():
+        raise ResultError('结果不存在')
+    try:
+        return json.loads(path.read_text(encoding='utf-8'))
+    except ValueError:
+        return None
+    except OSError as exc:
+        raise ResultError('结果不存在') from exc
 
 
-def read_part(base_dir, tenant_id: str, part: dict, *, offset: int = 0,
-              limit: int = DEFAULT_PAGE_LIMIT) -> dict:
+def read_part(base_dir, tenant_id: str, part: dict, *, result_id: str,
+              offset: int = 0, limit: int = DEFAULT_PAGE_LIMIT) -> dict:
     """读一个分块（有界）。
 
     `offset`/`limit` 是**字节**偏移；返回 `total` 与 `next_read_ref`，
-    让调用方知道"还有多少、接着从哪读"。
+    让调用方知道"还有多少、接着从哪读"。路径必须落在这个 result_id 自己的目录里。
     """
-    path = _resolve_part(base_dir, tenant_id, part)
-    if not path.exists():
+    path = open_registered_file(
+        base_dir, tenant_id=tenant_id, result_id=result_id,
+        storage_key=str(part.get('storage_key') or ''))
+    if not path.is_file():
         raise ResultError('结果分块不存在')
     payload = path.read_bytes()
     start = max(0, int(offset or 0))

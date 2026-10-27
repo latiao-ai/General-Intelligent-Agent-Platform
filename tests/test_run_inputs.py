@@ -56,6 +56,63 @@ class RunInputPureTests(unittest.IsolatedAsyncioTestCase):
         # 结果未定的动作要单独列出：修订计划不能假设它没发生
         self.assertEqual([a['step_id'] for a in decision['在途或未知动作']], ['s2'])
 
+    def test_supplement_is_merged_into_the_original_goal(self):
+        """补充是对原目标的修订，不是一条缺主体的新任务。"""
+        decision = run_inputs_module.build_decision_input(
+            original_goal='建画布并生成一张图片',
+            inputs=[{'input_seq': 1, 'message': '图片时间最好是早上',
+                     'intent_version': 2}],
+            asked_questions=['画面主体是什么'],
+            scene='项目 P1', intent_version=2)
+        merged = decision['合并后的要求']
+        self.assertIn('建画布并生成一张图片', merged)
+        self.assertIn('图片时间最好是早上', merged)
+        self.assertEqual(decision['已问过的问题'], ['画面主体是什么'])
+        self.assertEqual(decision['现场'], '项目 P1')
+        rules = run_inputs_module.revision_rules()
+        self.assertIn('增量修改', rules)
+        self.assertIn('不要再问第二遍', rules)
+
+
+class QuestionDedupeTests(unittest.TestCase):
+    """追问去重和快照：同一组问题不能因为换了措辞就再问一轮。"""
+
+    def test_near_duplicate_questions_are_dropped(self):
+        from app import nodes
+        self.assertTrue(nodes._same_question('画面主体是什么？', '画面主体是什么'))
+        self.assertFalse(nodes._same_question('画面主体是什么', '视频要几秒'))
+        fresh = nodes._fresh_questions(
+            ['画面主体是什么', '要横屏还是竖屏'],
+            ['画面主体是什么？'])
+        self.assertEqual(fresh, ['要横屏还是竖屏'])
+        remembered = nodes._remember_questions(
+            ['画面主体是什么？'], ['画面主体是什么', '要横屏还是竖屏'])
+        self.assertEqual(remembered, ['画面主体是什么？', '要横屏还是竖屏'])
+
+    def test_snapshot_keeps_the_waiting_context(self):
+        from app import nodes
+        snap = nodes._snapshot_state({
+            'asked_questions': ['画面主体是什么'],
+            'clarification': '画面主体是什么',
+            'intent_version': 3,
+            'processed_intent_version': 2,
+            'user_input': '建画布',
+        })
+        self.assertEqual(snap['asked_questions'], ['画面主体是什么'])
+        self.assertEqual(snap['clarification'], '画面主体是什么')
+        self.assertEqual(snap['intent_version'], 3)
+        self.assertEqual(snap['processed_intent_version'], 2)
+
+    def test_waiting_reply_does_not_repeat_the_question(self):
+        from app.messages import reply_text
+        text = reply_text({
+            'status': 'waiting_input',
+            'failure': '画面主体是什么',
+            'clarification': '画面主体是什么',
+        })
+        self.assertNotIn('画面主体是什么', text)
+        self.assertIn('等你回上面那条', text)
+
     def test_revision_rejects_rewriting_executed_steps(self):
         kept, issues = run_inputs_module.validate_revision(
             [{'tool': 'render_html', 'step_id': 's1'},
@@ -72,6 +129,39 @@ class RunInputPureTests(unittest.IsolatedAsyncioTestCase):
             known_tools={'deploy_site'})
         self.assertEqual(kept, [])
         self.assertEqual(issues[0]['code'], 'depends_on_unknown_action')
+
+    def test_supplement_keeps_prior_question_context(self):
+        decision = run_inputs_module.build_decision_input(
+            original_goal='建画布并生成一张图',
+            inputs=[{'input_seq': 1, 'message': '图片时间最好是早上',
+                     'intent_version': 2}],
+            asked_questions=['图片的主体是什么？'],
+            intent_version=2)
+        merged = decision['合并后的要求']
+        self.assertIn('建画布并生成一张图', merged)
+        self.assertIn('图片时间最好是早上', merged)
+        self.assertEqual(decision['已问过的问题'], ['图片的主体是什么？'])
+        rules = run_inputs_module.revision_rules()
+        self.assertIn('不是一条新任务', rules)
+        self.assertIn('不要再问第二遍', rules)
+
+    def test_question_context_survives_snapshot_and_reply(self):
+        from app.nodes import _fresh_questions, _snapshot_state
+        from app.messages import reply_text
+        asked = ['图片要写实、插画还是水彩？']
+        fresh = _fresh_questions(
+            ['图片要 16:9 写实摄影、插画还是卡通？', '要不要加字幕？'], asked)
+        self.assertEqual(fresh, ['要不要加字幕？'])
+        snap = _snapshot_state({
+            'asked_questions': asked, 'clarification': asked[0],
+            'intent_version': 2, 'user_input': '建画布'})
+        self.assertEqual(snap['asked_questions'], asked)
+        self.assertEqual(snap['clarification'], asked[0])
+        self.assertEqual(snap['intent_version'], 2)
+        reply = reply_text({'status': 'waiting_input', 'failure': asked[0],
+                            'clarification': asked[0]})
+        self.assertIn('等你回上面那条', reply)
+        self.assertNotIn('写实', reply)
 
 
 class AcceptInputTests(unittest.IsolatedAsyncioTestCase):
@@ -399,6 +489,30 @@ class ResumeWithInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(remote.name_count('second'), 1)
         await store.close()
 
+    async def test_answer_while_waiting_continues_the_same_run(self):
+        """停在等人时的下一句是补充，并让同一条 run 继续，不另开任务。"""
+        store = new_store()
+        await seed_run(store, status='waiting_input', message='建画布并生成图片')
+        hub = self.hub(store)
+        started = {}
+
+        async def fake_execute(claimed):
+            started['run_id'] = claimed['run_id']
+            started['task_id'] = claimed['task_id']
+            return None
+
+        with patch.object(hub, 'execute_claimed_run', fake_execute):
+            accepted = await hub.append_run_input(
+                'run1', request_id='req-1', message='图片时间最好是早上')
+            record = hub.tasks.get('task1')
+            if record is not None and record._task is not None:
+                await record._task
+        self.assertEqual(accepted['run_id'], 'run1')
+        self.assertEqual(started.get('run_id'), 'run1')
+        self.assertEqual(started.get('task_id'), 'task1')
+        self.assertEqual((await store.run('run1'))['task_id'], 'task1')
+        await store.close()
+
 
 if __name__ == '__main__':
     unittest.main()
@@ -412,6 +526,7 @@ class RunInputApiTests(unittest.IsolatedAsyncioTestCase):
         import httpx
         import app.api as api_module
         from app.api_hub import Hub
+        self._saved_hub = api_module.hub
         api_module.hub = Hub(new_store())
         self.api_module = api_module
         self.client = httpx.AsyncClient(
@@ -421,7 +536,11 @@ class RunInputApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.client.aclose()
-        await self.api_module.hub.store.close()
+        replacement = self.api_module.hub
+        self.api_module.hub = self._saved_hub
+        close = getattr(replacement, 'close', None)
+        if callable(close) and replacement is not self._saved_hub:
+            await close()
 
     async def _post(self, message='改成竖屏', request_id='req-1', run_id='run1'):
         return await self.client.post(

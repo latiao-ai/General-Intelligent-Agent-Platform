@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 
 from app import sources
-from app.capabilities.base import ToolError, error_entry
+from app.capabilities.base import ToolError, error_entry, usable_documents
 from app.capabilities.registry import tool
 from app.config import settings
 from app.events import action, emit
@@ -15,8 +15,10 @@ CAPABILITY = 'web'
 # 本能力包自带的规划规则。规划器提示词按"候选工具属于哪些能力包"自动拼接，
 # 内核里不再写死检索链路（文档 §4：业务提示词归能力包）。
 PROMPT_RULES = (
-    '【联网检索】需要外部或实时事实（最新、价格、版本、新闻）或用户要求调研时用 '
-    'web_search，搜索结果自带的正文就是本轮资料，直接用。'
+    '【联网检索】result_locus=chat，且需要公开网页上的外部或实时事实'
+    '（最新、价格、版本、新闻）或用户要求调研时用 web_search，'
+    '搜索结果自带的正文就是本轮资料，直接用。'
+    '对方平台里的对象要读或要改时，不要用它代替。'
     '【指定网页】只有本轮用户输入里出现了 URL、要求读某个链接时，才用 fetch_pages；'
     'urls 就填用户给出的那几个链接，输入里没有 URL 就不要调用它。'
     '但若「已有资料」里已经有正文，而用户只是要把这些内容转成网页，'
@@ -24,7 +26,15 @@ PROMPT_RULES = (
 )
 
 
-@tool(name='web_search', label='检索来源', effect='read',
+def planner_facts(state, catalog) -> dict:
+    """只有检索工具在本轮清单里，才告诉规划器手上有多少正文。"""
+    available, origin = usable_documents(state)
+    text = (f'{len(available)} 个来源的正文' + (f'（{origin}）' if origin else '')
+            if available else '无')
+    return {'已有资料': text}
+
+
+@tool(name='web_search', label='检索来源', effect='read', scope='public',
       key='local:web:search',
       description='联网搜索，把命中的网页登记为来源（含摘要，部分自带正文）。'
                   '需要外部/实时事实时先调它。',
@@ -81,7 +91,7 @@ async def _web_search(args: dict, state: dict) -> dict:
             'status': 'searched'}
 
 
-@tool(name='fetch_pages', label='抓取正文', effect='read',
+@tool(name='fetch_pages', label='抓取正文', effect='read', scope='public',
       key='local:web:fetch',
       description='读取**本轮用户输入里给出的 URL** 的正文（Markdown）。'
                   '输入里没有 URL 就不要调用：搜索结果自带的正文已经够用，'

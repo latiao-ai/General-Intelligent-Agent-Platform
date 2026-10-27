@@ -11,6 +11,8 @@
 发现（有 TTL、掉线、服务端前缀命名）。把它们混成一个注册表，"谁负责刷新"就说不清了。
 
 加一个本地能力 = 在 `app/capabilities/` 下加一个文件，这个文件一个字都不用改。
+远端工具若需要平台侧适配（调用前闸门、回执翻译），由该能力包的
+`adapt_mcp_tool` 认领，内核不点名是哪一种业务。
 """
 import asyncio
 import json
@@ -18,7 +20,6 @@ import logging
 import time
 
 from app.integrations import mcp_adapter, mcp_servers
-from app.capabilities import publishing as publishing_capability
 from app.capabilities import registry
 from app import tool_policy as tool_policy_module
 # 这几个是既有调用点仍在用的：`nodes` 用 usable_documents 判断"手上有没有料"，
@@ -48,21 +49,30 @@ def describe_tool(tool: Tool) -> str:
     return (f'- {tool.name}［{tool.effect}］：{tool.description}\n'
             f'  参数：{json.dumps(tool.args, ensure_ascii=False)}')
 
-# MCP 是"外来能力"，规则只能给通用纪律，不能替它编业务语义
+# MCP 是外来能力。这里只留任何远端工具都适用的纪律。
+# 某一家的业务说法（删哪个对象、生成还是分析、完成条件指向哪个工具名）
+# 写在该服务端配置的 prompt_rules 里，随那一家的工具进规划提示词。
 MCP_PROMPT_RULES = (
-    '【MCP 工具】调用查询类 MCP 工具时，只有不带过滤参数（如 keyword）的结果才是'
-    '全量清单；删改类操作（delete_*/update_*）之后若要告诉用户"还剩什么/还剩几个"，'
-    '必须再加一步**不带过滤参数**的查询（如 mcp__list_sites 且参数为空），'
-    '绝不能拿操作前的过滤结果或操作返回体去推断。'
-    '【先发现，再调用】服务端要是有"清单/描述"类工具（名字或描述里带 list/describe/'
-    'capabilities），先调它把真实能力读出来；通用调用类工具（如 run_tool）名字参数里的'
-    '内部工具名**只能取自清单**，清单里没有就是没有，不要凭经验编。'
-    '清单里标为不可用（缺依赖/缺 key/未安装）的工具不要调度。'
-    '【封装工具也有依赖】像 render_video 这类"封装型"执行工具，内部还要用到清单里的'
-    '工具（合成、字幕等）：调度前先确认它们可用；不可用就别调度，直接说清缺什么。'
-    '【业务失败要认】工具返回 status: error / failed、或 code 以 E_ 开头，就是这一步'
-    '失败：不要当成功继续，也不要换个参数重试同一个不存在的名字；如实报告失败原因'
-    '与缺失的能力，并把已经产出的文件说清楚。'
+    '【MCP 工具】查询如果带了过滤参数，返回的就只是筛选结果，不能当成全量。'
+    '删改之后若要告诉用户还剩什么，必须再调一次不带过滤参数的查询，'
+    '不能拿操作前的筛选结果或操作返回体去推断。'
+    '【先发现，再调用】服务端要是有清单或描述类工具（名字或描述里带 list、describe、'
+    'capabilities），先调它把真实能力读出来。通用调用类工具（如 run_tool）的内部工具名'
+    '只能取自这份清单，清单里没有就是没有，不要凭经验编。'
+    '工具描述里的清单可能只展示了一部分：被省略的工具仍然可用，要用就先按类别再查一次，'
+    '不要拿名单开头那几个凑数。'
+    '清单里标为不可用（缺依赖、缺 key、未安装）的工具不要调度。'
+    '【封装工具先看依赖】一次做完的执行工具，内部往往还要调用清单里的其它工具。'
+    '调度前先确认那些依赖可用；不可用就别调度，直接说清缺什么。'
+    '调用时必须带上该内部工具的全部必填参数，缺了就不要调用。'
+    '【失败要认】工具返回 status 为 error 或 failed，或 code 以 E_ 开头，这一步就是失败：'
+    '不要当成功继续，也不要换个参数重试同一个不存在的名字。如实报告失败原因和缺的能力，'
+    '并把已经产出的内容说清楚。'
+    '【写操作必须收尾】计划里只要有写或删除，最后一步用 answer_directly，'
+    '说清改了什么、对象的 id 是什么，让用户收到明确回执。'
+    '【远端产物不是本地文件】MCP 工具改的是远端平台上的状态，本地通常没有对应文件。'
+    '完成条件用 tool_succeeded，指向这次真正执行的调用。'
+    '不要声明 artifact_exists：它只核对本地文件，远端已经做完也会被判成未完成。'
 )
 
 
@@ -70,13 +80,6 @@ MCP_PROMPT_RULES = (
 
 MCP_PREFIX = mcp_servers.MCP_PREFIX
 
-# 原始 MCP 工具仍全部暴露（保留最大能力），但重复/不可逆的那几个补一句说明，
-# 让模型优先走有保障的路径，而不是靠删功能来限制它。
-MCP_HINTS = {
-    'delete_site': '⚠️ 不可逆。删除线上站点前必须先向用户复述将要删除的站点 ID 并确认。',
-    'update_site': '⚠️ 会改动线上站点内容，执行前先说明改什么。',
-    'list_sites': '不带 keyword 时返回全量站点；带了 keyword 只是筛选结果，不能当全量用。',
-}
 # 每次任务都去 discover 一次太慢（一次可能几十秒），进程内缓存一小段时间。
 # 缓存要跟"服务端配置签名"绑定：改了 MCP_SERVERS 立刻重新发现，不能等 TTL。
 _MCP_CACHE: dict = {'at': 0.0, 'tools': [], 'errors': {}, 'signature': (),
@@ -85,9 +88,10 @@ _MCP_TTL = 300.0
 
 
 def _signature() -> tuple:
-    # 部署开关也进签名：关掉部署后缓存里那个部署工具（或占位工具）必须立刻失效。
+    # 部署开关、各家规划规则和本机用法都进签名：改了配置，缓存里的工具说明必须立刻失效。
     return (settings.deploy_enabled,
-            tuple((s.id, s.transport, s.url or s.stdio_command)
+            tuple((s.id, s.transport, s.url or s.stdio_command, s.prompt_rules,
+                   tuple(sorted((s.tool_hints or {}).items())))
                   for s in mcp_servers.servers()))
 
 
@@ -213,32 +217,49 @@ def _is_available(status: str) -> bool:
     return 'AVAILABLE' in text and 'UNAVAILABLE' not in text
 
 
+def _capability_rank(info: dict) -> int:
+    """截断后的清单里，分析类能力排在后面。
+
+    目录顺序经常把 analysis 放在最前。名单只展示开头几项时，模型会拿分析工具
+    去完成生成请求。这里不点名任何一家的能力名，只把分析类挪到后面。
+    """
+    name = str((info or {}).get('capability') or '').lower()
+    if name == 'analysis' or name.startswith('analy'):
+        return 100
+    return 50
+
+
 def _capability_line(capabilities: dict, limit: int = 26,
                      max_chars: int = 1800) -> str:
     """把内部能力清单压成一行，塞进工具描述里给规划器看。
 
     真实服务端可能有几十上百个内部工具，全列出来会把规划提示词撑爆，所以各自
-    截断并标出总数——"还有 N 个"比把名字全塞进去更有用。
+    截断并标出总数。    截断不能说成「只能从这里选」——被省略的工具仍然可用，
+    否则模型只会在名单开头那几项里凑一个来用。
     """
     if not capabilities:
         return ''
     usable = [name for name, info in capabilities.items()
               if _is_available(info.get('status'))]
+    usable.sort(key=lambda name: (_capability_rank(capabilities[name]), name))
     unusable = [name for name in capabilities if name not in usable]
     def describe(name: str) -> str:
         info = capabilities[name]
+        kind = str(info.get('capability') or '')
+        prefix = f'{name}[{kind}]' if kind else name
         signature = info.get('signature') or ''
         if signature:
-            return f'{name}({signature})'
+            return f'{prefix}({signature})'
         required = info.get('required') or []
-        return (f'{name}(必填:{",".join(required)})' if required
-                else f'{name}(无必填)')
+        return (f'{prefix}(必填:{",".join(required)})' if required
+                else f'{prefix}(无必填)')
 
     parts = []
     if usable:
-        parts.append('可用（只能从这里选，括号里是必填参数）：'
-                     + '、'.join(describe(name) for name in usable[:limit])
-                     + (f' 等 {len(usable)} 个' if len(usable) > limit else ''))
+        shown = '、'.join(describe(name) for name in usable[:limit])
+        tail = (f' 等 {len(usable)} 个（被省略的仍然可用，先按类别再查清单）'
+                if len(usable) > limit else '')
+        parts.append('可用（括号里是必填参数）：' + shown + tail)
     else:
         parts.append('当前没有任何可用内部工具（缺依赖/缺 key/未安装）')
     if unusable:
@@ -283,8 +304,9 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
             continue
         inner = capabilities.get(server.id) or {}
         for item in items:
-            if publishing_capability.claims(server, item['name']):
-                tools.append(_deploy_tool(server, item))
+            adapted = registry.adapt_mcp_tool(server, item, _make_mcp_runner)
+            if adapted is not None:
+                tools.append(adapted)
                 continue
             name = mcp_servers.tool_name(server, item['name'], total)
             schema = item.get('inputSchema') or {'type': 'object', 'properties': {}}
@@ -294,9 +316,6 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
             description = f'{title}（MCP 服务端 {server.id} 的工具 {item["name"]}）'
             if detail:
                 description = f'{description}：{detail}'
-            hint = MCP_HINTS.get(item['name'], '')
-            if hint:
-                description = f'{description} {hint}'
             if inner and item['name'] == getattr(server, 'capability_tool', ''):
                 # 清单工具本身没什么可编排的，真正的价值是把名字告诉规划器
                 line = _capability_line(inner)
@@ -319,14 +338,16 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
                 tool_key=f'mcp:{server.id}:{item["name"]}',
                 effect=item.get('effect_type') or 'unknown',
                 capability='mcp',
-                prompt_rules=MCP_PROMPT_RULES,
+                prompt_rules=(getattr(server, 'prompt_rules', '') or '').strip(),
                 server_id=server.id,
             ))
-    if settings.deploy_enabled and not _has_publishing(tools):
-        # 配置了部署工具，却没有从服务端发现到它（掉线、或服务端没声明这个工具）。
-        # 留一个占位工具，让"部署到服务器"得到一句明确报错，而不是被当成未知
-        # 工具静默跳过——那会变成"任务成功但什么都没发生"。
-        stub = _deploy_placeholder(errors)
+    adapted_caps = {getattr(module, 'CAPABILITY', '')
+                    for module in registry.capability_modules()
+                    if getattr(module, 'adapt_mcp_tool', None)}
+    if not any(tool.capability in adapted_caps for tool in tools):
+        # 能力包声明要承接某个远端工具，发现时却没有它。留占位，调用时说明原因，
+        # 而不是被当成未知工具静默跳过。
+        stub = registry.mcp_placeholder(servers, errors)
         if stub is not None:
             tools.append(stub)
     _MCP_CACHE.update(at=now, tools=tools, errors=errors, signature=signature,
@@ -388,7 +409,8 @@ def _check_inner_name(server, args: dict, capabilities: dict) -> None:
             f'内部工具名 {wanted} 不在服务端的能力清单里。'
             f'真实存在的是：{"、".join(sorted(capabilities)[:20])}'
             + (f'；其中当前可用：{"、".join(usable[:12])}' if usable
-               else '；且它们当前都不可用'))
+               else '；且它们当前都不可用'),
+            certainty='not_executed', phase='validate')
     # 参数也不许瞎写：服务端只会回一句 "input validation failed: 'x' is a
     # required property"，用户看不出该传什么。这里本地就挡住并列出参数名。
     inputs = (args or {}).get('inputs')
@@ -399,7 +421,8 @@ def _check_inner_name(server, args: dict, capabilities: dict) -> None:
             raise ToolError(
                 f'内部工具 {wanted} 缺少必填参数：{"、".join(missing)}。'
                 f'它的参数有：{"、".join(info.get("params") or required)}'
-                f'（相对路径会按项目目录解析）')
+                f'（相对路径会按项目目录解析）',
+                certainty='not_executed', phase='validate')
     status = (info.get('status') or '').upper()
     if not _is_available(info.get('status')):
         usable = [name for name, item in capabilities.items()
@@ -407,61 +430,22 @@ def _check_inner_name(server, args: dict, capabilities: dict) -> None:
         raise ToolError(
             f'内部工具 {wanted} 当前不可用（{status}）。'
             + (f'可用的只有：{"、".join(usable[:12])}' if usable
-               else '该服务端当前没有任何可用工具，请如实说明能力缺失'))
-
-
-def _has_publishing(tools) -> bool:
-    return any(t.capability == publishing_capability.CAPABILITY for t in tools)
+               else '该服务端当前没有任何可用工具，请如实说明能力缺失'),
+            certainty='not_executed', phase='validate')
 
 
 def _deploy_tool(server, item: dict) -> Tool:
-    """把服务端的部署工具包装成平台认识的 `deploy_site`。
-
-    参数 schema 故意只暴露空对象：文件内容由平台从当前产物注入（模型写不出
-    base64），对外声明它只会引导模型编造一个 `files` 数组。
-    """
-    return Tool(
-        publishing_capability.TOOL_NAME,
-        publishing_capability.LABEL,
-        (f'{publishing_capability.DESCRIPTION}'
-         f'（MCP 服务端 {server.id} 的工具 {item["name"]}）'),
-        {'type': 'object', 'properties': {}},
-        _make_mcp_runner(item['name'], server,
-                         adapter=publishing_capability.adapter(server, item['name'])),
-        tool_key=f'mcp:{server.id}:{item["name"]}',
-        effect=item.get('effect_type') or 'unknown',
-        capability=publishing_capability.CAPABILITY,
-        prompt_rules=publishing_capability.PROMPT_RULES,
-        server_id=server.id,
-    )
+    """测试与旧调用点仍用这个名字。真正的包装在认领它的能力包里。"""
+    tool = registry.adapt_mcp_tool(server, item, _make_mcp_runner)
+    if tool is None:
+        raise RuntimeError(f'{getattr(server, "id", "")} 的 {item.get("name")} 没有能力包认领')
+    return tool
 
 
 def _deploy_placeholder(errors: dict):
-    """部署工具当前不可用时的占位工具（身份仍然是那个 MCP 工具）。"""
-    for server in mcp_servers.servers():
-        name = publishing_capability.configured_tool(server)
-        if not name:
-            continue
-        reason = errors.get(server.id) or f'服务端 {server.id} 未提供该工具'
-        return _unavailable_deploy(server, name, reason)
-    return None
-
-
-def _unavailable_deploy(server, tool_name: str, reason: str) -> Tool:
-    async def run(args: dict, state: dict) -> dict:
-        raise ToolError(f'部署不可用：{reason}。请检查 MCP 配置与服务端状态后重试')
-
-    return Tool(
-        publishing_capability.TOOL_NAME, publishing_capability.LABEL,
-        f'{publishing_capability.DESCRIPTION}（当前不可用：{reason}）',
-        {'type': 'object', 'properties': {}}, run,
-        tool_key=f'mcp:{server.id}:{tool_name}',
-        # 服务端没回话，动作性质只能按配置的用途记 write，不假装是 read。
-        effect='write',
-        capability=publishing_capability.CAPABILITY,
-        prompt_rules=publishing_capability.PROMPT_RULES,
-        server_id=server.id,
-    )
+    """发现失败时的占位工具。开关关掉的能力包不会留占位。"""
+    return registry.mcp_placeholder(mcp_servers.servers(), errors or {},
+                                    respect_switch=False)
 
 
 def mcp_status() -> dict:
@@ -520,19 +504,27 @@ def _describe_error(exc: BaseException) -> str:
     return f'{type(leaf).__name__}: {text}'[:200]
 
 
-async def _stage_result(payload: dict) -> str:
-    """把 JSON 回执落到按租户分开的结果目录。登记失败不影响这次调用的回执。"""
+async def _stage_result(payload: dict, *, tool_key: str = '') -> str:
+    """把 JSON 回执落到该企业自己的结果目录，并登记到当前用户名下。
+
+    读接口只认登记行。没有运行归属、或登记失败时不返回 result_id：
+    调用回执仍然保留，但这份落盘不能被别人凭编号读走。
+    """
     try:
         from app import execution_control
         from app import ledger as ledger_module
         from app import tool_results
-        tenant_id = 'default'
         book = ledger_module.current_ledger()
         context = execution_control.require()
         store = getattr(book, 'store', None) if book is not None else None
-        if store is not None and context is not None:
+        run = None
+        if store is not None and context is not None and hasattr(store, 'run'):
             run = await store.run(context.run_id)
-            tenant_id = str((run or {}).get('tenant_id') or 'default')
+        if not run or not hasattr(store, 'commit_tool_result'):
+            logger.warning('结果信封未登记：缺少运行归属或登记接口')
+            return ''
+        tenant_id = str(run.get('tenant_id') or 'default')
+        owner_user_id = str(run.get('owner_user_id') or 'default')
         captured = tool_results.CapturedResult(
             structured=payload,
             parts=[tool_results.ResultPart(
@@ -540,6 +532,16 @@ async def _stage_result(payload: dict) -> str:
                 text=json.dumps(payload, ensure_ascii=False, default=str))])
         staged = tool_results.stage_result(
             settings.artifact_dir, captured, tenant_id=tenant_id)
+        envelope = tool_results.envelope_v2(
+            result_id=str(staged.get('result_id') or ''), tool_key=tool_key,
+            structured_ref=str(staged.get('raw_ref') or ''),
+            complete=bool((staged.get('completeness') or {}).get('complete', True)),
+            completeness=staged.get('completeness') or {})
+        await store.commit_tool_result({
+            'tenant_id': tenant_id,
+            'owner_user_id': owner_user_id,
+            'run_id': str(context.run_id or ''),
+        }, staged, envelope)
         return str(staged.get('result_id') or '')
     except Exception:                              # noqa: BLE001
         logger.warning('结果信封落盘失败', exc_info=True)
@@ -619,7 +621,7 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None):
             tool_key, payload if isinstance(payload, dict) else None)
         result_id = ''
         if getattr(settings, 'result_envelope_v2', False) and isinstance(payload, dict):
-            result_id = await _stage_result(payload)
+            result_id = await _stage_result(payload, tool_key=tool_key)
         # 参数必须一起记：过滤类工具（如 list_sites 的 keyword）传不传参数，
         # 返回语义完全不同——不记下来就分不清"列表只有 1 个"和"只匹配到 1 个"。
         # 服务端也要记：多服务端时同名工具的行为可能完全不同。
@@ -657,10 +659,10 @@ async def catalog(context=None) -> list[Tool]:
     """
     tools = list(registry.registered())
     tools.extend(await mcp_tools())
-    if not settings.deploy_enabled:
-        # 关掉部署时连占位工具都不给，免得计划里出现注定失败的一步。
-        tools = [t for t in tools
-                 if t.capability != publishing_capability.CAPABILITY]
+    hidden = registry.suppressed_capabilities()
+    if hidden:
+        # 关掉的能力连占位都不留，免得计划里出现注定失败的一步。
+        tools = [tool for tool in tools if tool.capability not in hidden]
     if context is None:
         return tools
     return await visible_tools(tools, context)
@@ -725,12 +727,22 @@ async def find_tool(name: str, context=None):
 
 
 def planner_rules(catalog_tools) -> list[str]:
-    """按候选工具导出**去重后**的能力包规则块（顺序稳定，便于测试与 diff）。"""
+    """按候选工具导出**去重后**的规则块（顺序稳定，便于测试与 diff）。
+
+    远端工具在场时，最后补上一段通用 MCP 纪律。这段不点名任何一家的工具。
+    某一家自己的说法写在该服务端的 prompt_rules 上，只跟那一家的工具走。
+    """
     blocks, seen = [], set()
+    remote = False
     for tool in catalog_tools:
+        if getattr(tool, 'server_id', ''):
+            remote = True
         rules = (tool.prompt_rules or '').strip()
         if not rules or rules in seen:
             continue
         seen.add(rules)
         blocks.append(rules)
+    generic = MCP_PROMPT_RULES.strip()
+    if remote and generic and generic not in seen:
+        blocks.append(generic)
     return blocks

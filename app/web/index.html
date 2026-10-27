@@ -147,7 +147,7 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
     </div>
 
     <div class="bar"><div class="inner">
-      <textarea id="msg" placeholder="直接说你要什么，例如：整理 SQLite 的适用场景和限制，生成中文报告并部署到服务器（Enter 发送，Shift+Enter 换行）"></textarea>
+      <textarea id="msg" aria-label="消息"></textarea>
       <button id="send">发送</button>
     </div></div>
   </main>
@@ -198,7 +198,9 @@ a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-r
 
 <script>
 const S = { sessionId: null, taskId: null, runId: null, es: null,
-            running: false, status: null, stages: [], stageSeq: 0, skew: 0,
+            running: false, status: null, runStatus: null,
+            askedQuestions: [], clarification: '', lastEventSeq: 0,
+            stages: [], stageSeq: 0, skew: 0,
             turn: 0, streamBubble: null, sessions: [], lastEventAt: 0,
             // 正在跑的这条 run 的补充要求：requestId → {text, status, inputSeq}
             // 同一个 requestId 会在重试时复用，服务端据此保证"只有一条输入"。
@@ -264,6 +266,11 @@ async function openSession(id) {
   setRunning(false);
   S.sessionId = id;
   S.taskId = null;
+  S.runId = null;
+  S.runStatus = null;
+  S.askedQuestions = [];
+  S.clarification = '';
+  S.lastEventSeq = 0;
   S.status = null;
   renderSessionList();          // 高亮当前会话
   try {
@@ -282,10 +289,19 @@ async function openSession(id) {
       // 该往哪条 run 上补要求，只能新建任务（用户会看到"任务被打断"）
       S.runId = data.live_run_id || null;
       S.inputs.clear();
+      S.lastEventSeq = 0;
       setRunning(true);
       startNewTurn();              // 先建好这一轮的容器，补发的事件才有地方落
       openStream(liveTask);        // 重新接上：先补发历史事件，再继续实时
       return;
+    }
+    const latest = (data.turns || [])[(data.turns || []).length - 1];
+    if (latest && GOAL_OPEN[latest.run_status] && latest.run_id) {
+      S.taskId = latest.task_id;
+      S.runId = latest.run_id;
+      S.runStatus = latest.run_status;
+      S.askedQuestions = latest.asked_questions || [];
+      S.clarification = latest.clarification || '';
     }
     // 否则恢复最近一份还能打开的产物：视频/页面切回来仍然能看
     const withArtifact = [...(data.turns || [])].reverse()
@@ -353,7 +369,12 @@ async function newSession() {
   setRunning(false);
   S.sessionId = null;
   S.taskId = null;
+  S.runId = null;
   S.status = null;
+  S.runStatus = null;
+  S.askedQuestions = [];
+  S.clarification = '';
+  S.lastEventSeq = 0;
   renderSessionList();
 }
 
@@ -492,7 +513,17 @@ const TURN_STATUS = {answered: '已回答', cancelled: '已中断',
                      // 通用状态（没有专门展示词时兜底）
                      succeeded: '已完成', needs_reconcile: '待核实',
                      queued: '排队中', running: '执行中',
-                     reconciling: '核对中'};
+                     reconciling: '核对中', paused: '已暂停'};
+
+// 目标还没结束：下一句是补充，不能另开任务。暂停不在这里自动续跑。
+const GOAL_OPEN = {
+  waiting_input: true, waiting_approval: true, paused: true,
+  needs_reconcile: true, interrupted: true,
+};
+
+function goalOpen() {
+  return !!(S.runId && (S.running || GOAL_OPEN[S.runStatus]));
+}
 
 function turnSeconds(n) {
   return S.stages.filter(st => st.turn === n)
@@ -800,13 +831,23 @@ async function send() {
   const text = $('msg').value.trim();
   if (!text) return;
   $('msg').value = '';
-  // 任务在跑：这句话是补充。任务已经结束：发送会在当前会话里开一轮。
-  if (S.running && S.runId) {
+  // 目标还没结束（在跑，或停在等人/等批准/暂停/待核实）：这句话是补充。
+  // 只有目标已经结束，发送才会在当前会话里开一轮新任务。
+  if (goalOpen()) {
     const requestId = addInputBubble(text);
+    const resumeWait = !S.running && S.runStatus === 'waiting_input';
     $('send').disabled = true;
     try {
+      if (resumeWait) {
+        setRunning(true);
+        startNewTurn();
+        openStream(S.taskId);
+      }
       const ok = await sendRunInput(text, requestId);
-      if (!ok) $('msg').value = text;      // 没提交成功就把草稿还回去
+      if (!ok) {
+        $('msg').value = text;      // 没提交成功就把草稿还回去
+        if (resumeWait) setRunning(false);
+      }
     } finally {
       $('send').disabled = false;
       $('msg').focus();
@@ -822,6 +863,10 @@ async function startNewTask(text) {
   setRunning(true);
   $('send').disabled = true;
   S.runId = null;
+  S.runStatus = null;
+  S.askedQuestions = [];
+  S.clarification = '';
+  S.lastEventSeq = 0;
   S.inputs.clear();
   S.answerIntent = 0;
   S.answerPlan = 0;
@@ -904,10 +949,12 @@ function markStaleAnswer() {
 
 function openStream(taskId) {
   if (S.es) S.es.close();
-  const es = new EventSource(`${API_PREFIX}/tasks/${taskId}/events`);
+  const es = new EventSource(
+    `${API_PREFIX}/tasks/${taskId}/events?after=${S.lastEventSeq || 0}`);
   S.es = es;
   S.lastEventAt = Date.now();
   es.onmessage = e => {
+    if (e.lastEventId) S.lastEventSeq = Number(e.lastEventId) || S.lastEventSeq;
     S.lastEventAt = Date.now();
     let ev; try { ev = JSON.parse(e.data); } catch { return; }
     if (ev.type === 'ping') return;          // 心跳，只用来刷新 lastEventAt
@@ -923,6 +970,9 @@ function openStream(taskId) {
     }
     if (ev.type === 'result') { showDeployed(ev.public_url, ev.deployment_id); return; }
     if (ev.type === 'status') {
+      if (ev.run_status) S.runStatus = ev.run_status;
+      if (Array.isArray(ev.asked_questions)) S.askedQuestions = ev.asked_questions;
+      if (typeof ev.clarification === 'string') S.clarification = ev.clarification;
       if (ev.intent_version) {
         if (S.answerIntent && ev.intent_version > S.answerIntent) markStaleAnswer();
         S.answerIntent = ev.intent_version;

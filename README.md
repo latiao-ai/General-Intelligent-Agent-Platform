@@ -723,12 +723,19 @@ async def save_note(args, state):
 `Unable to find voice` / `ffmpeg` / `not installed` 这类字样时，回执会补一句该怎么装。
 服务端自检经常只查"命令在不在"，报 AVAILABLE 但真跑起来才炸——这类只能靠失败文本认。
 
-再加两条硬规则（`MCP_PROMPT_RULES`）：
+内核的 `MCP_PROMPT_RULES` 只讲任何远端工具都适用的纪律：过滤结果不是全量、
+内部工具名只能来自清单、封装工具先看依赖、失败要认、写操作最后要有一句回执、
+远端产物不要用 `artifact_exists` 当完成条件。
 
-- **创作内容（剧本/分镜/文案）由模型自己写**（`write_file` 已移除，需要落盘就交给
-  服务端的写入类工具）；不要假设服务端有
-  "生成脚本/分镜"的接口——多数服务端只提供执行动作。
-- **封装型执行工具**（如 `render_video`）也依赖内部工具，调度前先看清单里它们是否可用。
+某一家自己的说法写在该服务端的 `prompt_rules` 里，只在它的工具进入本轮清单时拼进
+规划提示词。例如 OpenMontage：
+
+```jsonc
+{"id": "openmontage", ..., "prompt_rules":
+ "用户要生成新视频、图片或声音时，用生成或合成能力（video_generation、image_generation、video_post）。analysis 工具（如 video_analyzer）只分析已有视频，不能凭空生成。render_video 调度前先确认内部的合成、字幕工具可用。"}
+```
+
+换一家没有这些工具的业务时，这段不会出现。
 
 ## 7. 部署行为
 
@@ -790,6 +797,8 @@ python -m scripts.list_mcp_tools
 代理/CONNECT 不可用时，**所有模型与检索调用**会报 `APIConnectionError` /
 `ConnectError`。DeepSeek 官方接口与 MCP 服务端都走网络，排查时先用 `curl` 直连确认。
 
+通用中台改进的迁移范围、配置兼容和验证说明见 [迁移记录](docs/general-platform-merge.md)。
+
 ## 9. 测试
 
 ```bash
@@ -798,18 +807,21 @@ PG_TEST_DSN=postgresql://…/agent_platform_test \
   python -W error::RuntimeWarning -m unittest discover -s tests -v
 ```
 
-**376 条用例，全绿**。项目只支持 PostgreSQL，用例也直接跑真实 PG：
+**453 条用例全部通过**（包含真实 PostgreSQL 测试）。主要覆盖：
 
-| 文件 | 条数 | 覆盖 |
-|---|---|---|
-| `tests/test_core.py` | 243 | 能力包、计划校验、账本、状态词汇、MCP 识别、接口与 SSE、仓储一致性、连接池 |
-| `tests/test_worker_execution.py` | 6 | Worker 领取/执行一次、两 Worker 抢同一条、异常不带走循环、空计划、无未 await 协程 |
-| `tests/test_execution_control.py` | 9 | 旧代次四件事全被拒、续租失败停派、暂停三种时序、续跑不重发、取消、工具消失 |
-| `tests/test_execution_recovery.py` | 7 | 计划先于调用提交、提交失败零调用、prepared 重做、unknown 阻断、succeeded 复用、结算失败不推进 |
-| `tests/test_mcp_uncertainty.py` | 6 | 业务失败=failed_confirmed、超时=unknown、连接失败=not_executed、包装后确定性不丢 |
-| `tests/test_observation.py` | 16 | 摘要保留结构、路由优先级、结果完整可追溯、空 continue 拒绝、缺证据不成功、无进展停止、预算耗尽、观察开关 |
-| `tests/test_run_inputs.py` | 28 | 补充接受/幂等/背压、旧版本动作零准入、计划 CAS、修订校验、收尾门禁、暂停期间补充、HTTP 202/409/404/422 |
-| `tests/test_ticket_auth.py` 等 | 56 | 票据验证、兑换、退出、跨平台隔离 |
+| 文件 | 覆盖 |
+|---|---|
+| `tests/test_core.py` | 能力包、计划校验、账本、状态词汇、MCP 识别、接口与 SSE、仓储一致性、连接池 |
+| `tests/test_worker_execution.py` | Worker 领取/执行一次、两 Worker 抢同一条、异常不带走循环、空计划、无未 await 协程 |
+| `tests/test_execution_control.py` | 旧代次四件事全被拒、续租失败停派、暂停三种时序、续跑不重发、取消、工具消失 |
+| `tests/test_execution_recovery.py` | 计划先于调用提交、提交失败零调用、prepared 重做、unknown 阻断、succeeded 复用、结算失败不推进 |
+| `tests/test_mcp_uncertainty.py` | 业务失败=failed_confirmed、超时=unknown、连接失败=not_executed、包装后确定性不丢 |
+| `tests/test_observation.py` | 摘要保留结构、路由优先级、结果完整可追溯、空 continue 拒绝、缺证据不成功、无进展停止、预算耗尽、观察开关 |
+| `tests/test_run_inputs.py` | 补充接受/幂等/背压、旧版本动作零准入、计划 CAS、修订校验、收尾门禁、暂停期间补充、HTTP 202/409/404/422 |
+| `tests/test_ticket_auth.py` 等 | 票据验证、兑换、退出、跨平台隔离 |
+
+新增测试覆盖结果登记与用户隔离（`test_result_isolation.py`）、stdio 会话复用（`test_stdio_session.py`）、
+通用平台边界与 AnyIO 连接作用域（`test_platform_generalization.py`）。
 
 `-W error::RuntimeWarning` 是刻意的：漏 `await` 的执行路径不会报错，只会静默失效，
 把它提升成错误才能守住"Worker 真的在等结果"这件事。

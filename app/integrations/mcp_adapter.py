@@ -10,7 +10,8 @@ import os
 import json
 import base64
 import asyncio
-from contextlib import asynccontextmanager
+import logging
+from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
 from urllib.parse import urlsplit
 from jsonschema import validate
@@ -23,7 +24,160 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 # 本模块直接读 os.environ，导入 config 触发 load_dotenv，
 # 避免单独调用 connect_session 时出现 KeyError: 'MCP_URL'。
 from app import config as _config  # noqa: F401
+from app.config import settings
 from app.integrations import mcp_servers
+
+logger = logging.getLogger(__name__)
+
+# 同一进程里按服务端复用 stdio 子进程。HTTP/SSE 每次调用仍然各自连接。
+# 一把锁串行化同一个子进程上的借用，并让独立任务持有连接的整个生命周期。
+_stdio_guard = asyncio.Lock()
+_stdio_slots: dict[str, '_StdioSlot'] = {}
+_stdio_idlers: set[asyncio.Task] = set()
+
+
+class _StdioSlot:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.owner: asyncio.Task | None = None
+        self.close_requested: asyncio.Event | None = None
+        self.session = None
+        self.generation = 0
+        self.idle: asyncio.Task | None = None
+
+
+def _stdio_key(server, command: str, args: list, token: str | None) -> str:
+    server_id = getattr(server, 'id', '') or getattr(server, 'server_id', '') or ''
+    return json.dumps([server_id, command, list(args), token or ''],
+                      ensure_ascii=False)
+
+
+def _session_broken(exc: BaseException) -> bool:
+    """传输断了才丢掉子进程。业务失败（服务端回了 error）留着继续用。"""
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_session_broken(item) for item in exc.exceptions)
+    name = type(exc).__name__
+    if name in {'BrokenResourceError', 'ClosedResourceError', 'EndOfStream',
+                'ConnectionResetError', 'BrokenPipeError', 'ConnectionError'}:
+        return True
+    return isinstance(exc, (ConnectionError, EOFError, BrokenPipeError, TimeoutError))
+
+
+async def _close_slot(slot: _StdioSlot) -> None:
+    owner = slot.owner
+    close_requested = slot.close_requested
+    slot.session = None
+    slot.owner = None
+    slot.close_requested = None
+    if owner is None:
+        return
+    if close_requested is not None:
+        close_requested.set()
+    try:
+        await asyncio.shield(owner)
+    except Exception:
+        logger.warning('关闭 stdio 会话时出错', exc_info=True)
+
+
+def _arm_idle(slot: _StdioSlot, generation: int) -> None:
+    delay = settings.stdio_session_idle_seconds
+
+    async def _later() -> None:
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        async with slot.lock:
+            if slot.generation != generation or slot.session is None:
+                return
+            await _close_slot(slot)
+
+    slot.idle = asyncio.create_task(_later())
+    _stdio_idlers.add(slot.idle)
+    slot.idle.add_done_callback(_stdio_idlers.discard)
+
+
+async def _open_slot(slot: _StdioSlot, command: str, args: list) -> None:
+    ready = asyncio.get_running_loop().create_future()
+    stop = asyncio.Event()
+
+    async def own_session():
+        # MCP/AnyIO 的取消作用域必须在同一个任务中进入和退出。
+        async with AsyncExitStack() as stack:
+            try:
+                read, write = await stack.enter_async_context(
+                    stdio_client(StdioServerParameters(command=command, args=args)))
+                session = await stack.enter_async_context(ClientSession(read, write))
+                await session.initialize()
+                ready.set_result(session)
+                await stop.wait()
+            except BaseException as exc:
+                if not ready.done():
+                    ready.set_exception(exc)
+                raise
+
+    slot.close_requested = stop
+    slot.owner = asyncio.create_task(own_session())
+    try:
+        slot.session = await asyncio.shield(ready)
+    except BaseException:
+        await _close_slot(slot)
+        raise
+
+
+@asynccontextmanager
+async def _borrow_stdio(server, command: str, args: list, token: str | None):
+    key = _stdio_key(server, command, args, token)
+    async with _stdio_guard:
+        slot = _stdio_slots.get(key)
+        if slot is None:
+            slot = _StdioSlot()
+            _stdio_slots[key] = slot
+    async with slot.lock:
+        stale = slot.idle
+        slot.idle = None
+        if stale is not None and not stale.done():
+            stale.cancel()
+        slot.generation += 1
+        if slot.owner is not None and slot.owner.done():
+            await _close_slot(slot)
+        if slot.session is None:
+            await _open_slot(slot, command, args)
+        try:
+            yield slot.session
+        except asyncio.CancelledError:
+            await _close_slot(slot)
+            raise
+        except Exception as exc:
+            if _session_broken(exc):
+                await _close_slot(slot)
+            raise
+        finally:
+            if slot.session is not None:
+                slot.generation += 1
+                if settings.stdio_session_idle_seconds <= 0:
+                    await _close_slot(slot)
+                else:
+                    _arm_idle(slot, slot.generation)
+
+
+async def close_stdio_sessions() -> None:
+    """进程退出时关掉还开着的 stdio 子进程。"""
+    async with _stdio_guard:
+        slots = list(_stdio_slots.values())
+        _stdio_slots.clear()
+    for task in list(_stdio_idlers):
+        task.cancel()
+    for slot in slots:
+        slot.idle = None
+        async with slot.lock:
+            slot.generation += 1
+            await _close_slot(slot)
+    for task in list(_stdio_idlers):
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 def _cfg(server, field: str, env: str, default: str = '') -> str:
@@ -68,11 +222,8 @@ async def connect_session(server=None, *, token: str | None = None):
         raw_args = getattr(server, 'stdio_args', ()) if server is not None else ()
         args = list(raw_args) if raw_args else json.loads(
             os.getenv('MCP_STDIO_ARGS', '[]'))
-        params = StdioServerParameters(command=command, args=args)
-        async with stdio_client(params) as (read, write):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                yield session
+        async with _borrow_stdio(server, command, args, token) as session:
+            yield session
     elif transport == 'sse':
         url = _cfg(server, 'url', 'MCP_URL')
         if not url:

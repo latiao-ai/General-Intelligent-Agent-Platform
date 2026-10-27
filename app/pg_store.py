@@ -3104,6 +3104,14 @@ class PostgresStore:
 
     # ---------- 工具运行时：通用结果 ----------
 
+    async def commit_tool_result(self, context: dict, staged: dict,
+                                 envelope: dict) -> str:
+        """登记一条已经落盘的结果。读接口只认这张登记，不认目录里的清单文件。"""
+        from app import tool_results
+        async with self._lease() as conn:
+            return await tool_results.commit_result_in_tx(
+                conn, context, staged, envelope)
+
     async def result_manifest(self, result_id: str) -> dict | None:
         async with self._lease() as conn:
             row = await self._one(conn,

@@ -131,15 +131,16 @@ def _materialize(task: dict, contract, payload: dict) -> str:
     from app import async_contracts
     from app import tool_results
     output = async_contracts.pointer(payload, contract.output_pointer) if contract else payload
+    logical_id = 'ext-' + str(task.get('external_task_id') or 'result')
     folder = tool_results.result_dir(
         settings.artifact_dir, str(task.get('tenant_id') or 'default'),
-        'ext-' + str(task.get('external_task_id') or 'result'))
+        logical_id)
     folder.mkdir(parents=True, exist_ok=True)
     import json
     body = json.dumps(output, ensure_ascii=False, default=str)
     (folder / 'structured.json').write_text(body, encoding='utf-8')
     (folder / 'manifest.json').write_text(json.dumps({
-        'result_id': folder.name, 'registered': True, 'created_at': time.time(),
+        'result_id': logical_id, 'registered': True, 'created_at': time.time(),
     }, ensure_ascii=False), encoding='utf-8')
     return str(folder)
 

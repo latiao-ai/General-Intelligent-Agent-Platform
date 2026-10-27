@@ -32,7 +32,7 @@ from app import policies
 from app import services
 from app import run_inputs as run_inputs_module
 from app import profile as profile_module
-from app.capabilities import publishing as publishing_capability
+from app.capabilities import registry as capability_registry
 from app.services import is_stop_command
 from app.persistence import open_store
 from app.pg_store import PostgresStore, now
@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # `RUN_STATUS_OF.get(status, status)` 兜底会把手写业务词静默写进 runs.status。
 TERMINAL_STATUS = outcome_module.TERMINAL_RUN_STATUSES
 
-# 合成阶段：衡量"用户发出指令"到"真正开始搜索"之间的空档。
+# 合成阶段：衡量"用户发出指令"到"真正开始调用工具"之间的空档。
 INSTRUCTION_STAGE = 'instruction'
 
 # 哨兵：通知订阅者流已结束
@@ -64,7 +64,7 @@ class TaskRecord:
     error: str | None = None
     state: dict | None = None
     started_at: float = field(default_factory=time.time)
-    latency: float | None = None        # 收到指令 → 开始搜索 的耗时
+    latency: float | None = None        # 收到指令 → 开始执行工具 的耗时
     open_stage: dict | None = None      # 当前未关闭的阶段 {'stage','at'}
     # 谁在执行这个 run：持有租约的那一方。就地执行（API 进程）也必须写上，
     # 否则 Worker 会把"正在跑的 run"当孤儿再领一遍。
@@ -183,6 +183,101 @@ class Hub:
         # 同一台机器上起多个副本时也不能互相认成"自己"。
         self.owner_id = owner_id or f'api:{time.time_ns():x}:{uuid.uuid4().hex[:6]}'
         self.lease_seconds = lease_seconds or settings.run_lease_seconds
+        # 本进程同时执行的运行数。满了就留在 queued，不领取、不起协程。
+        self._slots = asyncio.Condition()
+        self._waiting_runs: list[str] = []
+        # 等人补充的运行收到回答后，避免同一条 run 被排进两次续跑
+        self._continuing_inputs: set[str] = set()
+        self._closing = False
+
+    def _limit(self) -> int:
+        return max(1, int(settings.max_concurrent_runs))
+
+    def _inflight(self, *, ignore_current: bool = False) -> int:
+        """本进程里还没结束的执行。
+
+        收尾时当前这条还没标记完成，补领下一条要把它排除，否则名额永远补不出来。
+        对外判断是否已满时要算上它。
+        """
+        current = asyncio.current_task() if ignore_current else None
+        count = 0
+        for record in self.tasks.values():
+            task = record._task
+            if task is None or task.done() or task is current:
+                continue
+            count += 1
+        return count
+
+    def at_capacity(self) -> bool:
+        return self._inflight() >= self._limit()
+
+    def _arm(self, record: TaskRecord, claimed: dict, awaitable) -> None:
+        record.lease_owner = claimed.get('lease_owner')
+        record.lease_epoch = int(claimed.get('lease_epoch') or 0)
+        record.run_id = str(claimed.get('run_id') or record.run_id)
+        record.status = 'running'
+        record._lease_lost = False
+        self._waiting_runs = [
+            item for item in self._waiting_runs if item != record.run_id]
+        record._task = asyncio.get_running_loop().create_task(
+            self._finish_and_pump(awaitable))
+
+    async def _finish_and_pump(self, awaitable):
+        try:
+            return await awaitable
+        finally:
+            async with self._slots:
+                try:
+                    await self._pump_locked()
+                finally:
+                    self._slots.notify_all()
+
+    async def _pump_locked(self) -> None:
+        """调用方已持有名额锁。把先前留在队列里的运行补上，补到上限为止。"""
+        if self._closing:
+            return
+        while self._waiting_runs and self._inflight(ignore_current=True) < self._limit():
+            run_id = self._waiting_runs[0]
+            try:
+                claimed = await self.store.claim_run(
+                    self.owner_id, self.lease_seconds, run_id=run_id)
+            except Exception:                      # noqa: BLE001
+                logger.warning('补领排队运行 %s 失败', run_id, exc_info=True)
+                return
+            self._waiting_runs.pop(0)
+            if claimed is None:
+                continue
+            record = self.tasks.get(str(claimed.get('task_id') or ''))
+            if record is None or record.live:
+                await self.store.update_run(
+                    run_id, status='queued', lease_owner=None,
+                    lease_expires_at=None)
+                continue
+            self._arm(record, claimed, self.execute_claimed_run(claimed))
+
+    async def _claim_and_arm(self, record: TaskRecord, run_id: str, factory,
+                             *, wait: bool) -> str:
+        """领取并在本进程执行。
+
+        返回 `started`、`queued`（已达上限，留在队列）或 `unclaimed`（行已经被别人领走）。
+        `wait=True` 时等到有名额再领，用于部署和补偿这种调用方要等结果的入口。
+        """
+        async with self._slots:
+            while self._inflight() >= self._limit():
+                if not wait:
+                    if run_id not in self._waiting_runs:
+                        self._waiting_runs.append(run_id)
+                    record.status = 'queued'
+                    logger.info('run %s 已达并发上限 %s，留在队列',
+                                run_id, self._limit())
+                    return 'queued'
+                await self._slots.wait()
+            claimed = await self.store.claim_run(
+                self.owner_id, self.lease_seconds, run_id=run_id)
+            if claimed is None:
+                return 'unclaimed'
+            self._arm(record, claimed, factory(claimed))
+            return 'started'
 
     async def _assert_session_owner(self, session_id: str, tenant_id: str,
                                     user_id: str) -> None:
@@ -235,6 +330,9 @@ class Hub:
                 # 否则一切会话就再也找不到入口（只有最后一条 finish 时才渲染过）
                 'artifact': _artifact_view(state),
                 'live': live,
+                'asked_questions': [str(q) for q in (state.get('asked_questions') or [])
+                                    if str(q).strip()],
+                'clarification': str(state.get('clarification') or ''),
                 'events': [event for _, event in await self.store.events(task['task_id'])],
             })
         live_run_id = ''
@@ -316,6 +414,9 @@ class Hub:
         占住租约。以前这里是 `create_run(status='running')` 却从不写租约，于是
         Worker 的领取条件（queued/running 且租约为空或过期）完全命中——同时起
         API 和 Worker，同一个任务就会跑两遍，部署类写操作真的会建出第二个站点。
+
+        本进程同时执行的运行数有上限（`MAX_CONCURRENT_RUNS`）。到顶之后这条运行
+        留在 queued，不领取、不起协程。有名额空出来时，再补领先前留下的运行。
         """
         session_id = session_id or uuid.uuid4().hex[:12]
         tenant = getattr(principal, 'tenant_id', 'default')
@@ -350,19 +451,14 @@ class Hub:
         await self.store.create_run(record.run_id, record.task_id, status='queued',
                               tenant_id=tenant, owner_user_id=owner,
                               owner_role=str(getattr(principal, 'role', '') or 'member'))
-        claimed = await self.store.claim_run(self.owner_id, self.lease_seconds,
-                                       run_id=record.run_id)
-        if claimed is None:
+        outcome = await self._claim_and_arm(
+            record, record.run_id,
+            lambda claimed: self.execute_claimed_run(claimed), wait=False)
+        if outcome == 'unclaimed':
             # 理论上不可能（刚刚才建出来的行）。真发生了就留在队列里，
             # 让 Worker 接手，绝不在没有租约的情况下开始执行。
             logger.warning('run %s 领取失败，已留在队列等待 Worker', record.run_id)
             record.status = 'queued'
-            return record
-        record.lease_owner = claimed.get('lease_owner')
-        record.lease_epoch = int(claimed.get('lease_epoch') or 0)
-        # 就地执行也必须走**同一个**执行入口：上下文、账本、恢复判定都不另写一份
-        loop = asyncio.get_running_loop()
-        record._task = loop.create_task(self.execute_claimed_run(claimed))
         return record
 
     async def execute_claimed_run(self, claimed: dict) -> TaskRecord | None:
@@ -414,12 +510,21 @@ class Hub:
         plan = await self.store.plan(run_id) or {}
         steps = plan.get('steps') or []
         actions = await self.store.actions_of(run_id)
+        snapshot_state = await self._recovery_state(run_id)
+        waiting = {
+            'asked_questions': [str(q) for q in (snapshot_state.get('asked_questions') or [])
+                                if str(q).strip()],
+            'clarification': str(snapshot_state.get('clarification') or ''),
+            'intent_version': int(run.get('intent_version') or 0),
+            'processed_intent_version': int(run.get('processed_intent_version') or 0),
+        }
         if steps:
             plan_version = int(plan.get('version') or 1)
             context = context.with_plan_version(plan_version)
             resume_plan = {'steps': steps, 'summary': plan.get('goal') or '续跑',
                            'plan_version': plan_version,
-                           'step_index': _resume_index(steps, actions)}
+                           'step_index': _resume_index(steps, actions),
+                           **waiting}
             if actions:
                 # 落库 + 投递都要 await：这里本来就在协程里，"同步投递"只会
                 # 得到一个没被 await 的协程（事件静默丢失）。
@@ -438,7 +543,8 @@ class Hub:
             await record.persist(status='needs_reconcile', state=record.state)
             return record
         else:
-            resume_plan = None
+            # 停在追问、计划还没提交：下一轮仍要带着问过的问题和版本，不能从零规划
+            resume_plan = waiting
 
         history = await self.history(record.session_id)
         prior = await self.prior_context(record.session_id)
@@ -450,7 +556,7 @@ class Hub:
         # 所有步骤都已结算、但 run 没来得及收尾（进程在"最后一次结算"与
         # "写终态"之间消失）：这里只剩收尾，**不能**再跑一遍图——图拿不到
         # 上一次的 step_outputs，只会得出"什么都没有产出"（文档 §5.4）。
-        if resume_plan and resume_plan['step_index'] >= len(resume_plan['steps']) \
+        if resume_plan and resume_plan.get('steps') and resume_plan['step_index'] >= len(resume_plan['steps']) \
                 and not self._needs_observation():
             snapshot = await self._recovery_state(run_id)
             if not snapshot.get('step_outputs'):
@@ -633,13 +739,16 @@ class Hub:
             await record.publish(stage_end(opened['stage'],
                                      time.time() - opened['at'], status))
 
-        # 这些阶段一出现，说明"规划已完成、开始真正干活"，可结算指令耗时。
-        FIRST_WORK_STAGES = {'web_search', 'fetch_pages', 'render_sources_html',
-                             publishing_capability.TOOL_NAME}
+        # 编排节点（规划、观察、落库）还不算开始干活。第一个真正的工具阶段出现，
+        # 才结算「收到指令」的耗时。工具名来自能力包或 MCP，这里不列举业务名。
+        orchestration = {'instruction', 'plan', 'intake', 'persist_plan',
+                         'run_step', 'observe_result', 'decide_next',
+                         'wait_async', 'verify_completion', 'finalize'}
 
         async def relay(event: dict) -> None:
+            stage = str(event.get('stage') or '')
             if (event.get('type') == 'stage_start'
-                    and event.get('stage') in FIRST_WORK_STAGES):
+                    and stage and stage not in orchestration):
                 await close_instruction('规划完成')
             track(event)
             await record.publish(event)
@@ -819,16 +928,28 @@ class Hub:
         """读库里当前的计划与起点（续跑/修订后重新执行用）。"""
         plan = await self.store.plan(run_id) or {}
         steps = plan.get('steps') or []
-        if not steps:
-            return None
-        actions = await self.store.actions_of(run_id)
         info = await self.store.run_intent(run_id)
+        snapshot = await self._recovery_state(run_id)
+        # 已经问过的问题跟着快照走：下一轮修订不该把同一组问题再问一遍
+        asked = [str(q) for q in (snapshot.get('asked_questions') or [])
+                 if str(q).strip()]
+        clarified = str(snapshot.get('clarification') or '')
+        if not steps:
+            # 没有已提交计划（上一轮停在等补充）：只能带版本号和问过的问题。
+            # 版本号必须带上——收尾时的 CAS 拿它比对，缺了就会被当成
+            # "补充还没处理"从而把同一轮再跑一遍。
+            return {'asked_questions': asked, 'clarification': clarified,
+                    'intent_version': int(info.get('intent_version') or 0),
+                    'processed_intent_version': int(
+                        info.get('processed_intent_version') or 0)}
+        actions = await self.store.actions_of(run_id)
         return {'steps': steps, 'summary': plan.get('goal') or '续跑',
                 'plan_version': int(plan.get('version') or 1),
                 'intent_version': int(plan.get('intent_version')
                                       or info.get('intent_version') or 0),
                 'processed_intent_version': int(
                     info.get('processed_intent_version') or 0),
+                'asked_questions': asked, 'clarification': clarified,
                 'step_index': _resume_index(steps, actions)}
 
     async def _settle_round(self, record: 'TaskRecord', state: dict, status: str, *,
@@ -863,7 +984,10 @@ class Hub:
         await record.publish({'type': 'status', **outcome_module.view(status, state),
                               'detail': reply,
                               'intent_version': int(state.get('intent_version') or 0),
-                              'plan_version': int(state.get('plan_version') or 0)})
+                              'plan_version': int(state.get('plan_version') or 0),
+                              'asked_questions': [str(q) for q in (state.get('asked_questions') or [])
+                                                 if str(q).strip()],
+                              'clarification': str(state.get('clarification') or '')})
 
     async def _recovery_state(self, run_id: str) -> dict:
         """恢复用的最新 state：坏数据/没快照时退回空 dict，绝不因此失败。"""
@@ -1024,7 +1148,59 @@ class Hub:
                         result.get('input_seq'), result.get('intent_version'))
             # 提交之后才通知进程内执行者：通知只是加速，安全靠数据库
             await self._wake_executor(run_id)
+            await self._continue_waiting_input(run)
         return result
+
+    async def _continue_waiting_input(self, run: dict) -> None:
+        """等人补充的运行收到回答后，接着跑同一条 run，不另开任务。
+
+        暂停不在这里恢复：暂停期间的补充只落库，要等显式 resume。
+        执行者还在跑时也不领第二遍；等它退出后，若补充仍没被纳入，再排队续跑。
+        """
+        if str(run.get('status') or '') != 'waiting_input':
+            return
+        run_id = str(run.get('run_id') or '')
+        if not run_id or run_id in self._continuing_inputs:
+            return
+        for record in list(self.tasks.values()):
+            if record.run_id == run_id and record.live:
+                self._continuing_inputs.add(run_id)
+                asyncio.create_task(self._continue_after_executor(run_id))
+                return
+        await self._requeue_waiting_input(run)
+
+    async def _continue_after_executor(self, run_id: str) -> None:
+        """执行者还在收尾时先等它结束，再决定要不要把同一条 run 重新排队。"""
+        try:
+            record = next((item for item in self.tasks.values()
+                           if item.run_id == run_id), None)
+            task = getattr(record, '_task', None) if record else None
+            if task is not None:
+                try:
+                    await task
+                except Exception:                  # noqa: BLE001
+                    return
+            run = await self.store.run(run_id)
+            if not run or str(run.get('status') or '') != 'waiting_input':
+                return
+            if not await self.store.pending_run_inputs(run_id):
+                return
+            await self._requeue_waiting_input(run)
+        finally:
+            self._continuing_inputs.discard(run_id)
+
+    async def _requeue_waiting_input(self, run: dict) -> None:
+        """把停在等人的运行放回队列，由当前进程或 Worker 接着修订。"""
+        run_id = str(run.get('run_id') or '')
+        record = await self.get(run['task_id'])
+        if record is None or record.live:
+            return
+        await self.store.update_run(run_id, status='queued')
+        record.run_id = run_id
+        record.status = 'queued'
+        await self._claim_and_arm(
+            record, run_id,
+            lambda claimed: self.execute_claimed_run(claimed), wait=False)
 
     async def run_inputs(self, run_id: str, *, after_seq: int = 0,
                          limit: int = 50) -> dict:
@@ -1112,20 +1288,14 @@ class Hub:
                 and float(run['lease_expires_at']) > time.time()):
             return None
         await self.store.update_run(run_id, status='queued', pause_requested=0)
-        claimed = await self.store.claim_run(self.owner_id, self.lease_seconds,
-                                       run_id=run_id)
-        if claimed is None:
-            return None
         record.run_id = run_id
-        record.status = 'running'
-        record.lease_owner = claimed.get('lease_owner')
-        # **代次必须跟着新领取走**：漏掉这一行就会拿着旧代次去准入，
-        # 第一次动作就被仓储层判失租（文档 §4.2）。
-        record.lease_epoch = int(claimed.get('lease_epoch') or 0)
-        record._lease_lost = False
         # 续跑与 Worker 走**同一条执行入口**：计划复用、按步骤恢复、快照收尾、
-        # 失租处理只有一份实现。这里只负责领取并返回记录（API 要立刻回 run_id）。
-        record._task = asyncio.create_task(self.execute_claimed_run(claimed))
+        # 失租处理只有一份实现。满员时留在队列，不另起一条没有上限的协程。
+        outcome = await self._claim_and_arm(
+            record, run_id,
+            lambda claimed: self.execute_claimed_run(claimed), wait=False)
+        if outcome == 'unclaimed':
+            return None
         return record
 
     # ---------- 补偿（文档 §8.4） ----------
@@ -1183,16 +1353,16 @@ class Hub:
         await self.store.create_run(new_run_id, record.task_id, status='queued',
                               tenant_id=run.get('tenant_id') or 'default',
                               owner_user_id=str(run.get('owner_user_id') or 'default'))
-        claimed = await self.store.claim_run(self.owner_id, self.lease_seconds,
-                                       run_id=new_run_id)
-        if claimed is None:
-            raise RuntimeError('无法领取补偿运行，请稍后重试')
         record.run_id = new_run_id
-        record.lease_owner = claimed.get('lease_owner')
-        record._task = asyncio.create_task(self._run(
-            record, [], {},
-            resume_plan={'steps': undo, 'summary': '补偿已完成步骤',
-                         'kind': 'compensation'}))
+        outcome = await self._claim_and_arm(
+            record, new_run_id,
+            lambda claimed: self._run(
+                record, [], {},
+                resume_plan={'steps': undo, 'summary': '补偿已完成步骤',
+                             'kind': 'compensation'}),
+            wait=True)
+        if outcome != 'started':
+            raise RuntimeError('无法领取补偿运行，请稍后重试')
         try:
             await record._task
         except asyncio.CancelledError:
@@ -1289,23 +1459,26 @@ class Hub:
         它。文档 §13 明确不允许保留"绕过执行器的独立写入口"。
         """
         tenant = getattr(principal, 'tenant_id', record.tenant_id or 'default')
+        tool_name = capability_registry.direct_tool('deploy')
+        if not tool_name:
+            raise RuntimeError('没有声明部署动作的能力包')
         run_id = uuid.uuid4().hex[:12]
         await self.store.create_run(run_id, record.task_id, status='queued',
                               tenant_id=tenant,
                               owner_user_id=str(getattr(principal, 'user_id', '')
                                                 or record.owner_user_id or 'default'))
-        claimed = await self.store.claim_run(self.owner_id, self.lease_seconds,
-                                       run_id=run_id)
-        if claimed is None:
-            raise RuntimeError('无法领取部署运行，请稍后重试')
-        step = {'tool': publishing_capability.TOOL_NAME, 'step_id': 's1', 'args': {},
+        step = {'tool': tool_name, 'step_id': 's1', 'args': {},
                 'depends_on': [], 'why': '用户点击部署'}
         keep_artifact_id = record.artifact_id
         record.run_id = run_id
-        record.lease_owner = claimed.get('lease_owner')
-        record._task = asyncio.create_task(self._run(
-            record, [], {'artifact': prior_artifact},
-            resume_plan={'steps': [step], 'summary': '部署上一轮产物'}))
+        outcome = await self._claim_and_arm(
+            record, run_id,
+            lambda claimed: self._run(
+                record, [], {'artifact': prior_artifact},
+                resume_plan={'steps': [step], 'summary': '部署上一轮产物'}),
+            wait=True)
+        if outcome != 'started':
+            raise RuntimeError('无法领取部署运行，请稍后重试')
         try:
             await record._task
         except asyncio.CancelledError:
@@ -1328,6 +1501,7 @@ class Hub:
         再关连接池。反过来的话，执行协程会在池关闭后继续要连接，栈里就只剩
         "error connecting"，进程退出还会卡住。
         """
+        self._closing = True
         running = [record for record in self.tasks.values() if record.live]
         for record in running:
             logger.info('shutdown: 取消本地执行 run=%s', record.run_id)

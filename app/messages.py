@@ -38,12 +38,21 @@ def reply_text(state: dict) -> str:
         return '本次执行完成，但没有产出内容。'
 
     if status == 'needs_reconcile':
-        # 写请求可能真的成功了，只是回执看不懂：不能报失败，也不能说完成
+        # 写请求可能真的成功了，只是回执看不懂：不能报失败，也不能说完成。
+        # 文案不能写死"报告/部署"：这里也会被画布、表格、工单这类非发布类写操作
+        # 命中，Hardcode 一句"部署结果待确认"会让用户以为系统跑错了流程。
         url = deployment.get('public_url')
         if url:
             return (f'报告已生成，站点地址看起来是 {url}，但服务端回执没能确认，'
                     f'请核对站点列表。')
-        return '报告已生成，但部署结果待确认，请核对服务端站点列表。'
+        reason = state.get('failure') or '有写操作的结果没能确认'
+        written = [item for item in (outcome.get('effects') or [])
+                   if item.get('effect') == 'write' and item.get('verified')]
+        if written:
+            return (f'本次停在了这一步：{reason}。'
+                    f'前面 {len(written)} 个写操作已经落到服务端并核实过，'
+                    f'我没有撤销它们；请先核对再决定是补做还是回退。')
+        return f'本次执行结果没能确认：{reason}。'
 
     if status == 'partially_succeeded':
         # 不能只说"部分完成"：用户要知道哪些副作用没收回来
@@ -59,6 +68,11 @@ def reply_text(state: dict) -> str:
     if status in ('waiting_input', 'waiting_approval'):
         # 计划没过校验就停下来等人补信息——不能说"任务结束"了事
         reason = state.get('failure') or '需要补充信息后才能继续'
+        clarified = str(state.get('clarification') or '').strip()
+        if clarified and clarified == str(reason).strip():
+            # 问题已经作为单独一条消息弹过了（界面上的"需要你补充一句"），
+            # 这里再复述一遍就是同一句话刷两屏。只说"停在哪、等你什么"。
+            return '先停在这里：等你回上面那条，我就把细节并进同一件事继续。'
         return f'先停在这里：{reason}'
 
     if status == 'cancelled':

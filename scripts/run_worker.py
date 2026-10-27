@@ -62,6 +62,10 @@ async def run_once(hub: Hub, worker_id: str, lease_seconds: float | None = None,
     现在：领取 → 交给 `hub.execute_claimed_run()` 这一个入口，异常只影响本条 run。
     """
     lease = lease_seconds or settings.run_lease_seconds
+    if hub.at_capacity():
+        logger.info('本进程执行中的运行已达 %s，暂不领取',
+                    settings.max_concurrent_runs)
+        return False
     run = await hub.store.claim_run(worker_id, lease, run_id=run_id)
     if run is None:
         return False
@@ -179,6 +183,8 @@ async def run_worker(worker_id: str, once: bool, jobs_only: bool,
     try:
         await main_loop(hub, worker_id, once, jobs_only, interval)
     finally:
+        from app.integrations.mcp_adapter import close_stdio_sessions
+        await close_stdio_sessions()
         await hub.store.close()
 
 

@@ -23,6 +23,11 @@ PROMPT_RULES = (
 )
 
 
+def planner_facts(state, catalog) -> dict:
+    """只有导出网页在本轮清单里，才报告上一轮有没有 HTML 产物。"""
+    return {'上一轮已产出 HTML': bool((state or {}).get('prior_artifact'))}
+
+
 SOURCES_PAGE_CSS = """
 body{margin:0;background:#f5f6f8;color:#1b2430;
      font:15px/1.75 system-ui,-apple-system,"PingFang SC",sans-serif}
@@ -85,7 +90,7 @@ def _sources_page(title: str, documents: list[dict]) -> str:
 
 
 @tool(name='render_sources_html', label='资料转 HTML', effect='write',
-      key='local:export:sources_html',
+      scope='public', key='local:export:sources_html',
       description='把已检索到的原始资料（网页 JSON 元信息 + Markdown 正文）'
                   '直接排版成一份 HTML，不调用模型、不做摘要改写。'
                   '用户说"把资料/搜索结果存成网页"时用它；'

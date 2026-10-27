@@ -67,6 +67,9 @@ class Server:
     # 键可以是 MCP 工具名，也可以是 run_tool 的内部工具名。
     # 这些"本机知识"放在配置里，而不是让模型去猜。
     tool_hints: dict = field(default_factory=dict)
+    # 这家服务端自己的规划规则。只在它的工具进入本轮清单时拼进规划提示词。
+    # 内核不再替某一家编写业务语义（删站点、生成视频、画布节点这类话写在这里）。
+    prompt_rules: str = ''
 
 
 def _legacy_server() -> Server | None:
@@ -93,6 +96,13 @@ def _legacy_server() -> Server | None:
         default=True,
         title='默认服务端（MCP_* 单项配置）',
     )
+
+
+def _prompt_rules(raw) -> str:
+    """服务端自带的规划规则。只接受一段文字，别的形态当作没配。"""
+    if not isinstance(raw, str):
+        return ''
+    return raw.strip()
 
 
 def _json_object(raw: str) -> dict | None:
@@ -144,6 +154,7 @@ def _from_entry(entry: dict) -> Server | None:
         capability_tool=str(entry.get('capability_tool') or '').strip(),
         tool_name_arg=str(entry.get('tool_name_arg') or '').strip(),
         tool_hints=dict(entry.get('tool_hints') or {}),
+        prompt_rules=_prompt_rules(entry.get('prompt_rules')),
         default=bool(entry.get('default')),
         title=str(entry.get('title') or ''),
     )

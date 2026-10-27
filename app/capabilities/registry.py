@@ -55,6 +55,9 @@ class Tool:
     prompt_rules: str = ''
     # 远端工具来自哪个服务端（本地工具为空）。多服务端时靠它做路由与排障。
     server_id: str = ''
+    # public：答案在公开网页上（检索、抓页、把资料排成 HTML）。
+    # 空：不是这条路。平台上的读和改不能拿 public 工具充数。
+    scope: str = ''
 
 
 _DECLARATIONS: dict[str, dict] = {}
@@ -65,7 +68,8 @@ _LOADED = False
 
 
 def tool(*, name: str, label: str, description: str, args: dict,
-         effect: str = 'unknown', key: str = '', capability: str = ''):
+         effect: str = 'unknown', key: str = '', capability: str = '',
+         scope: str = ''):
     """把一个 async 函数登记成工具。
 
     只记录声明，真正的 `Tool` 在 `registered()` 里构建——这样能力包文件里
@@ -76,7 +80,8 @@ def tool(*, name: str, label: str, description: str, args: dict,
         _DECLARATIONS[name] = {'name': name, 'label': label,
                               'description': description, 'args': args,
                               'effect': effect, 'key': key,
-                              'capability': capability, 'run': fn}
+                              'capability': capability, 'scope': scope,
+                              'run': fn}
         _VERSION += 1
         return fn
     return decorate
@@ -118,6 +123,85 @@ def snapshot() -> dict[str, Tool]:
     return dict((spec.name, spec) for spec in registered())
 
 
+def capability_modules() -> list:
+    """已经加载的能力包模块。内核靠可选钩子找它们，不点名具体业务。"""
+    load()
+    package = importlib.import_module('app.capabilities')
+    modules = []
+    for info in pkgutil.iter_modules(package.__path__):
+        if info.name in {'base', 'registry'} or info.name.startswith('_'):
+            continue
+        module = sys.modules.get(f'app.capabilities.{info.name}')
+        if module is not None:
+            modules.append(module)
+    return modules
+
+
+def planner_facts(state: dict, catalog) -> dict:
+    """各能力包愿意告诉规划器的事实。包里的工具不在本轮清单里，就不出现。"""
+    present = {getattr(tool, 'capability', '') for tool in catalog}
+    facts = {}
+    for module in capability_modules():
+        capability = getattr(module, 'CAPABILITY', '')
+        fn = getattr(module, 'planner_facts', None)
+        if fn is None or not capability or capability not in present:
+            continue
+        extra = fn(state, catalog) or {}
+        if isinstance(extra, dict):
+            facts.update(extra)
+    return facts
+
+
+def suppressed_capabilities() -> set[str]:
+    """开关关掉的能力。清单里整段拿掉，避免出现注定失败的工具。"""
+    hidden = set()
+    for module in capability_modules():
+        capability = getattr(module, 'CAPABILITY', '')
+        gate = getattr(module, 'enabled', None)
+        if capability and gate is not None and not gate():
+            hidden.add(capability)
+    return hidden
+
+
+def adapt_mcp_tool(server, item: dict, make_runner):
+    """让能力包认领一个刚发现的远端工具。没有包认领就返回 None。"""
+    for module in capability_modules():
+        fn = getattr(module, 'adapt_mcp_tool', None)
+        if fn is None:
+            continue
+        tool = fn(server, item, make_runner)
+        if tool is not None:
+            return tool
+    return None
+
+
+def mcp_placeholder(servers, errors: dict, *, respect_switch: bool = True):
+    """发现失败时，由能力包自己决定要不要留一个会说清楚原因的占位工具。
+
+    `respect_switch=False` 只给测试：直接构造占位，不看总开关。
+    正常发现必须看开关，关掉的能力不留一个注定失败的工具。
+    """
+    for module in capability_modules():
+        gate = getattr(module, 'enabled', None)
+        if respect_switch and gate is not None and not gate():
+            continue
+        fn = getattr(module, 'mcp_placeholder', None)
+        if fn is None:
+            continue
+        tool = fn(servers, errors)
+        if tool is not None:
+            return tool
+    return None
+
+
+def direct_tool(action: str) -> str:
+    """按钮直接指定的工具名。哪个包响应这个动作，由包自己声明。"""
+    for module in capability_modules():
+        if getattr(module, 'DIRECT_ACTION', '') == action:
+            return str(getattr(module, 'TOOL_NAME', '') or '')
+    return ''
+
+
 def _build(declaration: dict) -> Tool:
     fn = declaration['run']
     module = sys.modules.get(fn.__module__)
@@ -135,6 +219,7 @@ def _build(declaration: dict) -> Tool:
         capability=capability,
         # 规则在构建时才取：能力包文件里 PROMPT_RULES 写在哪里都可以
         prompt_rules=getattr(module, 'PROMPT_RULES', ''),
+        scope=declaration.get('scope') or '',
     )
     _check(spec)
     return spec

@@ -125,6 +125,15 @@ def final_status(state: dict) -> str:
     # 就把三个脚本文件说成"没有产出可用结果"。
     if state.get('answer') or _produced(state):
         return 'succeeded'
+    # 外部状态变更也可以是成果，但部分步骤成功不能代替整份计划完成。
+    outputs = state.get('step_outputs') or {}
+    steps = plan.get('steps') or []
+    effects = _effects(plan, outputs)
+    if (steps and effects and all(item.get('verified') for item in effects)
+            and all((outputs.get(step.get('step_id')) or {}).get('__status__')
+                    == 'succeeded' for step in steps)
+            and not state.get('failure')):
+        return 'succeeded'
     return 'failed'
 
 

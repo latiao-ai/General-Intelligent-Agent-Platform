@@ -7,7 +7,7 @@ from pathlib import Path
 
 from app import approvals, artifact_store, async_contracts, external_tasks
 from app import runtime_check, tool_authorization
-from app.config import settings
+from app.config import governance_enabled, settings
 
 
 @contextmanager
@@ -144,6 +144,20 @@ class PathAndStartupTests(unittest.TestCase):
             found = runtime_check.issues()
         self.assertEqual(len(found), 3)
 
+    def test_ticket_mode_enables_governance_without_a_dev_escape(self):
+        self.assertTrue(governance_enabled('ticket', False, False))
+        self.assertTrue(governance_enabled('ticket', False, True))
+        self.assertFalse(governance_enabled('ticket', True, False))
+        self.assertFalse(governance_enabled('off', False, False))
+        self.assertTrue(governance_enabled('off', False, True))
+
+    def test_ticket_mode_starts_when_the_three_switches_are_on(self):
+        with tempfile.TemporaryDirectory() as folder, assigned(
+                settings, auth_mode='ticket', auth_dev_compat=False,
+                tool_policy_enforced=True, result_envelope_v2=True,
+                async_tool_runtime_enabled=True, artifact_dir=Path(folder)):
+            self.assertEqual(runtime_check.issues(), [])
+
     def test_off_mode_does_not_require_the_switches(self):
         with assigned(settings, auth_mode='off'):
             self.assertEqual(runtime_check.issues(), [])
@@ -252,6 +266,116 @@ class PollTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.run_row['status'], 'queued')
         self.assertEqual(store.snapshot['state']['tool_results'][0]['phase'],
                          'completed')
+
+
+class ContractFileTests(unittest.TestCase):
+    def test_missing_file_loads_nothing(self):
+        with assigned(settings,
+                      async_contracts_file='/tmp/does-not-exist-async-contracts.json'):
+            self.assertEqual(async_contracts.load(), [])
+            self.assertEqual(async_contracts.summary(),
+                             {'loaded': 0, 'recoverable': 0})
+
+    def test_contract_without_status_query_is_not_recoverable(self):
+        import json
+        body = {'contracts': [{
+            'contract_id': 'half',
+            'submit_tool_key': 'mcp:video:create_video',
+            'remote_id_pointer': '/job/id',
+            'recoverable': True,
+        }]}
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'async_tools.json'
+            path.write_text(json.dumps(body), encoding='utf-8')
+            with assigned(settings, async_contracts_file=str(path),
+                          async_tool_runtime_enabled=True):
+                found = async_contracts.load()
+                self.assertEqual(len(found), 1)
+                self.assertFalse(found[0].recoverable)
+                self.assertEqual(async_contracts.summary()['recoverable'], 0)
+                self.assertEqual(async_contracts.acceptance(
+                    'mcp:video:create_video',
+                    {'job': {'id': 'job-9', 'status': 'queued'}}), {})
+
+    def test_example_file_is_recoverable_only_when_selected(self):
+        example = Path(__file__).resolve().parents[1] / 'contracts' / 'async_tools.example.json'
+        with assigned(settings, async_contracts_file=str(example)):
+            rows = async_contracts.load()
+            self.assertEqual(len(rows), 1)
+            self.assertTrue(rows[0].recoverable)
+            self.assertEqual(async_contracts.summary(),
+                             {'loaded': 1, 'recoverable': 1})
+
+
+class ConcurrencyCapTests(unittest.IsolatedAsyncioTestCase):
+    async def test_second_run_stays_queued_until_a_slot_frees(self):
+        import asyncio
+        from app.api_hub import Hub, TaskRecord
+
+        class Store:
+            def __init__(self):
+                self.runs = {}
+
+            async def claim_run(self, worker_id, lease_seconds=60,
+                                run_id=None, now_ts=None):
+                row = self.runs.get(run_id)
+                if row is None or row.get('lease_owner'):
+                    return None
+                if row.get('status') not in ('queued', 'running', 'reconciling'):
+                    return None
+                row['status'] = 'running'
+                row['lease_owner'] = worker_id
+                row['lease_epoch'] = int(row.get('lease_epoch') or 0) + 1
+                return dict(row)
+
+            async def update_run(self, run_id, **fields):
+                self.runs[run_id].update(fields)
+
+        store = Store()
+        hub = Hub(store, owner_id='api-test', lease_seconds=30)
+        release = asyncio.Event()
+        started = []
+
+        async def execute(claimed):
+            started.append(claimed['run_id'])
+            await release.wait()
+
+        hub.execute_claimed_run = execute
+
+        def make(task_id, run_id):
+            item = TaskRecord(task_id=task_id, session_id='s', message='m',
+                              store=store)
+            item.run_id = run_id
+            store.runs[run_id] = {
+                'run_id': run_id, 'task_id': task_id, 'status': 'queued',
+                'lease_epoch': 0, 'lease_owner': None,
+            }
+            hub.tasks[task_id] = item
+            return item
+
+        first = make('t1', 'r1')
+        second = make('t2', 'r2')
+        with assigned(settings, max_concurrent_runs=1):
+            self.assertEqual(await hub._claim_and_arm(
+                first, 'r1', lambda claimed: hub.execute_claimed_run(claimed),
+                wait=False), 'started')
+            for _ in range(50):
+                if 'r1' in started:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn('r1', started)
+            self.assertEqual(await hub._claim_and_arm(
+                second, 'r2', lambda claimed: hub.execute_claimed_run(claimed),
+                wait=False), 'queued')
+            self.assertIsNone(store.runs['r2'].get('lease_owner'))
+            self.assertEqual(store.runs['r2']['status'], 'queued')
+            release.set()
+            for _ in range(50):
+                if 'r2' in started:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertIn('r2', started)
+            self.assertEqual(store.runs['r2']['status'], 'running')
 
 
 if __name__ == '__main__':

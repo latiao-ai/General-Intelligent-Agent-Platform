@@ -15,6 +15,7 @@ from app import outcome as outcome_module
 from app.capabilities.publishing import deploy_once
 from app.graph import build_graph
 from app.files import save_json
+from langgraph.errors import GraphRecursionError
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,10 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         'plan_version': int(resumed.get('plan_version') or 0),
         'processed_intent_version': int(resumed.get('processed_intent_version') or 0),
         'pending_inputs': [], 'intent_changed': False, 'revision_count': 0,
+        # 已经问过用户的问题：跨轮次带着走，同一组问题不重复弹
+        'asked_questions': [str(q) for q in (resumed.get('asked_questions') or [])
+                            if str(q).strip()],
+        'clarification': str(resumed.get('clarification') or ''),
         # 产物目录：persist_plan 节点提交快照时要记下它（恢复后仍能找到文件）
         'artifact_dir': str(folder),
         'step_index': 0, 'status': 'created',
@@ -125,6 +130,14 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         # 控制流异常必须**原样穿过**这一层：把它们包成 RuntimeError 会让
         # "失租"和"暂停"退化成普通失败，中枢再也没法区分该由谁收尾（§4.3、§7.2）。
         raise
+    except GraphRecursionError:
+        # 保留已执行步骤和真实副作用，预算耗尽按可恢复的中断处理。
+        logger.warning('任务 %s 达到步数上限（%s），按可续跑收尾',
+                       task_id, settings.graph_recursion_limit)
+        state['status'] = 'interrupted'
+        state['failure'] = (
+            f'这一轮已经用满 {settings.graph_recursion_limit} 步预算，先停在这里；'
+            '已经完成的步骤与产物都保留，可以从断点继续。')
     except Exception as exc:
         state['status'] = 'failed'
         state['errors'].append({'stage': 'runtime', 'type': type(exc).__name__})

@@ -131,8 +131,13 @@ class ApiIsolationTests(unittest.IsolatedAsyncioTestCase):
 
         replaced = replace(api_module.settings, auth_mode='ticket',
                            auth_cookie_secure=False, policy_legacy_visible=False)
+        async def fake_run_task(*args, **kwargs):
+            return {'task_id': 'auth-test', 'status': 'succeeded', 'timings': [],
+                    'deployment': {}, 'answer': '好的'}
+
         self._patches = [patch.object(ticket_auth.auth_connections, 'connections',
-                                      lambda *a, **k: CONNECTIONS)]
+                                      lambda *a, **k: CONNECTIONS),
+                         patch('app.api_hub.run_task', fake_run_task)]
         for module in (api_module, auth, policies, ticket_auth):
             self._patches.append(patch.object(module, 'settings', replaced))
         for item in self._patches:
@@ -142,6 +147,7 @@ class ApiIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.bob = await self._login(ticket_for('bob'))
 
     async def asyncTearDown(self):
+        await self.api.hub.close()
         for item in reversed(self._patches):
             item.stop()
         self.api.hub = self.saved_hub

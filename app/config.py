@@ -6,6 +6,26 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(PROJECT_ROOT / '.env')
 
+
+def _env_flag(name: str, default: str = 'false') -> bool:
+    return os.getenv(name, default).strip().lower() == 'true'
+
+
+def governance_enabled(auth_mode: str, dev_compat: bool, explicit: bool) -> bool:
+    """票模式且没有开发兼容时，政策、结果信封、异步查询一起打开。
+
+    本地单用户（AUTH_MODE=off）仍看各自的环境变量，默认关闭。
+    AUTH_DEV_COMPAT=true 时也看环境变量，只给本机签票联调用。
+    """
+    if str(auth_mode or '').strip().lower() == 'ticket' and not dev_compat:
+        return True
+    return bool(explicit)
+
+
+_AUTH_MODE = os.getenv('AUTH_MODE', 'off').strip().lower()
+_AUTH_DEV_COMPAT = _env_flag('AUTH_DEV_COMPAT')
+
+
 @dataclass(frozen=True)
 class Settings:
     llm_key: str = os.getenv('LLM_API_KEY', '')
@@ -52,12 +72,20 @@ class Settings:
     # 否则外层会先砍断内层重试，重试等于白写。
     task_timeout: float = max(30.0, float(os.getenv('TASK_TIMEOUT', '300')))
     # LangGraph 的递归上限：每个步骤算一跳，留出余量。
-    graph_recursion_limit: int = max(10, int(
-        os.getenv('GRAPH_RECURSION_LIMIT', '30')))
+    # 一次工具调用就要 2 跳（run_step + observe_result），再叠加 persist_plan /
+    # decide_next / verify_completion / finalize，30 跳连 8 步的计划都不够跑。
+    # 按 max_steps 折算，一个步骤给 8 跳（含修订引起的重跑）。
+    graph_recursion_limit: int = max(40, int(
+        os.getenv('GRAPH_RECURSION_LIMIT', str(max(40, max_steps * 8)))))
     # run 租约时长（秒）。执行期间由看守协程续租；设得太短，别的执行者会
     # 误判"这个人已经死了"并接手同一份计划。
     run_lease_seconds: float = max(15.0, float(
         os.getenv('RUN_LEASE_SECONDS', '120')))
+    # stdio 子进程在同一进程内复用，空闲这么多秒后再关掉。
+    # 0 表示每次调用结束就关，退回旧行为。对方只把任务放在进程内存里时，
+    # 进程重启后仍然接不上，那要靠对方自己的可查询任务号。
+    stdio_session_idle_seconds: float = float(
+        os.getenv('STDIO_SESSION_IDLE_SECONDS', '600'))
     # 创建任务幂等键的有效期（秒）。默认 24 小时：覆盖重试窗口，又不会让
     # 客户端某天重用旧键时拿到一个陈年任务。
     idempotency_ttl_seconds: float = max(60.0, float(
@@ -101,7 +129,7 @@ class Settings:
     # off      = 不介入，保持单用户行为（默认，本地开发与既有测试不受影响）
     # optional = 有中台会话就按会话，没有就匿名（灰度期）
     # ticket   = **平台签票 → 中台换会话**。所有业务接口必须带有效会话，否则 401
-    auth_mode: str = os.getenv('AUTH_MODE', 'off').strip().lower()
+    auth_mode: str = _AUTH_MODE
     # 票据有效期上限（秒）。票据是"一次性短期凭证"，不该活很久。
     auth_ticket_max_lifetime: int = max(5, int(
         os.getenv('AUTH_TICKET_MAX_LIFETIME', '60')))
@@ -127,21 +155,22 @@ class Settings:
         os.getenv('POLICY_LEGACY_VISIBLE', 'false').strip().lower() == 'true')
 
     # ---------- 工具运行时（《智能体中台说明书》） ----------
-    # 三个开关分别对应三个阶段，默认**全部关闭**：新能力必须先在关的状态下
-    # 验证兼容面，再逐项打开。任何一个都不允许"缺配置就静默回退到旧行为"。
+    # 本地单用户三个都关着。AUTH_MODE=ticket 且未开 AUTH_DEV_COMPAT 时，
+    # 三项在这里一起打开：不能只开票模式、却让政策或结果信封停在演示路径。
+    # 显式写成 true 时，即使还是 off 模式也会打开对应的一环。
     #
     # RESULT_ENVELOPE_V2：结果信封 v2（schema_version=2）。开启后结果以
     # manifest + 分块的形式保存与受控读取，旧字段由兼容投影生成。
-    result_envelope_v2: bool = (
-        os.getenv('RESULT_ENVELOPE_V2', 'false').strip().lower() == 'true')
+    result_envelope_v2: bool = governance_enabled(
+        _AUTH_MODE, _AUTH_DEV_COMPAT, _env_flag('RESULT_ENVELOPE_V2'))
     # TOOL_POLICY_ENFORCED：工具政策强制执行。开启后模型只看得到被授权的
     # 工具，调用前重新校验主体/凭据/批准/额度，缺绑定直接拒绝。
-    tool_policy_enforced: bool = (
-        os.getenv('TOOL_POLICY_ENFORCED', 'false').strip().lower() == 'true')
+    tool_policy_enforced: bool = governance_enabled(
+        _AUTH_MODE, _AUTH_DEV_COMPAT, _env_flag('TOOL_POLICY_ENFORCED'))
     # ASYNC_TOOL_RUNTIME_ENABLED：异步长任务受理与跟踪。**不能只开这一半**：
     # 没有外部任务合同与跟踪作业时，受理的动作会永远停在等待态。
-    async_tool_runtime_enabled: bool = (
-        os.getenv('ASYNC_TOOL_RUNTIME_ENABLED', 'false').strip().lower() == 'true')
+    async_tool_runtime_enabled: bool = governance_enabled(
+        _AUTH_MODE, _AUTH_DEV_COMPAT, _env_flag('ASYNC_TOOL_RUNTIME_ENABLED'))
 
     # 结果存储：单条结果的体积上限与单次读取的分页上限。超出时结果标记为
     # incomplete 并给出原因——**不能无限扩容，也不能悄悄截断**。
@@ -169,9 +198,8 @@ class Settings:
         os.getenv('APPROVAL_TTL_SECONDS', '900')))
     approval_max_actions: int = max(1, int(
         os.getenv('APPROVAL_MAX_ACTIONS', '20')))
-    # ticket 模式启动时要求三个治理开关都已打开。本地联调可显式关掉这道门。
-    auth_dev_compat: bool = (
-        os.getenv('AUTH_DEV_COMPAT', 'false').strip().lower() == 'true')
+    # 为 true 时，票模式不再强制打开三环，启动检查也跳过。只用于本机签票联调。
+    auth_dev_compat: bool = _AUTH_DEV_COMPAT
     auth_allowed_origins: tuple = tuple(
         item.strip() for item in os.getenv('AUTH_ALLOWED_ORIGINS', '').split(',')
         if item.strip())

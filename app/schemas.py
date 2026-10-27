@@ -53,6 +53,11 @@ class ExecutionPlan(BaseModel):
     after_segment: str = 'verify'
     observation_goal: str = ''
     completion_criteria: list[CompletionCriterion] = Field(default_factory=list)
+    # 结果落在哪里。程序按它核对步骤，不靠工具名字猜用户想干什么。
+    # chat：聊天里的回答，或公开网页整理出的本地文件。
+    # platform_state：要回答的事实只在对接平台里。
+    # platform_change：对接平台上的对象要被修改。
+    result_locus: str = ''
     # 本轮用户透露的个人信息，没有就留空。与旧版解析阶段的行为保持一致。
     profile_updates: dict[str, str] = Field(default_factory=dict)
 
@@ -73,6 +78,7 @@ class RevisedPlan(BaseModel):
     after_segment: str = 'verify'
     observation_goal: str = ''
     completion_criteria: list[CompletionCriterion] = Field(default_factory=list)
+    result_locus: str = ''
 
 
 class ObservationDecision(BaseModel):
@@ -97,6 +103,7 @@ class ObservationDecision(BaseModel):
     # stop：具体原因
     stop_reason: str = ''
     completion_criteria: list[CompletionCriterion] = Field(default_factory=list)
+    result_locus: str = ''
 
     DECISIONS: ClassVar[tuple[str, ...]] = (
         'continue', 'revise', 'wait_input', 'wait_approval', 'finish', 'stop')
@@ -183,6 +190,11 @@ class AgentState(TypedDict, total=False):
     intent_changed: bool                # 边界上发现版本变化，需要重新规划
     revision_count: int                 # 本次运行已经修订过几次计划
     plan_version: int                   # 当前计划版本
+    # 已经问过的问题，以及界面上单独展示过的那句追问。
+    # 必须声明在状态里：图只保留 schema 中的键，没声明的写入会被丢掉，
+    # 下一轮就不知道问过什么，同一组问题会再问一遍。
+    asked_questions: list[str]
+    clarification: str
     # intake 节点的路由结果：plan / revise / run_step / finalize / stop
     entry_route: str
     # 修订计划时给校验器的"受信历史输出"（已成功步骤 + 其 step_id）
@@ -221,5 +233,7 @@ class AgentState(TypedDict, total=False):
     elapsed_seconds: float
     # 多轮对话历史 [{'role','content'}]，供规划阶段理解指代型追加要求。
     history: list[dict]
+    # 平台签名过的现场：当前项目、选中对象。规划时用来判断结果落在哪。
+    scene: dict
     # 更早对话的压缩结果 {'summary','facts','upto'}，由 context 装配时注入。
     session_memory: dict

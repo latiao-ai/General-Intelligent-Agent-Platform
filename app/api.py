@@ -57,6 +57,16 @@ async def lifespan(app: FastAPI):
     problems = runtime_check.issues()
     if problems:
         raise RuntimeError('；'.join(problems))
+    from app import async_contracts
+    contract_summary = async_contracts.summary()
+    logger.info(
+        '身份模式 %s，工具政策 %s，结果信封 %s，异步运行 %s，可恢复合同 %s，并发上限 %s',
+        settings.auth_mode, settings.tool_policy_enforced,
+        settings.result_envelope_v2, settings.async_tool_runtime_enabled,
+        contract_summary['recoverable'], settings.max_concurrent_runs)
+    if settings.async_tool_runtime_enabled and contract_summary['recoverable'] == 0:
+        logger.warning(
+            '异步运行已打开，但没有可恢复合同。只返回「已受理」的长任务在重启后不能继续跟踪')
     # 先确保仓储就绪（PG 会在这里打开连接池并建表）：连不上库应当在启动日志里
     # 直接失败，而不是等第一个请求到了才炸
     ready = getattr(hub.store, 'ready', None)
@@ -75,6 +85,8 @@ async def lifespan(app: FastAPI):
     finally:
         await task_notify.stop()
         await hub.close()
+        from app.integrations.mcp_adapter import close_stdio_sessions
+        await close_stdio_sessions()
         # 连接池也要显式关：否则退出时池里的连接靠 GC 收，日志里看不到
         # "到底关没关"，测速/压测反复起停还会在服务端堆出空闲连接。
         close_store = getattr(hub.store, 'close', None)
@@ -226,7 +238,7 @@ async def drop_session(request: Request, response: Response):
 
 
 # ---------- 对象权限 ----------
-# 订阅 SSE、下载产物、读取画像全部执行对象权限。
+# 订阅 SSE、下载产物、读取画像、读取结果全部执行对象权限。
 # 以前只有 /api/runs 与 /api/artifacts 做了检查，其余接口知道 ID 就能读别人的
 # 会话——而 session_id 是客户端传入的 12 位十六进制，猜中即接管上下文。
 
@@ -259,6 +271,25 @@ async def _owned_run(run_id: str, principal) -> dict:
     resource['tenant_id'] = run.get('tenant_id') or 'default'
     policies.ensure_owner(resource, principal, '运行')
     return run
+
+
+async def _owned_result(result_id: str, principal) -> dict:
+    """结果只认登记行。没有登记，或不是当前企业的当前用户，都是 404。"""
+    manifest = await hub.store.result_manifest(result_id)
+    return policies.ensure_owner(manifest, principal, '结果')
+
+
+async def _owned_part(result_id: str, part_id: str, principal) -> tuple[dict, dict]:
+    """分块必须属于这条已通过归属检查的结果。磁盘清单不算数。"""
+    manifest = await _owned_result(result_id, principal)
+    rows = await hub.store.result_parts(result_id)
+    part = next((item for item in rows
+                 if str(item.get('part_id') or '') == part_id
+                 and str(item.get('result_id') or '') == str(manifest.get('result_id') or '')),
+                None)
+    if not isinstance(part, dict):
+        raise HTTPException(status_code=404, detail='分块不存在')
+    return manifest, part
 
 
 @contextmanager
@@ -488,8 +519,8 @@ async def deploy(task_id: str,
     """
     record = await _owned_task(task_id, principal)
     artifact = (record.state or {}).get('artifact') or {}
-    if not artifact.get('html_path'):
-        raise HTTPException(status_code=409, detail='该任务还没有生成产物')
+    if not (artifact.get('path') or artifact.get('html_path')):
+        raise HTTPException(status_code=409, detail='该任务还没有可交付的产物')
     if not settings.deploy_enabled:
         raise HTTPException(status_code=409,
                             detail='部署已关闭（DEPLOY_ENABLED=false）')
@@ -694,9 +725,21 @@ async def health():
     except Exception as exc:                     # noqa: BLE001
         raise HTTPException(status_code=503,
                             detail=f'数据库不可用（{type(exc).__name__}）') from None
+    from app import async_contracts
     body = {'ok': True, 'owner': hub.owner_id,
             'recovery': getattr(app.state, 'recovery', {}),
-            'mcp': tool_module.mcp_status(), **stats}
+            'mcp': tool_module.mcp_status(),
+            'governance': {
+                'auth_mode': settings.auth_mode,
+                'dev_compat': settings.auth_dev_compat,
+                'tool_policy_enforced': settings.tool_policy_enforced,
+                'result_envelope_v2': settings.result_envelope_v2,
+                'async_tool_runtime_enabled': settings.async_tool_runtime_enabled,
+                'async_contracts': async_contracts.summary(),
+                'max_concurrent_runs': settings.max_concurrent_runs,
+                'inflight': hub._inflight(),
+            },
+            **stats}
     pool_stats = getattr(hub.store, 'pool_stats', None)
     if callable(pool_stats):
         # 连接池态势：只有 PostgreSQL 实现有池，SQLite 没有这个口子
@@ -1005,18 +1048,15 @@ async def gc_results(principal=Depends(policies.current_principal)):
 @app.get('/api/results/{result_id}')
 async def read_staged_result(result_id: str,
                              principal=Depends(policies.current_principal)):
-    """按租户目录读取已落盘的结果。别的企业的 result_id 读不到。"""
+    """读取已登记的结果。先核对当前企业和用户，通过后才按登记引用打开文件。"""
     from app import tool_results
-    folder = tool_results.result_dir(
-        settings.artifact_dir, principal.tenant_id, result_id)
-    structured_path = folder / 'structured.json'
-    if not structured_path.is_file():
-        raise HTTPException(status_code=404, detail='结果不存在')
+    manifest = await _owned_result(result_id, principal)
     try:
-        structured = json.loads(structured_path.read_text(encoding='utf-8'))
-    except ValueError:
-        structured = None
-    return {'result_id': result_id, 'tenant_id': principal.tenant_id,
+        structured = tool_results.read_structured(settings.artifact_dir, manifest)
+    except tool_results.ResultError:
+        raise HTTPException(status_code=404, detail='结果不存在') from None
+    return {'result_id': result_id,
+            'tenant_id': manifest.get('tenant_id') or principal.tenant_id,
             'structured': structured}
 
 
@@ -1025,25 +1065,14 @@ async def read_result_part(result_id: str, part_id: str,
                            offset: int = Query(default=0),
                            limit: int = Query(default=0),
                            principal=Depends(policies.current_principal)):
-    """按清单里的 part_id 读取。不接受文件路径。"""
+    """按登记过的 part_id 读取。不接受文件路径，也不信磁盘上的清单。"""
     from app import tool_results
-    folder = tool_results.result_dir(
-        settings.artifact_dir, principal.tenant_id, result_id)
-    manifest_path = folder / 'manifest.json'
-    if not manifest_path.is_file():
-        raise HTTPException(status_code=404, detail='结果不存在')
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding='utf-8'))
-    except ValueError:
-        raise HTTPException(status_code=404, detail='结果不存在') from None
-    part = next((item for item in (manifest.get('parts') or [])
-                 if str(item.get('part_id') or '') == part_id), None)
-    if not isinstance(part, dict):
-        raise HTTPException(status_code=404, detail='分块不存在')
+    manifest, part = await _owned_part(result_id, part_id, principal)
     page_limit = limit or settings.tool_result_page_limit
     try:
         return tool_results.read_part(
-            settings.artifact_dir, principal.tenant_id, part,
+            settings.artifact_dir, str(manifest.get('tenant_id') or ''),
+            part, result_id=str(manifest.get('result_id') or ''),
             offset=offset, limit=page_limit)
-    except tool_results.ResultError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from None
+    except tool_results.ResultError:
+        raise HTTPException(status_code=404, detail='分块不存在') from None
