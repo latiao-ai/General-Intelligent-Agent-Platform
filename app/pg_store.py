@@ -3468,6 +3468,10 @@ class DecisionBudgetExceeded(RuntimeError):
 class BudgetExceeded(RuntimeError):
     """运行级预算（provider 请求数 / 工具调用数 …）用尽。"""
 
+    error_code = 'E_RUN_BUDGET'
+    certainty = 'not_executed'
+    phase = 'validate'
+
     def __init__(self, message: str = '运行预算用尽') -> None:
         super().__init__(message)
         self.safe_message = message

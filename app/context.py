@@ -12,6 +12,8 @@
   剩下的额度留给最近几轮原文。
 - 各用途给不同预算：规划只要"用户在说什么"，作答要"答什么"。
 """
+import copy
+import json
 import re
 
 # 用途决定需要哪些材料（文档 §11）。不同用途给不同预算，不要一份预算打天下。
@@ -155,7 +157,7 @@ def build(*, purpose: str = 'final_answer', rules: str = '', request: str = '',
     report['sections']['history'] = spent
     report['sections']['total'] = used + spent
 
-    if report['sections'].get('rules', 0) + report['sections'].get('tools', 0) > budget:
+    if report['sections']['total'] > budget:
         # 规则和工具 schema 已经撑爆预算：不能静默截断关键约束
         report['over_budget'] = True
 
@@ -172,3 +174,134 @@ def chat_messages(history, question: str, purpose: str = 'answer',
     """
     body = question if not prefix else f'{prefix}\n\n{question}'
     return select(history, purpose) + [{'role': 'user', 'content': body}]
+
+
+class ContextBudgetExceeded(ValueError):
+    """本地拒绝超限请求；不会调用 provider，也不会截断当前要求。"""
+
+    error_code = 'E_CONTEXT_LIMIT'
+    certainty = 'not_executed'
+    phase = 'validate'
+
+    def __init__(self, report: dict) -> None:
+        self.report = report
+        self.safe_message = (
+            f'完整模型输入超过预算（保守估算 {report["input_tokens"]}，'
+            f'可用 {report["input_limit"]}）。请合并或拆分要求，'
+            '或由管理员减少工具目录、调整模型上下文配置。')
+        super().__init__(self.safe_message)
+
+
+def prepare_request(system: str, messages: list, *, schema=None,
+                    purpose: str = 'final_answer', settings) -> tuple[list, dict]:
+    """核算实际发送的完整请求；仅移除明确可选材料，最终硬门禁不可绕过。
+
+    UTF-8 字节数是常见 byte-level tokenizer 的保守上界；另计消息和工具调用
+    包装，并预留输出和安全余量。报告不含原文、对象编号或密钥。
+    """
+    conversation = [{'role': 'system', 'content': system}]
+    for item in messages:
+        conversation.append({'role': item[0], 'content': item[1]}
+                            if isinstance(item, tuple) else copy.deepcopy(item))
+    tool_schema = None
+    if schema is not None:
+        from langchain_core.utils.function_calling import convert_to_openai_tool
+        tool_schema = convert_to_openai_tool(schema)
+
+    limit = min(settings.llm_input_budget, settings.llm_context_window
+                - settings.llm_output_tokens - settings.llm_context_margin)
+    trimmed = []
+
+    def size(value):
+        return len(json.dumps(value, ensure_ascii=False, separators=(',', ':'),
+                              default=str).encode('utf-8'))
+
+    def report():
+        sections = {'system': size(conversation[0]),
+                    'messages': size(conversation[1:]),
+                    'tool_schema': size(tool_schema) if tool_schema else 0}
+        # Include tool choice and provider chat framing beyond the JSON content.
+        overhead = 64 + 16 * len(conversation) + (64 if tool_schema else 0)
+        total = sum(sections.values()) + overhead
+        components = {}
+        try:
+            body = json.loads(conversation[-1]['content'])
+            if isinstance(body, dict):
+                for name, keys in {
+                    'request': ('用户要求', '原目标', '合并后的要求', '按序补充', '有效补充要求'),
+                    'tools': ('可用工具',), 'history': ('对话历史',),
+                    'memory': ('会话记忆', '已有摘要', '已有事实'),
+                    'state': ('当前计划', '当前片段', '版本', '在途或未知动作', '现场'),
+                    'evidence': ('步骤输出', '已完成动作与结果', '完成条件现状', '产物引用'),
+                }.items():
+                    components[name] = sum(size(body[k]) for k in keys if k in body)
+        except (TypeError, ValueError):
+            pass
+        return {'purpose': purpose, 'estimator': 'utf8_bytes_upper_bound',
+                'input_tokens': total, 'input_limit': max(0, limit),
+                'context_window': settings.llm_context_window,
+                'reserved_output': settings.llm_output_tokens,
+                'safety_margin': settings.llm_context_margin,
+                'sections': sections, 'components': components, 'overhead': overhead,
+                'truncated': list(trimmed), 'over_budget': total > limit}
+
+    # Last message is the current request. Never drop it or system/developer rules.
+    history_disclosed = False
+    while report()['over_budget']:
+        optional = next((i for i in range(1, len(conversation) - 1)
+                         if conversation[i].get('role') in ('user', 'assistant')), None)
+        if optional is None:
+            break
+        conversation.pop(optional)
+        trimmed.append('history_message')
+        if not history_disclosed:
+            conversation[0]['content'] += (
+                '\n[上下文预算说明] 部分较早对话已省略，不能声称已读取全部历史。')
+            history_disclosed = True
+
+    # Structured planner input has explicit optional sections. All other fields,
+    # including current input, pending requirements, scope and criteria, stay intact.
+    payload = None
+    if schema and conversation:
+        try:
+            decoded = json.loads(conversation[-1]['content'])
+            if isinstance(decoded, dict):
+                payload = decoded
+        except (TypeError, ValueError):
+            pass
+
+    def sync_payload():
+        if payload is not None:
+            payload['上下文预算说明'] = (
+                '较早历史或带完整引用的结果摘要已省略；未提供的内容不能视为已阅读。')
+            conversation[-1]['content'] = json.dumps(payload, ensure_ascii=False)
+
+    if payload is not None:
+        history = payload.get('对话历史')
+        while report()['over_budget'] and isinstance(history, list) and history:
+            history.pop(0)
+            trimmed.append('embedded_history_message')
+            sync_payload()
+        if report()['over_budget'] and isinstance(payload.get('会话记忆'), str):
+            memory = payload['会话记忆']
+            # Facts are hard conclusions; remove only the prose summary.
+            facts_at = memory.find('[会话关键事实]')
+            retained = memory[facts_at:] if facts_at >= 0 else ''
+            if retained != memory:
+                payload['会话记忆'] = retained
+                trimmed.append('memory_summary')
+                sync_payload()
+        for result in payload.get('已完成动作与结果') or []:
+            if not report()['over_budget']:
+                break
+            if (isinstance(result, dict) and result.get('evidence')
+                    and result.get('summary')):
+                result['summary'] = {'omitted': True,
+                                     'reason': '完整结果请按 evidence 引用读取'}
+                trimmed.append('referenced_result_summary')
+                sync_payload()
+
+    final = report()
+    if final['over_budget']:
+        raise ContextBudgetExceeded(final)
+    return [(m['role'], m['content']) for m in conversation], final

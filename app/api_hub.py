@@ -1274,7 +1274,8 @@ class Hub:
             return record
         plan = await self.store.plan(run_id) or {}
         steps = plan.get('steps') or []
-        if not steps:
+        if not steps and await self.store.actions_of(run_id):
+            # 有动作却没有计划必须核实；首次规划尚未成功且没有动作时可以重试规划。
             return None
         # 续跑也要先占租约：否则同一份计划可能被 Worker 与本次 resume 同时执行。
         # 但已被别人持有租约时不能动它的状态——先把 running 改成 queued 就等于

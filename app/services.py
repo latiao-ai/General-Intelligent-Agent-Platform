@@ -3,12 +3,20 @@ import re
 import json
 from contextvars import ContextVar
 import time
+import logging
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 import ipaddress
 from urllib.parse import urlsplit, urlunsplit
 from pydantic import ValidationError
 from langchain_core.utils.json import parse_partial_json
 from langchain_openai import ChatOpenAI
+from openai import (APIConnectionError, APIStatusError, OpenAIError)
 from app.config import settings
+from app import context
+from app.events import emit
+
+logger = logging.getLogger(__name__)
 
 
 def clean_public_url(value: str) -> str:
@@ -115,7 +123,8 @@ def new_llm(model: str | None = None, disable_thinking: bool = False):
         api_key=settings.llm_key,
         temperature=0,
         timeout=300,
-        max_retries=1,
+        max_retries=0,  # 真实请求由下面的有限重试计数，禁止 SDK 暗中再发一次。
+        max_tokens=settings.llm_output_tokens,
     )
     if settings.llm_base_url:
         options['base_url'] = settings.llm_base_url
@@ -173,7 +182,31 @@ def _final_of(accumulated, schema):
     return None
 
 
-class AttemptTimeout(RuntimeError):
+class ModelRequestError(RuntimeError):
+    error_code = 'E_MODEL_UNAVAILABLE'
+    certainty = 'not_executed'
+    phase = 'receive'
+
+    def __init__(self, message='模型服务暂不可用，任务已保留，可稍后恢复。'):
+        self.safe_message = message
+        super().__init__(message)
+
+
+class StructuredOutputError(ModelRequestError):
+    error_code = 'E_MODEL_OUTPUT'
+
+
+class ModelConfigurationError(ModelRequestError):
+    error_code = 'E_MODEL_CONFIG'
+
+
+def _provider_failure(exc):
+    if isinstance(exc, APIStatusError) and 400 <= exc.status_code < 500 and exc.status_code != 429:
+        return ModelConfigurationError('模型配置或认证被服务端拒绝，请联系管理员检查后恢复任务。')
+    return ModelRequestError()
+
+
+class AttemptTimeout(ModelRequestError):
     """单次模型调用超时：一次尝试没能在上限内返回完整结果。
 
     safe_message 是显式标记：任务失败时 run_task 默认只透出异常类型名
@@ -183,6 +216,44 @@ class AttemptTimeout(RuntimeError):
     def __init__(self, seconds: float) -> None:
         super().__init__(f'模型调用超时：单次尝试超过 {seconds:.0f}s 仍未返回完整结果')
         self.safe_message = f'模型单次尝试超时，上限 {seconds:.0f}s'
+
+
+def _prepare(system, messages, *, schema=None, purpose='final_answer'):
+    try:
+        conversation, report = context.prepare_request(
+            system, messages, schema=schema, purpose=purpose, settings=settings)
+    except context.ContextBudgetExceeded as exc:
+        emit({'type': 'context_budget', 'report': exc.report})
+        logger.info('模型请求被上下文预算拦截：%s', exc.report)
+        raise
+    emit({'type': 'context_budget', 'report': report})
+    logger.info('模型请求上下文预算：%s', report)
+    return conversation
+
+
+def _retry_delay(exc, attempt):
+    """仅重试连接错误、429、5xx；Retry-After 太长则交给恢复，不能提前重发。"""
+    retryable = isinstance(exc, APIConnectionError) or (
+        isinstance(exc, APIStatusError)
+        and (exc.status_code == 429 or exc.status_code >= 500))
+    if not retryable:
+        return None
+    value = getattr(getattr(exc, 'response', None), 'headers', {}).get('retry-after')
+    delay = min(2.0, 0.25 * (2 ** attempt))
+    if value:
+        try:
+            delay = float(value)
+        except ValueError:
+            try:
+                date = parsedate_to_datetime(value)
+                if date.tzinfo is None:
+                    date = date.replace(tzinfo=timezone.utc)
+                delay = (date - datetime.now(timezone.utc)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                return None
+    if not 0 <= delay <= settings.llm_retry_max_delay:
+        return None
+    return delay
 
 
 # ---------- provider 请求计数（文档 observe-decide §12） ----------
@@ -232,14 +303,20 @@ async def structured_call(
     timeout = timeout if timeout and timeout > 0 else None
 
     usages = []
-    messages = [('system', system), ('human', user)]
-    for _ in range(max(1, attempts)):
-        # 每次真实请求都先记账：超时/失败也算消耗，否则预算永远算不准
-        await _note_provider_request()
+    purpose = {'ExecutionPlan': 'plan', 'RevisedPlan': 'replan',
+               'ObservationDecision': 'observe', 'SessionMemory': 'memory_extract'}.get(
+                   schema.__name__, 'transform')
+    request = user
+    for attempt in range(max(1, attempts)):
+        messages = _prepare(system, [('user', request)], schema=schema, purpose=purpose)
         if on_draft:
             on_draft(None)
-        llm = new_llm(model, disable_thinking=disable_thinking).bind_tools(
-            [schema], tool_choice=schema.__name__)
+        try:
+            llm = new_llm(model, disable_thinking=disable_thinking).bind_tools(
+                [schema], tool_choice=schema.__name__)
+        except OpenAIError:
+            raise ModelRequestError('模型配置或认证不可用，请联系管理员检查后恢复任务。') from None
+        await _note_provider_request()
         accumulated = None
         buf = ''                 # 增量累积工具调用参数，避免每次重新拼接全部分片
         # 用 None 而不是 0.0：monotonic() 是开机以来的秒数，开机不足一个
@@ -276,6 +353,13 @@ async def structured_call(
                     on_draft(draft)
         except TimeoutError:
             timed_out = True
+        except OpenAIError as exc:
+            usages.append(getattr(accumulated, 'usage_metadata', None))
+            delay = _retry_delay(exc, attempt)
+            if attempt + 1 < max(1, attempts) and delay is not None:
+                await asyncio.sleep(delay)
+                continue
+            raise _provider_failure(exc) from None
         usages.append(getattr(accumulated, 'usage_metadata', None))
         if timed_out:
             raise AttemptTimeout(timeout)
@@ -284,7 +368,18 @@ async def structured_call(
             if on_draft:
                 on_draft(parsed)
             return parsed, _combine_usage(usages)
-    raise RuntimeError('模型结构化输出失败；检查 tool calling 支持及 schema')
+        repair = ('上次输出未通过结构校验。请按 ' + schema.__name__
+                  + ' 的参数定义返回完整对象，补齐必填字段；保留原目标、权限、'
+                  '结果落点和完成条件。')
+        try:
+            original = json.loads(user)
+        except (TypeError, ValueError):
+            original = None
+        if isinstance(original, dict):
+            request = json.dumps({**original, '结构化修复要求': repair}, ensure_ascii=False)
+        else:
+            request = user + '\n[结构化修复要求] ' + repair
+    raise StructuredOutputError('模型未能生成有效的结构化结果，任务已保留，可稍后恢复。')
 
 
 async def chat_reply(system: str, messages: list[dict], model: str | None = None,
@@ -294,16 +389,31 @@ async def chat_reply(system: str, messages: list[dict], model: str | None = None
     简单问题、概念解释、闲聊都走这里——它们不需要工具，也不该被拖去检索。
     关掉推理是为了快和便宜，这条路径的价值正在于此。
     """
-    llm = new_llm(model, disable_thinking=True)
-    conversation = [('system', system)] + [
-        (m['role'], m['content']) for m in messages]
-    parts = []
-    async for chunk in llm.astream(conversation):
-        text = chunk.content
-        if isinstance(text, str) and text:
-            parts.append(text)
-            if on_delta:
-                on_delta(text)
-    return ''.join(parts).strip()
-
-
+    for attempt in range(2):
+        conversation = _prepare(system, messages)
+        try:
+            llm = new_llm(model, disable_thinking=True)
+        except OpenAIError:
+            raise ModelRequestError('模型配置或认证不可用，请联系管理员检查后恢复任务。') from None
+        await _note_provider_request()
+        parts = []
+        try:
+            timeout = settings.llm_attempt_timeout
+            async with asyncio.timeout(timeout if timeout > 0 else None):
+                async for chunk in llm.astream(conversation):
+                    text = chunk.content
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+                        if on_delta:
+                            on_delta(text)
+            return ''.join(parts).strip()
+        except TimeoutError:
+            raise AttemptTimeout(timeout) from None
+        except OpenAIError as exc:
+            delay = _retry_delay(exc, attempt)
+            # 已向界面发出正文时不透明重试，避免两次回答混在一起。
+            if not parts and attempt == 0 and delay is not None:
+                await asyncio.sleep(delay)
+                continue
+            raise _provider_failure(exc) from None
+    raise ModelRequestError()

@@ -137,6 +137,7 @@ class SessionMemory(BaseModel):
 
 
 class AgentState(TypedDict, total=False):
+    planning_failure: dict             # 明确的规划/模型故障及可恢复原因
     task_id: str
     user_input: str
     # 编排计划：{'steps': [{'tool','args','why'}], 'summary': str}

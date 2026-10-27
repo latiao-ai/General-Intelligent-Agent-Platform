@@ -23,9 +23,11 @@ from app import (context, errors as errors_module, execution_control,
                  observation as observation_module,
                  outcome as outcome_module, profile,
                  run_inputs as run_inputs_module)
+from app import services as services_module
 from app import tool_authorization as authorization_module
 from app import tool_context as tool_context_module
 from app.config import settings
+from app.pg_store import BudgetExceeded
 from app.events import action, emit, stage_end, stage_start, thought
 from app.capabilities.base import ToolError
 from app.schemas import ExecutionPlan, ObservationDecision, RevisedPlan
@@ -95,15 +97,28 @@ def _catalog_text(catalog) -> str:
 
 
 def fallback_steps(state: dict) -> list[dict]:
-    """规划失败时的兜底：**不猜业务**。
-
-    这里以前会拼一条"检索 → 抓正文 → 成稿 → 渲染"的固定链路，等于把网页研究
-    业务写死进内核，而且用户只是想问句话也会被拉去跑一分钟检索。
-    中台不该替用户决定做什么——退化成一次直接作答，并明说规划失败。
-    """
-    # 能力裁剪后只剩「检索 → 抓正文 → 转 HTML →（可选）部署」这一条业务链，
-    # 兜底不再替用户拼它，直接返回空计划，由 plan() 如实报失败。
+    """旧调用点兼容：规划失败不猜业务，也不生成伪装成功的回答步骤。"""
     return []
+
+
+def planning_failure(state: dict, exc: Exception, *, stage='plan', usage=None) -> dict:
+    """明确停下；服务故障可恢复，输入超限等待调整，保留原计划与已完成事实。"""
+    limited = isinstance(exc, (context.ContextBudgetExceeded, BudgetExceeded))
+    code = getattr(exc, 'error_code',
+                   'E_RUN_BUDGET' if isinstance(exc, BudgetExceeded) else 'E_PLANNING_UNAVAILABLE')
+    detail = getattr(exc, 'safe_message', None) or '模型未能生成可执行计划，请稍后恢复。'
+    failure = {'stage': stage, 'code': code, 'recoverable': True}
+    if isinstance(exc, context.ContextBudgetExceeded):
+        failure['context_report'] = exc.report
+    emit(action('预算限制，暂时停止' if limited else '规划暂未完成', detail, '⚠️'))
+    return {'plan': dict(state.get('plan') or {'steps': []}),
+            'step_index': int(state.get('step_index') or 0),
+            'status': 'waiting_input' if limited else 'interrupted',
+            'failure': detail, 'planning_failure': failure, 'next_route': 'stop',
+            'usage': list(usage if usage is not None else state.get('usage') or []),
+            'errors': list(state.get('errors') or []) + [
+                {'stage': stage, 'type': type(exc).__name__, 'error_code': code}],
+            **_carry_waiting(state)}
 
 
 def describe_plan(steps: list[dict], summary: str = '') -> str:
@@ -662,7 +677,7 @@ async def plan(state):
             if round_index == 0:
                 # 把错误原文喂回去，让模型在同一份工具清单上修
                 payload = json.dumps({
-                    '用户要求': question,
+                    **brief,
                     '上次计划': data.get('steps'),
                     '校验错误': blocking,
                     '要求': '按校验错误修正计划；只能用清单里的工具；'
@@ -671,16 +686,10 @@ async def plan(state):
                     '现场': _scene_brief(state.get('scene')),
                     '可用工具': _catalog_text(catalog),
                 }, ensure_ascii=False)
+    except (execution_control.LeaseLost, execution_control.ControlStopped):
+        raise
     except Exception as exc:
-        # 规划失败不该让任务直接崩：退回一条保守的固定计划。
-        # 把异常类别透出来——否则界面上只有一个"规划失败"，没法判断是网关超时
-        # 还是 schema 两次校验都没过。
-        hint = getattr(exc, 'safe_message', None) or type(exc).__name__
-        emit(action('规划失败', f'{hint}，改用默认计划', '⚠️'))
-        errors = list(state.get('errors', [])) + [
-            {'stage': 'plan', 'type': type(exc).__name__}]
-        steps = None
-        issues = []
+        return planning_failure(state, exc, usage=usage)
 
     # 两轮修复后仍有结构化错误：**停下来**，不带着坏计划执行。
     #
@@ -695,13 +704,15 @@ async def plan(state):
         return {'plan': {'steps': [], 'summary': summary or '计划未通过校验'},
                 'step_index': 0, 'usage': usage, 'status': 'waiting_input',
                 'failure': f'计划没有通过校验（{detail}）。'
-                           f'可以补充更具体的要求，或明确要用的工具再试。',
+                           '目标已保留，未执行这份计划；可以调整要求后继续。',
+                'planning_failure': {'stage': 'plan', 'code': 'E_PLAN_INVALID',
+                                     'recoverable': True},
                 'errors': errors,
                 **_carry_waiting(state)}
 
     if not steps:
-        steps, _ = _valid_steps(fallback_steps(state), catalog)
-        summary = summary or '降级计划'
+        return planning_failure(state, services_module.StructuredOutputError(
+            '模型没有提供可执行步骤，尚未执行业务操作，可稍后恢复。'), usage=usage)
 
     # 能力不可用：模型可能已经把这些步骤删掉了，但**用户仍需知道**为什么没做成
     # 那件事（不然只会看到"已产出 script.md"，以为视频做完了）。
@@ -744,7 +755,7 @@ async def plan(state):
                        **({'warnings': warnings} if warnings else {}),
                        **({'blocked': blocked_notes} if blocked_notes else {})},
               'plan_version': 1,
-              'step_index': 0, 'usage': usage, 'status': 'planned'}
+              'step_index': 0, 'usage': usage, 'status': 'planned', 'planning_failure': {}}
     if blocked_notes:
         result['capability_blocked'] = blocked_notes
     if errors:
@@ -1094,8 +1105,9 @@ async def revise_plan(state):
         asked_questions=asked_before,
         scene=_scene_brief(state.get('scene')),
         tools=[{'name': tool.name, 'label': tool.label,
+                'description': tool.description,
                 'effect': tool.effect, 'args': tool.args}
-               for tool in catalog][:_catalog_limit()],
+               for tool in catalog],
         budget={'revisions_used': revisions,
                 'revisions_left': settings.run_max_revisions - revisions})
     payload = json.dumps(decision, ensure_ascii=False, default=str)
@@ -1109,14 +1121,12 @@ async def revise_plan(state):
             payload, disable_thinking=settings.llm_parse_disable_thinking)
         usage.append({'stage': 'revise', 'model_name': settings.llm_model,
                       'model': call_usage})
+    except (execution_control.LeaseLost, execution_control.ControlStopped):
+        raise
     except Exception as exc:                            # noqa: BLE001
-        hint = getattr(exc, 'safe_message', None) or type(exc).__name__
-        emit(action('调整失败', f'{hint}，先停在这里', '⚠️'))
-        return {'status': 'waiting_input', 'usage': usage, 'intent_changed': False,
-                'pending_inputs': pending,
-                'failure': f'按新要求调整计划失败（{hint}），'
-                           f'原计划已作废、未继续执行。可以再发一次要求重试。',
-                **_carry_waiting(state, intent=intent)}
+        return {**planning_failure({**state, 'intent_version': intent}, exc,
+                                    stage='revise', usage=usage),
+                'intent_changed': False, 'pending_inputs': pending}
 
     data = revised.model_dump()
     raw_steps = data.get('steps') or []
@@ -1148,10 +1158,12 @@ async def revise_plan(state):
             questions = _fresh_questions(data.get('questions') or [], asked_before)
             asked_now = [str(q).strip() for q in (data.get('questions') or [])
                          if str(q).strip()]
+        except (execution_control.LeaseLost, execution_control.ControlStopped):
+            raise
         except Exception as exc:                        # noqa: BLE001
-            # 重试也失败：退回到"如实问一次"，但不装作计划已经成立
-            logger.warning('放弃重复追问后的重试用例失败：%s', type(exc).__name__)
-            questions = asked_now
+            return {**planning_failure({**state, 'intent_version': intent}, exc,
+                                        stage='revise', usage=usage),
+                    'intent_changed': False, 'pending_inputs': pending}
     next_version = int(plan_row.get('version') or 0) + 1
     kept, issues = run_inputs_module.validate_revision(
         raw_steps, plan_version=next_version, done_steps=done_steps,
@@ -1218,14 +1230,10 @@ async def revise_plan(state):
         'step_index': 0, 'intent_changed': False, 'pending_inputs': [],
         'intent_version': intent,
         'revision_count': revisions + 1,
+        'status': 'planned', 'planning_failure': {},
         'revision_issues': issues + issues2,
         'usage': usage,
     }
-
-
-def _catalog_limit() -> int:
-    """给模型的工具清单上限：工具很多时不必全塞进修订提示词。"""
-    return int(getattr(settings, 'revision_catalog_limit', 24) or 24)
 
 
 def _asked_questions(state: dict) -> list[str]:
@@ -1318,6 +1326,8 @@ async def observe_result(state):
     为什么单独一个节点而不是塞进 run_step：观察是每个工具之后都要做的便宜判断，
     而模型决策是贵的。分开之后，"确定步骤连着跑"的链路一次模型都不多调。
     """
+    if state.get('planning_failure') and state.get('status') in ('waiting_input', 'interrupted'):
+        return {'next_route': 'stop'}
     book = ledger_module.current_ledger()
     context_ = execution_control.require()
     control, actions = {}, []
@@ -1517,16 +1527,8 @@ async def decide_next(state):
             return {'decision_id': decision_id, 'next_route': observation_module.ROUTE_STEP}
         return {'decision_id': decision_id, 'next_route': 'stop'}
 
+    # provider 预算由 services 的真实发送入口扣减；预检拒绝不扣，重试逐次扣。
     usage = list(state.get('usage') or [])
-    try:
-        await store_.consume_budget(context_, run_id=run_id, key='provider_requests',
-                                   limit=settings.run_max_provider_requests)
-    except Exception as exc:                            # noqa: BLE001
-        await store_.finish_decision(decision_id, status='budget_exhausted',
-                                     error_code='budget')
-        return {'status': 'waiting_input', 'next_route': 'stop',
-                'failure': f'模型请求预算用尽：{exc}',
-                **_carry_waiting(state)}
 
     emit(action('正在根据结果决定下一步',
                 f'要求版本 {state.get("intent_version")} · 结果水位 {state.get("observation_seq")}',
@@ -1538,16 +1540,13 @@ async def decide_next(state):
             disable_thinking=settings.llm_parse_disable_thinking)
         usage.append({'stage': 'observe', 'model_name': settings.llm_model,
                       'model': call_usage})
+    except (execution_control.LeaseLost, execution_control.ControlStopped):
+        raise
     except Exception as exc:                            # noqa: BLE001
-        hint = getattr(exc, 'safe_message', None) or type(exc).__name__
         await store_.finish_decision(decision_id, status='failed',
-                                     error_code='model_error')
-        emit(action('判断失败', f'{hint}，先停在这里', '⚠️'))
-        return {'decision_id': decision_id, 'usage': usage, 'next_route': 'stop',
-                'status': 'waiting_input',
-                'failure': f'根据结果判断下一步失败（{hint}）。'
-                           f'已完成的步骤保留，可以补充要求后继续。',
-                **_carry_waiting(state)}
+                                     error_code=getattr(exc, 'error_code', 'model_error'))
+        return {**planning_failure(state, exc, stage='observe', usage=usage),
+                'decision_id': decision_id}
 
     data = decision.model_dump()
     kind = str(data.get('kind') or '')
@@ -1636,6 +1635,7 @@ async def decide_next(state):
                      'superseded': [item for item in (data.get('superseded') or [])]},
             'plan_version': next_version,
             'step_index': 0,
+            'status': 'planned', 'planning_failure': {},
             'next_route': 'persist_plan',
         }
 
@@ -2240,6 +2240,16 @@ async def run_step(state):
         raise
     except Exception as exc:                      # noqa: BLE001
         emit(stage_end(name, time.perf_counter() - started, '失败', tool.label))
+        if tool.effect == 'read' and isinstance(
+                exc, (context.ContextBudgetExceeded, services_module.ModelRequestError,
+                      BudgetExceeded)):
+            if book is not None and action_id:
+                await book.fail_from_exception(step_id=step_id, action_id=action_id,
+                                               attempt_id=attempt_id, exc=exc,
+                                               effect=tool.effect)
+            # 本地回答未完成不应撤销前面已经成功的业务修改。
+            return {**planning_failure(state, exc, stage=name),
+                    'step_label': tool.label, 'step_index': index}
         outcome = errors_module.as_outcome(exc)
         hint = outcome.safe_message or type(exc).__name__
         emit(action(f'{tool.label}失败', hint, '⚠️'))
@@ -2426,7 +2436,7 @@ def _snapshot_state(state: dict) -> dict:
             'decision_id', 'criteria_state', 'revision_reasons',
             # 追问上下文：下一轮修订要知道问过什么、问到第几版
             'intent_version', 'processed_intent_version',
-            'asked_questions', 'clarification')
+            'asked_questions', 'clarification', 'planning_failure')
     snapshot = {key: state.get(key) for key in keep if key in state}
     # documents 里不放大段正文（正文在 artifacts/<task>/sources/*.txt）
     if isinstance(snapshot.get('documents'), list):

@@ -92,6 +92,9 @@ def _next_after_persist(state) -> str:
     """计划提交之后：要求又变了就重新修订，否则继续执行（或直接核对完成）。"""
     if state.get('intent_changed'):
         return 'revise_plan'
+    if state.get('status') in ('waiting_input', 'waiting_approval', 'failed',
+                               'paused', 'interrupted'):
+        return 'end'
     if (state.get('plan') or {}).get('steps'):
         return 'run_step'
     return 'verify_completion'
@@ -99,12 +102,12 @@ def _next_after_persist(state) -> str:
 
 def _next_after_revise(state) -> str:
     """修订之后：拿到新计划就去提交，否则按停下来的原因退出。"""
+    if state.get('status') in ('waiting_input', 'waiting_approval', 'failed',
+                               'paused', 'interrupted'):
+        return 'end'
     steps = (state.get('plan') or {}).get('steps') or []
     if steps and not state.get('intent_changed'):
         return 'persist_plan'
-    if state.get('status') in ('waiting_input', 'waiting_approval', 'failed',
-                               'paused'):
-        return 'end'
     return 'verify_completion'
 
 
@@ -142,7 +145,7 @@ def build_graph(checkpointer_=None):
         'plan', 'revise_plan', 'run_step', 'verify_completion'))
     graph.add_edge('plan', 'persist_plan')
     graph.add_conditional_edges('persist_plan', _next_after_persist,
-                                _map('revise_plan', 'run_step', 'verify_completion'))
+                                _map('revise_plan', 'run_step', 'verify_completion', 'end'))
     graph.add_conditional_edges('revise_plan', _next_after_revise,
                                 _map('persist_plan', 'verify_completion'))
     # 每个工具之后都做程序观察：便宜、无模型请求；要不要叫模型由观察决定

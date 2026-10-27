@@ -78,7 +78,7 @@ def reply_text(state: dict) -> str:
     if status == 'cancelled':
         return '已停止当前任务。已生成的本地产物仍然保留。'
     if status == 'interrupted':
-        return '执行中断了（执行者与任务的连接断开）。可重新发起一次。'
+        return (state.get('failure') or '执行中断，任务与已完成结果均已保留。') + ' 可以继续当前运行。'
     return f'任务结束，状态：{status}'
 
 

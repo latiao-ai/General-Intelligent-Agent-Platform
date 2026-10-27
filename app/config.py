@@ -52,6 +52,14 @@ class Settings:
     # 单次模型调用的硬超时（秒）。没有上限时一旦卡住，会一直耗到整个任务
     # 300s 的预算。超时即失败、不重试（重试只会把耗时翻倍）。
     llm_attempt_timeout: float = float(os.getenv('LLM_ATTEMPT_TIMEOUT', '180'))
+    # 完整请求预算：包含 system、消息、工具 schema 与序列化开销。
+    # 按实际模型窗口配置；输入使用 UTF-8 字节上界保守估算，不依赖联网分词器。
+    llm_context_window: int = max(1, int(os.getenv('LLM_CONTEXT_WINDOW', '32768')))
+    llm_input_budget: int = max(1, int(os.getenv('LLM_INPUT_BUDGET', '24576')))
+    llm_output_tokens: int = max(1, int(os.getenv('LLM_OUTPUT_TOKENS', '4096')))
+    llm_context_margin: int = max(0, int(os.getenv('LLM_CONTEXT_MARGIN', '2048')))
+    llm_retry_max_delay: float = max(0.0, min(30.0, float(
+        os.getenv('LLM_RETRY_MAX_DELAY', '2'))))
     artifact_dir: Path = PROJECT_ROOT / os.getenv('ARTIFACT_DIR', 'artifacts')
     # 数据库：**只支持 PostgreSQL**（SQLite 实现已删除）。仓储接口见
     # app/persistence.py；留空会在 open_store() 里直接报错，不静默退回本地文件库。
@@ -102,9 +110,6 @@ class Settings:
     # 一次运行最多因补充要求修订几次计划。超过就停下来等用户显式继续——
     # 无限修订等于让一次任务永远不结束，而且每一次都要一次模型调用。
     run_max_revisions: int = max(1, int(os.getenv('RUN_MAX_REVISIONS', '3')))
-    # 修订时随提示词带给模型的工具清单条数上限（工具很多时不必全塞进去）。
-    revision_catalog_limit: int = max(4, int(
-        os.getenv('REVISION_CATALOG_LIMIT', '24')))
     # ---------- 结果观察与自主决策（《智能体中台说明书》） ----------
     # 功能开关：关掉时观察节点只做程序事实采集，不调用模型（等价于"按计划跑完"）。
     observe_enabled: bool = (
