@@ -81,3 +81,27 @@ async def bearer_for_current(server) -> str | None:
     user_id = str((run or {}).get('owner_user_id') or '') or 'default'
     return await bearer_for(
         store, tenant_id=tenant_id, user_id=user_id, server_id=server.id)
+
+
+async def discovery_scope(servers) -> tuple:
+    """目录缓存的身份与凭据版本，不含密钥；每次命中前重新核对。"""
+    from app.ledger import current_ledger
+    from app import execution_control
+    book = current_ledger()
+    context = execution_control.require()
+    if book is None or context is None:
+        raise credentials_module.CredentialMissing('工具发现缺少可信执行主体')
+    run = await book.store.run(context.run_id)
+    if not run:
+        raise credentials_module.CredentialMissing('工具发现缺少有效运行主体')
+    tenant = str(run.get('tenant_id') or 'default')
+    user = str(run.get('owner_user_id') or 'default')
+    scope = []
+    for server in servers:
+        binding = await binding_for_server(book.store, tenant_id=tenant,
+                                           user_id=user, server_id=server.id)
+        if binding is None:
+            raise credentials_module.CredentialMissing('工具发现缺少有效凭据绑定')
+        scope.append((server.id, binding.binding_id, binding.revision,
+                      credentials_module.parse_scope(binding.scope)))
+    return tenant, user, scope

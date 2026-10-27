@@ -19,8 +19,6 @@ import hashlib
 import json
 import logging
 import time
-from collections import OrderedDict
-from contextvars import ContextVar
 
 from app.integrations import mcp_adapter, mcp_servers
 from app.capabilities import registry
@@ -90,8 +88,32 @@ MCP_PREFIX = mcp_servers.MCP_PREFIX
 _MCP_CACHE: dict = {'at': 0.0, 'tools': [], 'errors': {}, 'signature': (),
                     'capabilities': {}}
 _MCP_TTL = 300.0
-_SCOPED_MCP_CACHES = OrderedDict()
-_ACTIVE_MCP_CACHE = ContextVar('active_mcp_cache', default=None)
+_SCOPED_MCP_CACHES: dict = {}
+
+
+def _current_mcp_cache() -> dict:
+    """正式模式的目录按可信运行隔离，比按用户隔离更严格。
+
+    由账本取作用域，不能让模型选择。同步校验和异步发现读取同一份目录；
+    不用 ContextVar 写回缓存，避免图的兄弟节点丢失上下文更新。
+    """
+    from app.ledger import current_ledger
+    from app.execution_control import require
+    book = current_ledger()
+    execution = getattr(book, 'context', None) or require()
+    if book is None or execution is None:
+        if not getattr(settings, 'tool_policy_enforced', False):
+            return _MCP_CACHE
+        return {'at': 0.0, 'tools': [], 'errors': {}, 'capabilities': {}}
+    key = (id(book.store), execution.run_id, execution.lease_epoch)
+    if key not in _SCOPED_MCP_CACHES:
+        if len(_SCOPED_MCP_CACHES) >= 128:
+            oldest = min(_SCOPED_MCP_CACHES,
+                         key=lambda item: _SCOPED_MCP_CACHES[item].get('at', 0))
+            _SCOPED_MCP_CACHES.pop(oldest, None)
+        _SCOPED_MCP_CACHES[key] = {'at': 0.0, 'tools': [], 'errors': {},
+                                   'signature': (), 'capabilities': {}}
+    return _SCOPED_MCP_CACHES[key]
 
 
 def _signature() -> tuple:
@@ -100,41 +122,6 @@ def _signature() -> tuple:
     body = json.dumps([vars(s) for s in mcp_servers.servers()],
                       sort_keys=True, default=str)
     return (settings.deploy_enabled, hashlib.sha256(body.encode()).hexdigest())
-
-
-async def _discovery_cache():
-    """不同企业、用户和凭据不能共用发现结果；任务内用 ContextVar 持有视图。"""
-    from app import execution_control, ledger, mcp_connections
-    book = ledger.current_ledger()
-    execution = execution_control.require()
-    if book is None or execution is None:
-        _ACTIVE_MCP_CACHE.set(_MCP_CACHE)
-        return _MCP_CACHE
-    run = await book.store.run(execution.run_id)
-    if not run:
-        # 主体读取不到时不复用任何已有目录，由发现路径按强制政策拒绝。
-        cache = {'at': 0.0, 'tools': [], 'errors': {}, 'signature': (), 'capabilities': {}}
-        _ACTIVE_MCP_CACHE.set(cache)
-        return cache
-    tenant = str(run.get('tenant_id') or 'default')
-    user = str(run.get('owner_user_id') or 'default')
-    revisions = []
-    if getattr(settings, 'tool_policy_enforced', False):
-        for server in mcp_servers.servers():
-            binding = await mcp_connections.binding_for_server(
-                book.store, tenant_id=tenant, user_id=user, server_id=server.id)
-            revisions.append((server.id, binding.binding_id, binding.revision)
-                             if binding else (server.id, '', 0))
-    key = (id(book.store), tenant, user, tuple(revisions))
-    cache = _SCOPED_MCP_CACHES.get(key)
-    if cache is None:
-        cache = {'at': 0.0, 'tools': [], 'errors': {}, 'signature': (), 'capabilities': {}}
-        _SCOPED_MCP_CACHES[key] = cache
-    _SCOPED_MCP_CACHES.move_to_end(key)
-    while len(_SCOPED_MCP_CACHES) > 128:
-        _SCOPED_MCP_CACHES.popitem(last=False)
-    _ACTIVE_MCP_CACHE.set(cache)
-    return cache
 
 
 async def _subject_token(server):
@@ -309,9 +296,20 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
     - **部署工具也在这里注册**：它由服务端声明、身份是 `mcp:<server>:<tool>`，
       只是多挂了一个由 publishing 能力包提供的适配器（闸门 + 回执归一）。
     """
-    cache = await _discovery_cache()
     now = time.monotonic()
+    cache = _current_mcp_cache()
     signature = _signature()
+    if getattr(settings, 'tool_policy_enforced', False):
+        # 每次检查绑定和密钥，撤权不能等五分钟 TTL。明文不进入缓存。
+        try:
+            from app.mcp_connections import discovery_scope
+            scope = await discovery_scope(mcp_servers.servers())
+            tokens = await asyncio.gather(*(_subject_token(s) for s in mcp_servers.servers()))
+            signature = (signature, scope, tuple(hashlib.sha256((token or '').encode()).hexdigest()
+                                          for token in tokens))
+        except Exception:
+            cache.update(at=0.0, tools=[], capabilities={}, signature=())
+            raise
     cached = (cache['tools'] and cache.get('signature') == signature
               and now - cache['at'] < _MCP_TTL)
     if cached and not force:
@@ -394,7 +392,7 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
         if stub is not None:
             tools.append(stub)
     cache.update(at=now, tools=tools, errors=errors, signature=signature,
-                      capabilities=capabilities)
+                 capabilities=capabilities)
     return tools
 
 
@@ -427,8 +425,7 @@ def unusable_reason(server_id: str) -> str:
 
 def known_inner_names(server_id: str) -> dict:
     """某个服务端上一次发现到的内部能力清单（没有就空）。"""
-    cache = _ACTIVE_MCP_CACHE.get() or _MCP_CACHE
-    return dict((cache.get('capabilities') or {}).get(server_id) or {})
+    return dict((_current_mcp_cache().get('capabilities') or {}).get(server_id) or {})
 
 
 def _check_inner_name(server, args: dict, capabilities: dict) -> None:
@@ -494,7 +491,7 @@ def _deploy_placeholder(errors: dict):
 
 def mcp_status() -> dict:
     """MCP 连接态势：给 /api/health 与排障用。"""
-    cache = _ACTIVE_MCP_CACHE.get() or _MCP_CACHE
+    cache = _current_mcp_cache()
     return {'tools': len(cache['tools']),
             'errors': dict(cache.get('errors') or {}),
             'scoped_catalogs': len(_SCOPED_MCP_CACHES),

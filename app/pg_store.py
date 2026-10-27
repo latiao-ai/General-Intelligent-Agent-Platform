@@ -31,6 +31,14 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+
+class SessionGoalConflict(RuntimeError):
+    """会话已有未结束目标；调用方应向该 run 提交补充。"""
+
+    def __init__(self, task_id: str, run_id: str) -> None:
+        super().__init__('会话已有未结束目标，请向当前运行提交补充要求')
+        self.task_id, self.run_id = task_id, run_id
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
     session_id    TEXT PRIMARY KEY,
@@ -1145,6 +1153,85 @@ class PostgresStore:
         return out
 
     # ---------- 任务 ----------
+
+    async def create_goal(self, task_id: str, run_id: str, session_id: str,
+                          message: str, *, tenant_id: str, owner_user_id: str,
+                          owner_role: str = 'member', scene: dict | None = None,
+                          request_spec: dict | None = None) -> dict:
+        """会话准入、任务、运行、消息及请求键关联同事务提交。
+
+        请求键先锁、会话后锁。事务提交前不会派发任务；崩溃只可能全部回滚或
+        留下带 task/run 的可重放请求，不能留下已执行但查不到任务的占位。
+        """
+        from app.idempotency import IdempotencyConflict, IdempotencyInFlight
+
+        stamp = now()
+        async with self._lease() as conn:
+            if request_spec:
+                scope = request_spec['scope']
+                await self._run(conn, 'SELECT pg_advisory_xact_lock(hashtext(%s))',
+                                ('request:' + scope,))
+                row = await self._one(conn, 'SELECT * FROM request_keys '
+                                      'WHERE scope_key=%s FOR UPDATE', (scope,))
+                if row and float(row['expires_at']) < time.time():
+                    await self._run(conn, 'DELETE FROM request_keys WHERE scope_key=%s',
+                                    (scope,))
+                    row = None
+                if row:
+                    if row['fingerprint'] != request_spec['fingerprint']:
+                        raise IdempotencyConflict('该幂等键已用于不同内容的请求')
+                    if row.get('task_id'):
+                        return {'task_id': row['task_id'], 'run_id': row['run_id'],
+                                'session_id': row['session_id'], 'replayed': True}
+                    # 旧版本的孤立占位无法证明没有执行过，不可盲目重建任务。
+                    raise IdempotencyInFlight('旧请求占位尚未关联任务，需要核实后重试')
+                else:
+                    await self._run(conn, 'INSERT INTO request_keys '
+                        '(scope_key, client_key, tenant_id, owner_user_id, endpoint, '
+                        'fingerprint, created_at, expires_at) '
+                        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s)',
+                        (scope, request_spec['client_key'], tenant_id, owner_user_id,
+                         'tasks.create', request_spec['fingerprint'], stamp,
+                         time.time() + settings.idempotency_ttl_seconds))
+
+            await self._run(conn, 'INSERT INTO sessions '
+                '(session_id, tenant_id, owner_user_id, created_at, updated_at) '
+                'VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING',
+                (session_id, tenant_id, owner_user_id, stamp, stamp))
+            session = await self._one(conn, 'SELECT * FROM sessions '
+                                      'WHERE session_id=%s FOR UPDATE', (session_id,))
+            if (session['tenant_id'], session['owner_user_id']) != (tenant_id, owner_user_id):
+                raise PermissionError('会话不属于当前主体')
+            current = await self._one(conn,
+                'SELECT r.task_id, r.run_id FROM tasks t JOIN tasks_meta m '
+                'ON m.task_id=t.task_id JOIN runs r ON r.run_id=m.current_run_id '
+                "WHERE t.session_id=%s AND r.status NOT IN "
+                "('succeeded','partially_succeeded','failed','cancelled') "
+                'ORDER BY r.created_at LIMIT 1', (session_id,))
+            if current:
+                raise SessionGoalConflict(current['task_id'], current['run_id'])
+            await self._run(conn, 'INSERT INTO tasks '
+                '(task_id,session_id,message,status,created_at,updated_at) '
+                "VALUES (%s,%s,%s,'queued',%s,%s)",
+                (task_id, session_id, message, stamp, stamp))
+            await self._run(conn, 'INSERT INTO tasks_meta '
+                '(task_id,tenant_id,owner_user_id,goal,current_run_id,created_at,scene_context_json) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s)',
+                (task_id, tenant_id, owner_user_id, message, run_id, stamp,
+                 json.dumps(scene or {}, ensure_ascii=False)))
+            await self._run(conn, 'INSERT INTO runs '
+                '(run_id,task_id,tenant_id,status,owner_user_id,owner_role,created_at,updated_at) '
+                "VALUES (%s,%s,%s,'queued',%s,%s,%s,%s)",
+                (run_id, task_id, tenant_id, owner_user_id, owner_role, stamp, stamp))
+            await self._run(conn, 'INSERT INTO messages (session_id,role,content,created_at) '
+                "VALUES (%s,'user',%s,%s)", (session_id, message, stamp))
+            await self._run(conn, 'UPDATE sessions SET updated_at=%s WHERE session_id=%s',
+                            (stamp, session_id))
+            if request_spec:
+                await self._run(conn, 'UPDATE request_keys SET task_id=%s,run_id=%s,session_id=%s '
+                    'WHERE scope_key=%s', (task_id, run_id, session_id, request_spec['scope']))
+        return {'task_id': task_id, 'run_id': run_id, 'session_id': session_id,
+                'replayed': False}
 
     async def create_task(self, task_id: str, session_id: str, message: str) -> None:
         stamp = now()

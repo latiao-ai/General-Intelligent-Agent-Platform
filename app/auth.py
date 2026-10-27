@@ -158,6 +158,9 @@ async def principal_from_session(request: Request, store):
         role=row.get('role') or 'member',
         platform_id=row.get('platform_id') or '',
         auth_session_id=row['auth_session_id'],
+        connection_id=row.get('connection_id') or '',
+        subject=row.get('subject') or '',
+        identity_provider_id=row.get('identity_provider_id') or '',
         authenticated=True)
 
 

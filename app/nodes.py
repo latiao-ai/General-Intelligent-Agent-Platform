@@ -859,7 +859,7 @@ async def intake(state):
             emit(action('读取补充要求',
                         f'{len(pending)} 条待纳入的要求（第 {pending[0]["input_seq"]} 条起）',
                         '📝'))
-        prior = {'result_locus': saved_locus} if saved_locus else {}
+        prior = dict(saved_plan)
         return {**updates, 'entry_route': 'revise_plan',
                 **({'plan': prior} if prior else {})}
     if steps:
@@ -884,7 +884,7 @@ async def intake(state):
             # 片段跑完不等于任务完成：先去核对完成条件（文档 §2 第 5 条）
             'entry_route': ('verify_completion' if index >= len(steps)
                             else 'run_step'),
-            'plan': {'steps': steps,
+            'plan': {**saved_plan, 'steps': steps,
                      'summary': plan_row.get('goal') or '续跑',
                      'kind': plan_row.get('kind') or '',
                      'result_locus': saved_locus,
@@ -999,6 +999,44 @@ REVISION_SYSTEM = (
 )
 
 
+def revision_metadata(data: dict, previous: dict, fields_set=None) -> tuple[dict, list[dict]]:
+    """两种修订共用的目标约束。省略字段继承，完成条件只能累加。"""
+    provided = set(data) if fields_set is None else set(fields_set)
+    old_locus = str(previous.get('result_locus') or '')
+    proposed = str(data.get('result_locus') or old_locus)
+    issues = []
+    if old_locus and proposed != old_locus:
+        issues.append({'code': 'result_locus_changed',
+                       'detail': '修订不能改变原目标的结果落点；如需改变目标，请先结束当前目标再新建任务'})
+    criteria, seen = [], set()
+    replacement_ids = {}
+    for step in previous.get('steps') or []:
+        if step.get('step_id') in (data.get('superseded') or []):
+            replacements = [new for new in (data.get('steps') or [])
+                            if new.get('tool') == step.get('tool')]
+            if len(replacements) == 1:
+                replacement_ids[step['step_id']] = replacements[0]['step_id']
+    for item in [*(previous.get('completion_criteria') or []),
+                 *(data.get('completion_criteria') or [])]:
+        item = dict(item)
+        if item.get('kind') == 'tool_succeeded' and item.get('target') in replacement_ids:
+            item['target'] = replacement_ids[item['target']]
+        key = json.dumps(item, sort_keys=True, ensure_ascii=False)
+        if key not in seen:
+            seen.add(key)
+            criteria.append(item)
+    segment = (data.get('after_segment') if 'after_segment' in provided
+               else previous.get('after_segment')) or 'verify'
+    goal = (data.get('observation_goal') if 'observation_goal' in provided
+            else previous.get('observation_goal')) or ''
+    if segment not in ('observe', 'verify') or (segment == 'observe' and not goal.strip()):
+        issues.append({'code': 'bad_segment_policy',
+                       'detail': '片段策略只能是 observe/verify，observe 必须给出观察目标'})
+    return {'result_locus': old_locus or proposed,
+            'completion_criteria': criteria, 'after_segment': segment,
+            'observation_goal': goal if segment == 'observe' else ''}, issues
+
+
 async def revise_plan(state):
     """按最新要求重写**剩余**计划（文档 §5 第十步）。
 
@@ -1016,6 +1054,11 @@ async def revise_plan(state):
     actions = await store_.actions_of(run_id)
     plan_row = await store_.plan(run_id) or {}
     old_steps = plan_row.get('steps') or []
+    previous = dict((state.get('plan') or {}))
+    # 快照保留完整计划元数据；plans 表本身只有版本、步骤和目标。
+    if hasattr(store_, 'run_snapshot'):
+        snapshot = await store_.run_snapshot(run_id) or {}
+        previous = {**((snapshot.get('state') or {}).get('plan') or {}), **previous}
     intent = int(info.get('intent_version') or 1)
     processed = int(info.get('processed_intent_version') or 0)
     revisions = int(state.get('revision_count') or 0)
@@ -1042,7 +1085,10 @@ async def revise_plan(state):
         inputs=pending, plan={'version': plan_row.get('version'),
                               'intent_version': plan_row.get('intent_version'),
                               'goal': plan_row.get('goal'),
-                              'steps': old_steps},
+                              'steps': old_steps, **{
+                                  key: previous[key] for key in (
+                                      'result_locus', 'completion_criteria',
+                                      'after_segment', 'observation_goal') if key in previous}},
         step_outputs=outputs, actions=actions, intent_version=intent,
         processed_intent_version=processed,
         asked_questions=asked_before,
@@ -1097,6 +1143,7 @@ async def revise_plan(state):
             usage.append({'stage': 'revise_no_repeat', 'model_name': settings.llm_model,
                           'model': retry_usage})
             data = retried.model_dump()
+            revised = retried
             raw_steps = data.get('steps') or []
             questions = _fresh_questions(data.get('questions') or [], asked_before)
             asked_now = [str(q).strip() for q in (data.get('questions') or [])
@@ -1147,10 +1194,10 @@ async def revise_plan(state):
                 'pending_inputs': pending,
                 'failure': '按新要求调整后没有剩下可执行的步骤，请再说明一句要做什么。',
                 **_carry_waiting(state, intent=intent)}
-    locus = str(data.get('result_locus')
-                or (state.get('plan') or {}).get('result_locus') or '')
-    locus_issues = check_result_locus(
-        locus, normalized, catalog, data.get('completion_criteria'))
+    metadata, metadata_issues = revision_metadata(data, previous, revised.model_fields_set)
+    locus = metadata['result_locus']
+    locus_issues = metadata_issues + check_result_locus(
+        locus, normalized, catalog, metadata['completion_criteria'])
     if locus_issues:
         detail = '；'.join(f'{item["code"]}:{item["detail"]}'
                           for item in locus_issues)[:300]
@@ -1164,7 +1211,7 @@ async def revise_plan(state):
     return {
         'plan': {'steps': normalized, 'summary': summary,
                  'version': next_version, 'intent_version': intent,
-                 'result_locus': locus if locus in RESULT_LOCI else '',
+                 **metadata,
                  'base_plan_version': int(plan_row.get('version') or 0),
                  'superseded': superseded},
         'plan_version': next_version,
@@ -1549,13 +1596,16 @@ async def decide_next(state):
                     'status': 'waiting_input',
                     'failure': f'根据结果调整的计划没有通过校验（{detail}）。',
                     **_carry_waiting(state)}
-        normalized, _ = validate_plan(
+        normalized, step_issues = validate_plan(
             [{**step, 'step_id': step.get('step_id')
               or f'p{int(plan.get("version") or 0) + 1}_s{index}'}
              for index, step in enumerate(kept, 1)], catalog)
-        locus = str(data.get('result_locus') or plan.get('result_locus') or '')
-        locus_issues = check_result_locus(
-            locus, normalized, catalog, data.get('completion_criteria'))
+        metadata, metadata_issues = revision_metadata(data, plan, decision.model_fields_set)
+        locus = metadata['result_locus']
+        locus_issues = (
+            [i for i in step_issues if i.get('severity') != 'warning']
+            + metadata_issues + check_result_locus(
+                locus, normalized, catalog, metadata['completion_criteria']))
         if locus_issues:
             detail = '；'.join(f'{item["code"]}:{item["detail"]}'
                               for item in locus_issues)[:200]
@@ -1580,11 +1630,9 @@ async def decide_next(state):
             'plan': {'steps': normalized,
                      'summary': data.get('summary') or '按结果调整',
                      'version': next_version,
-                     'result_locus': locus if locus in RESULT_LOCI else '',
+                     **metadata,
                      'intent_version': int(state.get('intent_version') or 0),
                      'base_plan_version': int(plan.get('version') or 0),
-                     'after_segment': data.get('after_segment') or 'verify',
-                     'observation_goal': data.get('observation_goal') or '',
                      'superseded': [item for item in (data.get('superseded') or [])]},
             'plan_version': next_version,
             'step_index': 0,
@@ -1684,7 +1732,9 @@ async def verify_completion(state):
     """
     plan = dict(state.get('plan') or {})
     if state.get('criteria_proposed'):
-        plan['completion_criteria'] = state['criteria_proposed']
+        metadata, _ = revision_metadata(
+            {'completion_criteria': state['criteria_proposed']}, plan)
+        plan['completion_criteria'] = metadata['completion_criteria']
         state = {**state, 'plan': plan}
     criteria = observation_module.criteria_of(plan, state)
     folder = str(state.get('artifact_dir') or '')

@@ -156,6 +156,9 @@ def build_decision_input(*, original_goal: str, inputs=None, plan: dict | None =
         '决策依据版本': int(intent_version or 0),
         '已处理版本': int(processed_intent_version or 0),
         '当前计划': {
+            **{key: plan[key] for key in ('result_locus', 'completion_criteria',
+                                         'after_segment', 'observation_goal')
+               if plan and key in plan},
             'plan_version': int((plan or {}).get('version') or 0),
             'intent_version': int((plan or {}).get('intent_version') or 0),
             'summary': (plan or {}).get('goal') or '',

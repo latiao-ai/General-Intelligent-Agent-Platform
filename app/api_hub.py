@@ -17,7 +17,7 @@ import asyncio
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from app.config import settings
@@ -74,6 +74,7 @@ class TaskRecord:
     lease_epoch: int = 0
     tenant_id: str = 'default'
     owner_user_id: str = 'default'
+    idempotent_replay: bool = False
     _lease_lost: bool = False
     _subscribers: set = field(default_factory=set)
     _task: asyncio.Task | None = None
@@ -407,7 +408,8 @@ class Hub:
         return record
 
     async def start(self, message: str, session_id: str | None = None,
-              principal=None, scene: dict | None = None) -> TaskRecord:
+              principal=None, scene: dict | None = None,
+              request_spec: dict | None = None) -> TaskRecord:
         """建任务 + 建 run + **领取** + 就地执行。
 
         关键在"领取"这一步：API 进程要跑就地执行，也必须先按同一条 claim 路径
@@ -427,30 +429,24 @@ class Hub:
             await self._assert_session_owner(session_id, tenant, owner)
         if is_stop_command(message):
             return await self.stop_session(session_id, message, principal)
-        # 历史与上轮产物由 execute_claimed_run 统一装配，这里不预读
-        await self.store.append_message(session_id, 'user', message,
-                                  tenant_id=tenant, owner_user_id=owner)
-        record = TaskRecord(task_id=uuid.uuid4().hex[:12], session_id=session_id,
-                            message=message, store=self.store,
-                            tenant_id=tenant, owner_user_id=owner)
-        await self.store.create_task(record.task_id, session_id, message)
+        task_id, run_id = uuid.uuid4().hex[:12], uuid.uuid4().hex[:12]
+        admitted = await self.store.create_goal(
+            task_id, run_id, session_id, message, tenant_id=tenant,
+            owner_user_id=owner,
+            owner_role=str(getattr(principal, 'role', '') or 'member'),
+            scene=scene, request_spec=request_spec)
+        if admitted['replayed']:
+            record = await self.get(admitted['task_id'])
+            if record is None:
+                raise RuntimeError('幂等记录指向不存在的任务')
+            return replace(record, run_id=admitted['run_id'], idempotent_replay=True)
+        record = TaskRecord(task_id=task_id, session_id=session_id,
+                            message=message, store=self.store, run_id=run_id,
+                            status='queued', tenant_id=tenant, owner_user_id=owner)
         self.tasks[record.task_id] = record
-        # 先占位一条"收到指令"的开始事件，让它排在阶段表第一行；
-        # 真正进入检索阶段时再补齐耗时。
         event = stage_start(INSTRUCTION_STAGE)
         record.open_stage = {'stage': INSTRUCTION_STAGE, 'at': event['at']}
         await record.publish(event)
-        # 建 run：task 是持续目标，run 是这一次执行尝试（文档 §3.1）。
-        # 账本挂在 run 上，重跑同样的 run_id 才能复用"已成功不重发"。
-        record.run_id = uuid.uuid4().hex[:12]
-        await self.store.ensure_task_meta(record.task_id, session_id=session_id,
-                                    goal=message, tenant_id=tenant,
-                                    owner_user_id=owner)
-        if scene and hasattr(self.store, 'save_scene_context'):
-            await self.store.save_scene_context(record.task_id, scene)
-        await self.store.create_run(record.run_id, record.task_id, status='queued',
-                              tenant_id=tenant, owner_user_id=owner,
-                              owner_role=str(getattr(principal, 'role', '') or 'member'))
         outcome = await self._claim_and_arm(
             record, record.run_id,
             lambda claimed: self.execute_claimed_run(claimed), wait=False)

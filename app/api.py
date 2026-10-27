@@ -31,6 +31,7 @@ from app import run_inputs as run_inputs_module
 from app import tools as tool_module
 from app.api_hub import CLOSE, Hub
 from app.config import settings
+from app.pg_store import SessionGoalConflict
 from app.logging_setup import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -321,18 +322,29 @@ async def create_task(payload: TaskRequest, request: Request,
     """
     client_key = (request.headers.get('idempotency-key')
                   or payload.idempotency_key or '').strip()
-    if not client_key:
-        return await _start_task(payload, principal)
-
+    request_spec = None
     try:
-        reservation = await idempotency.reserve(
-            hub.store, principal=principal, endpoint='tasks.create',
-            client_key=client_key,
-            payload={'message': payload.message,
-                     'session_id': payload.session_id,
-                     'context_hash': scene_context_module.canonical_hash(payload.context)
-                     if payload.context else ''},
-            ttl_seconds=settings.idempotency_ttl_seconds)
+        if client_key:
+            key = idempotency.validate_key(client_key)
+            request_spec = {
+                'scope': idempotency.scope_key(principal.tenant_id, principal.user_id,
+                                               'tasks.create', key),
+                'client_key': key,
+                'fingerprint': idempotency.fingerprint({
+                    'message': payload.message, 'session_id': payload.session_id,
+                    'context_hash': scene_context_module.canonical_hash(payload.context)
+                    if payload.context else ''}),
+            }
+            existing = await hub.store.request_key(request_spec['scope'])
+            if existing and float(existing['expires_at']) >= time.time():
+                if existing['fingerprint'] != request_spec['fingerprint']:
+                    raise idempotency.IdempotencyConflict('该幂等键已用于不同内容的请求')
+                if existing.get('task_id'):
+                    record = await _owned_task(existing['task_id'], principal)
+                    # 已验收过的请求可以重放，不要求重试时现场票仍未过期。
+                    return {**_creation_response(record, run_id=existing['run_id']),
+                            'idempotent_replay': True}
+        return await _start_task(payload, principal, request_spec=request_spec)
     except idempotency.IdempotencyConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from None
     except idempotency.IdempotencyInFlight as exc:
@@ -340,22 +352,6 @@ async def create_task(payload: TaskRequest, request: Request,
                             headers={'Retry-After': '1'}) from None
     except idempotency.IdempotencyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from None
-
-    if reservation.replayed:
-        body = dict(await reservation.response or {})
-        body['idempotent_replay'] = True
-        logger.info('幂等重放 task=%s', body.get('task_id'))
-        return body
-
-    try:
-        body = await _start_task(payload, principal)
-    except BaseException:
-        # 占位了却没建成任务：撤销占位，否则这个键会永远返回一个不存在的任务
-        await reservation.release()
-        raise
-    await reservation.complete(body, task_id=body['task_id'],
-                              session_id=body['session_id'], run_id=body['run_id'])
-    return body
 
 
 def _scene_for(payload: TaskRequest, principal) -> dict | None:
@@ -366,7 +362,11 @@ def _scene_for(payload: TaskRequest, principal) -> dict | None:
         try:
             return scene_context_module.verify(
                 payload.context_assertion or '', payload.context,
-                tenant_id=principal.tenant_id)
+                tenant_id=principal.tenant_id,
+                **({'subject': principal.subject,
+                    'platform_id': principal.platform_id,
+                    'connection_id': principal.connection_id}
+                   if principal.authenticated else {}))
         except scene_context_module.SceneError as exc:
             raise HTTPException(status_code=400, detail=exc.reason) from None
     return {'verified': False,
@@ -374,18 +374,28 @@ def _scene_for(payload: TaskRequest, principal) -> dict | None:
             'context': payload.context}
 
 
-async def _start_task(payload: TaskRequest, principal) -> dict:
+async def _start_task(payload: TaskRequest, principal, *, request_spec=None) -> dict:
     scene = _scene_for(payload, principal)
     try:
         record = await hub.start(payload.message, payload.session_id, principal,
-                                 scene=scene)
+                                 scene=scene, request_spec=request_spec)
+    except SessionGoalConflict as exc:
+        raise HTTPException(status_code=409, detail={
+            'code': 'session_goal_open', 'message': str(exc),
+            'task_id': exc.task_id, 'run_id': exc.run_id,
+            'inputs_url': f'/api/runs/{exc.run_id}/inputs'}) from None
     except PermissionError:
         # 传入的 session_id 不属于当前主体：按项目约定回 404，不区分"不存在/无权限"
         raise HTTPException(status_code=404, detail='会话不存在') from None
+    return _creation_response(record)
+
+
+def _creation_response(record, *, run_id=None) -> dict:
     # status 是展示标签（旧字段名不变），run_status 才是状态机里的通用状态
     return {'task_id': record.task_id, 'session_id': record.session_id,
-            'run_id': record.run_id,
-            **outcome_module.view(record.status, record.state or {})}
+            'run_id': run_id or record.run_id,
+            **outcome_module.view(record.status, record.state or {}),
+            **({'idempotent_replay': True} if record.idempotent_replay else {})}
 
 
 @app.get('/api/tasks/{task_id}')

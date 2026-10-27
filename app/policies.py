@@ -41,6 +41,9 @@ class Principal:
     platform_id: str = ''          # 这次登录来自哪个接入平台（排障/审计用）
     auth_session_id: str = ''      # 中台登录会话 ID（撤销、踢人用）
     authenticated: bool = False
+    connection_id: str = ''
+    subject: str = ''                 # 登录票中的外部用户编号，不是中台 user_id
+    identity_provider_id: str = ''
 
     @property
     def anonymous(self) -> bool:
