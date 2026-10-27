@@ -27,6 +27,7 @@
 - **归属由登记上的企业和用户决定**，不由内容 hash 或目录名决定。相同内容不许因此共享读取权。
 """
 import hashlib
+import base64
 import json
 import logging
 import os
@@ -134,6 +135,8 @@ def capture_mcp_result(result) -> CapturedResult:
         if part is None:
             continue
         captured.parts.append(part)
+        if part.kind == 'unsupported':
+            captured.unsupported.append(part.metadata.get('block_type', 'unknown'))
     return captured
 
 
@@ -360,6 +363,8 @@ def stage_result(base_dir, captured: CapturedResult, *, tenant_id: str = 'defaul
         if len(raw) <= max_bytes:
             (folder / 'structured.json').write_bytes(raw)
             raw_ref = relative_result_file(tenant_id, result_id, 'structured.json')
+        else:
+            truncated_reason = truncated_reason or f'结构化结果超过单条上限 {max_bytes} 字节，未保存'
 
     completeness = {
         'complete': not truncated_reason,
@@ -556,9 +561,9 @@ def read_part(base_dir, tenant_id: str, part: dict, *, result_id: str,
     start = max(0, int(offset or 0))
     size = max(1, min(int(limit or DEFAULT_PAGE_LIMIT), DEFAULT_PAGE_LIMIT))
     chunk = payload[start:start + size]
+    binary = str(part.get('kind') or '') in ('image', 'audio', 'binary', 'resource')
     try:
-        text = chunk.decode('utf-8')
-        binary = False
+        text = '' if binary else chunk.decode('utf-8')
     except UnicodeDecodeError:
         text = ''
         binary = True
@@ -569,6 +574,7 @@ def read_part(base_dir, tenant_id: str, part: dict, *, result_id: str,
         'mime': part.get('mime') or part.get('content_type') or '',
         'text': text,
         'binary': binary,
+        'data_base64': base64.b64encode(chunk).decode('ascii') if binary else '',
         'bytes': len(chunk),
         'total': len(payload),
         'complete': end >= len(payload),

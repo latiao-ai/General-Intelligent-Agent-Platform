@@ -11,10 +11,12 @@ import json
 import base64
 import asyncio
 import logging
+import hashlib
+import re
 from contextlib import asynccontextmanager, AsyncExitStack
 from pathlib import Path
 from urllib.parse import urlsplit
-from jsonschema import validate
+from jsonschema import validate, ValidationError, SchemaError
 from mcp import ClientSession
 import httpx
 from mcp.client.streamable_http import streamable_http_client
@@ -26,6 +28,7 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 from app import config as _config  # noqa: F401
 from app.config import settings
 from app.integrations import mcp_servers
+from app import mcp_contract, tool_results
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +49,13 @@ class _StdioSlot:
         self.idle: asyncio.Task | None = None
 
 
-def _stdio_key(server, command: str, args: list, token: str | None) -> str:
+def _stdio_key(server, command: str, args: list, token: str | None,
+               env=None, subject=()) -> str:
     server_id = getattr(server, 'id', '') or getattr(server, 'server_id', '') or ''
-    return json.dumps([server_id, command, list(args), token or ''],
-                      ensure_ascii=False)
+    # 缓存键也不能保留明文凭据。环境、主体或凭据变化必须创建新连接。
+    body = json.dumps([server_id, command, list(args), token or '', env, subject],
+                      sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(body.encode()).hexdigest()
 
 
 def _session_broken(exc: BaseException) -> bool:
@@ -97,7 +103,7 @@ def _arm_idle(slot: _StdioSlot, generation: int) -> None:
     slot.idle.add_done_callback(_stdio_idlers.discard)
 
 
-async def _open_slot(slot: _StdioSlot, command: str, args: list) -> None:
+async def _open_slot(slot: _StdioSlot, command: str, args: list, env=None) -> None:
     ready = asyncio.get_running_loop().create_future()
     stop = asyncio.Event()
 
@@ -106,7 +112,7 @@ async def _open_slot(slot: _StdioSlot, command: str, args: list) -> None:
         async with AsyncExitStack() as stack:
             try:
                 read, write = await stack.enter_async_context(
-                    stdio_client(StdioServerParameters(command=command, args=args)))
+                    stdio_client(StdioServerParameters(command=command, args=args, env=env)))
                 session = await stack.enter_async_context(ClientSession(read, write))
                 await session.initialize()
                 ready.set_result(session)
@@ -126,8 +132,9 @@ async def _open_slot(slot: _StdioSlot, command: str, args: list) -> None:
 
 
 @asynccontextmanager
-async def _borrow_stdio(server, command: str, args: list, token: str | None):
-    key = _stdio_key(server, command, args, token)
+async def _borrow_stdio(server, command: str, args: list, token: str | None,
+                        env=None, subject=()):
+    key = _stdio_key(server, command, args, token, env, subject)
     async with _stdio_guard:
         slot = _stdio_slots.get(key)
         if slot is None:
@@ -142,7 +149,7 @@ async def _borrow_stdio(server, command: str, args: list, token: str | None):
         if slot.owner is not None and slot.owner.done():
             await _close_slot(slot)
         if slot.session is None:
-            await _open_slot(slot, command, args)
+            await _open_slot(slot, command, args, env)
         try:
             yield slot.session
         except asyncio.CancelledError:
@@ -222,7 +229,38 @@ async def connect_session(server=None, *, token: str | None = None):
         raw_args = getattr(server, 'stdio_args', ()) if server is not None else ()
         args = list(raw_args) if raw_args else json.loads(
             os.getenv('MCP_STDIO_ARGS', '[]'))
-        async with _borrow_stdio(server, command, args, token) as session:
+        from app import credentials, execution_control, ledger
+        env = {}
+        configured_env = (getattr(server, 'stdio_env', None) or {}) if server is not None else json.loads(
+            os.getenv('MCP_STDIO_ENV', '{}'))
+        if not isinstance(configured_env, dict):
+            raise credentials.CredentialMissing('stdio_env 必须是环境变量引用对象')
+        for name, ref in configured_env.items():
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+                raise credentials.CredentialMissing('stdio 环境变量名无效')
+            env[name] = credentials._read_secret(ref)
+        effective_token = ((str(getattr(server, 'token', '') or '') if server is not None
+                            else os.getenv('MCP_BEARER_TOKEN', ''))
+                           if token is None else token)
+        credential_env = ((getattr(server, 'credential_env', '') or '') if server is not None
+                          else os.getenv('MCP_CREDENTIAL_ENV', ''))
+        if effective_token:
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', credential_env):
+                raise credentials.CredentialMissing('stdio 使用凭据时必须配置 credential_env')
+            env[credential_env] = effective_token
+        elif token is not None and credential_env in env:
+            # 显式空凭据不能偷偷退回静态环境里的另一把钥匙。
+            env.pop(credential_env)
+        subject = ()
+        book, execution = ledger.current_ledger(), execution_control.require()
+        if book is not None and execution is not None:
+            run = await book.store.run(execution.run_id)
+            if not run:
+                raise credentials.CredentialMissing('读取不到 stdio 调用主体')
+            subject = (str(run.get('tenant_id') or 'default'),
+                       str(run.get('owner_user_id') or 'default'))
+        async with _borrow_stdio(server, command, args, effective_token,
+                                  env=env, subject=subject) as session:
             yield session
     elif transport == 'sse':
         url = _cfg(server, 'url', 'MCP_URL')
@@ -311,6 +349,7 @@ async def list_server_tools(server=None, *, token: str | None = None):
                 'outputSchema': getattr(t, 'outputSchema', None),
                 'annotations': _annotations(t),
                 'effect_type': effect_type(t),
+                '_meta': getattr(t, 'meta', None) or {},
             } for t in tools]
 
 
@@ -383,10 +422,19 @@ def summarize(payload, limit: int = 120) -> str:
     return f'返回 {keys}'[:limit]
 
 
+class MCPPayload(dict):
+    """可序列化业务视图；原始分块只在当前调用里持有，随后受控落盘。"""
+
+    def __init__(self, payload, captured):
+        super().__init__(payload)
+        self.captured = captured
+
+
 def result_payload(result):
+    captured = tool_results.capture_mcp_result(result)
     if getattr(result, 'isError', False):
-        # 不将可能包含内部信息的服务端报错内容直接送到页面。
-        raise RuntimeError('MCP 工具返回 isError，请在服务端查看日志')
+        # 协议明确报告工具失败；原始内容不直接送到页面。
+        raise MCPToolFailure('MCP 工具返回 isError，请在服务端查看日志', 'E_MCP_TOOL_ERROR')
     payload = getattr(result, 'structuredContent', None)
     if payload is None:
         for block in result.content:
@@ -399,12 +447,20 @@ def result_payload(result):
                 except (ValueError, TypeError):
                     continue
     if payload is None:
-        raise RuntimeError('未找到 JSON 结果，请按真实返回格式修改 result_payload')
+        # 合法的 MCP 文本、媒体和资源结果都能接收。二进制只进入受控结果存储。
+        payload = {'text': captured.text(), 'content': [
+            {'ordinal': part.ordinal, 'type': part.kind,
+             'mimeType': part.mime or part.content_type,
+             **({'text': part.text} if part.text else {}),
+             **({'uri': part.link_ref} if part.link_ref else {}),
+             **({'size_bytes': part.size_bytes, 'sha256': part.sha256}
+                if part.data is not None else {})}
+            for part in captured.parts]}
     # 协议层成功 ≠ 业务成功：服务端可能正常返回一条 status:error
     failed = failure_of(payload)
     if failed:
         raise MCPToolFailure(failed, str(payload.get('code') or ''))
-    return payload
+    return MCPPayload(payload, captured)
 
 
 def certainty_of_error(exc: BaseException) -> str:
@@ -416,6 +472,8 @@ def certainty_of_error(exc: BaseException) -> str:
     '''
     if isinstance(exc, MCPToolFailure):
         return 'failed_confirmed'
+    if isinstance(exc, mcp_contract.ContractError):
+        return 'not_executed'
     name = type(exc).__name__
     if name in {'ConnectError', 'ConnectTimeout', 'ConnectionRefusedError',
                 'ClientConnectorError', 'LeaseLost', 'CredentialMissing',
@@ -509,6 +567,16 @@ async def call_tool(tool_name: str, arguments: dict, artifact: dict | None = Non
             merged = dict(arguments or {})
             if artifact is not None and payload_mode(tool, server) == 'files_base64':
                 merged = {**build_arguments(tool, artifact, server), **merged}
-            validate(instance=merged, schema=tool.inputSchema)
+            merged = mcp_contract.call_arguments(
+                tool.inputSchema, getattr(tool, 'meta', None), merged)
+            try:
+                validate(instance=merged, schema=tool.inputSchema)
+            except (ValidationError, SchemaError) as exc:
+                raise mcp_contract.ContractError('MCP 参数或输入定义不符合合同，调用尚未发送') from exc
             result = await session.call_tool(tool_name, arguments=merged)
+            output_schema = getattr(tool, 'outputSchema', None)
+            if output_schema is not None and not getattr(result, 'isError', False):
+                # 写请求已发送。输出不合约只能标结果未知，不能归为“未执行”重发。
+                structured = getattr(result, 'structuredContent', None)
+                validate(instance=structured, schema=output_schema)
             return result_payload(result)

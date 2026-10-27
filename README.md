@@ -1,10 +1,14 @@
 # 通用智能体执行中台
 
+企业新接入请从 [MCP Server 对接协议 v1](docs/mcp-server-contract.md) 开始：提供可发现的工具、真实输入输出和副作用语义，优先通过协议接入，避免新增企业专属适配代码。
+已配置连接可运行 `python -m scripts.check_mcp_contract --server-id <id>` 做只读合同检查。
+本次跨分支取舍见 [设计审查记录](docs/platform-branch-review.md)，其中列明已实现能力与后续建设项。
+
 中台目标、边界与对接合同见仓库根目录 [`智能体中台运行机制说明.md`](../智能体中台运行机制说明.md)。
 
 按用户目标生成计划、从已接入的能力里选工具、逐步执行并记录每一次外部调用的中台。
 执行内核与业务解耦：**网页检索、资料转 HTML、发布到 MCP 服务器**只是当前接入的
-一个业务能力包，换成工单/文件/数据库查询只需增加能力包，不动内核。
+一组示例能力。工单、库存等企业业务优先由企业 MCP Server 按协议暴露，无需在中台增加业务能力包。
 
 当前能力面（有意保持最小）：
 
@@ -807,7 +811,7 @@ PG_TEST_DSN=postgresql://…/agent_platform_test \
   python -W error::RuntimeWarning -m unittest discover -s tests -v
 ```
 
-**453 条用例全部通过**（包含真实 PostgreSQL 测试）。主要覆盖：
+**467 条用例全部通过**（包含真实 PostgreSQL 和真实 stdio MCP 测试）。主要覆盖：
 
 | 文件 | 覆盖 |
 |---|---|
@@ -819,6 +823,7 @@ PG_TEST_DSN=postgresql://…/agent_platform_test \
 | `tests/test_observation.py` | 摘要保留结构、路由优先级、结果完整可追溯、空 continue 拒绝、缺证据不成功、无进展停止、预算耗尽、观察开关 |
 | `tests/test_run_inputs.py` | 补充接受/幂等/背压、旧版本动作零准入、计划 CAS、修订校验、收尾门禁、暂停期间补充、HTTP 202/409/404/422 |
 | `tests/test_ticket_auth.py` 等 | 票据验证、兑换、退出、跨平台隔离 |
+| `tests/test_mcp_contract.py` | 两种行业 Server 共用协议、动作身份注入、防伪造、输入/输出错误确定性、发现缓存并发隔离、多分块与二进制读取、真实 Worker 调用 |
 
 新增测试覆盖结果登记与用户隔离（`test_result_isolation.py`）、stdio 会话复用（`test_stdio_session.py`）、
 通用平台边界与 AnyIO 连接作用域（`test_platform_generalization.py`）。

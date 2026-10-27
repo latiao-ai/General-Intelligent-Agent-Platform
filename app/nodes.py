@@ -1895,7 +1895,9 @@ async def _run_compensations(state: dict, steps: list[dict], outputs: dict,
             action_id = prepared.get('action_id')
             attempt_id = prepared.get('attempt_id')
         try:
-            await tool.run(args, state)
+            from app.mcp_contract import action_scope
+            with action_scope(action_id or ''):
+                await tool.run(args, state)
         except Exception as exc:                      # noqa: BLE001
             hint = getattr(exc, 'safe_message', None) or type(exc).__name__
             if book is not None and action_id:
@@ -2181,7 +2183,9 @@ async def run_step(state):
 
     try:
         if not reused:
-            updates = await tool.run(args, state)
+            from app.mcp_contract import action_scope
+            with action_scope(action_id or ''):
+                updates = await tool.run(args, state)
     except execution_control.LeaseLost:
         raise
     except Exception as exc:                      # noqa: BLE001

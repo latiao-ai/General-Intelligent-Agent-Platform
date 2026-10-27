@@ -48,6 +48,9 @@ class Server:
     token: str = ''
     stdio_command: str = ''
     stdio_args: tuple = ()
+    # 值是受控凭据引用（env:/file:/literal:），不把整份中台环境交给子进程。
+    stdio_env: dict = field(default_factory=dict)
+    credential_env: str = ''
     # 以下只在"这个服务端承接部署"时有意义
     deploy_tool: str = ''
     payload_mode: str = ''
@@ -85,6 +88,8 @@ def _legacy_server() -> Server | None:
         token=os.getenv('MCP_BEARER_TOKEN', '').strip(),
         stdio_command=command,
         stdio_args=tuple(json.loads(os.getenv('MCP_STDIO_ARGS', '[]') or '[]')),
+        stdio_env=_json_object(os.getenv('MCP_STDIO_ENV', '{}')) or {},
+        credential_env=os.getenv('MCP_CREDENTIAL_ENV', '').strip(),
         deploy_tool=os.getenv('MCP_TOOL_NAME', '').strip(),
         payload_mode=os.getenv('MCP_PAYLOAD_MODE', '').strip(),
         html_field=os.getenv('MCP_HTML_FIELD', '').strip(),
@@ -145,6 +150,8 @@ def _from_entry(entry: dict) -> Server | None:
         token=str(entry.get('token') or '').strip(),
         stdio_command=command,
         stdio_args=tuple(entry.get('stdio_args') or ()),
+        stdio_env=dict(entry.get('stdio_env') or {}),
+        credential_env=str(entry.get('credential_env') or '').strip(),
         deploy_tool=str(entry.get('deploy_tool') or '').strip(),
         payload_mode=str(entry.get('payload_mode') or '').strip(),
         html_field=str(entry.get('html_field') or '').strip(),
