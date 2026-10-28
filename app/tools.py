@@ -23,6 +23,7 @@ import time
 from app.integrations import mcp_adapter, mcp_servers
 from app.capabilities import registry
 from app import tool_policy as tool_policy_module
+from app import credentials as credentials_module
 # 这几个是既有调用点仍在用的：`nodes` 用 usable_documents 判断"手上有没有料"，
 # 测试用 _select_sources 校验预算截断。
 from app.capabilities.base import (ToolError, usable_documents,  # noqa: F401
@@ -41,16 +42,52 @@ BUILTIN_TOOLS = registry.load()
 BUILTIN_BY_NAME = {tool.name: tool for tool in BUILTIN_TOOLS}
 
 
+def schema_preview(schema: dict, depth: int = 0, root=None) -> dict:
+    """Bound planning data only; transport still validates the complete schema."""
+    root = schema if root is None else root
+    if not isinstance(schema, dict):
+        return {}
+    ref = schema.get('$ref', '')
+    if ref.startswith('#/'):
+        target = root
+        for part in ref[2:].split('/'):
+            target = target.get(part.replace('~1', '/').replace('~0', '~'), {})
+        schema = target if isinstance(target, dict) else schema
+    out = {k: v for k, v in schema.items() if k in ('type', 'const', 'format')}
+    if schema.get('description'):
+        out['description'] = str(schema['description'])[:120]
+    if schema.get('enum'):
+        out['enum'] = schema['enum'][:12]
+    if depth >= 4:
+        return out
+    required = schema.get('required') or []
+    if required:
+        out['required'] = required
+    props = schema.get('properties') or {}
+    names = list(dict.fromkeys([*required, *list(props)[:20]]))
+    if names:
+        out['properties'] = {k: schema_preview(props.get(k, {}), depth + 1, root) for k in names}
+    for key in ('items', 'additionalProperties'):
+        if isinstance(schema.get(key), dict):
+            out[key] = schema_preview(schema[key], depth + 1, root)
+    for key in ('anyOf', 'oneOf', 'allOf'):
+        if schema.get(key):
+            out[key] = [schema_preview(s, depth + 1, root) for s in schema[key][:4]]
+    return out
+
+
+def planning_schema(tool: Tool) -> dict:
+    return schema_preview(tool.args) if len(json.dumps(tool.args)) > 6000 else tool.args
+
+
 def describe_tool(tool: Tool) -> str:
     """工具在规划器眼里的样子：名称 + 动作性质 + 描述 + 参数。
 
     动作性质必须一起给：规划器据此判断"这类操作要不要先向用户确认"，
     只靠名字（比如看到 delete）去猜是不可靠的。
     """
-    output = (f'\n  输出：{json.dumps(tool.output_schema, ensure_ascii=False)}'
-              if tool.output_schema is not None else '')
     return (f'- {tool.name}［{tool.effect}］：{tool.description}\n'
-            f'  参数：{json.dumps(tool.args, ensure_ascii=False)}{output}')
+            f'  参数概要（完整约束由工具执行时校验）：{json.dumps(planning_schema(tool), ensure_ascii=False)}')
 
 # MCP 是外来能力。这里只留任何远端工具都适用的纪律。
 # 某一家的业务说法（删哪个对象、生成还是分析、完成条件指向哪个工具名）
@@ -246,6 +283,18 @@ def _is_available(status: str) -> bool:
     return 'AVAILABLE' in text and 'UNAVAILABLE' not in text
 
 
+def _capability_rank(info: dict) -> int:
+    """截断后的清单里，分析类能力排在后面。
+
+    目录顺序经常把 analysis 放在最前。名单只展示开头几项时，模型会拿分析工具
+    去完成生成请求。这里不点名任何一家的能力名，只把分析类挪到后面。
+    """
+    name = str((info or {}).get('capability') or '').lower()
+    if name == 'analysis' or name.startswith('analy'):
+        return 100
+    return 50
+
+
 def _capability_line(capabilities: dict, limit: int = 26,
                      max_chars: int = 1800) -> str:
     """把内部能力清单压成一行，塞进工具描述里给规划器看。
@@ -258,7 +307,7 @@ def _capability_line(capabilities: dict, limit: int = 26,
         return ''
     usable = [name for name, info in capabilities.items()
               if _is_available(info.get('status'))]
-    usable.sort()
+    usable.sort(key=lambda name: (_capability_rank(capabilities[name]), name))
     unusable = [name for name in capabilities if name not in usable]
     def describe(name: str) -> str:
         info = capabilities[name]
@@ -299,12 +348,14 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
     now = time.monotonic()
     cache = _current_mcp_cache()
     signature = _signature()
+    servers = mcp_servers.servers()
     if getattr(settings, 'tool_policy_enforced', False):
         # 每次检查绑定和密钥，撤权不能等五分钟 TTL。明文不进入缓存。
         try:
-            from app.mcp_connections import discovery_scope
-            scope = await discovery_scope(mcp_servers.servers())
-            tokens = await asyncio.gather(*(_subject_token(s) for s in mcp_servers.servers()))
+            from app.mcp_connections import discovery_scope, discoverable_servers
+            servers = await discoverable_servers(servers)
+            scope = await discovery_scope(servers)
+            tokens = await asyncio.gather(*(_subject_token(s) for s in servers))
             signature = (signature, scope, tuple(hashlib.sha256((token or '').encode()).hexdigest()
                                           for token in tokens))
         except Exception:
@@ -315,7 +366,6 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
     if cached and not force:
         return cache['tools']
 
-    servers = mcp_servers.servers()
     discovered = await asyncio.gather(*(_discover(server) for server in servers)) \
         if servers else []
     # 有"通用调用 + 内部工具名"设计的服务端，顺带把内部能力清单读回来：
@@ -324,7 +374,7 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
         *(_discover_capabilities(server) for server in servers)) if servers else []
     capabilities = {server.id: caps
                     for server, caps in zip(servers, capability_lists) if caps}
-    total = len(servers)
+    total = len(mcp_servers.servers())
     tools: list[Tool] = []
     errors: dict[str, str] = {}
     for server, (items, error) in zip(servers, discovered):
@@ -333,21 +383,12 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
             continue
         inner = capabilities.get(server.id) or {}
         for item in items:
-            # 声明新接入约定的工具直接走通用调用，避免旧业务包装器改写其契约。
-            profile_declared = 'agent_hub' in (item.get('_meta') or {})
-            adapted = (None if profile_declared else
-                       registry.adapt_mcp_tool(server, item, _make_mcp_runner))
+            adapted = registry.adapt_mcp_tool(server, item, _make_mcp_runner)
             if adapted is not None:
                 tools.append(adapted)
                 continue
             name = mcp_servers.tool_name(server, item['name'], total)
-            from app import mcp_contract
-            raw_schema = item.get('inputSchema') or {'type': 'object', 'properties': {}}
-            try:
-                schema = mcp_contract.model_schema(raw_schema, item.get('_meta'))
-            except mcp_contract.ContractError as exc:
-                errors[f'{server.id}:{item["name"]}'] = str(exc)
-                continue
+            schema = item.get('inputSchema') or {'type': 'object', 'properties': {}}
             # 用服务端给的真实描述，而不是拿工具名猜用途
             title = item.get('title') or item['name']
             detail = (item.get('description') or '').strip()
@@ -378,9 +419,6 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
                 capability='mcp',
                 prompt_rules=(getattr(server, 'prompt_rules', '') or '').strip(),
                 server_id=server.id,
-                output_schema=item.get('outputSchema'),
-                annotations=dict(item.get('annotations') or {}),
-                metadata=dict(item.get('_meta') or {}),
             ))
     adapted_caps = {getattr(module, 'CAPABILITY', '')
                     for module in registry.capability_modules()
@@ -491,10 +529,8 @@ def _deploy_placeholder(errors: dict):
 
 def mcp_status() -> dict:
     """MCP 连接态势：给 /api/health 与排障用。"""
-    cache = _current_mcp_cache()
-    return {'tools': len(cache['tools']),
-            'errors': dict(cache.get('errors') or {}),
-            'scoped_catalogs': len(_SCOPED_MCP_CACHES),
+    return {'tools': len(_MCP_CACHE['tools']),
+            'errors': dict(_MCP_CACHE.get('errors') or {}),
             'servers': mcp_servers.status()}
 
 
@@ -568,19 +604,13 @@ async def _stage_result(payload: dict, *, tool_key: str = '') -> str:
             return ''
         tenant_id = str(run.get('tenant_id') or 'default')
         owner_user_id = str(run.get('owner_user_id') or 'default')
-        captured = getattr(payload, 'captured', None)
-        if captured is not None and captured.structured is None:
-            from dataclasses import replace
-            captured = replace(captured, structured=dict(payload))
-        if captured is None:
-            captured = tool_results.CapturedResult(
-                structured=dict(payload),
-                parts=[tool_results.ResultPart(
-                    ordinal=0, kind='json', content_type='application/json',
-                    text=json.dumps(payload, ensure_ascii=False, default=str))])
+        captured = tool_results.CapturedResult(
+            structured=payload,
+            parts=[tool_results.ResultPart(
+                ordinal=0, kind='json', content_type='application/json',
+                text=json.dumps(payload, ensure_ascii=False, default=str))])
         staged = tool_results.stage_result(
-            settings.artifact_dir, captured, tenant_id=tenant_id,
-            max_bytes=settings.tool_result_max_bytes)
+            settings.artifact_dir, captured, tenant_id=tenant_id)
         envelope = tool_results.envelope_v2(
             result_id=str(staged.get('result_id') or ''), tool_key=tool_key,
             structured_ref=str(staged.get('raw_ref') or ''),
@@ -707,7 +737,14 @@ async def catalog(context=None) -> list[Tool]:
     以便单元测试与 CLI 直调继续可用。
     """
     tools = list(registry.registered())
-    tools.extend(await mcp_tools())
+    try:
+        tools.extend(await mcp_tools())
+    except credentials_module.CredentialMissing:
+        if context is None or not settings.tool_policy_enforced:
+            raise
+        # Unbound external servers must not disable separately authorized local
+        # capabilities. No external tool is exposed and no fallback key is used.
+        logger.info('当前主体无可发现的 MCP 凭据，仅保留经政策过滤的本地工具')
     hidden = registry.suppressed_capabilities()
     if hidden:
         # 关掉的能力连占位都不留，免得计划里出现注定失败的一步。
@@ -727,6 +764,18 @@ async def visible_tools(tools, context) -> list[Tool]:
     visible, hidden = tool_policy_module.filter_catalog(
         tools, policies, tenant_id=context.tenant_id,
         role=context.role, user_id=context.user_id)
+    if settings.tool_policy_enforced:
+        from app import mcp_connections
+        scoped = []
+        for tool in visible:
+            server_id = mcp_connections.server_id_of(tool.tool_key)
+            if server_id and not await mcp_connections.binding_for_server(
+                    store, tenant_id=context.tenant_id, user_id=context.user_id,
+                    platform_id=context.platform_id, server_id=server_id):
+                hidden.append(tool.tool_key)
+                continue
+            scoped.append(tool)
+        visible = scoped
     if hidden:
         logger.info('按主体隐藏了 %s 个未授权工具（tenant=%s）',
                     len(hidden), context.tenant_id)
@@ -759,13 +808,11 @@ async def find_tool(name: str, context=None):
     # 这样"新增一个能力包文件"不需要动任何清单，名字也能解析到。
     tool = BUILTIN_BY_NAME.get(name) or registry.snapshot().get(name)
     if tool is not None:
-        visible = await visible_tools([tool], context)
-        return visible[0] if visible else None
+        return tool if context is None or await visible_tools([tool], context) else None
     tools = await mcp_tools()
     exact = next((t for t in tools if t.name == name), None)
     if exact is not None:
-        visible = await visible_tools([exact], context)
-        return visible[0] if visible else None
+        return exact if context is None or await visible_tools([exact], context) else None
     _, bare = mcp_servers.split_tool_name(name)
     matches = [t for t in tools if t.name == f'{MCP_PREFIX}{bare}'
                or t.name.endswith(f'__{bare}')

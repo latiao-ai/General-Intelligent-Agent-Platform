@@ -74,6 +74,33 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_StdioCM.enters, 1)
         self.assertEqual(_StdioCM.live, 1)
 
+    async def test_platform_customers_get_distinct_processes_and_transport_identity(self):
+        from app import execution_control, ledger
+        from unittest.mock import AsyncMock
+        server = _server()
+        server.forward_subject = True
+        store = SimpleNamespace(run=AsyncMock(return_value={'platform_subject': 'alice'}))
+        ctx = execution_control.ExecutionContext('r', lease_epoch=1)
+        book = ledger.ActionLedger(store, 'r', 1, context=ctx)
+        params_seen = []
+        def client(params):
+            params_seen.append(params)
+            return _StdioCM(params)
+        with ledger.use_ledger(book), execution_control.use(ctx), \
+                patch.object(mcp_adapter, 'stdio_client', client):
+            async with mcp_adapter.connect_session(server, token='platform-key') as alice:
+                pass
+            store.run.return_value = {'platform_subject': 'bob'}
+            async with mcp_adapter.connect_session(server, token='platform-key') as bob:
+                self.assertIsNot(alice, bob)
+            self.assertEqual(params_seen[0].env['MCP_CALLER_SUBJECT'], 'alice')
+            self.assertEqual(params_seen[1].env['MCP_CALLER_SUBJECT'], 'bob')
+            self.assertEqual(params_seen[0].env['MCP_BEARER_TOKEN'], 'platform-key')
+            store.run.return_value = {}
+            with self.assertRaises(RuntimeError):
+                async with mcp_adapter.connect_session(server, token='platform-key'):
+                    pass
+
     async def test_other_server_gets_its_own_process(self):
         async with mcp_adapter.connect_session(_server('openmontage')):
             pass

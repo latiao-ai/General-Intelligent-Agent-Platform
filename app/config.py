@@ -60,6 +60,9 @@ class Settings:
     llm_context_margin: int = max(0, int(os.getenv('LLM_CONTEXT_MARGIN', '2048')))
     llm_retry_max_delay: float = max(0.0, min(30.0, float(
         os.getenv('LLM_RETRY_MAX_DELAY', '2'))))
+    # All host platforms share this scene budget; full request limits still apply.
+    platform_context_max_chars: int = max(800, min(64000, int(
+        os.getenv('PLATFORM_CONTEXT_MAX_CHARS', '12000'))))
     artifact_dir: Path = PROJECT_ROOT / os.getenv('ARTIFACT_DIR', 'artifacts')
     # 数据库：**只支持 PostgreSQL**（SQLite 实现已删除）。仓储接口见
     # app/persistence.py；留空会在 open_store() 里直接报错，不静默退回本地文件库。

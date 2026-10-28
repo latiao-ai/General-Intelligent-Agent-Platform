@@ -649,6 +649,8 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS waiting_external INTEGER NOT NULL DEFA
 -- "这次调用该用哪把钥匙"。
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS owner_user_id TEXT NOT NULL DEFAULT 'default';
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS owner_role TEXT NOT NULL DEFAULT 'member';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS platform_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS platform_subject TEXT NOT NULL DEFAULT '';
 -- step/action 增加受理阶段：提交拿到了回执，但该逻辑步骤尚未完成。
 ALTER TABLE steps ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT '';
 ALTER TABLE actions ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT '';
@@ -1157,7 +1159,8 @@ class PostgresStore:
     async def create_goal(self, task_id: str, run_id: str, session_id: str,
                           message: str, *, tenant_id: str, owner_user_id: str,
                           owner_role: str = 'member', scene: dict | None = None,
-                          request_spec: dict | None = None) -> dict:
+                          request_spec: dict | None = None, platform_id: str = '',
+                          platform_subject: str = '') -> dict:
         """会话准入、任务、运行、消息及请求键关联同事务提交。
 
         请求键先锁、会话后锁。事务提交前不会派发任务；崩溃只可能全部回滚或
@@ -1220,9 +1223,9 @@ class PostgresStore:
                 (task_id, tenant_id, owner_user_id, message, run_id, stamp,
                  json.dumps(scene or {}, ensure_ascii=False)))
             await self._run(conn, 'INSERT INTO runs '
-                '(run_id,task_id,tenant_id,status,owner_user_id,owner_role,created_at,updated_at) '
-                "VALUES (%s,%s,%s,'queued',%s,%s,%s,%s)",
-                (run_id, task_id, tenant_id, owner_user_id, owner_role, stamp, stamp))
+                '(run_id,task_id,tenant_id,status,owner_user_id,owner_role,platform_id,platform_subject,created_at,updated_at) '
+                "VALUES (%s,%s,%s,'queued',%s,%s,%s,%s,%s,%s)",
+                (run_id, task_id, tenant_id, owner_user_id, owner_role, platform_id, platform_subject, stamp, stamp))
             await self._run(conn, 'INSERT INTO messages (session_id,role,content,created_at) '
                 "VALUES (%s,'user',%s,%s)", (session_id, message, stamp))
             await self._run(conn, 'UPDATE sessions SET updated_at=%s WHERE session_id=%s',
@@ -1408,16 +1411,20 @@ class PostgresStore:
 
     async def create_run(self, run_id: str, task_id: str, *, budget: dict | None = None,
                    tenant_id: str = 'default', status: str = 'queued',
-                   owner_user_id: str = 'default', owner_role: str = 'member') -> None:
+                   owner_user_id: str = 'default', owner_role: str = 'member',
+                   platform_id: str | None = None) -> None:
         stamp = now()
         async with self._lease() as conn:
             await self._run(conn, 'INSERT INTO runs (run_id, task_id, tenant_id, status, '
-                'budget_json, consumed_json, owner_user_id, owner_role, '
+                'budget_json, consumed_json, owner_user_id, owner_role, platform_id, platform_subject, '
                 'created_at, updated_at) '
-                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
+                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '
+                "COALESCE(%s, (SELECT platform_id FROM runs WHERE task_id=%s ORDER BY created_at LIMIT 1), ''), "
+                "COALESCE((SELECT platform_subject FROM runs WHERE task_id=%s ORDER BY created_at LIMIT 1), ''), %s, %s)",
                 (run_id, task_id, tenant_id, status,
                  json.dumps(budget or {}, ensure_ascii=False), '{}',
                  str(owner_user_id or 'default'), str(owner_role or 'member'),
+                 platform_id, task_id, task_id,
                  stamp, stamp))
             await self._run(conn, 'UPDATE tasks_meta SET current_run_id=%s WHERE task_id=%s',
                 (run_id, task_id))

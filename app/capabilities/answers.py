@@ -65,6 +65,9 @@ async def _answer_directly(args: dict, state: dict) -> dict:
         system = ANSWER_SYSTEM
         prefix = f'问题：{question}'
         emit(action('直接回答', '本轮无需联网检索', '💬'))
+    scene = context.platform_scene_text(state.get('scene'))
+    if scene != '无':
+        prefix += '\n\n平台提供的当前现场：\n' + scene
     messages = context.chat_messages(state.get('history'), prefix,
                                      purpose='answer')
     answer = await chat_reply(

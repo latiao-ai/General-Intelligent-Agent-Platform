@@ -34,6 +34,14 @@ class GoalAdmissionTests(unittest.IsolatedAsyncioTestCase):
             't' + suffix, 'r' + suffix, session, '修改对象', tenant_id=tenant,
             owner_user_id=user, request_spec=spec)
 
+    async def test_login_platform_survives_admission_and_new_run(self):
+        await self.store.create_goal('platform-task', 'platform-run', 'platform-session',
+            'read tools', tenant_id='ta', owner_user_id='ua', platform_id='platform-a')
+        self.assertEqual((await self.store.run('platform-run'))['platform_id'], 'platform-a')
+        await self.store.create_run('platform-retry', 'platform-task',
+                                    tenant_id='ta', owner_user_id='ua')
+        self.assertEqual((await self.store.run('platform-retry'))['platform_id'], 'platform-a')
+
     def spec(self, body='修改对象', key='k1'):
         return {'scope': idempotency.scope_key('ta', 'ua', 'tasks.create', key),
                 'client_key': key, 'fingerprint': idempotency.fingerprint(body)}
@@ -379,6 +387,7 @@ class DiscoveryIsolationTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(tools, 'settings', replace(tools.settings, tool_policy_enforced=True)), \
                 patch.object(tools.mcp_servers, 'servers', return_value=[server]), \
                 patch('app.mcp_connections.discovery_scope', scope), \
+                patch('app.mcp_connections.discoverable_servers', AsyncMock(return_value=[server])), \
                 patch.object(tools, '_subject_token', token), \
                 patch.object(tools, '_discover', AsyncMock(side_effect=discover)) as calls, \
                 patch.object(tools, '_discover_capabilities', capabilities):

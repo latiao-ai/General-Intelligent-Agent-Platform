@@ -58,7 +58,7 @@ class ApprovalRequired(AuthorizationDenied):
 
 async def resolve_binding(store, *, tenant_id: str, user_id: str,
                           server_binding_id: str = '',
-                          subject_kind: str = '') -> credentials_module.CredentialBinding | None:
+                          subject_kind: str = '', platform_id: str = '') -> credentials_module.CredentialBinding | None:
     """按主体取凭据绑定。**取不到就是没有**，不退回全局 token。
 
     优先级：用户级绑定 > 租户级绑定。同一个主体可以换一把新钥匙（轮换），
@@ -90,7 +90,7 @@ async def resolve_binding(store, *, tenant_id: str, user_id: str,
             scope=credentials_module.parse_scope(row.get('scope')),
             revision=int(row.get('revision') or 1),
             status=str(row.get('status') or 'active'))
-        if binding.matches(tenant_id=tenant_id, subject_id=user_id):
+        if binding.matches(tenant_id=tenant_id, subject_id=user_id, platform_id=platform_id):
             return binding
     return None
 
@@ -202,7 +202,7 @@ async def authorize_call(store, context, *, tool_key: str, effect: str = 'unknow
     if server_id:
         credential = await mcp_connections.binding_for_server(
             store, tenant_id=context.tenant_id, user_id=context.user_id,
-            server_id=server_id)
+            server_id=server_id, platform_id=context.platform_id)
         require_credential = True
     else:
         # 本地工具不拿别的服务端的钥匙来凑「有凭据」。
@@ -231,7 +231,7 @@ async def authorize_call(store, context, *, tool_key: str, effect: str = 'unknow
 
 async def check_revocations(store, decision: policy_module.PolicyDecision,
                             *, tool_key: str, tenant_id: str,
-                            user_id: str, role: str = '') -> None:
+                            user_id: str, role: str = '', platform_id: str = '') -> None:
     """发送前再核对一次：政策被停用 / 凭据被撤销 → 阻断新发送。
 
     为什么要有第二次检查：发现（`catalog`）与发送之间隔着一次模型规划，
@@ -252,6 +252,16 @@ async def check_revocations(store, decision: policy_module.PolicyDecision,
             f'工具 {tool_key} 的政策在发送前被停用，拒绝发送',
             code='E_POLICY_REVOKED')
     if decision.credential is not None:
+        from app import mcp_connections
+        try:
+            binding = await mcp_connections.binding_for_server(
+                store, tenant_id=tenant_id, user_id=user_id,
+                server_id=mcp_connections.server_id_of(tool_key), platform_id=platform_id)
+        except Exception as exc:
+            raise AuthorizationDenied('发送前无法确认平台服务绑定，拒绝发送',
+                                      code='E_CREDENTIAL_LOOKUP_FAILED') from exc
+        if binding is None or binding.binding_id != decision.credential.binding_id:
+            raise AuthorizationDenied('平台服务绑定已变更，拒绝发送', code='E_CREDENTIAL_REVOKED')
         binding_id = decision.credential.binding_id
         try:
             rows = await store.credential_bindings(tenant_id=tenant_id)

@@ -1,16 +1,12 @@
 # 通用智能体执行中台
 
-企业新接入请从 [MCP Server 对接协议 v1](docs/mcp-server-contract.md) 开始：提供可发现的工具、真实输入输出和副作用语义，优先通过协议接入，避免新增企业专属适配代码。
-已配置连接可运行 `python -m scripts.check_mcp_contract --server-id <id>` 做只读合同检查。
-本次跨分支取舍见 [设计审查记录](docs/platform-branch-review.md)，其中列明已实现能力与后续建设项。
-
-中台目标、边界与对接合同见仓库根目录 [`智能体中台运行机制说明.md`](../智能体中台运行机制说明.md)。
+中台目标、边界与对接合同见仓库根目录 [`智能体中台运行机制说明.md`](智能体中台运行机制说明.md)。
 
 规划故障如何恢复、完整模型请求如何限制上下文，见 [模型请求与恢复策略](docs/model-request-policy.md)。
 
 按用户目标生成计划、从已接入的能力里选工具、逐步执行并记录每一次外部调用的中台。
 执行内核与业务解耦：**网页检索、资料转 HTML、发布到 MCP 服务器**只是当前接入的
-一组示例能力。工单、库存等企业业务优先由企业 MCP Server 按协议暴露，无需在中台增加业务能力包。
+一个业务能力包，换成工单/文件/数据库查询只需增加能力包，不动内核。
 
 当前能力面（有意保持最小）：
 
@@ -24,7 +20,7 @@
 | `deploy_site` | 发布产物到服务器 | **MCP 服务端**（带平台适配器） | `mcp:<server>:<tool>` |
 | `mcp__*` | 服务端动态发现的工具（含查询/删除/更新站点） | MCP 服务端 | `mcp:<server>:<tool>` |
 
-只有前五个是"内置"工具：不需要外部服务、身份以 `local:` 开头。`deploy_site`
+只有前五个是"内置"工具：由本地能力包注册、身份以 `local:` 开头；检索与抓页仍需外部 API。`deploy_site`
 **不是内置工具**——它就是服务端声明的那个部署工具，身份是 `mcp:<server>:<tool>`，
 和 `mcp__*` 走同一条调用通道（同一份账本记录、同样进 `mcp_calls`、同样的
 结果未定判定）。平台只为它多挂了一个适配器（调用前的开关/产物闸门 + 调用后的
@@ -131,9 +127,9 @@ python --version             # Python 3.12.15
 `python -m scripts.list_mcp_tools`，应能在 `openmontage` 下发现 9 个业务工具。
 多个服务端同时配置时，模型看到的工具名如 `mcp__openmontage__list_capabilities`。
 
-当前连接方式适合工具发现与同步调用。客户端每次调用结束都会关闭 stdio 子进程，
-而 OpenMontage 的异步任务保存在进程内存中；正式使用后台视频任务与跨调用轮询前，
-需将客户端改为复用持续存活的会话。
+stdio 会话现已在同一进程中复用，默认空闲 600 秒后关闭；
+`STDIO_SESSION_IDLE_SECONDS=0` 才恢复每次调用结束关闭。OpenMontage 的异步任务若只保存在
+子进程内存中，空闲回收或进程重启后仍不能继续查询；正式恢复需要服务端持久任务号和匹配的异步查询合同。
 
 ## 3. 运行
 
@@ -612,7 +608,7 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
 - `AUTH_MODE=ticket` 时业务接口一律要求中台会话，**改 `X-DSH-User` 无效**；
 - 退出登录撤销数据库会话；已连上的 SSE 会按 `AUTH_SSE_RECHECK` 周期复查并断开。
 
-> **给客户平台研发的对接合同**：[`智能体中台运行机制说明.md`](../智能体中台运行机制说明.md) 第 18 节。
+> **给客户平台研发的对接合同**：[`智能体中台运行机制说明.md`](智能体中台运行机制说明.md) 第 18 节；具体接入步骤见 [通用宿主平台接入](docs/platform-integration.md)。
 > —— 签什么票、怎么换会话、错误码、续期/退出，都在那份里。
 
 ### 本地跑通（两个模拟平台）
@@ -809,11 +805,14 @@ python -m scripts.list_mcp_tools
 
 ```bash
 # PG_TEST_DSN 必须指向一次性测试库（库名含 test），用例会 TRUNCATE 全部业务表
-PG_TEST_DSN=postgresql://…/agent_platform_test \
-  python -W error::RuntimeWarning -m unittest discover -s tests -v
+export PG_TEST_DSN=postgresql://…/agent_platform_test
+DATABASE_URL="$PG_TEST_DSN" AUTH_MODE=off TOOL_POLICY_ENFORCED=false \
+  RESULT_ENVELOPE_V2=false ASYNC_TOOL_RUNTIME_ENABLED=false \
+  AUTH_ALLOWED_ORIGINS='' AUTH_OPERATORS=default \
+  python -W error::RuntimeWarning -m unittest discover -s tests -t . -v
 ```
 
-**467 条用例全部通过**（包含真实 PostgreSQL 和真实 stdio MCP 测试）。主要覆盖：
+**2026-10-28：537 条用例全部通过，无跳过项**（包含独立临时 PostgreSQL 测试；模型与远端工具使用受控替身）。主要覆盖：
 
 | 文件 | 覆盖 |
 |---|---|
@@ -825,10 +824,11 @@ PG_TEST_DSN=postgresql://…/agent_platform_test \
 | `tests/test_observation.py` | 摘要保留结构、路由优先级、结果完整可追溯、空 continue 拒绝、缺证据不成功、无进展停止、预算耗尽、观察开关 |
 | `tests/test_run_inputs.py` | 补充接受/幂等/背压、旧版本动作零准入、计划 CAS、修订校验、收尾门禁、暂停期间补充、HTTP 202/409/404/422 |
 | `tests/test_ticket_auth.py` 等 | 票据验证、兑换、退出、跨平台隔离 |
-| `tests/test_mcp_contract.py` | 两种行业 Server 共用协议、动作身份注入、防伪造、输入/输出错误确定性、发现缓存并发隔离、多分块与二进制读取、真实 Worker 调用 |
 
 新增测试覆盖结果登记与用户隔离（`test_result_isolation.py`）、stdio 会话复用（`test_stdio_session.py`）、
-通用平台边界与 AnyIO 连接作用域（`test_platform_generalization.py`）。
+通用平台边界与 AnyIO 连接作用域（`test_platform_generalization.py`）、现场握手与来源平台隔离
+（`test_platform_context_api.py`、`test_platform_mcp_access.py`）、完整要求核对（`test_request_review.py`），
+以及工具停用、运维权限与日志脱敏（`test_platform_review_fixes.py`）。
 
 `-W error::RuntimeWarning` 是刻意的：漏 `await` 的执行路径不会报错，只会静默失效，
 把它提升成错误才能守住"Worker 真的在等结果"这件事。

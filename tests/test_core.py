@@ -4063,6 +4063,30 @@ class McpBusinessFailureTests(unittest.IsolatedAsyncioTestCase):
                 content=[])
         self.assertEqual(mcp_adapter.result_payload(ok)['job_id'], 'j1')
 
+    def test_mcp_iserror_preserves_confirmed_parameter_rejection(self):
+        from types import SimpleNamespace as NS
+        from app.integrations import mcp_adapter
+
+        rejected = NS(isError=True, structuredContent=None, content=[NS(
+            type='text', text='{"reason":"invalid_parameter",'
+                              '"message":"audioPitch 的值无效"}')])
+        with self.assertRaises(mcp_adapter.MCPToolFailure) as ctx:
+            mcp_adapter.result_payload(rejected)
+        self.assertIn('audioPitch', str(ctx.exception))
+        self.assertEqual(mcp_adapter.certainty_of_error(ctx.exception), 'failed_confirmed')
+
+        unknown = NS(isError=True, structuredContent=None, content=[NS(
+            type='text', text='{"reason":"operation_failed",'
+                              '"message":"Traceback: private server path"}')])
+        with self.assertRaises(RuntimeError) as ctx:
+            mcp_adapter.result_payload(unknown)
+        self.assertNotIn('private server path', str(ctx.exception))
+        self.assertEqual(mcp_adapter.certainty_of_error(ctx.exception), 'unknown')
+
+        from jsonschema import ValidationError as JsonSchemaValidationError
+        self.assertEqual(mcp_adapter.certainty_of_error(
+            JsonSchemaValidationError('invalid parameter')), 'not_executed')
+
     def test_enum_prefixed_status_is_parsed_correctly(self):
         """`ToolStatus.AVAILABLE` 这种带枚举前缀的状态不能当成"不可用"。
 

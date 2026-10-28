@@ -117,10 +117,11 @@ async def _default_querier(store, task: dict, contract):
     tool_name = parts[-1] if parts else ''
     if not tool_name or not contract.status_id_argument:
         raise RuntimeError('合同没有状态查询工具')
+    run = await store.run(str(task.get('run_id') or ''))
     token = await mcp_connections.bearer_for(
         store, tenant_id=str(task.get('tenant_id') or 'default'),
         user_id=str(task.get('owner_user_id') or 'default'),
-        server_id=server_id)
+        server_id=server_id, platform_id=str((run or {}).get('platform_id') or ''))
     server = mcp_servers.by_id(server_id) if server_id else None
     return await mcp_adapter.call_tool(
         tool_name, {contract.status_id_argument: task.get('remote_task_id')},

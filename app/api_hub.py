@@ -434,6 +434,8 @@ class Hub:
             task_id, run_id, session_id, message, tenant_id=tenant,
             owner_user_id=owner,
             owner_role=str(getattr(principal, 'role', '') or 'member'),
+            platform_id=str(getattr(principal, 'platform_id', '') or ''),
+            platform_subject=str(getattr(principal, 'subject', '') or ''),
             scene=scene, request_spec=request_spec)
         if admitted['replayed']:
             record = await self.get(admitted['task_id'])

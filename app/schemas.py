@@ -2,6 +2,14 @@ from typing import ClassVar
 from typing_extensions import TypedDict
 from pydantic import BaseModel, Field
 
+class ToolSelection(BaseModel):
+    tools: list[int] = Field(default_factory=list, max_length=12)
+
+class RequestReview(BaseModel):
+    complete: bool
+    unmet_requirements: list[str] = Field(default_factory=list, max_length=12)
+    unsafe_substitutions: list[str] = Field(default_factory=list, max_length=12)
+
 class PlanStep(BaseModel):
     """编排计划中的一步。
 

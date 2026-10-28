@@ -82,11 +82,15 @@ class ToolPolicy:
 
     def matches(self, *, tenant_id: str, tool_key: str, role: str = '',
                 user_id: str = '') -> bool:
-        if not self.enabled:
-            return False
+        # 匹配范围与启用状态分开：停用的精确政策仍须覆盖服务默认政策，
+        # 否则撤权会意外回退到通配放行。
         if self.tenant_id != tenant_id:
             return False
-        if self.tool_key and self.tool_key != tool_key:
+        server_wildcard = (self.tool_key.startswith('mcp:')
+                           and self.tool_key.count(':') == 2
+                           and self.tool_key.endswith(':*'))
+        if self.tool_key and self.tool_key != tool_key and not (
+                server_wildcard and tool_key.startswith(self.tool_key[:-1])):
             return False
         if self.role and self.role != role:
             return False
@@ -126,7 +130,7 @@ def specificity(policy: ToolPolicy) -> int:
     """
     score = 0
     if policy.tool_key:
-        score += 8
+        score += 8 if policy.tool_key.endswith(':*') else 16
     if policy.user_id:
         score += 4
     if policy.role:
@@ -226,13 +230,14 @@ def visible_to(policy: ToolPolicy | None, tool_key: str, *, tenant_id: str,
     看不见比拒绝更重要：模型只要看得见名字，就可能去规划它。名称都不给，
     "上游偷偷加一个 delete_*，规划器看到了就会用"这件事就不会发生。
 
-    没有匹配政策时**默认可见**（在强制模式关闭时）——强制模式下由
-    `decide()` 给出明确的拒绝理由，而不是让工具凭空消失。
+    停用或明确禁止的政策不可见，需要批准的工具仍可供规划。
+    没有匹配政策时，仅在强制模式关闭时默认可见。
     """
     if policy is None:
         return not enforcement_enabled()
-    return policy.matches(tenant_id=tenant_id, tool_key=tool_key,
-                           role=role, user_id=user_id)
+    return (policy.enabled and policy.approval_mode != APPROVAL_NEVER
+            and policy.matches(tenant_id=tenant_id, tool_key=tool_key,
+                               role=role, user_id=user_id))
 
 
 def filter_catalog(tools, policies, *, tenant_id: str, role: str = '',

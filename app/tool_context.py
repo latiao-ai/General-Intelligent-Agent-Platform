@@ -54,6 +54,7 @@ class ToolCallContext:
     # 原始认证是否可信。False 表示"开发兜底"：调用点走兼容路径。
     authenticated: bool = True
     extra: dict = field(default_factory=dict)
+    platform_id: str = ''
 
     def subject_key(self) -> str:
         """凭据缓存键：必须包含主体与绑定版本，否则 A 的钥匙会被 B 用上。"""
@@ -83,7 +84,8 @@ def from_principal(principal, *, run_id: str = '', step_id: str = '',
         intent_version=int(intent_version or 0),
         plan_version=max(1, int(plan_version or 1)),
         server_binding_id=server_binding_id,
-        authenticated=bool(getattr(principal, 'authenticated', False)))
+        authenticated=bool(getattr(principal, 'authenticated', False)),
+        platform_id=str(getattr(principal, 'platform_id', '') or ''))
 
 
 def from_run(run: dict, *, user_id: str = '', role: str = 'member',
@@ -107,7 +109,8 @@ def from_run(run: dict, *, user_id: str = '', role: str = 'member',
         intent_version=int(intent_version or run.get('intent_version') or 0),
         plan_version=max(1, int(plan_version or run.get('plan_version') or 1)),
         server_binding_id=server_binding_id,
-        authenticated=bool(authenticated))
+        authenticated=bool(authenticated),
+        platform_id=str(run.get('platform_id') or ''))
 
 
 def dev_context(**overrides) -> ToolCallContext:

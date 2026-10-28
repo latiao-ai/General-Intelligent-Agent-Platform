@@ -135,14 +135,18 @@ class RunInputRequest(BaseModel):
     task_id: str | None = Field(default=None, max_length=64)
 
 
-class TaskRequest(BaseModel):
+class PlatformContextRequest(BaseModel):
+    """Any registered platform can preview its signed scene without starting work."""
+    context: dict | None = None
+    context_assertion: str | None = Field(default=None, max_length=8192)
+
+
+class TaskRequest(PlatformContextRequest):
     message: str = Field(min_length=1, max_length=10000)
     session_id: str | None = None
     # 也可以放在 Idempotency-Key 头里；两处都给时以头为准。
     idempotency_key: str | None = Field(default=None, max_length=200)
     # 平台后端签名过的当前项目 / 选中对象。ticket 模式下必须带 context_assertion。
-    context: dict | None = None
-    context_assertion: str | None = Field(default=None, max_length=8192)
 
 
 def sse(event: dict) -> str:
@@ -354,7 +358,7 @@ async def create_task(payload: TaskRequest, request: Request,
         raise HTTPException(status_code=400, detail=str(exc)) from None
 
 
-def _scene_for(payload: TaskRequest, principal) -> dict | None:
+def _scene_for(payload: PlatformContextRequest, principal) -> dict | None:
     """ticket 模式下，带了现场就必须有平台签名。没带现场则不注入。"""
     if not payload.context:
         return None
@@ -372,6 +376,21 @@ def _scene_for(payload: TaskRequest, principal) -> dict | None:
     return {'verified': False,
             'context_hash': scene_context_module.canonical_hash(payload.context),
             'context': payload.context}
+
+
+@app.post('/api/context/verify')
+async def verify_platform_context(payload: PlatformContextRequest,
+                                  principal=Depends(policies.current_principal)):
+    """Verify a platform scene for UI readiness; no task, model or tool execution.
+
+    Uses exactly the same verifier as task admission. Platform fields stay opaque
+    here: identity, trust registration and hash binding define the contract.
+    """
+    if not principal.authenticated:
+        raise HTTPException(status_code=401, detail='需要已验证的平台登录会话')
+    if not payload.context or not payload.context_assertion:
+        raise HTTPException(status_code=400, detail='缺少现场上下文或签名证明')
+    return _scene_for(payload, principal)
 
 
 async def _start_task(payload: TaskRequest, principal, *, request_spec=None) -> dict:
@@ -720,16 +739,18 @@ async def read_artifact(artifact_id: str,
 
 
 @app.get('/api/recovery')
-async def recovery_status():
+async def recovery_status(principal=Depends(policies.current_principal)):
+    _require_operator(principal)
     return getattr(app.state, 'recovery', {})
 
 
 @app.get('/api/health')
-async def health():
+async def health(principal=Depends(policies.current_principal)):
     """存活与态势：队列积压、待核实动作、失败作业都能看到。
 
     没有这个口子，上面那些状态只能手工查库——排障成本高到没人会去查。
     """
+    _require_operator(principal)
     try:
         stats = await hub.store.stats()
     except Exception as exc:                     # noqa: BLE001
@@ -887,6 +908,7 @@ class CredentialBindingRequest(BaseModel):
     subject_kind: str = 'tenant'
     subject_id: str = ''
     credential_ref: str = Field(min_length=1, max_length=500)
+    platform_id: str = Field(default='', max_length=80)
 
 
 class ToolPolicyRequest(BaseModel):
@@ -943,7 +965,8 @@ async def bind_credential(payload: CredentialBindingRequest,
     row = await hub.store.upsert_credential_binding(
         tenant_id=payload.tenant_id, subject_kind=payload.subject_kind,
         subject_id=subject, server_binding_id=str(server.get('binding_id') or ''),
-        credential_ref=payload.credential_ref)
+        credential_ref=payload.credential_ref,
+        scope={'platforms': [payload.platform_id]} if payload.platform_id else {})
     return {'binding_id': row.get('binding_id'),
             'server_binding_id': row.get('server_binding_id'),
             'subject_kind': row.get('subject_kind'),

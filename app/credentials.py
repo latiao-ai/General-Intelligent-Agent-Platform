@@ -60,7 +60,7 @@ class CredentialBinding:
     revision: int
     status: str = 'active'
 
-    def matches(self, tenant_id: str, subject_id: str) -> bool:
+    def matches(self, tenant_id: str, subject_id: str, platform_id: str = '') -> bool:
         """这条绑定能不能用于这个主体。
 
         `subject_kind='tenant'` 的绑定对该租户的所有主体可用；`subject_kind=
@@ -70,6 +70,12 @@ class CredentialBinding:
         if self.tenant_id != tenant_id:
             return False
         if self.status != 'active':
+            return False
+        platforms = (self.scope or {}).get('platforms')
+        if platform_id and platforms is None:
+            return False
+        if platforms is not None and (not isinstance(platforms, list)
+                                      or platform_id not in platforms):
             return False
         if self.subject_kind == 'tenant':
             return True

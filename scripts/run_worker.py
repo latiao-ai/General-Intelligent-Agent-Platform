@@ -143,8 +143,8 @@ async def drain_jobs(hub: Hub, worker_id: str, limit: int = 5) -> int:
 
 async def main_loop(hub: Hub, worker_id: str, once: bool,
                     jobs_only: bool, interval: float) -> None:
-    logger.info('启动 worker_id=%s db=%s', worker_id, settings.database_url)
-    print(f'[worker] 启动 worker_id={worker_id} db={settings.database_url}')
+    logger.info('启动 worker_id=%s', worker_id)
+    print(f'[worker] 启动 worker_id={worker_id}')
     ready = getattr(hub.store, 'ready', None)
     if callable(ready):
         await ready()          # 连不上库就在启动阶段失败

@@ -29,7 +29,7 @@ import importlib
 import logging
 import pkgutil
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -58,9 +58,6 @@ class Tool:
     # public：答案在公开网页上（检索、抓页、把资料排成 HTML）。
     # 空：不是这条路。平台上的读和改不能拿 public 工具充数。
     scope: str = ''
-    output_schema: dict | None = None
-    annotations: dict = field(default_factory=dict)
-    metadata: dict = field(default_factory=dict)
 
 
 _DECLARATIONS: dict[str, dict] = {}

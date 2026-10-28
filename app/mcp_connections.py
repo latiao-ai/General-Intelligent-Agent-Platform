@@ -22,7 +22,7 @@ def server_id_of(tool_key: str) -> str:
 
 
 async def binding_for_server(store, *, tenant_id: str, user_id: str,
-                              server_id: str):
+                              server_id: str, platform_id: str = ''):
     """只取**这个服务端**的绑定。取不到别的服务端的钥匙来顶。"""
     if store is None or not server_id:
         return None
@@ -32,18 +32,20 @@ async def binding_for_server(store, *, tenant_id: str, user_id: str,
     from app import tool_authorization as authorization_module
     return await authorization_module.resolve_binding(
         store, tenant_id=tenant_id, user_id=user_id,
+        platform_id=platform_id,
         server_binding_id=str(row.get('binding_id') or ''))
 
 
 async def bearer_for(store, *, tenant_id: str, user_id: str,
-                     server_id: str) -> str | None:
+                     server_id: str, platform_id: str = '') -> str | None:
     """这次连接要用的明文。
 
     `None` = 调用方沿用服务端 / 环境 token。
     非空 = 必须用这把，禁止再退回全局 token。
     """
     binding = await binding_for_server(
-        store, tenant_id=tenant_id, user_id=user_id, server_id=server_id)
+        store, tenant_id=tenant_id, user_id=user_id, server_id=server_id,
+        platform_id=platform_id)
     if binding is None:
         if policy_module.enforcement_enabled():
             raise credentials_module.CredentialMissing(
@@ -80,7 +82,30 @@ async def bearer_for_current(server) -> str | None:
     tenant_id = str((run or {}).get('tenant_id') or 'default')
     user_id = str((run or {}).get('owner_user_id') or '') or 'default'
     return await bearer_for(
-        store, tenant_id=tenant_id, user_id=user_id, server_id=server.id)
+        store, tenant_id=tenant_id, user_id=user_id, server_id=server.id,
+        platform_id=str((run or {}).get('platform_id') or ''))
+
+
+async def discoverable_servers(servers):
+    """Filter before opening any transport, including stdio processes."""
+    from app.ledger import current_ledger
+    from app import execution_control
+    book = current_ledger()
+    context = execution_control.require()
+    if book is None or context is None:
+        raise credentials_module.CredentialMissing('工具发现缺少可信执行主体')
+    run = await book.store.run(context.run_id)
+    if not run:
+        raise credentials_module.CredentialMissing('工具发现缺少有效运行主体')
+    allowed = []
+    for server in servers:
+        binding = await binding_for_server(
+            book.store, tenant_id=str(run.get('tenant_id') or 'default'),
+            user_id=str(run.get('owner_user_id') or 'default'),
+            platform_id=str(run.get('platform_id') or ''), server_id=server.id)
+        if binding is not None:
+            allowed.append(server)
+    return allowed
 
 
 async def discovery_scope(servers) -> tuple:
@@ -99,9 +124,10 @@ async def discovery_scope(servers) -> tuple:
     scope = []
     for server in servers:
         binding = await binding_for_server(book.store, tenant_id=tenant,
-                                           user_id=user, server_id=server.id)
+                                           user_id=user, server_id=server.id,
+                                           platform_id=str(run.get('platform_id') or ''))
         if binding is None:
             raise credentials_module.CredentialMissing('工具发现缺少有效凭据绑定')
         scope.append((server.id, binding.binding_id, binding.revision,
                       credentials_module.parse_scope(binding.scope)))
-    return tenant, user, scope
+    return tenant, user, scope, str(run.get('platform_id') or '')

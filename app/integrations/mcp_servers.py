@@ -48,9 +48,6 @@ class Server:
     token: str = ''
     stdio_command: str = ''
     stdio_args: tuple = ()
-    # 值是受控凭据引用（env:/file:/literal:），不把整份中台环境交给子进程。
-    stdio_env: dict = field(default_factory=dict)
-    credential_env: str = ''
     # 以下只在"这个服务端承接部署"时有意义
     deploy_tool: str = ''
     payload_mode: str = ''
@@ -73,6 +70,9 @@ class Server:
     # 这家服务端自己的规划规则。只在它的工具进入本轮清单时拼进规划提示词。
     # 内核不再替某一家编写业务语义（删站点、生成视频、画布节点这类话写在这里）。
     prompt_rules: str = ''
+    stdio_env: dict = field(default_factory=dict)
+    forward_subject: bool = False
+    planning_tools: tuple = ()
 
 
 def _legacy_server() -> Server | None:
@@ -88,8 +88,6 @@ def _legacy_server() -> Server | None:
         token=os.getenv('MCP_BEARER_TOKEN', '').strip(),
         stdio_command=command,
         stdio_args=tuple(json.loads(os.getenv('MCP_STDIO_ARGS', '[]') or '[]')),
-        stdio_env=_json_object(os.getenv('MCP_STDIO_ENV', '{}')) or {},
-        credential_env=os.getenv('MCP_CREDENTIAL_ENV', '').strip(),
         deploy_tool=os.getenv('MCP_TOOL_NAME', '').strip(),
         payload_mode=os.getenv('MCP_PAYLOAD_MODE', '').strip(),
         html_field=os.getenv('MCP_HTML_FIELD', '').strip(),
@@ -150,8 +148,6 @@ def _from_entry(entry: dict) -> Server | None:
         token=str(entry.get('token') or '').strip(),
         stdio_command=command,
         stdio_args=tuple(entry.get('stdio_args') or ()),
-        stdio_env=dict(entry.get('stdio_env') or {}),
-        credential_env=str(entry.get('credential_env') or '').strip(),
         deploy_tool=str(entry.get('deploy_tool') or '').strip(),
         payload_mode=str(entry.get('payload_mode') or '').strip(),
         html_field=str(entry.get('html_field') or '').strip(),
@@ -162,6 +158,9 @@ def _from_entry(entry: dict) -> Server | None:
         tool_name_arg=str(entry.get('tool_name_arg') or '').strip(),
         tool_hints=dict(entry.get('tool_hints') or {}),
         prompt_rules=_prompt_rules(entry.get('prompt_rules')),
+        stdio_env={str(k): str(v) for k, v in (entry.get('stdio_env') or {}).items()},
+        forward_subject=bool(entry.get('forward_subject', False)),
+        planning_tools=tuple(str(x) for x in (entry.get('planning_tools') or [])),
         default=bool(entry.get('default')),
         title=str(entry.get('title') or ''),
     )
