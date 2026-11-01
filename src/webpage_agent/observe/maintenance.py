@@ -20,7 +20,7 @@ async def run_once(store, *, root=None, now_ts=None):
     root = Path(root or settings.artifact_dir).resolve()
     current = time.time() if now_ts is None else now_ts
     stamp = lambda days: datetime.fromtimestamp(current-days*86400, timezone.utc).isoformat()
-    stats = {'events': 0, 'artifacts': 0, 'results': 0, 'orphans': 0}
+    stats = {'events': 0, 'artifacts': 0, 'results': 0, 'orphans': 0, 'orphan_tasks': 0}
     async with store._lease() as conn:
         row = await store._one(conn, 'SELECT pg_try_advisory_xact_lock(%s) AS locked', (719284632,))
         if not row['locked']:
@@ -80,6 +80,12 @@ async def run_once(store, *, root=None, now_ts=None):
         stats['orphans'] = await asyncio.to_thread(artifact_store.gc_unregistered, root,
             grace_seconds=settings.result_gc_grace_seconds, now_ts=current,
             registered_ids={r['result_id'] for r in registered})
+        # 任务目录没有登记表，保留策略扫不到"库重建后剩下的目录"——按 task_id
+        # 是否还在库里判断孤儿，与 retention_artifacts_days 相互独立。
+        live = await store._all(conn, 'SELECT task_id FROM tasks')
+        stats['orphan_tasks'] = await asyncio.to_thread(artifact_store.gc_orphan_task_dirs, root,
+            grace_seconds=settings.result_gc_grace_seconds, now_ts=current,
+            live_task_ids={row['task_id'] for row in live})
     return stats
 
 

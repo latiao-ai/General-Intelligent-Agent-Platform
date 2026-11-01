@@ -13,13 +13,23 @@
 import asyncio
 import os
 import sys
+import tempfile
 
 from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from webpage_agent.core.config import settings
+
 PG_DSN = os.getenv('PG_TEST_DSN', '')
+
+# 测试默认不往仓库真实的 artifacts/ 目录里写：整轮测试共用一个临时目录。
+# 跑真实执行链的用例（seed_run + run_worker / api_hub）会落 state.json、
+# results/ 和产出文件，不隔离就会在仓库里越攒越多。需要自己目录的用例仍然
+# 可以用 override_settings(artifact_dir=...) 或 object.__setattr__ 覆盖。
+_SESSION_ARTIFACTS = tempfile.TemporaryDirectory(prefix='agent-test-artifacts-')
+object.__setattr__(settings, 'artifact_dir', Path(_SESSION_ARTIFACTS.name))
 
 TEST_TABLES = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
                'action_attempts', 'actions', 'steps', 'plans', 'run_snapshots',

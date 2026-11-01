@@ -67,6 +67,7 @@ API 启动后台维护任务，按 `MAINTENANCE_INTERVAL_SECONDS` 执行，数�
 - `RETENTION_EVENTS_DAYS` 清理到期且所有运行均最终成功/失败/取消的任务事件，保留最后一条，保证后续事件 seq 不倒退。
 - `RETENTION_ARTIFACTS_DAYS` 清理同类已结束任务的过期产物与已登记工具结果，保留暂停、等待输入、等待批准、结果未知和需要核实的工作。到期文件清理后下载返回 404；台账、对话和运行历史保留。
 - 任一保留天数设为 0 时关闭对应清理。`/api/ops/gc-results` 仍只清理超过宽限期、无 manifest 的暂存目录。维护不跟随 symlink 删除外部目录。
+- 任务目录（`ARTIFACT_DIR/<task_id>` 下的 `state.json`、`results/`、产出文件）没有登记表可反查：库重建或任务被删之后，这些目录不会被保留策略扫到，会一直留在磁盘上。维护另外按「`task_id` 是否还在 `tasks` 表里」判断孤儿，删除超过 `RESULT_GC_GRACE_SECONDS`（默认 86400 秒）的孤儿目录；该值设为 0 关闭这段清理。只处理名字是 32 位十六进制的普通目录，符号链接既不跟随也不删除。
 - 限流窗口、过期登录会话和幂等键自动清理。费用台账没有自动删除，长期保留/归档由组织审计策略决定。
 
 `/api/ops/metrics` 保留 operator 权限。`METRICS_FORMAT=prometheus` 返回 Prometheus 文本，否则 JSON；包括队列、未知动作、批准积压、provider 请求/费用/token/未结算数。费用值为 micros，采集器应使用受控 operator 会话，不提供匿名指标入口。当前指标是数据库聚合快照（gauge），并非永久只增计数器。

@@ -1497,7 +1497,6 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_orphan_running_task_marked_interrupted_on_reopen(self):
         with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / 'agent.db'
             first = new_store()
             await first.create_task('t1', 's1', '中断前的任务')
             await first.close()
@@ -1582,7 +1581,6 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         import webpage_agent.api.api_hub as hub_module
         from webpage_agent.api.api_hub import Hub
         with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / 'agent.db'
             first = Hub(new_store())
             with patch.object(hub_module, 'run_task', self.stub()):
                 record = await first.start('老任务')
