@@ -8,7 +8,6 @@
 """
 import argparse
 import os
-import socket
 
 import uvicorn
 # 直接跑脚本时（python scripts/xxx.py）sys.path[0] 是 scripts/，仓库根与 src/ 都不在其中，
@@ -21,13 +20,12 @@ if str(_ROOT) not in _sys.path:
 
 
 def lan_address():
-    """Ask the routing table for the primary IPv4 address; sends no packets."""
+    """本机局域网地址。见 scripts/lanaddr.py（避开代理 TUN 的 198.18/15）。"""
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(('192.0.2.1', 9))
-            return sock.getsockname()[0]
-    except OSError:
-        return None
+        from scripts.lanaddr import lan_address as _lan
+    except ImportError:            # 直接 python scripts/serve_api.py 时 sys.path[0] 是 scripts/
+        from lanaddr import lan_address as _lan
+    return _lan()
 
 
 def main():

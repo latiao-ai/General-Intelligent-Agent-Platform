@@ -60,15 +60,25 @@ webpage-agent-main/
 # 首次：建库建表（需要 DATABASE_URL 指向的 PostgreSQL 已就绪）
 python -m scripts.migrate
 
-# 启动
-python -m scripts.serve_api        # API + 内置界面，默认 127.0.0.1:8002
-python -m scripts.run_worker       # Worker，跑后台任务与外部任务轮询
+# 一键启动：后端 + Worker，默认对局域网开放
+python -m scripts.serve_dev
 
-# 可选：单独的前端入口（8001 转发到 8002，前端改动用）
-python -m scripts.serve_frontend
+# 需要嵌进 BeeFTV 画布时再加前端代理（8001）
+python -m scripts.serve_dev --with-frontend
+
+# 其它开关：--local 只绑 127.0.0.1 / --no-worker / --migrate / --reload
+#          --port 8002 / --frontend-port 8001
 
 # 测试：ruff + mypy + 全部用例（需要 PG，会 TRUNCATE 测试库）
 bash scripts/run_tests.sh
+```
+
+单进程分别启动（调试用）：
+
+```bash
+python -m scripts.serve_api        # API + 内置界面，默认 127.0.0.1:8002
+python -m scripts.run_worker       # Worker，跑后台任务与外部任务轮询
+python -m scripts.serve_frontend   # 8001 前端代理，需要 BeeFTV 在 8003/8004
 ```
 
 `python -m scripts.xxx` **不需要**预先设置 `PYTHONPATH`：`scripts/__init__.py`
