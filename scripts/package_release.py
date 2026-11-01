@@ -10,8 +10,7 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DIRECTORIES = ('src', 'scripts', 'contracts', 'docs', 'deploy', 'tests', '.github')
-FILES = ('.env.example', '.gitignore', '.dockerignore', 'Dockerfile', 'compose.yaml',
-         'README.md', 'requirements.txt', 'requirements.lock.txt',
+FILES = ('.env.example', '.gitignore', 'README.md', 'requirements.txt', 'requirements.lock.txt',
          'requirements-dev.txt', 'pyproject.toml', '智能体中台运行机制说明.md')
 SECRET = re.compile(rb'(?:-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|sk-[A-Za-z0-9_-]{24,})')
 
@@ -31,9 +30,9 @@ def source_files(root: Path) -> list[Path]:
         if not path.is_file():
             continue
         rel = path.relative_to(root)
-        if rel.parts[0] == 'deploy' and (len(rel.parts) != 2 or not (path.name.endswith('.example') or path.name == 'init-db.sh')):
+        if rel.parts[0] == 'deploy' and (len(rel.parts) != 2 or not path.name.endswith('.example')):
             continue
-        if any(part.startswith('.') and part not in ('.github', '.env.example', '.gitignore', '.dockerignore')
+        if any(part.startswith('.') and part not in ('.github', '.env.example', '.gitignore')
                or part in ('__pycache__', 'node_modules', 'secrets', 'profile', 'artifacts') for part in rel.parts):
             continue
         if path.suffix in ('.pyc', '.pyo', '.pem', '.key', '.sqlite', '.db') or path.name.startswith('.env.') and path.name != '.env.example':

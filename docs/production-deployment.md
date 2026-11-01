@@ -1,6 +1,9 @@
 # 独立部署与运维
 
-当前代码提供生产启动检查、容器、迁移作业、共享限流与租户日预算。仓库内的 `.env`、`secrets/`、`profile/`、`artifacts/` 是本机运行数据，不属于交付物。现有密钥没有自动作废；若曾外发完整工作目录，应在密钥所属平台轮换，不能依靠删除本地文件撤销远端权限。
+> 容器部署文件（Dockerfile、compose.yaml、.dockerignore、deploy/init-db.sh）
+> 已移除，待重新编写。当前按下方「运行方式」直接以进程方式部署。
+
+当前代码提供生产启动检查、迁移作业、共享限流与租户日预算。仓库内的 `.env`、`secrets/`、`profile/`、`artifacts/` 是本机运行数据，不属于交付物。现有密钥没有自动作废；若曾外发完整工作目录，应在密钥所属平台轮换，不能依靠删除本地文件撤销远端权限。
 
 ## 生成交付包
 
@@ -8,17 +11,17 @@
 python -m scripts.package_release
 ```
 
-产出 `dist/webpage-agent.tar.gz`，内部包含逐文件 `SHA256SUMS`。打包使用固定目录/文件允许列表，排除运行数据、部署环境文件、实际接入登记、缓存及符号链接，并拦截私钥、常见 API key 和当前本地已知密钥的复制品。新增的交付文件须加入允许列表。不要用 `tar .`、Finder 压缩整个工作目录或把现有数据目录作为镜像上下文上传。`.dockerignore` 仅允许容器所需源文件进入构建上下文，Dockerfile 也只显式复制运行代码。
+产出 `dist/webpage-agent.tar.gz`，内部包含逐文件 `SHA256SUMS`。打包使用固定目录/文件允许列表，排除运行数据、部署环境文件、实际接入登记、缓存及符号链接，并拦截私钥、常见 API key 和当前本地已知密钥的复制品。新增的交付文件须加入允许列表。不要用 `tar .` 或 Finder 压缩整个工作目录。
 
 ## 配置与启动
 
 1. 从发布包解压后，复制 `deploy/production.env.example` 为 `deploy/production.env`，权限设为 600；填入自己的模型、检索密钥、HTTPS 地址、模型名称、平台来源及计价上界。
 2. 创建 `deploy/config/`。按现有平台接入文档生成 `auth-connections.json`，只放平台公钥和信任登记，不放平台私钥。复制 `deploy/mcp-servers.json.example` 为 `deploy/config/mcp-servers.json`。JSON 字符串中的 `${PUBLISH_MCP_URL}` / `${PUBLISH_MCP_TOKEN}` 由进程环境展开，缺变量或配置无效时拒绝使用该登记表，不回退旧 token。
 3. 在部署终端分别设置数据库管理员 `POSTGRES_PASSWORD` 和应用账号 `AGENT_DB_PASSWORD`。初始化脚本建立非超级用户的 agent 账号，应用不使用 postgres 管理员。应用密码直接插入数据库 URL，使用随机十六进制密码（例如 `openssl rand -hex 32` 的输出）；使用包含 URL 特殊字符的现有密码时，改为自行设置经过 URL 编码的完整 `DATABASE_URL`。不要将生产密码提交到仓库。
-4. 运行 `docker compose up --build -d`。数据库通过健康检查后，`migrate` 作业完成迁移，API 与 Worker 才启动。API 仅绑定宿主机 `127.0.0.1:8000`。
+4. 先运行迁移，再启动 API 与 Worker（命令见下节）。API 仅绑定宿主机 `127.0.0.1:8000`。
 5. 按 `deploy/nginx.conf.example` 配置自己的域名与证书，将公网 HTTPS 转发给 API。模板关闭 SSE 缓冲。运维平台访问 `/healthz` 检查应用与数据库就绪状态。
 
-不使用容器时：Python 3.12，先安装 `requirements.lock.txt`，从部署系统注入环境变量，再依次运行：
+运行方式：Python 3.12，先安装 `requirements.lock.txt`，从部署系统注入环境变量，再依次运行：
 
 ```sh
 python -m scripts.migrate
@@ -31,7 +34,7 @@ python -m scripts.run_worker
 
 生产 MCP 使用 HTTPS。已有的公网 HTTP MCP 必须由该服务端配置 TLS 或由部署方建立加密隧道；不能只给 URL 改成 https 就认定远端支持 TLS。显式 `MCP_ALLOW_LOOPBACK_HTTP=true` 仅允许当前进程网络命名空间的 loopback HTTP 隧道入口，不允许远端 HTTP。请求发送时也检查 URL，阻止重定向或 SSE 消息端点降级到远端明文 HTTP。
 
-本机 stdio MCP 不随应用镜像分发。需要视频等能力时，在自己的派生镜像安装对应依赖，使用镜像中存在的命令，或改接远端 HTTPS MCP。基础配置只示例通用发布服务，不包含开发者个人路径。
+本机 stdio MCP 不随发布包分发。需要视频等能力时，在运行环境自行安装对应依赖并使用可用命令，或改接远端 HTTPS MCP。基础配置只示例通用发布服务，不包含开发者个人路径。
 
 ## 迁移与升级
 
@@ -43,7 +46,7 @@ python -m scripts.run_worker
 
 - IP 请求限流：`API_RATE_LIMIT_PER_MINUTE`，默认 120；登录相关接口单独 `AUTH_RATE_LIMIT_PER_MINUTE`，默认 10。
 - 已认证主体限流：企业 + 用户，`USER_RATE_LIMIT_PER_MINUTE`，默认 60。所有 API 副本共用数据库原子计数，超额返回 429 和 `Retry-After`；限流存储故障时拒绝处理请求。
-- 采用固定分钟窗口，窗口边界可以出现两倍短时突发。客户端真实 IP 取 ASGI peer，只有在代理来源可信且应用服务器正确配置 proxy headers 时才能信任转发 IP。默认 Docker 示例可能将代理地址作为共享 IP，限流会更保守；用户级限流仍独立有效。不要向公网开放任意来源可信的 `--forwarded-allow-ips=*`。
+- 采用固定分钟窗口，窗口边界可以出现两倍短时突发。客户端真实 IP 取 ASGI peer，只有在代理来源可信且应用服务器正确配置 proxy headers 时才能信任转发 IP。反向代理后可能把代理地址当作共享 IP，限流会更保守；用户级限流仍独立有效。不要向公网开放任意来源可信的 `--forwarded-allow-ips=*`。
 - 每个企业独立的 UTC 日额度：`TENANT_DAILY_PROVIDER_REQUESTS` 与 `TENANT_DAILY_COST_MICROS`，跨新任务、重试、进程和重启累计。后台摘要、LLM 和内置搜索/抓取都计入。无可信企业计费上下文时不发送请求。
 - `1,000,000 micros = 1` 个配置货币单位。输入/输出单价按每百万 token 的 micros 设置；搜索/抓取按每次请求的 micros 设置。必须填写适用于所有可选模型的保守计价上界，不能把示例数值当成供应商报价。第三方 MCP 自己的费用需通过其工具政策和外部账单管理，这里没有自动探测其价格。
 - LLM 请求发送前，按最大上下文输入 + 最大输出预留费用；正常完成且提供完整 token usage 时按用量结算，多退少补。失败、超时、取消、进程崩溃或缺 usage 保留保守费用，不能通过重启/失败获得免费额度。异常供应商若突破声明的 token 上限，实际结算仍会如实记账，并阻断后续超额调用。
@@ -55,7 +58,7 @@ API 和 Worker 都使用 PostgreSQL 领取运行与租约 fencing。每个进程
 
 所有事件，包括 draft 与 answer_delta，先持久化后 NOTIFY；各副本按 seq 读取，通知失联时约 15 秒补读。跨进程结束事件会关闭 SSE；被动副本查询任务时重新读取数据库，不长期展示旧内存状态。客户端仍应在断线后携带 `Last-Event-ID` 或 `after`。逐条增量落库增加数据库写入量，实际容量需按自己的模型吞吐压测。
 
-Compose 的命名卷在同一 Docker 主机共享产物与画像。跨主机部署须将 `ARTIFACT_DIR` 和 `PROFILE_PATH` 指向各副本可见的共享存储，并保持相同绝对挂载路径（旧产物仍可能包含绝对引用）。当前没有 S3 后端，不应把多台主机各自的本地卷当成共享存储。
+多副本部署须将 `ARTIFACT_DIR` 和 `PROFILE_PATH` 指向各副本可见的共享存储，并保持相同绝对挂载路径（旧产物仍可能包含绝对引用）。当前没有 S3 后端，不应把各主机各自的本地目录当成共享存储。
 
 ## 清理和监控
 

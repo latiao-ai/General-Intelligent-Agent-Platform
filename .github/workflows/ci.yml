@@ -44,4 +44,3 @@ jobs:
           cd "$RUNNER_TEMP/source-release"
           sha256sum -c SHA256SUMS
           python -W error::RuntimeWarning -m unittest discover -s tests -t . -v
-      - run: docker build -t webpage-agent:ci .

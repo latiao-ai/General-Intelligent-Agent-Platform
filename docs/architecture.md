@@ -20,9 +20,7 @@ webpage-agent-main/
 ├── tests/                    # 用例，镜像源码职责
 ├── contracts/                # 异步工具契约（JSON）
 ├── docs/                     # 文档
-├── deploy/                   # 部署配置
-├── Dockerfile
-├── compose.yaml
+├── deploy/                   # 部署配置模板（nginx、MCP 接入、环境变量示例）
 └── pyproject.toml            # 打包 + ruff + mypy 配置，单一来源
 ```
 
