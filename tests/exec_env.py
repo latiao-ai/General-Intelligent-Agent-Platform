@@ -24,12 +24,14 @@ from webpage_agent.core.config import settings
 
 PG_DSN = os.getenv('PG_TEST_DSN', '')
 
-# 测试默认不往仓库真实的 artifacts/ 目录里写：整轮测试共用一个临时目录。
+# 测试默认不往仓库真实的 artifacts/ 和 profile/ 目录里写：整轮测试共用一个临时目录。
 # 跑真实执行链的用例（seed_run + run_worker / api_hub）会落 state.json、
-# results/ 和产出文件，不隔离就会在仓库里越攒越多。需要自己目录的用例仍然
-# 可以用 override_settings(artifact_dir=...) 或 object.__setattr__ 覆盖。
-_SESSION_ARTIFACTS = tempfile.TemporaryDirectory(prefix='agent-test-artifacts-')
-object.__setattr__(settings, 'artifact_dir', Path(_SESSION_ARTIFACTS.name))
+# results/ 和产出文件；走 HTTP 的用例（如 test_auth_isolation）会落用户画像。
+# 不隔离就会在仓库里越攒越多。需要自己目录的用例仍然可以用
+# override_settings(...) 或 object.__setattr__ 覆盖。
+_SESSION_DATA = tempfile.TemporaryDirectory(prefix='agent-test-data-')
+object.__setattr__(settings, 'artifact_dir', Path(_SESSION_DATA.name) / 'artifacts')
+object.__setattr__(settings, 'profile_path', Path(_SESSION_DATA.name) / 'profile' / 'USER.md')
 
 TEST_TABLES = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
                'action_attempts', 'actions', 'steps', 'plans', 'run_snapshots',
