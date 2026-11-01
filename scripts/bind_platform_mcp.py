@@ -22,7 +22,7 @@ from pathlib import Path as _Path
 # 让"直接跑"和"python -m scripts.bind_platform_mcp"都能用。
 _ROOT = _Path(__file__).resolve().parent.parent
 if str(_ROOT) not in _sys.path:
-    _sys.path.insert(0, str(_ROOT))
+    _sys.path.insert(0, str(_ROOT / 'src'))
 
 from webpage_agent.core import credentials
 from webpage_agent.core.config import settings

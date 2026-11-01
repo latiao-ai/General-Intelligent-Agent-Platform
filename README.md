@@ -372,14 +372,15 @@ SQLite 实现已整体删除——两套实现意味着租约、代次、事务�
 DATABASE_URL=postgresql://latiao@127.0.0.1:5432/agent_platform
 ```
 
-早期 SQLite 数据的迁移脚本仍保留（一次性用）：
+SQLite 实现已整体删除，`scripts/migrate_to_postgres.py` 也随之移除。当前数据库
+直接用 `scripts/migrate.py` 建表与升级：
 
 ```bash
-python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/agent_platform"
+python -m scripts.migrate
 ```
 
-脚本会逐表搬数据并**校验行数一致**，完成后复位 `messages.id` 的序列。
-本地实测迁移了 21 会话 / 139 消息 / 71 任务 / 1069 事件，行数校验通过。
+若确实需要重跑早期 SQLite 数据的搬运，从 git 历史里取回那个脚本
+（`git log --diff-filter=D -- scripts/migrate_to_postgres.py`）再单独运行。
 
 ### 表一览（38 张：原有 35 张 + 生产治理 3 张）
 

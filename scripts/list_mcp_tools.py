@@ -25,9 +25,9 @@ import sys as _sys
 from pathlib import Path as _Path
 _ROOT = _Path(__file__).resolve().parents[1]
 if str(_ROOT) not in _sys.path:
-    _sys.path.insert(0, str(_ROOT))
+    _sys.path.insert(0, str(_ROOT / 'src'))
 
-from webpage_agent.core.config import settings
+from webpage_agent.core.config import settings  # noqa: F401  # 导入即触发 .env 加载
 from webpage_agent.integrations.mcp_adapter import describe_error, list_server_tools
 from webpage_agent.integrations import mcp_servers
 

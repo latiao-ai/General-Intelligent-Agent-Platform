@@ -40,7 +40,7 @@ import urllib.parse
 
 _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in _sys.path:
-    _sys.path.insert(0, str(_ROOT))
+    _sys.path.insert(0, str(_ROOT / 'src'))
 
 import jwt
 from cryptography.hazmat.primitives import serialization

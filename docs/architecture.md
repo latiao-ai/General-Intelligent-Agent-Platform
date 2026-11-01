@@ -57,8 +57,20 @@ webpage-agent-main/
 ## 本地运行
 
 ```bash
-export PYTHONPATH=src          # 或 pip install -e .
-python -m scripts.serve_api        # 起 API
-python -m scripts.run_worker       # 起 Worker
-bash scripts/run_tests.sh          # ruff + mypy + 全部用例（需要 PG）
+# 首次：建库建表（需要 DATABASE_URL 指向的 PostgreSQL 已就绪）
+python -m scripts.migrate
+
+# 启动
+python -m scripts.serve_api        # API + 内置界面，默认 127.0.0.1:8002
+python -m scripts.run_worker       # Worker，跑后台任务与外部任务轮询
+
+# 可选：单独的前端入口（8001 转发到 8002，前端改动用）
+python -m scripts.serve_frontend
+
+# 测试：ruff + mypy + 全部用例（需要 PG，会 TRUNCATE 测试库）
+bash scripts/run_tests.sh
 ```
+
+`python -m scripts.xxx` **不需要**预先设置 `PYTHONPATH`：`scripts/__init__.py`
+会把 `src/` 加进 `sys.path`。只有测试需要 `PYTHONPATH=src`，由
+`scripts/run_tests.sh` 与 CI 负责设置，这样用例必须走真实的包路径导入。
