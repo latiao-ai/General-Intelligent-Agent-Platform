@@ -1,5 +1,9 @@
 .venv/
 .env
+# .env 的备份副本同样含密钥，任何形式都不许进版本库
+.env.bak*
+.env.*.bak
+*.env.bak
 artifacts/
 __pycache__/
 *.pyc
@@ -28,3 +32,11 @@ secrets/
 
 # 第三方 MCP 服务端（自带 .git 与 node_modules，本地检出即可，不入本仓库）
 openmontage-zh-mcp/
+
+# Deployment secrets and generated release bundles
+/deploy/production.env
+/deploy/config/
+/dist/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/

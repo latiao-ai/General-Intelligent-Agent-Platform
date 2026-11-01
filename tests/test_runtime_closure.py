@@ -5,9 +5,13 @@ import unittest
 from contextlib import contextmanager
 from pathlib import Path
 
-from app import approvals, artifact_store, async_contracts, external_tasks
-from app import runtime_check, tool_authorization
-from app.config import governance_enabled, settings
+from webpage_agent.governance import approvals
+from webpage_agent.store import artifact_store
+from webpage_agent.core import async_contracts
+from webpage_agent.core import external_tasks
+from webpage_agent.observe import runtime_check
+from webpage_agent.tools import tool_authorization
+from webpage_agent.core.config import governance_enabled, settings
 
 
 @contextmanager
@@ -310,7 +314,7 @@ class ContractFileTests(unittest.TestCase):
 class ConcurrencyCapTests(unittest.IsolatedAsyncioTestCase):
     async def test_second_run_stays_queued_until_a_slot_frees(self):
         import asyncio
-        from app.api_hub import Hub, TaskRecord
+        from webpage_agent.api.api_hub import Hub, TaskRecord
 
         class Store:
             def __init__(self):

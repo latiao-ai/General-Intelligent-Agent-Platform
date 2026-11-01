@@ -1,0 +1,9 @@
+[
+  {
+    "id": "publishing",
+    "transport": "streamable_http",
+    "url": "${PUBLISH_MCP_URL}",
+    "token": "${PUBLISH_MCP_TOKEN}",
+    "default": true
+  }
+]

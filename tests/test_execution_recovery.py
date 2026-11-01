@@ -17,7 +17,7 @@ import unittest
 
 from unittest.mock import patch
 
-from app import ledger as ledger_module
+from webpage_agent.store import ledger as ledger_module
 from tests.exec_env import (Remote, install_main, install_plan, install_tools,
                             new_store, one_step_plan, reset_db, seed_run)
 
@@ -31,7 +31,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def hub(self, store, **kwargs):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(store, **kwargs)
 
     async def commit_plan(self, store, steps=STEPS, version=1):
@@ -60,7 +60,7 @@ class RecoveryTests(unittest.IsolatedAsyncioTestCase):
             seen['snapshot'] = await store.run_snapshot('run1')
             return {'answer': '好了'}
 
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
         tool = Tool('deploy', '部署', '', {}, spy,
                     tool_key='local:test:deploy', effect='write')
         await self.execute(store, {'deploy': tool})

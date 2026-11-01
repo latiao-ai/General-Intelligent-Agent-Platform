@@ -18,8 +18,8 @@ _ROOT = _Path(__file__).resolve().parents[1]
 if str(_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_ROOT))
 
-from app import tools                      # noqa: E402
-from app.integrations import mcp_servers   # noqa: E402
+from webpage_agent.tools import core as tools
+from webpage_agent.integrations import mcp_servers
 
 
 async def main() -> int:

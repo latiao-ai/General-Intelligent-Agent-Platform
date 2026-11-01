@@ -10,11 +10,13 @@ from unittest.mock import patch
 
 import anyio
 
-from app import nodes, observation, outcome
-from app.capabilities.base import ToolError
-from app.capabilities.registry import Tool
-from app.config import settings
-from app.integrations import mcp_adapter
+from webpage_agent.agent import nodes
+from webpage_agent.observe import observation
+from webpage_agent.core import outcome
+from webpage_agent.capabilities.base import ToolError
+from webpage_agent.capabilities.registry import Tool
+from webpage_agent.core.config import settings
+from webpage_agent.integrations import mcp_adapter
 
 
 class GeneralPlatformTests(unittest.TestCase):

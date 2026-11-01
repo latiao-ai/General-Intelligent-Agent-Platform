@@ -1,0 +1,1493 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>网页研究与 HTML 报告</title>
+<style>
+:root{--bg:#f5f6f8;--fg:#1b2430;--muted:#6b7684;--line:#e2e6eb;--accent:#165eb4;
+      --user:#d9ecff;--card:#fff;--warn:#fff6df}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:var(--fg);
+     font:15px/1.7 system-ui,-apple-system,"PingFang SC",sans-serif;
+     display:flex;flex-direction:column;overflow:hidden}
+
+/* 左栏 + 主区 */
+.app{display:flex;flex:1;min-height:0}
+.sidebar{width:264px;flex:0 0 264px;background:var(--card);
+  border-right:1px solid var(--line);display:flex;flex-direction:column;
+  padding:14px 12px}
+.sidebar button.full{width:100%;margin-bottom:12px}
+.sidebar .side-label{color:var(--muted);font-size:12px;margin:4px 2px 8px}
+.session-list{flex:1;overflow-y:auto}
+.session-item{padding:9px 12px;border-radius:8px;cursor:pointer;margin-bottom:4px;
+  border:1px solid transparent}
+.session-item:hover{background:#f0f3f7}
+.session-item.active{background:var(--user);border-color:#bcd7f2}
+.session-item .t{font-size:14px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;line-height:1.4}
+.session-item .m{font-size:12px;color:var(--muted)}
+.content{flex:1;min-width:0;display:flex;flex-direction:column}
+.scroll{flex:1;overflow-y:auto;padding:20px 18px 12px}
+
+h1{font-size:20px;margin:0 0 4px}
+.sub{color:var(--muted);font-size:13px;margin-bottom:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+      padding:14px 16px;margin-bottom:12px}
+.msg{display:flex;margin-bottom:10px}
+.msg .bubble{max-width:76%;padding:10px 14px;border-radius:12px;white-space:pre-wrap;
+             overflow-wrap:anywhere}
+.msg.user{justify-content:flex-end}
+.msg.user .bubble{background:var(--user)}
+.msg.assistant .bubble{background:var(--card);border:1px solid var(--line)}
+.msg.assistant .bubble a{color:var(--accent);word-break:break-all}
+.input-note{margin-top:6px;font-size:12px}
+#process .row{display:flex;gap:8px;align-items:flex-start;padding:3px 0;
+               overflow-wrap:anywhere}
+#process .ico{flex:0 0 18px;text-align:center}
+.thought{color:#3b4757;font-style:normal}
+.detail{color:var(--muted)}
+.hint{color:var(--muted);font-size:13px}
+#process .stage-row{display:flex;gap:8px;align-items:flex-start;padding:4px 0;
+                    margin-top:2px}
+#process .stage-row .stage-ico{flex:0 0 18px;text-align:center;font-size:13px}
+#process .stage-row .stage-text{font-size:14px}
+#process .stage-row .stage-sec{font-size:12px;color:var(--muted);
+  font-variant-numeric:tabular-nums;margin-left:auto;padding:0 2px;
+  white-space:nowrap;flex:0 0 auto;min-width:72px;text-align:right;
+  font-family:ui-monospace,monospace}
+#process .stage-row .stage-sec b{color:var(--fg);font-weight:600}
+#process .turn{margin-bottom:14px}
+/* 每轮的执行步骤可折叠：完成后自动收起，点标题栏展开。 */
+#process .turn-head{display:flex;align-items:center;gap:7px;color:var(--muted);
+  font-size:12px;margin:2px 0 6px;white-space:nowrap;cursor:pointer;
+  user-select:none;border-radius:6px;padding:3px 5px}
+#process .turn-head:hover{background:#eef1f5;color:var(--fg)}
+#process .turn-head .caret{display:inline-block;width:11px;text-align:center;
+  font-size:10px;transition:transform .15s ease}
+#process .turn.collapsed .turn-head .caret{transform:rotate(-90deg)}
+#process .turn-head .turn-title{color:var(--fg)}
+#process .turn-head .turn-sum{margin-left:auto;font-variant-numeric:tabular-nums;
+  font-family:ui-monospace,monospace}
+#process .turn.collapsed .turn-body{display:none}
+#process .turn-body{overflow-wrap:anywhere}
+#process .draft{background:#fafbfc;border:1px solid var(--line);
+  border-left:3px solid var(--accent);border-radius:8px;padding:10px 12px;
+  margin:6px 0;font-size:14px;max-height:340px;overflow:auto}
+#process .draft-head{color:var(--muted);font-size:12px;margin-bottom:6px}
+#process .draft-title{font-weight:600;margin-bottom:6px}
+#process .draft-sum{color:#3b4757;margin-bottom:6px}
+#process .draft-sec{font-weight:600;margin:8px 0 2px}
+#process .draft-p{color:#3b4757;overflow-wrap:anywhere;margin:2px 0}
+
+.bar{flex:0 0 auto;border-top:1px solid var(--line);background:var(--card);
+     padding:12px 16px}
+.bar .inner{max-width:920px;margin:0 auto;display:flex;gap:8px}
+textarea{flex:1;resize:none;height:46px;padding:11px 12px;border:1px solid var(--line);
+         border-radius:9px;font:inherit;outline:none}
+textarea:focus{border-color:var(--accent)}
+button{padding:0 18px;height:46px;border:0;border-radius:9px;background:var(--accent);
+       color:#fff;font:inherit;cursor:pointer;white-space:nowrap}
+button.ghost{background:#eef1f5;color:#2a3442}
+button.warn{background:#c0392b}
+button:disabled{opacity:.45;cursor:not-allowed}
+.workspace{flex:0 0 auto;border-bottom:1px solid var(--line);background:var(--card);padding:12px 18px}
+.workspace[hidden]{display:none}
+.workspace [hidden]{display:none}
+.workspace-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;max-width:920px;margin:auto}
+.workspace select,.workspace input{font:inherit;border:1px solid var(--line);border-radius:7px;padding:7px;max-width:100%;min-width:0}
+.workspace select{flex:1;min-width:180px}
+.workspace button{height:36px;padding:0 12px;font-size:13px}
+.workspace a{color:var(--accent);font-size:13px}
+.workspace .hint,.workspace details{max-width:920px;margin:8px auto 0}
+.workspace-nodes{display:flex;gap:8px 16px;flex-wrap:wrap;max-height:150px;overflow:auto;padding:8px 0}
+.workspace-nodes label{display:flex;align-items:center;gap:5px;font-size:13px}
+.workspace-nodes input{margin:0}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+a.btn{display:inline-flex;align-items:center;height:38px;padding:0 16px;border-radius:9px;
+      background:#eef1f5;color:#2a3442;text-decoration:none}
+.ok{background:#e8f6ec;border:1px solid #b7e0c4;padding:10px 14px;border-radius:9px;
+    margin-top:8px;overflow-wrap:anywhere}
+.err{color:#c0392b}
+
+/* 画像编辑弹层 */
+.modal{position:fixed;inset:0;background:rgba(20,28,38,.42);display:flex;
+       align-items:center;justify-content:center;padding:20px;z-index:50}
+.modal-card{background:var(--card);border-radius:12px;width:min(640px,100%);
+            max-height:min(80vh,720px);display:flex;flex-direction:column;
+            padding:16px 18px;box-shadow:0 18px 48px rgba(20,28,38,.28)}
+.modal-head{display:flex;align-items:center;gap:10px}
+.modal-head .hint{margin-left:auto;font-size:12px}
+.modal-head button{height:32px;padding:0 14px;font-size:13px}
+.modal-card textarea{flex:1;min-height:220px;height:auto;margin:6px 0 10px;
+  font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px;
+  line-height:1.7;resize:vertical}
+.modal-actions{display:flex;align-items:center;gap:10px}
+.modal-actions .hint{flex:1;font-size:12px}
+.modal-actions button{height:38px}
+@media(max-width:760px){
+  .sidebar{display:none}
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <button id="newSession" class="ghost full">＋ 新建会话</button>
+    <button id="profileBtn" class="ghost full">🧠 我的画像</button>
+    <button id="memoryBtn" class="ghost full">🗂 会话记忆</button>
+    <div class="side-label">历史会话</div>
+    <div class="session-list" id="sessionList"></div>
+  </aside>
+  <main class="content">
+    <section id="workspace" class="workspace" aria-label="画布上下文" hidden>
+      <div class="workspace-row">
+        <label for="workspaceSelect">操作画布</label>
+        <select id="workspaceSelect"><option value="">请选择画布</option></select>
+        <button id="workspaceRefresh" class="ghost">刷新上下文</button>
+        <a id="workspaceOpen" target="_blank" rel="noopener" hidden>打开画布</a>
+      </div>
+      <details id="workspaceCreate"><summary>新建画布</summary>
+        <div class="workspace-row"><input id="workspaceTitle" aria-label="新画布名称" placeholder="输入新画布名称" maxlength="120"><button id="workspaceCreateBtn">创建并选择</button></div>
+      </details>
+      <div id="workspaceStatus" class="hint" role="status">请先选择或新建画布。每张画布与平台内智能体共用一段对话。</div>
+      <details id="workspaceObjects" hidden><summary id="workspaceObjectsTitle">选择节点（可选）</summary><div id="workspaceNodes" class="workspace-nodes"></div></details>
+      <div id="workspaceRunActions" class="workspace-row" hidden>
+        <button id="workspaceResume" class="ghost">继续当前任务</button>
+        <button id="workspaceStop" class="ghost">停止当前任务</button>
+      </div>
+    </section>
+    <div class="scroll" id="scroll">
+      <h1>网页研究与 HTML 报告</h1>
+      <div class="sub">
+        输入主题或链接，智能体会实时展示执行过程，每个阶段后面跟着它已用的时间（秒）。
+        只有一个「发送」按钮：目标还在进行时，再发一条是补充；结束后再发，会在当前会话开一轮。
+      </div>
+
+      <div id="messages"></div>
+
+      <div class="card" id="processCard">
+        <div class="hint" id="processTitle">智能体执行过程（尚无动作）</div>
+        <div id="process"></div>
+      </div>
+
+      <div id="result"></div>
+    </div>
+
+    <div class="bar"><div class="inner">
+      <textarea id="msg" aria-label="消息"></textarea>
+      <button id="send">发送</button>
+    </div></div>
+  </main>
+</div>
+
+<div class="modal" id="memoryModal" style="display:none">
+  <div class="modal-card">
+    <div class="modal-head">
+      <b>🗂 会话记忆</b>
+      <span class="hint" id="memoryMeta"></span>
+      <button class="ghost" id="memoryClose">关闭</button>
+    </div>
+    <div class="hint" style="margin:4px 0 8px">
+      更早的对话会被压成这里的摘要与关键事实，用来在长会话里不丢线索。
+      原文仍在数据库里，改这里只是改"给模型看的版本"。
+    </div>
+    <div class="side-label" style="margin:0 0 4px">摘要</div>
+    <textarea id="memorySummary" spellcheck="false" style="min-height:110px"></textarea>
+    <div class="side-label" style="margin:0 0 4px">关键事实（每行「键：值」）</div>
+    <textarea id="memoryFacts" spellcheck="false" style="min-height:90px"></textarea>
+    <div class="modal-actions">
+      <button class="warn" id="memoryClear">清空记忆</button>
+      <span class="hint" id="memoryStatus"></span>
+      <button id="memorySave">保存</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="profileModal" style="display:none">
+  <div class="modal-card">
+    <div class="modal-head">
+      <b>🧠 我的画像</b>
+      <span class="hint" id="profileMeta"></span>
+      <button class="ghost" id="profileClose">关闭</button>
+    </div>
+    <div class="hint" style="margin:4px 0 8px">
+      每行「键：值」一条。助手会在对话中自动补充，你也可以直接改、删、清空。
+      保存后立即生效，下一轮对话就用新的画像。
+    </div>
+    <textarea id="profileText" spellcheck="false"></textarea>
+    <div class="modal-actions">
+      <button class="warn" id="profileClear">清空画像</button>
+      <span class="hint" id="profileStatus"></span>
+      <button id="profileSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const S = { sessionId: null, taskId: null, runId: null, es: null,
+            running: false, status: null, runStatus: null,
+            askedQuestions: [], clarification: '', lastEventSeq: 0,
+            stages: [], stageSeq: 0, skew: 0,
+            turn: 0, streamBubble: null, sessions: [], lastEventAt: 0,
+            // 正在跑的这条 run 的补充要求：requestId → {text, status, inputSeq}
+            // 同一个 requestId 会在重试时复用，服务端据此保证"只有一条输入"。
+            inputs: new Map(),
+            // 本轮最新一次回答的版本；旧版本的回答只作为过程记录保留
+            answerIntent: 0, answerPlan: 0 };
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function addMessage(role, text) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + role;
+  el.innerHTML = `<div class="bubble">${esc(text)}</div>`;
+  $('messages').appendChild(el);
+  el.scrollIntoView({block: 'end', behavior: 'smooth'});
+}
+
+// ---------- 侧边栏：会话列表 ----------
+
+function fmtTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function renderSessionList() {
+  const box = $('sessionList');
+  box.innerHTML = '';
+  if (!S.sessions.length) {
+    box.innerHTML = '<div class="hint" style="padding:8px 4px">还没有历史会话</div>';
+    return;
+  }
+  for (const s of S.sessions) {
+    const item = document.createElement('div');
+    item.className = 'session-item' + (s.session_id === S.sessionId ? ' active' : '');
+    item.dataset.id = s.session_id;
+    item.innerHTML =
+      `<div class="t">${esc(s.title)}</div>` +
+      `<div class="m">${esc(s.message_count)} 条消息 · ${fmtTime(s.updated_at)}</div>`;
+    item.onclick = () => openSession(s.session_id);
+    box.appendChild(item);
+  }
+}
+
+async function loadSessions() {
+  try {
+    const res = checkAuth(await fetch(API_PREFIX + '/sessions'));
+    if (!res.ok) return;
+    const data = await res.json();
+    S.sessions = data.sessions || [];
+    renderSessionList();
+  } catch { /* 拉不到列表不阻塞主流程 */ }
+}
+
+async function openSession(id, options = {}) {
+  const sessionEpoch = S.sessionEpoch = (S.sessionEpoch || 0) + 1;
+  if (W.enabled && !options.keepWorkspace) await restoreWorkspace(id);
+  if (sessionEpoch !== S.sessionEpoch) return;
+  // 切会话**只解绑事件流，不取消后端任务**：任务在服务端继续跑，
+  // 切回来时按 seq 补齐事件（以前这里会 POST /cancel，一换会话就把活儿停了）。
+  detachStream();
+  clearAll();
+  setRunning(false);
+  S.sessionId = id;
+  S.taskId = null;
+  S.runId = null;
+  S.runStatus = null;
+  S.askedQuestions = [];
+  S.clarification = '';
+  S.lastEventSeq = 0;
+  S.status = null;
+  renderSessionList();          // 高亮当前会话
+  try {
+    const res = checkAuth(await fetch(`${API_PREFIX}/sessions/${id}/timeline`));
+    if (!res.ok) return;
+    const data = await res.json();
+    if (sessionEpoch !== S.sessionEpoch) return;
+    for (const m of (data.messages || [])) {
+      addMessage(m.role, m.content);
+    }
+    // 还在跑的那一轮不在这里回放（事件流会从 seq 0 全量补发，避免重复）
+    const liveTask = data.live_task_id || '';
+    renderHistory((data.turns || []).filter(t => t.task_id !== liveTask));
+    if (liveTask) {
+      S.taskId = liveTask;
+      // 正在跑的那一轮也要拿到 run_id：否则切回来之后再发一句，前端不知道
+      // 该往哪条 run 上补要求，只能新建任务（用户会看到"任务被打断"）
+      S.runId = data.live_run_id || null;
+      S.inputs.clear();
+      S.lastEventSeq = Number(data.live_after_event_id) || 0;
+      setRunning(true);
+      startNewTurn();              // 先建好这一轮的容器，补发的事件才有地方落
+      openStream(liveTask);        // 重新接上：先补发历史事件，再继续实时
+      return;
+    }
+    const latest = (data.turns || [])[(data.turns || []).length - 1];
+    if (latest && GOAL_OPEN[latest.run_status] && latest.run_id) {
+      S.taskId = latest.task_id;
+      S.runId = latest.run_id;
+      S.runStatus = latest.run_status;
+      S.askedQuestions = latest.asked_questions || [];
+      S.clarification = latest.clarification || '';
+    }
+    // 否则恢复最近一份还能打开的产物：视频/页面切回来仍然能看
+    const withArtifact = [...(data.turns || [])].reverse()
+      .find(t => t.artifact && t.artifact.exists);
+    if (withArtifact) {
+      S.taskId = withArtifact.task_id;
+      renderResult({artifact: withArtifact.artifact}, withArtifact.task_id);
+    }
+  } catch { /* 读历史失败不影响 */ }
+  finally { workspaceControls(); }
+}
+
+// 把历史会话里每一轮的执行步骤重建出来（默认折叠）。
+// 事件不落库的部分（草稿、逐字回答）本来就没有，这里只还原可持久化的步骤。
+function renderHistory(turns) {
+  const box = $('process');
+  turns.forEach((task, index) => {
+    const turn = createTurn(index + 1);
+    box.appendChild(turn);
+    const body = turn.querySelector('.turn-body');
+    const open = new Map();
+    let total = 0;
+
+    for (const ev of (task.events || [])) {
+      if (ev.type === 'stage_start') {
+        if (ev.stage === 'instruction') continue;   // 与解析需求重复
+        const st = { id: ++S.stageSeq, stage: ev.stage,
+                     label: ev.label || ev.stage, done: false,
+                     seconds: null, status: '' };
+        const row = stageRowEl(st);
+        body.appendChild(row);
+        open.set(ev.stage, {st, row});
+      } else if (ev.type === 'stage_end') {
+        if (ev.stage === 'instruction') continue;
+        const hit = open.get(ev.stage);
+        if (!hit) continue;
+        hit.st.done = true;
+        hit.st.seconds = Number(ev.seconds) || 0;
+        hit.st.status = ev.status || '完成';
+        markStageDone(hit.row, hit.st);
+        total += hit.st.seconds;
+        open.delete(ev.stage);
+      } else if (ev.type === 'thought' || ev.type === 'action') {
+        body.appendChild(eventRowEl(ev));
+      }
+    }
+    // 没等到 stage_end 的（进程重启前被中断），标成未完成而不是留个空表。
+    for (const {st, row} of open.values()) {
+      row.querySelector('.stage-text').innerHTML =
+        `${esc(st.label)}<span class="detail"> · 未完成</span>`;
+      row.querySelector('.stage-sec').innerHTML = '—';
+    }
+    turn.classList.add('collapsed');
+    turn.querySelector('.turn-sum').textContent =
+      `${TURN_STATUS[task.status] || '已完成'} · ${total.toFixed(2)}s`;
+  });
+  S.turn = turns.length;                 // 新消息接着编号
+  $('processTitle').textContent = turns.length
+    ? `智能体执行过程 · 历史会话（共 ${turns.length} 轮，点标题展开）`
+    : '智能体执行过程（尚无动作）';
+}
+
+async function newSession() {
+  if (W.enabled) {
+    $('workspaceSelect').focus();
+    $('workspaceCreate').open = true;
+    $('workspaceStatus').textContent = '选择另一张画布或新建画布以切换对话；当前画布继续使用原有会话。';
+    return;
+  }
+  detachStream();               // 只解绑；正在跑的任务留在服务端继续
+  clearAll();
+  setRunning(false);
+  S.sessionId = null;
+  S.taskId = null;
+  S.runId = null;
+  S.status = null;
+  S.runStatus = null;
+  S.askedQuestions = [];
+  S.clarification = '';
+  S.lastEventSeq = 0;
+  renderSessionList();
+}
+
+// 直接回答问题时的增量文本（打字机效果）。后端用流式返回，这里边收边追加。
+function onAnswerDelta(ev) {
+  if (!S.streamBubble) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg assistant';
+    wrap.innerHTML = '<div class="bubble"></div>';
+    $('messages').appendChild(wrap);
+    S.streamBubble = wrap.querySelector('.bubble');
+  }
+  S.streamBubble.textContent += ev.text || '';
+  S.streamBubble.parentElement.scrollIntoView({block: 'end', behavior: 'smooth'});
+}
+
+// 整理报告阶段是全程最长的静默期。模型流式生成工具参数，后端边收边解析出半成品报告，
+// 这里就地渲染，让用户看到报告在长出来。
+function renderDraft(report) {
+  const parts = [];
+  if (report.title) parts.push(`<div class="draft-title">${esc(report.title)}</div>`);
+  if (report.summary) parts.push(`<div class="draft-sum">${esc(report.summary)}</div>`);
+  for (const sec of (report.sections || [])) {
+    if (sec.heading) parts.push(`<div class="draft-sec">${esc(sec.heading)}</div>`);
+    for (const p of (sec.paragraphs || [])) {
+      if (p.text) parts.push(`<div class="draft-p">${esc(p.text)}</div>`);
+    }
+  }
+  return parts.join('');
+}
+
+function onDraft(ev) {
+  const turn = currentTurnEl();
+  let box = turn.querySelector('.draft');
+  if (!ev.report) {                 // null = 清空（重试用）
+    if (box) box.remove();
+    return;
+  }
+  if (!box) {
+    box = document.createElement('div');
+    box.className = 'draft';
+    turn.appendChild(box);
+  }
+  box.innerHTML = '<div class="draft-head">📝 报告草稿（生成中）</div>'
+                  + renderDraft(ev.report);
+  box.scrollIntoView({block: 'end', behavior: 'smooth'});
+}
+
+function sealDraft() {
+  document.querySelectorAll('#process .draft-head').forEach(el => {
+    el.textContent = '📝 报告内容';
+  });
+}
+
+function eventRowEl(ev) {
+  const row = document.createElement('div');
+  row.className = 'row';
+  if (ev.type === 'thought') {
+    row.innerHTML = `<div class="ico">💭</div><div class="thought">${esc(ev.text)}</div>`;
+  } else {
+    const detail = ev.detail ? `<span class="detail">：${esc(ev.detail)}</span>` : '';
+    row.innerHTML = `<div class="ico">${esc(ev.icon || '•')}</div>` +
+                    `<div>${esc(ev.label)}${detail}</div>`;
+  }
+  return row;
+}
+
+function addEvent(ev) {
+  if (ev.type !== 'thought' && ev.type !== 'action') return;
+  const row = eventRowEl(ev);
+  currentTurnEl().appendChild(row);
+  row.scrollIntoView({block: 'end', behavior: 'smooth'});
+}
+
+// 一轮任务 = 可折叠的标题栏（倒三角 + 第 N 轮 + 结论/耗时）+ 内容区。
+function createTurn(n, live = false) {
+  const turn = document.createElement('div');
+  turn.className = 'turn';
+  turn.dataset.turn = n;
+  if (live) turn.dataset.live = '1';
+  const head = document.createElement('div');
+  head.className = 'turn-head';
+  head.innerHTML =
+    `<span class="caret">▾</span>` +
+    `<span class="turn-title">${esc(`第 ${n} 轮`)}</span>` +
+    `<span class="turn-sum"></span>`;
+  head.onclick = () => turn.classList.toggle('collapsed');
+  turn.appendChild(head);
+  const body = document.createElement('div');
+  body.className = 'turn-body';
+  turn.appendChild(body);
+  return turn;
+}
+
+// 返回"当前轮"的内容容器；需要整轮时用 closest('.turn')。
+function currentTurnEl() {
+  let el = $('process').lastElementChild;
+  if (!el || !el.classList.contains('turn') || el.dataset.live !== '1') {
+    el = createTurn(S.turn || 1, true);
+    $('process').appendChild(el);
+  }
+  return el.querySelector('.turn-body');
+}
+
+// 展示词汇：后端返回的 status 已经是派生出来的标签，通用状态也在其中
+// （succeeded/needs_reconcile 这类以后端 run_status 出现）。新增能力若要新的
+// 展示词，改这张表即可——状态机那边不需要加值。
+// API 前缀可配置：中台独立部署，但浏览器可能通过客户平台的**同源路径代理**访问
+// （例如 客户平台 /agent/* → 中台）。写死 API_PREFIX + '/...' 在那种部署下会全部 404。
+// 部署时给 <body data-api-prefix="/agent/api"> 即可，不用改代码。
+const API_PREFIX = (document.body.dataset.apiPrefix || '/api').replace(/\/$/, '');
+const W = {enabled: document.body.dataset.workspace === 'true', id: '', ready: false,
+  selected: [], epoch: 0, items: [], creating: false, createKey: null, sending: false};
+
+function workspaceControls() {
+  if (!W.enabled) return;
+  $('send').disabled = !W.ready || W.sending;
+  $('workspaceSelect').disabled = W.sending || W.creating;
+  $('workspaceCreateBtn').disabled = W.creating || W.sending;
+  $('workspaceRefresh').disabled = W.creating || W.sending;
+  for (const checkbox of $('workspaceNodes').querySelectorAll('input')) {
+    checkbox.disabled = !W.ready || W.sending || S.running || !!GOAL_OPEN[S.runStatus];
+  }
+  $('workspaceRunActions').hidden = !S.runId || !(S.running || ['paused', 'interrupted'].includes(S.runStatus));
+  $('workspaceResume').hidden = !['paused', 'interrupted'].includes(S.runStatus);
+  $('workspaceResume').disabled = W.sending;
+  $('workspaceStop').disabled = W.sending;
+  $('workspaceStop').hidden = !S.running;
+}
+
+async function workspaceRequest(path, payload) {
+  const res = checkAuth(await fetch(API_PREFIX + '/workspace' + path, payload === undefined ? {} : {
+    method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload),
+  }));
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : (data.msg || '画布读取失败'));
+  return data;
+}
+
+async function loadWorkspaces() {
+  const data = await workspaceRequest('');
+  W.items = data.items || [];
+  renderWorkspaces();
+}
+
+function renderWorkspaces() {
+  const select = $('workspaceSelect');
+  select.replaceChildren(new Option('请选择画布', ''));
+  for (const item of W.items) select.add(new Option(item.title || item.id, item.id));
+  select.value = W.id;
+}
+
+function clearWorkspace() {
+  W.epoch++; W.id = ''; W.ready = false; W.selected = [];
+  $('workspaceSelect').value = '';
+  $('workspaceOpen').hidden = true;
+  $('workspaceObjects').hidden = true;
+  $('workspaceStatus').textContent = '请先选择或新建画布，再发送消息。';
+  const url = new URL(location.href); url.searchParams.delete('workspace_id');
+  url.searchParams.delete('selected_id');
+  history.replaceState(null, '', url);
+  workspaceControls();
+}
+
+async function readWorkspace(id, selected = []) {
+  const epoch = ++W.epoch;
+  W.ready = false;
+  workspaceControls();
+  $('workspaceStatus').textContent = '正在验证画布上下文…';
+  try {
+    const data = await workspaceRequest('/context', {workspace_id: id, selected_ids: selected});
+    if (epoch !== W.epoch) return null;
+    if (!data.verified || data.id !== id) throw new Error('画布上下文未通过验证');
+    W.id = id; W.selected = selected; W.ready = true;
+    const url = new URL(location.href); url.searchParams.set('workspace_id', id);
+    url.searchParams.delete('selected_id');
+    for (const selectedId of selected) url.searchParams.append('selected_id', selectedId);
+    history.replaceState(null, '', url);
+    if (!W.items.some(item => item.id === id)) {
+      W.items.push({id, title: data.title, session_id: data.session_id});
+      renderWorkspaces();
+    }
+    $('workspaceSelect').value = id;
+    $('workspaceStatus').textContent = `上下文已验证 · 已选 ${selected.length} 个节点 · 已读取 ${data.visible_count}/${data.node_count} 个节点${data.truncated ? ' · 部分内容未传递' : ''}。发送时会重新读取最新内容。`;
+    const link = $('workspaceOpen');
+    link.hidden = false;
+    link.href = data.open_url;
+    $('workspaceObjects').hidden = !(data.objects || []).length;
+    $('workspaceObjectsTitle').textContent = `选择节点（可选，已选 ${selected.length} 个）`;
+    $('workspaceNodes').replaceChildren();
+    for (const object of data.objects || []) {
+      const label = document.createElement('label');
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox'; checkbox.value = object.id; checkbox.checked = selected.includes(object.id);
+      checkbox.onchange = () => {
+        const ids = Array.from($('workspaceNodes').querySelectorAll('input:checked'), el => el.value);
+        if (ids.length > 100) { checkbox.checked = false; return; }
+        readWorkspace(id, ids);
+      };
+      label.append(checkbox, document.createTextNode(object.title || object.id));
+      $('workspaceNodes').appendChild(label);
+    }
+    workspaceControls();
+    return data;
+  } catch (error) {
+    if (epoch === W.epoch) {
+      W.ready = false;
+      $('workspaceStatus').textContent = error.message;
+      workspaceControls();
+    }
+    return null;
+  }
+}
+
+async function selectWorkspace(id, selected = []) {
+  S.sessionEpoch = (S.sessionEpoch || 0) + 1;
+  detachStream();
+  W.id = id; W.selected = []; W.ready = false;
+  $('workspaceObjects').hidden = true; $('workspaceOpen').hidden = true;
+  clearAll(); setRunning(false);
+  S.sessionId = null; S.taskId = null; S.runId = null; S.runStatus = null;
+  workspaceControls();
+  if (!id) { clearWorkspace(); return; }
+  const data = await readWorkspace(id, selected);
+  if (data && W.id === id) {
+    await openSession(data.session_id, {keepWorkspace: true});
+    workspaceControls();
+  }
+}
+
+async function restoreWorkspace(sessionId) {
+  clearWorkspace();
+  const epoch = W.epoch;
+  try {
+    const data = await workspaceRequest('?session_id=' + encodeURIComponent(sessionId));
+    if (epoch !== W.epoch) return;
+    const target = (data.items || [])[0];
+    if (target) await readWorkspace(target.id);
+  } catch (error) { $('workspaceStatus').textContent = error.message; }
+}
+
+async function initializeWorkspace() {
+  if (!W.enabled) return;
+  $('workspace').hidden = false;
+  $('newSession').textContent = '＋ 切换 / 新建画布';
+  $('workspaceSelect').onchange = () => selectWorkspace($('workspaceSelect').value);
+  for (const [id, action] of [['workspaceResume', 'resume'], ['workspaceStop', 'cancel']]) {
+    $(id).onclick = async () => {
+      if (W.sending || !S.runId) return;
+      W.sending = true; workspaceControls();
+      try {
+        const endpoint = action === 'resume' ? `/runs/${S.runId}/resume` : `/tasks/${S.taskId}/cancel`;
+        const res = checkAuth(await fetch(API_PREFIX + endpoint, {method: 'POST'}));
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(typeof data.detail === 'string' ? data.detail : '操作未完成，请稍后重试');
+        await openSession(S.sessionId, {keepWorkspace: true});
+      } catch (error) { $('workspaceStatus').textContent = error.message; }
+      finally { W.sending = false; workspaceControls(); }
+    };
+  }
+  $('workspaceRefresh').onclick = async () => {
+    try { await loadWorkspaces(); if (W.id) await readWorkspace(W.id, W.selected); }
+    catch (error) { $('workspaceStatus').textContent = error.message; }
+  };
+  $('workspaceCreateBtn').onclick = async () => {
+    if (W.creating || W.sending) return;
+    const title = $('workspaceTitle').value.trim();
+    if (!title) { $('workspaceTitle').focus(); return; }
+    W.creating = true;
+    if (!W.createKey || W.createKey.title !== title) W.createKey = {title, key: newIdempotencyKey()};
+    workspaceControls();
+    try {
+      const created = await workspaceRequest('', {title, request_id: W.createKey.key});
+      W.createKey = null;
+      await loadWorkspaces(); await selectWorkspace(created.id);
+      $('workspaceCreate').open = false; $('workspaceTitle').value = '';
+    } catch (error) { $('workspaceStatus').textContent = error.message; }
+    finally { W.creating = false; workspaceControls(); }
+  };
+  workspaceControls();
+  try {
+    await loadWorkspaces();
+    const params = new URLSearchParams(location.search);
+    const initial = params.get('workspace_id');
+    if (initial) await selectWorkspace(initial, params.getAll('selected_id'));
+    else {
+      const latest = W.items.find(item => item.session_id === S.sessions[0]?.session_id);
+      if (latest) await selectWorkspace(latest.id);
+    }
+  } catch (error) { $('workspaceStatus').textContent = error.message; }
+  window.addEventListener('focus', () => {
+    if (W.ready && S.sessionId && !W.sending) openSession(S.sessionId, {keepWorkspace: true});
+  });
+}
+
+// 登录失效统一收口：关掉事件流、停表并提示重新登录，而不是界面空转。
+function handleUnauthorized() {
+  if (S.es) { S.es.close(); S.es = null; }
+  S.running = false;
+  const box = $('result');
+  if (box) box.innerHTML = '<div class="card">登录已失效，请回到平台重新进入智能体。</div>';
+}
+
+function checkAuth(res) {
+  if (res && res.status === 401) handleUnauthorized();
+  return res;
+}
+
+const TURN_STATUS = {answered: '已回答', cancelled: '已中断',
+                     interrupted: '已中断', failed: '已失败',
+                     deployed: '已部署', local_ready: '已完成',
+                     deploy_needs_check: '已完成',
+                     // 计划没过校验就停下等人补充：不能显示成"已完成"
+                     waiting_input: '待补充信息',
+                     waiting_approval: '待确认',
+                     partially_succeeded: '部分完成',
+                     // 补偿运行：副作用已收回，与"失败"不是一回事
+                     compensated: '已撤销',
+                     // 通用状态（没有专门展示词时兜底）
+                     succeeded: '已完成', needs_reconcile: '待核实',
+                     queued: '排队中', running: '执行中',
+                     reconciling: '核对中', paused: '已暂停'};
+
+// 目标还没结束：下一句是补充，不能另开任务。暂停不在这里自动续跑。
+const GOAL_OPEN = {
+  waiting_input: true, waiting_approval: true, paused: true,
+  needs_reconcile: true, interrupted: true,
+};
+
+function goalOpen() {
+  return !!(S.runId && (S.running || GOAL_OPEN[S.runStatus]));
+}
+
+function turnSeconds(n) {
+  return S.stages.filter(st => st.turn === n)
+                 .reduce((sum, st) => sum + elapsedOf(st), 0);
+}
+
+// 收尾时把这一轮折起来：步骤不再持续占用视线，要看再点开。
+function collapseLastTurn(status) {
+  const turn = $('process').lastElementChild;
+  if (!turn || !turn.classList.contains('turn')) return;
+  if (turn.dataset.live !== '1') return;      // 历史轮不动
+  // 已经收过的不再改：完成的那轮状态是"已回答/已完成"，后续开新轮不能覆盖成"已中断"。
+  if (turn.classList.contains('collapsed')) return;
+  const body = turn.querySelector('.turn-body');
+  if (!body || !body.children.length) { turn.remove(); return; }  // 空轮次不留痕
+  turn.classList.add('collapsed');
+  const n = Number(turn.dataset.turn);
+  turn.querySelector('.turn-sum').textContent =
+    `${TURN_STATUS[status] || '已完成'} · ${turnSeconds(n).toFixed(2)}s`;
+}
+
+function startNewTurn() {
+  // 上一条还没收尾的阶段先关掉，否则它们的计时会一直涨下去。
+  closeOpenStages('已中断');
+  collapseLastTurn('cancelled');       // 上一轮收起
+  S.turn += 1;
+  S.streamBubble = null;
+  $('result').innerHTML = '';
+  $('process').appendChild(createTurn(S.turn, true));
+  $('processTitle').textContent = '智能体执行过程';
+}
+
+// ---------- 阶段耗时（内联到执行过程流，进行中实时累加） ----------
+
+function elapsedOf(st) {
+  if (st.done) return st.seconds;
+  return Math.max(0, (Date.now() / 1000 - S.skew) - st.at);
+}
+
+function onStageStart(ev) {
+  if (ev.stage === 'instruction') return;   // 与解析需求重复，不展示
+  if (!S.stages.length) S.skew = Date.now() / 1000 - ev.at;
+  const st = { id: ++S.stageSeq, stage: ev.stage, label: ev.label || ev.stage,
+               at: ev.at, done: false, seconds: null, status: '', turn: S.turn };
+  S.stages.push(st);
+  appendStageRow(st);
+}
+
+function onStageEnd(ev) {
+  for (let i = S.stages.length - 1; i >= 0; i--) {
+    const st = S.stages[i];
+    if (st.stage === ev.stage && !st.done) {
+      st.done = true;
+      st.seconds = ev.seconds;
+      st.status = ev.status || '完成';
+      break;
+    }
+  }
+  renderStages();
+}
+
+function stageRowEl(st) {
+  const row = document.createElement('div');
+  row.className = 'stage-row';
+  row.dataset.id = st.id;
+  row.innerHTML =
+    `<div class="stage-ico">🔹</div>` +
+    `<div class="stage-text">${esc(st.label)}<span class="detail"> · 进行中…</span></div>` +
+    `<div class="stage-sec"><b>0.00s</b></div>`;
+  return row;
+}
+
+function markStageDone(row, st) {
+  row.querySelector('.stage-sec').innerHTML =
+    `${Number(st.seconds).toFixed(2)}s`;
+  row.querySelector('.stage-text').innerHTML =
+    `${esc(st.label)}<span class="detail"> · ${esc(st.status || '完成')}</span>`;
+}
+
+function appendStageRow(st) {
+  const row = stageRowEl(st);
+  currentTurnEl().appendChild(row);
+  row.scrollIntoView({block: 'end', behavior: 'smooth'});
+}
+
+function renderStages() {
+  for (const st of S.stages) {
+    if (!st.done) continue;
+    const row = document.querySelector(`#process .stage-row[data-id="${st.id}"]`);
+    if (row) markStageDone(row, st);
+  }
+  updateTotal();
+}
+
+function updateTotal() {
+  const turnTotal = S.stages
+    .filter(st => st.turn === S.turn)
+    .reduce((sum, st) => sum + elapsedOf(st), 0);
+  const allTotal = S.stages.reduce((sum, st) => sum + elapsedOf(st), 0);
+  $('processTitle').textContent = allTotal > 0
+    ? `智能体执行过程 · 本轮 ${turnTotal.toFixed(2)}s（累计 ${allTotal.toFixed(2)}s）`
+    : '智能体执行过程';
+}
+
+function closeOpenStages(status) {
+  const label = status === 'cancelled' ? '已中断'
+              : status === 'interrupted' ? '连接已断开'
+              : status === 'failed' ? '已失败' : '已结束';
+  let changed = false;
+  for (const st of S.stages) {
+    if (st.done) continue;
+    // 必须先量再标记：elapsedOf 见到 done 会直接返回 st.seconds（此刻还是 null），
+    // 顺序反了耗时就被写成 null，收起后显示成 0.00s。
+    st.seconds = elapsedOf(st);
+    st.done = true;
+    st.status = label;
+    changed = true;
+  }
+  if (changed) renderStages();
+}
+
+setInterval(() => {
+  let ticking = false;
+  for (const st of S.stages) {
+    if (st.done) continue;
+    ticking = true;
+    const row = document.querySelector(`#process .stage-row[data-id="${st.id}"]`);
+    if (row) row.querySelector('.stage-sec').innerHTML = `<b>${elapsedOf(st).toFixed(2)}s</b>`;
+  }
+  if (ticking) updateTotal();
+  // 连接看门狗：服务端每 15s 发一次心跳（ping 事件）。超过 45s 一个事件都没收到，
+  // 说明后端已经不可达（进程被杀 / 连接断了）——立刻收尾，别让那一行永远"进行中"。
+  if (S.running && S.lastEventAt && Date.now() - S.lastEventAt > 45000) {
+    finish('interrupted');
+  }
+}, 100);
+
+function clearAll() {
+  $('process').innerHTML = '';
+  $('messages').innerHTML = '';
+  $('result').innerHTML = '';
+  $('processTitle').textContent = '智能体执行过程';
+  S.stages = [];
+  S.turn = 0;
+  S.stageSeq = 0;
+  S.skew = 0;
+  S.lastEventAt = 0;
+  S.streamBubble = null;
+}
+
+// 只有一个按钮：跑着的时候再发一条就会自动打断上一轮，不做额外提示。
+function setRunning(on) {
+  S.running = on;
+  $('send').disabled = false;
+  $('send').textContent = '发送';
+  workspaceControls();
+}
+
+// 解绑当前事件流（不通知后端取消）。任务仍在服务端跑，切回来能接着看。
+function detachStream() {
+  if (S.es) { S.es.close(); S.es = null; }
+}
+
+async function interrupt() {
+  if (!S.taskId || !S.running) return;
+  const stream = S.es;
+  try {
+    await fetch(`${API_PREFIX}/tasks/${S.taskId}/cancel`, {method: 'POST'});
+  } catch { /* 取消失败也让新一轮继续 */ }
+  const deadline = Date.now() + 2000;
+  while (S.running && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 50));
+  }
+  if (S.es === stream) { S.es.close(); S.es = null; }
+  S.running = false;
+  // 被中断的那一轮也要停表，否则旧轮那行会一直在跳。
+  closeOpenStages('已中断');
+}
+
+// 创建任务时带幂等键：网络中断后重试、或用户重复点击，服务端只会建一个任务。
+// 键在"这一条消息"的生命周期内不变——重试必须用同一个键才有意义。
+function newIdempotencyKey() {
+  return (window.crypto && crypto.randomUUID)
+    ? crypto.randomUUID()
+    : 'k-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+}
+
+async function postTask(text, key) {
+  const options = {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json', 'Idempotency-Key': key},
+    body: JSON.stringify({message: text, session_id: S.sessionId,
+      ...(W.enabled ? {workspace_id: W.id, selected_ids: W.selected} : {})}),
+  };
+  try {
+    return await fetch(API_PREFIX + '/tasks', options);
+  } catch (err) {
+    // 网络层失败：请求可能已经到了服务端，用同一个键再试一次，
+    // 服务端会返回原来那个任务而不是再建一个。
+    return await fetch(API_PREFIX + '/tasks', options);
+  }
+}
+
+// 给**当前任务**补一句要求。
+// 关键：不打断、不新建任务、不换 EventSource——原任务继续跑，只是下个边界改计划。
+// requestId 会跟着这一条消息走到最后：网络失败重试时必须复用同一个 ID，
+// 否则服务端会当成两条不同的补充、把要求版本推高两版。
+async function postRunInput(text, requestId) {
+  const options = {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({request_id: requestId, message: text,
+                          task_id: S.taskId, run_id: S.runId}),
+  };
+  const url = `${API_PREFIX}/runs/${S.runId}/inputs`;
+  try {
+    return await checkAuth(await fetch(url, options));
+  } catch (err) {
+    // 网络层失败：请求可能已经到了服务端，用同一个 requestId 再试一次
+    return await fetch(url, options);
+  }
+}
+
+function setInputStatus(requestId, status, detail) {
+  const item = S.inputs.get(requestId);
+  if (!item) return;
+  item.status = status;
+  if (detail) item.detail = detail;
+  renderInputNote(requestId);
+}
+
+// 每条补充下面挂一行状态：已收到 / 已纳入 / 接收待确认。
+// 「已收到」只是数据库提交，「已按新要求调整」才代表计划纳入了它。
+function renderInputNote(requestId) {
+  const item = S.inputs.get(requestId);
+  const el = item && item.el;
+  if (!el) return;
+  const text = {
+    sent: '⏳ 正在提交…',
+    accepted: '📝 已收到，执行到边界时按新要求调整',
+    applied: '✅ 已按新要求调整计划',
+    uncertain: '⚠️ 接收待确认（网络异常，重发会用同一条记录）',
+    finished: '任务已结束，这条没有生效',
+    failed: '提交失败',
+  }[item.status] || '';
+  el.textContent = item.detail || text;
+}
+
+async function sendRunInput(text, requestId) {
+  const existing = S.inputs.get(requestId);
+  if (existing && ['accepted', 'applied'].includes(existing.status)) return true;
+  if (existing) { existing.status = 'sent'; renderInputNote(requestId); }
+  let res;
+  try {
+    res = await postRunInput(text, requestId);
+  } catch (err) {
+    setInputStatus(requestId, 'uncertain', '⚠️ 接收待确认：' + err.message);
+    return false;
+  }
+  let data = {};
+  try { data = await res.json(); } catch { data = {}; }
+  if (res.status === 202 || res.ok) {
+    if (data.input_seq) {
+      const item = S.inputs.get(requestId);
+      if (item) item.inputSeq = data.input_seq;
+    }
+    setInputStatus(requestId, 'accepted');
+    NudgeInputVersions(data.intent_version);
+    return true;
+  }
+  const detail = data.detail || ('HTTP ' + res.status);
+  if (res.status === 409) {
+    // 任务已经结束：这是唯一需要提示"要不要另开一轮"的情况，且**不自动**开
+    setInputStatus(requestId, 'finished', '任务已结束：' + detail);
+    S.runId = null;
+    setRunning(false);
+    addMessage('assistant',
+      '这条补充没生效：上一轮任务已经结束。再按一次发送，会在当前会话里开一轮新任务。');
+    return false;
+  }
+  setInputStatus(requestId, 'failed', '提交失败：' + detail);
+  return false;
+}
+
+// 补一条"补充要求"气泡：它属于当前这一轮，不新起一轮。
+function addInputBubble(text) {
+  const requestId = newIdempotencyKey();
+  const el = document.createElement('div');
+  el.className = 'msg user';
+  el.innerHTML = `<div class="bubble">${esc(text)}<div class="input-note hint"></div></div>`;
+  $('messages').appendChild(el);
+  const note = el.querySelector('.input-note');
+  S.inputs.set(requestId, {text, status: 'sent', el: note});
+  return requestId;
+}
+
+function NudgeInputVersions(intentVersion) {
+  if (!intentVersion) return;
+  S.answerIntent = Math.max(S.answerIntent || 0, 0);
+  const title = $('processTitle');
+  if (title && S.running) {
+    title.textContent = `智能体执行过程（按新要求调整中 · 要求版本 ${intentVersion}）`;
+  }
+}
+
+async function send() {
+  if (W.enabled && (!W.ready || W.sending)) {
+    $('workspaceStatus').textContent = '请先选择或新建画布，并等待上下文验证完成。';
+    return;
+  }
+  const text = $('msg').value.trim();
+  if (!text) return;
+  $('msg').value = '';
+  // 目标还没结束（在跑，或停在等人/等批准/暂停/待核实）：这句话是补充。
+  // 只有目标已经结束，发送才会在当前会话里开一轮新任务。
+  if (goalOpen()) {
+    const requestId = addInputBubble(text);
+    const resumeWait = !S.running && S.runStatus === 'waiting_input';
+    $('send').disabled = true;
+    W.sending = true;
+    workspaceControls();
+    try {
+      if (resumeWait) {
+        setRunning(true);
+        startNewTurn();
+        openStream(S.taskId);
+      }
+      const ok = await sendRunInput(text, requestId);
+      if (!ok) {
+        $('msg').value = text;      // 没提交成功就把草稿还回去
+        if (resumeWait) setRunning(false);
+      }
+    } finally {
+      W.sending = false;
+      $('send').disabled = false;
+      workspaceControls();
+      $('msg').focus();
+    }
+    return;
+  }
+  await startNewTask(text);
+}
+
+async function startNewTask(text) {
+  W.sending = true;
+  workspaceControls();
+  addMessage('user', text);
+  startNewTurn();
+  setRunning(true);
+  $('send').disabled = true;
+  S.runId = null;
+  S.runStatus = null;
+  S.askedQuestions = [];
+  S.clarification = '';
+  S.lastEventSeq = 0;
+  S.inputs.clear();
+  S.answerIntent = 0;
+  S.answerPlan = 0;
+  const idempotencyKey = newIdempotencyKey();
+  try {
+    const res = checkAuth(await postTask(text, idempotencyKey));
+    if (!res.ok) {
+      const error = await res.json().catch(() => ({}));
+      if (res.status === 409 && error.detail?.code === 'session_goal_open') {
+        await openSession(S.sessionId, {keepWorkspace: true});
+        S.taskId = error.detail.task_id; S.runId = error.detail.run_id;
+        const requestId = addInputBubble(text);
+        if (!await sendRunInput(text, requestId) && !$('msg').value) $('msg').value = text;
+        return;
+      }
+      const detail = typeof error.detail === 'string' ? error.detail : '';
+      throw new Error(res.status === 401
+        ? '请先通过平台登录，再进入智能体。'
+        : (detail || ('HTTP ' + res.status)));
+    }
+    const data = await res.json();
+    S.sessionId = data.session_id;
+    S.taskId = data.task_id;
+    S.runId = data.run_id || null;      // 补充要求必须打到**这一条 run** 上
+    S.status = null;
+    loadSessions();            // 新会话或活跃时间变了，刷新侧边栏
+    openStream(S.taskId);
+  } catch (err) {
+    addMessage('assistant', '提交失败：' + err.message);
+    if (!$('msg').value) $('msg').value = text;
+    setRunning(false);
+  } finally {
+    W.sending = false;
+    $('send').disabled = false;
+    workspaceControls();
+  }
+}
+
+// 补充要求相关的三类事件（文档 §6）。它们不改任务身份，只改变"接下来做什么"。
+// 观察与自主决策事件（文档 observe-decide §13）。
+// 关键是让用户知道"系统正在自己判断下一步"，**不需要补一句"继续"**。
+function onDecisionEvent(ev) {
+  const title = $('processTitle');
+  if (ev.decision_reserved) {
+    if (title && S.running) title.textContent = '智能体执行过程（正在根据结果判断下一步）';
+    addEvent({type: 'action', icon: '🔎', label: '正在根据结果判断下一步',
+              detail: ev.detail || ''});
+    return;
+  }
+  if (ev.decision_kind) {
+    if (title && S.running) title.textContent = '智能体执行过程';
+    addEvent({type: 'action', icon: '🧭', label: '判断结果：' + ev.decision_kind,
+              detail: ev.detail || ''});
+    if (ev.decision_kind === 'wait_input' || ev.decision_kind === 'wait_approval') {
+      // 这是**唯一**需要用户动手的情况：其余时候不必输入"继续"
+      addMessage('assistant', '需要你确认一下：' + (ev.detail || '补充必要信息后继续。'));
+    }
+  }
+}
+
+function onIntentEvent(ev) {
+  if (ev.input_received) {
+    // 服务端已落库：把对应的那条气泡标成"已收到"
+    for (const [requestId, item] of S.inputs.entries()) {
+      if (item.status === 'sent') { setInputStatus(requestId, 'accepted'); break; }
+    }
+    return;
+  }
+  if (ev.plan_revised) {
+    // 计划已纳入新要求：旧回答只作为过程记录，别让用户以为它就是最终答复
+    markStaleAnswer();
+    for (const [requestId, item] of S.inputs.entries()) {
+      if (item.status === 'accepted') { setInputStatus(requestId, 'applied'); }
+    }
+    return;
+  }
+  if (ev.input_needs_clarification) {
+    addMessage('assistant',
+      '这条要求我还需要一点信息才能接着做：' + (ev.detail || '请补充具体要求。'));
+  }
+}
+
+// 旧版本的回答不能被当成最终答复，但也不能假装没出现过：
+// 给它打一个"调整前"的标记，后续新回答另起一条。
+function markStaleAnswer() {
+  const bubbles = document.querySelectorAll('#messages .msg.assistant .bubble');
+  for (const bubble of bubbles) {
+    if (bubble.dataset.stale) continue;
+    bubble.dataset.stale = '1';
+    const tag = document.createElement('div');
+    tag.className = 'hint';
+    tag.textContent = '（以上是调整前的输出，已按新要求继续）';
+    bubble.appendChild(tag);
+  }
+}
+
+function openStream(taskId) {
+  if (S.es) S.es.close();
+  const es = new EventSource(
+    `${API_PREFIX}/tasks/${taskId}/events?after=${S.lastEventSeq || 0}`);
+  S.es = es;
+  S.lastEventAt = Date.now();
+  es.onmessage = e => {
+    if (e.lastEventId) S.lastEventSeq = Number(e.lastEventId) || S.lastEventSeq;
+    S.lastEventAt = Date.now();
+    let ev; try { ev = JSON.parse(e.data); } catch { return; }
+    if (ev.type === 'ping') return;          // 心跳，只用来刷新 lastEventAt
+    if (ev.type === 'draft') { onDraft(ev); return; }
+    if (ev.type === 'answer_delta') { onAnswerDelta(ev); return; }
+    if (ev.type === 'stage_start') { onStageStart(ev); return; }
+    if (ev.type === 'stage_end') { onStageEnd(ev); return; }
+    if (ev.input_received || ev.plan_revised || ev.input_needs_clarification) {
+      onIntentEvent(ev); return;
+    }
+    if (ev.decision_reserved || ev.decision_kind) {
+      onDecisionEvent(ev); return;
+    }
+    if (ev.type === 'result') { showDeployed(ev.public_url, ev.deployment_id); return; }
+    if (ev.type === 'status') {
+      if (ev.run_status) S.runStatus = ev.run_status;
+      if (Array.isArray(ev.asked_questions)) S.askedQuestions = ev.asked_questions;
+      if (typeof ev.clarification === 'string') S.clarification = ev.clarification;
+      if (ev.intent_version) {
+        if (S.answerIntent && ev.intent_version > S.answerIntent) markStaleAnswer();
+        S.answerIntent = ev.intent_version;
+        S.answerPlan = ev.plan_version || S.answerPlan;
+      }
+      if (ev.detail) {
+        if (S.streamBubble) {
+          S.streamBubble.textContent = ev.detail;
+          S.streamBubble = null;
+        } else {
+          addMessage('assistant', ev.detail);
+        }
+      }
+      finish(ev.status);
+      return;
+    }
+    if (ev.type === 'end') { finish(ev.status); return; }
+    addEvent(ev);
+  };
+  es.onerror = () => { /* 断线由浏览器自动重连 */ };
+}
+
+async function finish(status) {
+  if (!S.running && S.status === status) return;
+  S.status = status;
+  setRunning(false);
+  if (S.es) { S.es.close(); S.es = null; }
+  closeOpenStages(status);
+  sealDraft();
+  collapseLastTurn(status);   // 跑完就收起步骤，需要时再点开
+  loadSessions();            // 消息数、活跃时间变了，刷新侧边栏
+  if (W.enabled && W.id) readWorkspace(W.id, W.selected);
+  if (!S.taskId) return;
+  const taskId = S.taskId;
+  try {
+    const res = checkAuth(await fetch(`${API_PREFIX}/tasks/${taskId}`));
+    const data = await res.json();
+    if (S.taskId !== taskId) return;
+    renderResult(data.state);
+  } catch { /* 结果区拿不到不影响主流程 */ }
+}
+
+function renderResult(state, taskId = null) {
+  if (!state) return;
+  const box = $('result');
+  box.innerHTML = '';
+  const deployment = state.deployment || {};
+  // 回放历史产物时用那一轮的 task_id；实时结束时就是当前这一轮
+  const owner = taskId || S.taskId;
+
+  // 只有确实产出文件时才显示播放器或下载入口。
+  if (state.artifact) {
+    const card = document.createElement('div');
+    card.className = 'card';
+    const isVideo = state.artifact.kind === 'video';
+    const label = isVideo ? '视频成片' : state.artifact.kind === 'sources' ? '资料页面' : '报告产物';
+    card.innerHTML = `<b>${label}</b><div class="actions"></div>`;
+    const actions = card.querySelector('.actions');
+    if (owner) {
+      const a = document.createElement('a');
+      a.className = 'btn';
+      a.href = `${API_PREFIX}/tasks/${owner}/artifact`;
+      a.target = '_blank';
+      a.textContent = isVideo ? '下载 MP4 视频' : '打开 / 下载 HTML';
+      if (isVideo) {
+        a.download = 'final.mp4';
+        const player = document.createElement('video');
+        player.controls = true;
+        player.preload = 'metadata';
+        player.src = a.href;
+        player.style.cssText = 'width:100%;max-width:960px;display:block;margin:16px 0;border-radius:12px';
+        card.insertBefore(player, actions);
+      }
+      actions.appendChild(a);
+    }
+    const hint = document.createElement('div');
+    hint.className = 'hint';
+    hint.textContent = isVideo ? '已生成中文旁白、动画和字幕。' : '想发布的说一句「部署到服务器」即可。';
+    card.appendChild(hint);
+    box.appendChild(card);
+  }
+
+  if (deployment.public_url) showDeployed(deployment.public_url, deployment.deployment_id);
+}
+
+function showDeployed(url, siteId) {
+  const box = $('result');
+  box.insertAdjacentHTML('afterbegin',
+    `<div class="card ok">已部署：<a href="${esc(url)}" target="_blank">${esc(url)}</a>` +
+    (siteId ? `<div class="hint">站点 ID：${esc(siteId)}</div>` : '') + '</div>');
+}
+
+// ---------- 我的画像 ----------
+
+async function loadProfileForm() {
+  const res = await fetch(API_PREFIX + '/profile');
+  const data = await res.json();
+  $('profileText').value = data.text || '';
+  const n = Object.keys(data.facts || {}).length;
+  $('profileMeta').textContent = n ? `${n} 条 · v${data.version}` : '尚未建立';
+}
+
+async function openProfile() {
+  $('profileStatus').textContent = '';
+  $('profileModal').style.display = 'flex';
+  try { await loadProfileForm(); }
+  catch { $('profileMeta').textContent = '读取失败'; }
+}
+
+function closeProfile() {
+  $('profileModal').style.display = 'none';
+}
+
+async function saveProfile() {
+  $('profileStatus').textContent = '保存中…';
+  try {
+    const res = await fetch(API_PREFIX + '/profile', {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text: $('profileText').value}),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+    await loadProfileForm();               // 服务端会重写头部，重新拉一次
+    $('profileStatus').textContent = `已保存 · ${data.count} 条 · v${data.version}`;
+  } catch (err) {
+    $('profileStatus').textContent = '保存失败：' + err.message;
+  }
+}
+
+async function clearProfile() {
+  if (!confirm('确定清空画像？会在 profile/USER.md.bak 留一份备份。')) return;
+  $('profileStatus').textContent = '清空中…';
+  try {
+    await fetch(API_PREFIX + '/profile', {method: 'DELETE'});
+    await loadProfileForm();
+    $('profileStatus').textContent = '已清空';
+  } catch (err) {
+    $('profileStatus').textContent = '清空失败：' + err.message;
+  }
+}
+
+// ---------- 会话记忆 ----------
+
+async function loadMemoryForm() {
+  if (!S.sessionId) {
+    $('memoryMeta').textContent = '当前没有会话';
+    $('memorySummary').value = '';
+    $('memoryFacts').value = '';
+    return;
+  }
+  const res = await fetch(`${API_PREFIX}/sessions/${S.sessionId}/memory`);
+  const data = await res.json();
+  $('memorySummary').value = data.summary || '';
+  $('memoryFacts').value = data.facts_text || '';
+  $('memoryMeta').textContent = data.upto
+    ? `已压缩前 ${data.upto} 条消息`
+    : '尚未压缩';
+}
+
+async function openMemory() {
+  $('memoryStatus').textContent = '';
+  $('memoryModal').style.display = 'flex';
+  try { await loadMemoryForm(); }
+  catch { $('memoryMeta').textContent = '读取失败'; }
+}
+
+function closeMemory() { $('memoryModal').style.display = 'none'; }
+
+async function saveMemory() {
+  if (!S.sessionId) { $('memoryStatus').textContent = '当前没有会话'; return; }
+  $('memoryStatus').textContent = '保存中…';
+  try {
+    const res = await fetch(`${API_PREFIX}/sessions/${S.sessionId}/memory`, {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({summary: $('memorySummary').value,
+                            facts: $('memoryFacts').value}),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+    await loadMemoryForm();
+    $('memoryStatus').textContent = `已保存 · ${Object.keys(data.facts || {}).length} 条事实`;
+  } catch (err) {
+    $('memoryStatus').textContent = '保存失败：' + err.message;
+  }
+}
+
+async function clearMemory() {
+  if (!S.sessionId) { $('memoryStatus').textContent = '当前没有会话'; return; }
+  if (!confirm('清空会话记忆？之后会从原文重新累积。')) return;
+  try {
+    await fetch(`${API_PREFIX}/sessions/${S.sessionId}/memory`, {method: 'DELETE'});
+    await loadMemoryForm();
+    $('memoryStatus').textContent = '已清空';
+  } catch (err) {
+    $('memoryStatus').textContent = '清空失败：' + err.message;
+  }
+}
+
+$('memoryBtn').onclick = openMemory;
+$('memoryClose').onclick = closeMemory;
+$('memorySave').onclick = saveMemory;
+$('memoryClear').onclick = clearMemory;
+$('memoryModal').addEventListener('click', e => {
+  if (e.target === $('memoryModal')) closeMemory();
+});
+
+$('profileBtn').onclick = openProfile;
+$('profileClose').onclick = closeProfile;
+$('profileSave').onclick = saveProfile;
+$('profileClear').onclick = clearProfile;
+$('profileModal').addEventListener('click', e => {
+  if (e.target === $('profileModal')) closeProfile();   // 点遮罩关闭
+});
+document.addEventListener('keydown', e => {
+  if (e.key !== 'Escape') return;
+  if ($('profileModal').style.display !== 'none') closeProfile();
+  if ($('memoryModal').style.display !== 'none') closeMemory();
+});
+
+$('send').onclick = send;
+$('newSession').onclick = newSession;
+// Enter 直接发送，Shift+Enter 换行。
+// isComposing 必须判：中文输入法用 Enter 选词时也会触发 keydown，
+// 不跳过就会把还没上屏的候选词发出去。
+$('msg').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+    e.preventDefault();
+    send();
+  }
+});
+
+async function initializePage() {
+  await loadSessions();
+  await initializeWorkspace();
+}
+initializePage();
+
+// Conversations may advance in the canvas sidebar or another window.
+let externalTimeline = null;
+let externalRefreshBusy = false;
+setInterval(async () => {
+  if (!W.enabled || document.hidden || externalRefreshBusy || W.sending || S.running) return;
+  externalRefreshBusy = true;
+  try {
+    await loadSessions();
+    if (!S.sessionId) {
+      const latest = W.items.find(item => item.session_id === S.sessions[0]?.session_id);
+      if (latest) await selectWorkspace(latest.id);
+      return;
+    }
+    const id = S.sessionId;
+    const response = checkAuth(await fetch(`${API_PREFIX}/sessions/${id}/timeline`));
+    if (!response.ok || id !== S.sessionId || W.sending || S.running) return;
+    const timeline = await response.json();
+    if (id !== S.sessionId || W.sending || S.running) return;
+    const fingerprint = id + ':' + JSON.stringify(timeline);
+    if (fingerprint !== externalTimeline) {
+      externalTimeline = fingerprint;
+      await openSession(id, {keepWorkspace: true});
+      if (W.id && !W.sending && !S.running) await readWorkspace(W.id, W.selected);
+    }
+  } catch { /* Preserve the current conversation during a transient disconnect. */ }
+  finally { externalRefreshBusy = false; }
+}, 3000);
+</script>
+</body>
+</html>

@@ -5,7 +5,8 @@ from unittest.mock import patch
 
 import jwt
 
-from app import auth_connections, scene_context
+from webpage_agent.api import auth_connections
+from webpage_agent.agent import scene_context
 from tests.test_ticket_auth import ISS, PRIVATE_A, PUBLIC_A, connection
 
 

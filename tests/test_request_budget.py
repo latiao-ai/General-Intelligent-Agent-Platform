@@ -12,11 +12,14 @@ import httpx
 from openai import APIConnectionError, AuthenticationError, RateLimitError
 from pydantic import BaseModel
 
-from app import context, graph, nodes, services
-from app.api_hub import Hub
-from app.capabilities.registry import Tool
-from app.config import settings
-from app.schemas import ExecutionPlan, RevisedPlan
+from webpage_agent.agent import context
+from webpage_agent.agent import graph
+from webpage_agent.agent import nodes
+from webpage_agent.core import services
+from webpage_agent.api.api_hub import Hub
+from webpage_agent.capabilities.registry import Tool
+from webpage_agent.core.config import settings
+from webpage_agent.core.schemas import ExecutionPlan, RevisedPlan
 from tests.exec_env import (Remote, install_main, install_tools, new_store,
                             reset_db, seed_run)
 
@@ -128,8 +131,8 @@ class CompleteBudgetTests(unittest.TestCase):
 
 class ModelBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_denied_run_budget_never_sends_and_is_known_not_executed(self):
-        from app.pg_store import BudgetExceeded
-        from app.errors import as_outcome
+        from webpage_agent.store.pg_store import BudgetExceeded
+        from webpage_agent.observe.errors import as_outcome
         model = StubModel([[chunk({'value': 'unused'})]])
         token = services.bind_budget(AsyncMock(side_effect=BudgetExceeded()))
         try:

@@ -11,11 +11,13 @@ from types import SimpleNamespace
 
 import httpx
 
-import app.api as api_module
-from app import execution_control, ledger, policies
-from app import tool_results
-from app import tools as tool_module
-from app.config import settings
+import webpage_agent.api.routes as api_module
+from webpage_agent.governance import execution_control
+from webpage_agent.store import ledger
+from webpage_agent.governance import policies
+from webpage_agent.tools import tool_results
+from webpage_agent.tools import core as tool_module
+from webpage_agent.core.config import settings
 
 
 def person(user_id: str, tenant_id: str) -> policies.Principal:

@@ -11,7 +11,7 @@ import unittest
 
 from unittest.mock import patch
 
-from app import execution_control
+from webpage_agent.governance import execution_control
 from tests.exec_env import (Remote, install_main, install_plan, install_tools,
                             new_store, one_step_plan, reset_db, seed_run)
 
@@ -23,7 +23,7 @@ class LeaseFencingTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def hub(self, store, **kwargs):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(store, **kwargs)
 
     async def test_stale_epoch_cannot_advance_the_run(self):
@@ -62,7 +62,7 @@ class LeaseFencingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_renewal_failure_stops_before_the_next_step(self):
         """续租失败 = 已经不该继续：停在这里，且**不写任何业务状态**。"""
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
 
         store = new_store()
         await seed_run(store, status='queued')
@@ -113,7 +113,7 @@ class PauseBoundaryTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def hub(self, store, **kwargs):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(store, **kwargs)
 
     async def test_pause_committed_before_admission_blocks_the_call(self):
@@ -225,7 +225,7 @@ class PauseBoundaryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_request_stops_the_dispatch(self):
         import scripts.run_worker as worker
-        from app.pg_store import now
+        from webpage_agent.store.pg_store import now
 
         store = new_store()
         await seed_run(store, status='running')

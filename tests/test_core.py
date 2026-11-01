@@ -1,3 +1,4 @@
+from tests.exec_env import valid_test_dsn
 import os
 import json
 import time
@@ -10,11 +11,11 @@ from types import SimpleNamespace
 from dataclasses import replace
 from unittest.mock import AsyncMock, patch
 from pydantic import ValidationError
-from app.schemas import ExecutionPlan, PlanStep
-from app.services import clean_public_url
-from app.files import save_json
-from app.integrations import mcp_adapter
-from app import nodes
+from webpage_agent.core.schemas import ExecutionPlan, PlanStep
+from webpage_agent.core.services import clean_public_url
+from webpage_agent.core.files import save_json
+from webpage_agent.integrations import mcp_adapter
+from webpage_agent.agent import nodes
 
 
 from contextlib import ExitStack
@@ -32,9 +33,9 @@ def new_store():
     """测试用仓储：真实 PostgreSQL（库名必须含 test，用例会 TRUNCATE）。"""
     if not PG_DSN:
         raise unittest.SkipTest('需要 PG_TEST_DSN（项目已不再支持 SQLite）')
-    if 'test' not in PG_DSN:
+    if not valid_test_dsn(PG_DSN):
         raise unittest.SkipTest('PG_TEST_DSN 必须指向一次性测试库（库名含 test）')
-    from app.pg_store import PostgresStore
+    from webpage_agent.store.pg_store import PostgresStore
     return PostgresStore(PG_DSN)
 
 
@@ -51,7 +52,7 @@ async def reset_db() -> None:
 
 def patch_all_emits(sink):
     """能力包各自持有 emit 引用，测试里需要一起打桩。"""
-    from app.capabilities import answers, export, publishing, web
+    from webpage_agent.capabilities import answers, export, publishing, web
     stack = ExitStack()
     for module in (answers, export, publishing, web):
         stack.enter_context(patch.object(module, 'emit', sink))
@@ -69,7 +70,7 @@ class SourceStoreTests(unittest.TestCase):
     """P0：正文落盘，state 里只留元数据。"""
 
     def test_text_roundtrip_and_metadata(self):
-        from app import sources
+        from webpage_agent.core import sources
         with tempfile.TemporaryDirectory() as folder:
             with patch.object(sources, 'settings',
                               SimpleNamespace(artifact_dir=Path(folder))):
@@ -83,7 +84,7 @@ class SourceStoreTests(unittest.TestCase):
                 self.assertTrue(sources.has_text(doc))
 
     def test_missing_text_and_legacy_compat(self):
-        from app import sources
+        from webpage_agent.core import sources
         with tempfile.TemporaryDirectory() as folder:
             with patch.object(sources, 'settings',
                               SimpleNamespace(artifact_dir=Path(folder))):
@@ -103,8 +104,8 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
     """P0：检索/成稿都走落盘正文，state 不再背几百 KB。"""
 
     async def test_search_keeps_text_out_of_state(self):
-        from app import sources
-        from app.capabilities import web as web_cap
+        from webpage_agent.core import sources
+        from webpage_agent.capabilities import web as web_cap
 
         async def fake_search(query):
             return {'results': [{'url': 'https://example.com/a', 'title': '甲文',
@@ -131,8 +132,9 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
         能力包拆分时漏了 datetime 导入，单测只覆盖搜索路径所以没发现，
         是实测一次真实任务才暴露的（NameError in fetch_pages）。
         """
-        from app import sources, tools as tool_module
-        from app.capabilities import web as web_cap
+        from webpage_agent.core import sources
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import web as web_cap
 
         async def fake_fetch(urls):
             return {'results': [{'url': urls[0], 'raw_content': '抓到的正文'}],
@@ -159,16 +161,16 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
         "为没有正文的搜索结果补抓"是个不存在的场景（检索接口自带正文），
         规则里留着它只会让规划器以为还有第二条路。
         """
-        from app.capabilities import web as web_cap
-        from app import tools as tool_module
+        from webpage_agent.capabilities import web as web_cap
+        from webpage_agent.tools import core as tool_module
         rules = web_cap.PROMPT_RULES
         self.assertIn('用户输入里出现了 URL', rules)
         self.assertNotIn('补抓', rules)
         self.assertNotIn('补抓', tool_module.BUILTIN_BY_NAME['fetch_pages'].description)
 
     async def test_fetch_requires_user_supplied_urls_before_network(self):
-        from app.capabilities import web as web_cap
-        from app.capabilities.base import ToolError
+        from webpage_agent.capabilities import web as web_cap
+        from webpage_agent.capabilities.base import ToolError
 
         # 即使搜索已登记了缺正文的 URL，也不能省略参数或把它当用户链接抓取。
         state = {'user_input': '查找王林的资料', 'documents': [
@@ -181,8 +183,8 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
             fetch.assert_not_awaited()
 
     async def test_fetch_only_updates_requested_user_url(self):
-        from app import sources
-        from app.capabilities import web as web_cap
+        from webpage_agent.core import sources
+        from webpage_agent.capabilities import web as web_cap
 
         target = 'https://example.com/user-page'
         fetch = AsyncMock(return_value={
@@ -204,8 +206,8 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(sources.load_text(result['documents'][1]), '用户链接的正文')
 
     async def test_fetch_reuses_existing_text_for_user_url(self):
-        from app import sources
-        from app.capabilities import web as web_cap
+        from webpage_agent.core import sources
+        from webpage_agent.capabilities import web as web_cap
 
         target = 'https://example.com/user-page'
         with tempfile.TemporaryDirectory() as folder:
@@ -221,7 +223,8 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result['documents'], [doc])
 
     async def test_select_sources_reads_text_from_disk(self):
-        from app import sources, tools as tool_module
+        from webpage_agent.core import sources
+        from webpage_agent.tools import core as tool_module
         with tempfile.TemporaryDirectory() as folder:
             with patch.object(sources, 'settings',
                               SimpleNamespace(artifact_dir=Path(folder))):
@@ -238,7 +241,7 @@ class MarkdownRenderTests(unittest.TestCase):
     """资料转 HTML 的底座：Markdown 转换。"""
 
     def test_basic_blocks(self):
-        from app import md
+        from webpage_agent.core import md
         out = md.to_html('# 标题\n\n正文\n\n- a\n- b\n\n1. x\n2. y\n')
         self.assertIn('<h1>标题</h1>', out)
         self.assertIn('<p>正文</p>', out)
@@ -246,7 +249,7 @@ class MarkdownRenderTests(unittest.TestCase):
         self.assertIn('<ol><li>x</li><li>y</li></ol>', out)
 
     def test_inline_and_code_fence(self):
-        from app import md
+        from webpage_agent.core import md
         out = md.to_html('**粗** 与 `code`\n\n```py\nprint(1)\n```')
         self.assertIn('<strong>粗</strong>', out)
         self.assertIn('<code>code</code>', out)
@@ -255,7 +258,7 @@ class MarkdownRenderTests(unittest.TestCase):
 
     def test_handles_backslash_escapes(self):
         """DeepSeek 的 fetch 返回大量反斜杠转义，必须还原成字面字符。"""
-        from app import md
+        from webpage_agent.core import md
         out = md.to_html(r'\# 1\. Overview 与 \*字面星号\*')
         self.assertIn('# 1. Overview', out)
         self.assertIn('*字面星号*', out)
@@ -263,7 +266,7 @@ class MarkdownRenderTests(unittest.TestCase):
 
     def test_escapes_untrusted_html(self):
         """来源是任意网页，正文必须先转义——否则我们等于在替它执行脚本。"""
-        from app import md
+        from webpage_agent.core import md
         out = md.to_html('<script>alert(1)</script>\n\n[点我](javascript:alert(1))')
         self.assertNotIn('<script>', out)
         self.assertIn('&lt;script&gt;', out)
@@ -275,8 +278,8 @@ class RuntimeKeyCheckTests(unittest.TestCase):
     """启动自检要提示缺哪个 key，而不是等到第一次检索才 401。"""
 
     def test_missing_deepseek_key_is_reported(self):
-        from app import config as config_module
-        from app.config import Settings
+        from webpage_agent.core import config as config_module
+        from webpage_agent.core.config import Settings
         fake = Settings()                       # 字段来自当前 .env
         object.__setattr__(fake, 'deepseek_api_key', '')
         with patch.object(config_module, 'settings', fake):
@@ -289,7 +292,7 @@ class SearchBackendTests(unittest.IsolatedAsyncioTestCase):
     """检索后端：DeepSeek 官方接口归一化成 tools 使用的形状。"""
 
     async def test_deepseek_search_normalises_payload(self):
-        from app.integrations import search
+        from webpage_agent.integrations import search
         captured = {}
 
         class FakeResponse:
@@ -326,7 +329,7 @@ class SearchBackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item['site_name'], '示例站')
 
     async def test_deepseek_fetch_collects_failures(self):
-        from app.integrations import search
+        from webpage_agent.integrations import search
 
         class FakeResponse:
             def __init__(self, ok): self.ok = ok
@@ -355,8 +358,8 @@ class SourcesHtmlToolTests(unittest.IsolatedAsyncioTestCase):
     """资料转 HTML：不调模型，把原始资料直接排版成网页。"""
 
     async def test_renders_page_from_disk_markdown(self):
-        from app import sources
-        from app.capabilities import export as export_cap
+        from webpage_agent.core import sources
+        from webpage_agent.capabilities import export as export_cap
         with tempfile.TemporaryDirectory() as folder:
             fake = SimpleNamespace(artifact_dir=Path(folder))
             with patch.object(sources, 'settings', fake), \
@@ -375,10 +378,10 @@ class SourcesHtmlToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('https://a/1', html)
 
     async def test_refuses_without_documents(self):
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
         with self.assertRaises(tool_module.ToolError):
             await export_cap._render_sources_html({}, {'documents': []})
 
@@ -387,13 +390,13 @@ class ContextBuilderTests(unittest.TestCase):
     """P1：按 token 预算装配上下文。"""
 
     def test_estimate_tokens_prefers_conservative(self):
-        from app import context
+        from webpage_agent.agent import context
         self.assertGreater(context.estimate_tokens('中文' * 100), 100)
         self.assertGreater(context.estimate_tokens('a' * 100), 0)
         self.assertEqual(context.estimate_tokens(''), 0)
 
     def test_select_trims_to_budget_but_keeps_one(self):
-        from app import context
+        from webpage_agent.agent import context
         history = [{'role': 'user', 'content': '很长的内容' * 800}
                    for _ in range(30)]
         picked = context.select(history, 'plan')
@@ -404,7 +407,7 @@ class ContextBuilderTests(unittest.TestCase):
         self.assertEqual(len(context.select(huge, 'plan')), 1)
 
     def test_memory_text_and_system_injection(self):
-        from app import context
+        from webpage_agent.agent import context
         memory = {'summary': '用户在减脂', 'facts': {'目标': '降到15%'}, 'upto': 12}
         block = context.memory_text(memory)
         self.assertIn('会话摘要', block)
@@ -424,13 +427,13 @@ class SessionMemoryTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     async def test_parse_and_render_facts(self):
-        from app import memory
+        from webpage_agent.core import memory
         self.assertEqual(memory.parse_facts('目标：减脂\n- 已否决: 节食\n\n'),
                          {'目标': '减脂', '已否决': '节食'})
         self.assertEqual(memory.render_facts({'目标': '减脂'}), '目标：减脂')
 
     async def test_needs_compaction_thresholds(self):
-        from app import memory
+        from webpage_agent.core import memory
         few = [{'content': '短'} for _ in range(3)]
         self.assertFalse(memory.needs_compaction(few))
         many = [{'content': '短'} for _ in range(memory.MAX_MESSAGES + 1)]
@@ -439,8 +442,8 @@ class SessionMemoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(memory.needs_compaction(fat))
 
     async def test_compact_folds_old_messages_into_summary(self):
-        from app import memory
-        from app.schemas import SessionMemory
+        from webpage_agent.core import memory
+        from webpage_agent.core.schemas import SessionMemory
         store = new_store()
         for i in range(memory.MAX_MESSAGES + 4):
             await store.append_message('s1', 'user' if i % 2 == 0 else 'assistant',
@@ -461,7 +464,7 @@ class SessionMemoryTests(unittest.IsolatedAsyncioTestCase):
                          memory.KEEP_RECENT)
 
     async def test_compact_failure_is_silent(self):
-        from app import memory
+        from webpage_agent.core import memory
         store = new_store()
         for i in range(memory.MAX_MESSAGES + 4):
             await store.append_message('s1', 'user', f'第{i}条')
@@ -480,7 +483,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
     """Planner-Executor：计划决定走哪条路，执行器逐步落实。"""
 
     async def test_next_step_follows_the_cursor(self):
-        from app import nodes
+        from webpage_agent.agent import nodes
         plan = {'steps': [{'tool': 'web_search'}, {'tool': 'render_html'}]}
         self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 0}), 'run_step')
         self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 1}), 'run_step')
@@ -491,7 +494,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_next_step_stops_on_states_that_need_a_human(self):
         """暂停/待核实/失败：本次执行直接退出，不要继续派发下一步。"""
-        from app import nodes
+        from webpage_agent.agent import nodes
         plan = {'steps': [{'tool': 'web_search'}, {'tool': 'render_html'}]}
         for status in ('paused', 'needs_reconcile', 'failed',
                        'partially_succeeded', 'cancelled', 'waiting_input'):
@@ -500,7 +503,7 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_next_step_prefers_revision_when_intent_changed(self):
         """用户补了要求：先去修订剩余计划，而不是把旧计划的下一步跑掉。"""
-        from app import nodes
+        from webpage_agent.agent import nodes
         plan = {'steps': [{'tool': 'web_search'}, {'tool': 'render_html'}]}
         self.assertEqual(nodes.next_step({'plan': plan, 'step_index': 0,
                                           'intent_changed': True}),
@@ -508,7 +511,8 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_final_status_is_generic_and_label_is_derived(self):
         """状态机只存通用状态；answered / local_ready 是**派生**出来的展示标签。"""
-        from app import nodes, outcome
+        from webpage_agent.agent import nodes
+        from webpage_agent.core import outcome
         self.assertEqual(nodes.final_status({'answer': 'hi'}), 'succeeded')
         self.assertEqual(nodes.final_status(
             {'deployment': {'status': 'success'}}), 'succeeded')
@@ -540,11 +544,11 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_valid_steps_reports_unknown_tools(self):
         """未知工具要**回报**而不是静默过滤——计划引用不存在的工具属于规划错误。"""
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
         kept, dropped = nodes._valid_steps(
             [{'tool': 'web_search', 'args': {'query': 'q'}},
              {'tool': 'not_a_tool', 'args': {}},
@@ -556,16 +560,16 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_fallback_does_not_guess_business(self):
         """能力裁剪后只剩一条业务链，兜底不再替用户拼它，直接返回空计划。"""
-        from app import nodes
+        from webpage_agent.agent import nodes
         for text in ('整理一份 SQLite 报告', '查询如何降低体脂', '你好'):
             self.assertEqual(nodes.fallback_steps({'user_input': text}), [], text)
 
     async def test_plan_asks_the_model_and_keeps_its_steps(self):
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
         captured = {}
 
         async def fake_catalog(context=None):
@@ -599,9 +603,9 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_planner_brief_omits_facts_from_absent_capabilities(self):
         """网页资料和 HTML 不是内核的默认世界。清单里没有这些能力，简报里就没有这些字段。"""
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities.registry import Tool
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities.registry import Tool
         captured = {}
 
         async def fake_catalog(context=None):
@@ -624,11 +628,11 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('mcp__list_items', captured['user'])
 
     async def test_plan_falls_back_when_the_model_fails(self):
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
 
         async def fake_catalog(context=None):
             return tool_module.BUILTIN_TOOLS
@@ -644,12 +648,12 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_run_step_runs_exactly_one_tool_and_advances(self):
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
-        from app.tools import Tool
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
+        from webpage_agent.tools.core import Tool
         seen = []
 
         async def runner(args, state):
@@ -667,12 +671,12 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['step_label'], '资料转 HTML')
 
     async def test_run_step_aborts_remaining_steps_on_error(self):
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
-        from app.tools import Tool
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
+        from webpage_agent.tools.core import Tool
 
         async def boom(args, state):
             # 本地检索在派发前就失败：显式标注"确认没执行"（文档 §6.1）
@@ -694,9 +698,9 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unlabelled_failure_is_treated_as_unknown(self):
         """没标注确定性的异常按 unknown 处理：宁可让人核实，也不猜着重发。"""
-        from app import nodes
-        from app import tools as tool_module
-        from app.tools import Tool
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.tools.core import Tool
 
         async def murky(args, state):
             raise RuntimeError('连接被重置')
@@ -711,8 +715,8 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['errors'][0]['certainty'], 'unknown')
 
     async def test_run_step_fails_when_a_planned_tool_disappeared(self):
-        from app import nodes
-        from app import tools as tool_module
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
 
         async def no_mcp():
             return []
@@ -742,7 +746,7 @@ class ActionLedgerTests(unittest.IsolatedAsyncioTestCase):
 
     async def ledger(self, store):
         """账本必须挂在真实的 run 上：准入要校验运行状态与租约。"""
-        from app.ledger import ActionLedger
+        from webpage_agent.store.ledger import ActionLedger
         await store.create_task('task1', 'sess1', '测试')
         await store.create_run('run1', 'task1', status='running')
         return ActionLedger(store, 'run1', 1)
@@ -786,7 +790,7 @@ class ActionLedgerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_result_blocks_blind_retry(self):
         """结果不确定时不能当成失败去重发，也不能当成功复用。"""
-        from app.capabilities.base import ToolError
+        from webpage_agent.capabilities.base import ToolError
         store = new_store()
         book = await self.ledger(store)
         first = await book.admit(step_id='s1', tool_key='mcp:publishing:deploy_site',
@@ -804,7 +808,7 @@ class ActionLedgerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_not_executed_is_recorded_as_failed_and_retryable(self):
         """确认没执行 → 记为 failed（可显式重试），不能落成 unknown。"""
-        from app.capabilities.base import ToolError
+        from webpage_agent.capabilities.base import ToolError
         store = new_store()
         book = await self.ledger(store)
         first = await book.admit(step_id='s1', tool_key='local:web:search',
@@ -818,7 +822,7 @@ class ActionLedgerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored['status'], 'failed')
 
     async def test_failure_records_error_code_and_certainty(self):
-        from app.capabilities.base import ToolError
+        from webpage_agent.capabilities.base import ToolError
         store = new_store()
         book = await self.ledger(store)
         first = await book.admit(step_id='s1', tool_key='t', effect='write', args={})
@@ -863,7 +867,7 @@ class ContextBudgetTests(unittest.TestCase):
     """完整上下文预算与截断披露（文档 §11）。"""
 
     def test_budget_report_lists_every_section(self):
-        from app import context
+        from webpage_agent.agent import context
         built = context.build(purpose='final_answer', rules='规则',
                               request='问题', tools='工具', evidence='证据')
         sections = built['report']['sections']
@@ -872,7 +876,7 @@ class ContextBudgetTests(unittest.TestCase):
         self.assertEqual(built['report']['purpose'], 'final_answer')
 
     def test_history_is_trimmed_and_flagged(self):
-        from app import context
+        from webpage_agent.agent import context
         history = [{'role': 'user', 'content': '很长的历史' * 500}
                    for _ in range(8)]
         built = context.build(purpose='plan', rules='x', history=history)
@@ -881,13 +885,13 @@ class ContextBudgetTests(unittest.TestCase):
 
     def test_oversized_rules_are_reported_not_silently_cut(self):
         """规则+工具 schema 已超预算时必须报出来，不能悄悄截断关键约束。"""
-        from app import context
+        from webpage_agent.agent import context
         built = context.build(purpose='plan', rules='约束' * 3000,
                               tools='工具' * 3000)
         self.assertTrue(built['report']['over_budget'])
 
     def test_each_purpose_has_its_own_budget(self):
-        from app import context
+        from webpage_agent.agent import context
         self.assertGreater(context.PURPOSE_BUDGETS['transform'],
                            context.PURPOSE_BUDGETS['plan'])
         for purpose in context.PURPOSES:
@@ -944,7 +948,7 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
         部署不在里面：它由 MCP 发现得到（身份 mcp:<server>:<tool>），
         见 `DeployGateTests`。本地身份只发给"纯计算/纯回答"的工具。
         """
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         self.assertEqual(sorted(tool_module.BUILTIN_BY_NAME),
                          ['answer_directly', 'answer_with_sources',
                           'fetch_pages', 'render_sources_html', 'web_search'])
@@ -959,8 +963,8 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_small_talk_skips_planning_but_still_answers(self):
         """闲聊不花规划调用，但**回答仍由模型给出**（不是固定文案）。"""
-        from app import nodes
-        from app import tools as tool_module
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
 
         async def forbidden(*a, **k):
             raise AssertionError('闲聊不该调用模型做规划')
@@ -976,8 +980,8 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.get('usage', []), [])
 
     async def test_answer_directly_never_touches_documents(self):
-        from app import tools as tool_module
-        from app.capabilities import answers as answers_cap
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import answers as answers_cap
 
         async def fake_chat(system, messages, model=None, on_delta=None):
             return 'ACID 是事务的四个特性。'
@@ -990,8 +994,9 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('ACID', result['answer'])
 
     async def test_answer_with_sources_returns_the_reply_verbatim(self):
-        from app import sources, tools as tool_module
-        from app.capabilities import answers as answers_cap
+        from webpage_agent.core import sources
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import answers as answers_cap
         with tempfile.TemporaryDirectory() as folder:
             fake = SimpleNamespace(artifact_dir=Path(folder))
             with patch.object(sources, 'settings', fake):
@@ -1012,8 +1017,8 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('参考来源', result['answer'])
 
     async def test_answer_with_sources_requires_material(self):
-        from app.capabilities import answers as answers_cap
-        from app.capabilities.base import ToolError
+        from webpage_agent.capabilities import answers as answers_cap
+        from webpage_agent.capabilities.base import ToolError
         with self.assertRaises(ToolError):
             await answers_cap._answer_with_sources(
                 {'question': 'q'}, {'documents': [], 'usage': []})
@@ -1023,7 +1028,8 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
     """计划合同：步骤 ID、依赖、输入绑定与结构化校验（文档 §6）。"""
 
     async def test_step_ids_assigned_and_dependencies_validated(self):
-        from app import nodes, tools as tm
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tm
         steps, issues = nodes.validate_plan([
             {'tool': 'web_search', 'args': {'query': 'x'}},
             {'tool': 'render_sources_html', 'depends_on': ['s1']},
@@ -1033,7 +1039,8 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(steps[0]['tool_key'], 'local:web:search')
 
     async def test_forward_or_missing_dependency_is_an_error(self):
-        from app import nodes, tools as tm
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tm
         _, issues = nodes.validate_plan([
             {'tool': 'web_search', 'args': {'query': 'x'}, 'step_id': 'a'},
             {'tool': 'render_sources_html', 'depends_on': ['b'], 'step_id': 'c'},
@@ -1041,7 +1048,8 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('bad_dependency', [i['code'] for i in issues])
 
     async def test_duplicate_step_id_is_an_error(self):
-        from app import nodes, tools as tm
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tm
         _, issues = nodes.validate_plan([
             {'tool': 'web_search', 'args': {}, 'step_id': 'a'},
             {'tool': 'render_sources_html', 'step_id': 'a'},
@@ -1049,7 +1057,7 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('duplicate_step_id', [i['code'] for i in issues])
 
     async def test_input_binding_resolves_previous_output(self):
-        from app import nodes
+        from webpage_agent.agent import nodes
         args = nodes.resolve_inputs(
             {'args': {'artifact_id': {'ref': {'step_id': 's1',
                                               'pointer': '/artifact/id'}},
@@ -1061,8 +1069,8 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_binding_fails_instead_of_feeding_none(self):
         """引用解析不到就报错——把 None 喂给远端只会换来一句看不出来的 400。"""
-        from app import nodes
-        from app.capabilities.base import ToolError
+        from webpage_agent.agent import nodes
+        from webpage_agent.capabilities.base import ToolError
         with self.assertRaises(ToolError) as ctx:
             nodes.resolve_inputs(
                 {'step_id': 's9',
@@ -1083,7 +1091,7 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
         "`{'ref': ...}` is not of type 'string'"——看着像模型传错类型，
         其实是调度器没解析。
         """
-        from app import nodes
+        from webpage_agent.agent import nodes
         args = nodes.resolve_inputs(
             {'step_id': 's4',
              'args': {'canvasId': 'c1', 'kind': 'image',
@@ -1097,7 +1105,7 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_binding_inside_list_is_resolved(self):
         """数组元素里的绑定同样要解析。"""
-        from app import nodes
+        from webpage_agent.agent import nodes
         args = nodes.resolve_inputs(
             {'step_id': 's2',
              'args': {'nodeIds': [{'ref': {'step_id': 's1', 'pointer': '/ids/1'}},
@@ -1107,7 +1115,7 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_ref_supports_list_index_and_whole_output(self):
         """指针要能下标取数组；空指针表示整份输出。"""
-        from app import nodes
+        from webpage_agent.agent import nodes
         outputs = {'s1': {'rows': [{'id': 'r0'}, {'id': 'r1'}]}}
         args = nodes.resolve_inputs(
             {'step_id': 's2',
@@ -1119,8 +1127,8 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_nested_binding_failure_points_at_the_field(self):
         """嵌套引用解析不到时报错要指到具体字段，别只说参数名。"""
-        from app import nodes
-        from app.capabilities.base import ToolError
+        from webpage_agent.agent import nodes
+        from webpage_agent.capabilities.base import ToolError
         with self.assertRaises(ToolError) as ctx:
             nodes.resolve_inputs(
                 {'step_id': 's4',
@@ -1132,7 +1140,7 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_plain_object_with_ref_like_field_is_left_alone(self):
         """普通参数里恰好有个 ref 字段（不是整份绑定）不能被改写。"""
-        from app import nodes
+        from webpage_agent.agent import nodes
         args = nodes.resolve_inputs(
             {'step_id': 's1',
              'args': {'filter': {'ref': 'inner-1', 'other': 2}}},
@@ -1146,7 +1154,7 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
         `results/<step>.json` 里。模型写指针时对着的正是那层结构，所以解析
         必须能落到它上面，否则 `/nodes/0/id` 永远"引用不到值"。
         """
-        from app import nodes
+        from webpage_agent.agent import nodes
         with tempfile.TemporaryDirectory() as tmp:
             results = Path(tmp) / 'results'
             results.mkdir()
@@ -1175,12 +1183,12 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
                     outputs)
 
     async def test_run_step_blocks_when_dependency_not_succeeded(self):
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
-        from app.tools import Tool
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
+        from webpage_agent.tools.core import Tool
 
         async def should_not_run(args, state):
             raise AssertionError('依赖未完成时不应执行')
@@ -1197,12 +1205,12 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('依赖', result['failure'])
 
     async def test_run_step_records_output_for_downstream_binding(self):
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
-        from app.tools import Tool
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
+        from webpage_agent.tools.core import Tool
 
         async def run(args, state):
             return {'artifact': {'id': 'art_9'}}
@@ -1226,19 +1234,25 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
     这组用例把这四条一起钉住。
     """
 
+    def setUp(self):
+        from webpage_agent.capabilities import publishing
+        fixture = patch.object(publishing, 'settings', replace(publishing.settings, deploy_enabled=True))
+        fixture.start()
+        self.addCleanup(fixture.stop)
+
     @staticmethod
     def server():
-        from app.integrations import mcp_servers
+        from webpage_agent.integrations import mcp_servers
         return mcp_servers.Server(id='publishing', url='https://a.example/mcp',
                                   deploy_tool='deploy_site', default=True)
 
     def tool(self, effect='write'):
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         return tool_module._deploy_tool(
             self.server(), {'name': 'deploy_site', 'effect_type': effect})
 
     async def test_tool_takes_its_identity_from_mcp(self):
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         tool = self.tool(effect='destructive')
         self.assertEqual(tool.name, 'deploy_site')
         self.assertEqual(tool.tool_key, 'mcp:publishing:deploy_site')
@@ -1248,7 +1262,7 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('【发布】', tool.prompt_rules)
 
     async def test_requires_an_artifact_before_touching_the_server(self):
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         call = AsyncMock()
         with patch.object(tool_module.mcp_adapter, 'call_tool', call), \
                 patch_all_emits(lambda e: None):
@@ -1258,8 +1272,8 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
         call.assert_not_awaited()
 
     async def test_requires_global_enable(self):
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
         call = AsyncMock()
         with patch.object(publishing_cap, 'settings',
                           SimpleNamespace(deploy_enabled=False)), \
@@ -1271,7 +1285,7 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
         call.assert_not_awaited()
 
     async def test_deploys_records_mcp_call_and_status(self):
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         with tempfile.TemporaryDirectory() as folder:
             html = Path(folder) / 'index.html'
             html.write_text('<html></html>', encoding='utf-8')
@@ -1301,7 +1315,7 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deploy_falls_back_to_prior_artifact(self):
         """用户单说一句"部署到服务器"也要能落到上一轮的产物上。"""
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         with tempfile.TemporaryDirectory() as folder:
             html = Path(folder) / 'index.html'
             html.write_text('<html></html>', encoding='utf-8')
@@ -1321,7 +1335,7 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unreadable_receipt_is_needs_check_not_failure(self):
         """回执看不懂不等于失败：站点可能真的建出来了，不能说"没部署"。"""
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         with tempfile.TemporaryDirectory() as folder:
             html = Path(folder) / 'index.html'
             html.write_text('<html></html>', encoding='utf-8')
@@ -1339,7 +1353,7 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_server_payload_counts_as_success(self):
         """线上服务端回的是 `status: deployed`，不是 success——不能判成待确认。"""
-        from app.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import publishing as publishing_cap
         payload = {'status': 'deployed', 'site_id': 'n6HRJXd8',
                    'name': 'site-n6HRJXd8',
                    'url': 'http://42.194.146.23:3456/sites/n6HRJXd8/'}
@@ -1354,7 +1368,7 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(publishing_cap.marker_of(deployment), 'deployed')
 
     async def test_remote_failure_surfaces_as_tool_error(self):
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
 
         async def boom(name, arguments, artifact=None, server=None):
             raise RuntimeError('502')
@@ -1368,8 +1382,8 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_discovered_deploy_tool_is_the_only_deploy_entry(self):
         """清单里只留一份部署工具：旧的内置那份已经没了，旧名字仍能解析。"""
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
         server = self.server()
 
         async def fake_list(_server):
@@ -1403,8 +1417,8 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_placeholder_keeps_the_tool_visible_when_server_is_down(self):
         """服务端掉线时留占位工具：报错要清楚，而不是当作未知工具静默跳过。"""
-        from app import tools as tool_module
-        from app.integrations import mcp_servers
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.integrations import mcp_servers
         server = self.server()
         with patch.object(mcp_servers, 'servers', lambda: [server]), \
                 patch.object(mcp_servers, 'deploy_server', lambda: server):
@@ -1506,7 +1520,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def hub():
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(new_store())
 
     @staticmethod
@@ -1534,7 +1548,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         return fake_run_task
 
     async def test_start_broadcasts_events_and_records_messages(self):
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         with patch.object(hub_module, 'run_task', self.stub()):
             record = await hub.start('测试需求')
@@ -1553,7 +1567,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await hub.store.task(record.task_id))['status'], 'succeeded')
 
     async def test_late_subscriber_still_gets_history(self):
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         with patch.object(hub_module, 'run_task', self.stub()):
             record = await hub.start('测试需求')
@@ -1565,8 +1579,8 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_record_restored_from_db_after_restart(self):
         """模拟进程重启：新 Hub 打开同一个库，应能查到旧任务并补发事件。"""
-        import app.api_hub as hub_module
-        from app.api_hub import Hub
+        import webpage_agent.api.api_hub as hub_module
+        from webpage_agent.api.api_hub import Hub
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'agent.db'
             first = Hub(new_store())
@@ -1587,7 +1601,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
             await second.store.close()
 
     async def test_multi_turn_history_is_passed(self):
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         captured = {}
         with patch.object(hub_module, 'run_task', self.stub(captured)):
@@ -1599,7 +1613,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured['history'][1]['role'], 'assistant')
 
     async def test_cancel_marks_cancelled_and_releases_subscribers(self):
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         with patch.object(hub_module, 'run_task', self.stub(delay=30)):
             record = await hub.start('慢任务')
@@ -1623,7 +1637,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_instruction_stage_is_first_and_closes_on_search(self):
         """「收到指令 → 开始执行」应排在阶段表第一行，并在真正开始干活时补齐耗时。"""
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
@@ -1658,7 +1672,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_instruction_stage_closed_on_cancel(self):
         """中断时也要补齐，否则那一行会一直停在"进行中"。"""
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         with patch.object(hub_module, 'run_task', self.stub(delay=30)):
             record = await hub.start('慢任务')
@@ -1673,7 +1687,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_leaves_assistant_marker_in_history(self):
         """中断也要留下助手回复，否则下一轮上下文是两条连续 user 消息。"""
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         with patch.object(hub_module, 'run_task', self.stub(delay=30)):
             record = await hub.start('慢任务')
@@ -1686,7 +1700,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_send_while_running_starts_new_turn_same_session(self):
         """运行中直接发第二条消息：同会话开新一轮，历史照常带上。"""
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         captured = {}
         with patch.object(hub_module, 'run_task', self.stub(delay=30)):
@@ -1710,7 +1724,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         消费循环此刻已被取消，没人来取。所以中枢必须直接补发，否则前端那一行
         会永远停在"进行中"、耗时一路涨。
         """
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
@@ -1737,7 +1751,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cancel_before_search_closes_instruction(self):
         """在检索之前就被打断：合成阶段也要补上结束事件。"""
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
@@ -1760,7 +1774,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ends.get('plan'), '已中断')
 
     async def test_failed_task_closes_in_flight_stage(self):
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
@@ -1780,7 +1794,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stop_command_cancels_instead_of_starting_a_task(self):
         """说"暂停"要停流程，而不是拿"暂停"去检索。"""
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         started = {'n': 0}
 
@@ -1804,7 +1818,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any('已停止当前任务' in (d or '') for d in details))
 
     async def test_stop_command_with_nothing_running(self):
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         with patch.object(hub_module, 'run_task', self.stub()):
             record = await hub.start('暂停')
@@ -1831,7 +1845,7 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await hub.prior_context('nope'), {})
 
     async def test_cancel_done_task_is_noop(self):
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         with patch.object(hub_module, 'run_task', self.stub()):
             record = await hub.start('快任务')
@@ -1847,11 +1861,11 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def hub(self):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(new_store())
 
     async def test_finishing_a_run_persists_plan_and_steps(self):
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         # 真实链路里 validate_plan 会给每步补 tool_key；这里按同一形状构造
         plan = {'steps': [{'tool': 'web_search', 'step_id': 's1', 'args': {},
@@ -1880,7 +1894,7 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_resume_reuses_saved_plan(self):
         """续跑沿用已存计划，不重新规划（§7：已完成步骤不可改写）。"""
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         seen = {}
 
@@ -1906,7 +1920,7 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_resume_refuses_a_finished_run(self):
         """已成功的 run 不能"再跑一遍"：那是重复副作用（§7.3）。"""
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
 
         async def fake(text, progress=None, on_event=None, history=None,
@@ -1949,10 +1963,10 @@ class RunLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_action_blocks_instead_of_resending(self):
         """已发出但结果未定的动作，续跑时必须停下来而不是再发一次。"""
-        from app import nodes
-        from app import tools as tool_module
-        from app.ledger import ActionLedger, use_ledger
-        from app.tools import Tool
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.store.ledger import ActionLedger, use_ledger
+        from webpage_agent.tools.core import Tool
 
         store = new_store()
         await store.create_task('task1', 'sess1', '测试')
@@ -2004,14 +2018,14 @@ class PolicyTests(unittest.TestCase):
     """身份与权限缝：单用户恒通过，跨用户必须被挡住。"""
 
     def test_same_owner_passes(self):
-        from app import policies
+        from webpage_agent.governance import policies
         principal = policies.Principal(tenant_id='t1', user_id='u1')
         resource = {'tenant_id': 't1', 'owner_user_id': 'u1'}
         self.assertEqual(policies.ensure_owner(resource, principal, '运行'),
                          resource)
 
     def test_cross_tenant_is_hidden_as_not_found(self):
-        from app import policies
+        from webpage_agent.governance import policies
         from fastapi import HTTPException
         principal = policies.Principal(tenant_id='t1', user_id='u1')
         other = {'tenant_id': 't2', 'owner_user_id': 'u1'}
@@ -2021,7 +2035,7 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 404)
 
     def test_anonymous_default_principal_is_permissive(self):
-        from app import policies
+        from webpage_agent.governance import policies
         principal = policies.Principal()
         self.assertTrue(principal.anonymous)
         resource = {'tenant_id': 'default', 'owner_user_id': 'default'}
@@ -2036,7 +2050,7 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def hub(self):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(new_store())
 
     async def test_worker_claims_and_reports_nothing_to_do(self):
@@ -2069,8 +2083,8 @@ class PostgresParityTests(unittest.IsolatedAsyncioTestCase):
     """
 
     async def asyncSetUp(self):
-        from app.pg_store import PostgresStore
-        if 'test' not in PG_DSN:
+        from webpage_agent.store.pg_store import PostgresStore
+        if not valid_test_dsn(PG_DSN):
             raise unittest.SkipTest('PG_TEST_DSN 必须指向测试库（库名含 test）')
         self.store = PostgresStore(PG_DSN)
         tables = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
@@ -2199,13 +2213,13 @@ class RepositoryContractTests(unittest.TestCase):
         await reset_db()
 
     def test_store_satisfies_repository_protocol(self):
-        from app.persistence import Repository, check_repository
+        from webpage_agent.store.persistence import Repository, check_repository
         store = new_store()
         self.assertEqual(check_repository(store), [])
         self.assertIsInstance(store, Repository)
 
     def test_missing_methods_are_reported(self):
-        from app.persistence import check_repository
+        from webpage_agent.store.persistence import check_repository
 
         class Partial:
             def append_message(self, *a, **k): ...
@@ -2219,8 +2233,8 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await reset_db()
         import httpx
-        import app.api as api_module
-        from app.api_hub import Hub
+        import webpage_agent.api.routes as api_module
+        from webpage_agent.api.api_hub import Hub
         # 每个测试用独立的内存库：互不污染，也不去碰真实的 agent.db
         self._saved_hub = api_module.hub
         api_module.hub = Hub(new_store())
@@ -2280,7 +2294,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.get('/api/tasks/nope/artifact')).status_code, 404)
 
     async def test_create_task_streams_events_and_ends(self):
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
 
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
@@ -2315,7 +2329,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         是否还活着：后端一被杀，那一行会永远"进行中"、耗时一直涨。
         """
         import inspect
-        import app.api as api_module
+        import webpage_agent.api.routes as api_module
 
         source = inspect.getsource(api_module.task_events)
         self.assertIn("sse({'type': 'ping'})", source)
@@ -2326,7 +2340,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(frame.endswith('\n\n'))
 
     async def test_session_messages_endpoint(self):
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
 
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
@@ -2345,7 +2359,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_session_timeline_replays_execution_steps(self):
         """切换会话时要能重建执行过程：接口必须带回每轮持久化的事件。"""
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
 
         async def fake_run_task(text, progress=None, on_event=None,
                                 history=None, on_start=None,
@@ -2390,7 +2404,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_profile_can_be_read_and_rewritten(self):
         """画像必须能在界面上改：读回原文、整体覆盖、清空留备份。"""
-        from app import profile
+        from webpage_agent.core import profile
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'USER.md'
             with patch.object(profile, 'settings',
@@ -2426,7 +2440,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
         早先硬编码 index.html，"资料转 HTML" 产出的 sources.html 一律 404。
         """
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         with tempfile.TemporaryDirectory() as folder:
             sources_html = Path(folder) / 'sources.html'
             sources_html.write_text('<h1>资料页</h1>', encoding='utf-8')
@@ -2550,20 +2564,20 @@ class MessageTests(unittest.TestCase):
     """助手回执与停止提示的文案（CLI / API 共用）。"""
 
     def test_reply_mentions_deployed_url(self):
-        from app.messages import reply_text
+        from webpage_agent.core.messages import reply_text
         text = reply_text({'status': 'deployed',
                            'deployment': {'public_url': 'http://x/y/'}})
         self.assertIn('http://x/y/', text)
 
     def test_reply_for_local_ready_mentions_deploy_option(self):
-        from app.messages import reply_text
+        from webpage_agent.core.messages import reply_text
         text = reply_text({'status': 'succeeded', 'task_id': 'abc',
                            'artifact': {'html_path': '/tmp/a/index.html',
                                         'kind': 'sources'}})
         self.assertIn('部署', text)
 
     def test_reply_for_failed_is_explainable(self):
-        from app.messages import reply_text
+        from webpage_agent.core.messages import reply_text
         self.assertIn('没有产出可用结果', reply_text({'status': 'failed'}))
         # 有具体失败原因时要透出来，而不是只说"失败了"
         with_reason = reply_text({'status': 'failed',
@@ -2573,8 +2587,8 @@ class MessageTests(unittest.TestCase):
     def test_cancel_note_warns_when_already_deployed(self):
         import json
         from pathlib import Path as P
-        from app.config import settings
-        from app.messages import cancel_note
+        from webpage_agent.core.config import settings
+        from webpage_agent.core.messages import cancel_note
         with tempfile.TemporaryDirectory() as folder:
             # cancel_note 会在 artifact_dir 下再拼一层 task_id
             task_dir = P(folder) / 'task1'
@@ -2593,20 +2607,20 @@ class MessageTests(unittest.TestCase):
         self.assertIn('不会撤销', note)
 
     def test_cancel_note_without_artifact(self):
-        from app.messages import cancel_note
+        from webpage_agent.core.messages import cancel_note
         self.assertIn('已停止', cancel_note(None))
 
 
 
 class TimingLabelTests(unittest.TestCase):
     def test_every_graph_node_has_a_chinese_label(self):
-        from app.graph import NODE_NAMES
-        from app.main import STAGE_LABELS
+        from webpage_agent.agent.graph import NODE_NAMES
+        from webpage_agent.api.main import STAGE_LABELS
         missing = [name for name in NODE_NAMES if name not in STAGE_LABELS]
         self.assertEqual(missing, [])
 
     def test_format_timings_includes_label_and_seconds(self):
-        from app.main import format_timings
+        from webpage_agent.api.main import format_timings
         lines = format_timings([{'stage': 'render_sources_html', 'seconds': 8.4,
                                  'status': 'composed'}])
         self.assertEqual(len(lines), 1)
@@ -2614,7 +2628,7 @@ class TimingLabelTests(unittest.TestCase):
         self.assertIn('8.40', lines[0])
 
     def test_format_timings_tolerates_empty(self):
-        from app.main import format_timings
+        from webpage_agent.api.main import format_timings
         self.assertEqual(format_timings(None), [])
         self.assertEqual(format_timings([]), [])
 
@@ -2622,20 +2636,26 @@ class TimingLabelTests(unittest.TestCase):
 class ModelOverrideTests(unittest.TestCase):
     """整理报告阶段可以用独立（更快）的模型。"""
 
+    def setUp(self):
+        from webpage_agent.core import services
+        fixture = patch.object(services, 'settings', replace(services.settings,
+            llm_key='isolated-unit-test-key', llm_model='unit-test-base-model'))
+        fixture.start()
+        self.addCleanup(fixture.stop)
+
     def test_default_uses_main_model(self):
-        from app.config import settings
-        from app.services import new_llm
-        self.assertEqual(new_llm().model_name, settings.llm_model)
+        from webpage_agent.core import services
+        self.assertEqual(services.new_llm().model_name, services.settings.llm_model)
 
     def test_explicit_override_wins(self):
-        from app.services import new_llm
+        from webpage_agent.core.services import new_llm
         self.assertEqual(new_llm('some-fast-model').model_name, 'some-fast-model')
 
 class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
     """推理开关：解析/规划阶段可以关。"""
 
     async def test_disable_thinking_sets_thinking_disabled(self):
-        import app.services as services
+        import webpage_agent.core.services as services
         with patch.object(services, 'ChatOpenAI') as fake:
             services.new_llm(disable_thinking=True)
         kwargs = fake.call_args.kwargs
@@ -2643,7 +2663,7 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs['extra_body'], {'thinking': {'type': 'disabled'}})
 
     async def test_default_keeps_thinking_enabled(self):
-        import app.services as services
+        import webpage_agent.core.services as services
         with patch.object(services, 'ChatOpenAI') as fake:
             services.new_llm()
         kwargs = fake.call_args.kwargs
@@ -2651,11 +2671,11 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('reasoning_effort', kwargs)
 
     async def test_planner_passes_the_flag(self):
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
         captured = {}
 
         async def fake_catalog(context=None):
@@ -2669,7 +2689,7 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(tool_module, 'catalog', fake_catalog), \
                 patch.object(nodes, 'structured_call', fake_call):
             await nodes.plan({'user_input': '介绍一下 SQLite', 'usage': []})
-        from app.config import settings
+        from webpage_agent.core.config import settings
         self.assertEqual(captured['disable_thinking'],
                          settings.llm_parse_disable_thinking)
 
@@ -2678,7 +2698,7 @@ class ProfileTests(unittest.TestCase):
     """用户画像：Markdown 文件 + 原子写 + 版本守卫。"""
 
     def setUp(self):
-        from app.config import settings
+        from webpage_agent.core.config import settings
         self._tmp = tempfile.TemporaryDirectory()
         self._orig = settings.profile_path
         # settings 是 frozen dataclass，用 object.__setattr__ 绕过冻结
@@ -2686,12 +2706,12 @@ class ProfileTests(unittest.TestCase):
                            Path(self._tmp.name) / 'USER.md')
 
     def tearDown(self):
-        from app.config import settings
+        from webpage_agent.core.config import settings
         object.__setattr__(settings, 'profile_path', self._orig)
         self._tmp.cleanup()
 
     def test_merge_and_reload_roundtrip(self):
-        from app import profile
+        from webpage_agent.core import profile
         profile.merge({'姓名': '张三', '电话': '13800001111'})
         self.assertEqual(profile.load()['姓名'], '张三')
         self.assertEqual(profile.load()['电话'], '13800001111')
@@ -2704,7 +2724,7 @@ class ProfileTests(unittest.TestCase):
         self.assertIn('姓名：张三', text)
 
     def test_version_increments(self):
-        from app import profile
+        from webpage_agent.core import profile
         self.assertEqual(profile.version(), 0)
         profile.merge({'a': 'b'})
         self.assertEqual(profile.version(), 1)
@@ -2712,7 +2732,7 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(profile.version(), 2)
 
     def test_block_and_with_profile(self):
-        from app import profile
+        from webpage_agent.core import profile
         profile.merge({'偏好': '简洁'})
         self.assertIn('[用户画像]', profile.block())
         self.assertIn('偏好：简洁', profile.block())
@@ -2725,7 +2745,7 @@ class ProfileTests(unittest.TestCase):
 
     def test_merge_reports_only_real_changes(self):
         """merge 只返回变化量，调用方才能区分"学到新的"和"把已有的抄一遍"。"""
-        from app import profile
+        from webpage_agent.core import profile
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'USER.md'
             with patch.object(profile, 'settings', SimpleNamespace(profile_path=path)):
@@ -2739,15 +2759,15 @@ class ProfileTests(unittest.TestCase):
                 self.assertEqual(profile.load()['身高'], '173cm')
 
     def test_clear(self):
-        from app import profile
+        from webpage_agent.core import profile
         profile.merge({'x': 'y'})
         profile.clear()
         self.assertEqual(profile.load(), {})
         self.assertEqual(profile.version(), 0)
 
     def test_backup_kept_on_save(self):
-        from app import profile
-        from app.config import settings
+        from webpage_agent.core import profile
+        from webpage_agent.core.config import settings
         profile.merge({'旧': '值'})
         profile.merge({'新': '值'})
         bak = settings.profile_path.parent / 'USER.md.bak'
@@ -2756,7 +2776,7 @@ class ProfileTests(unittest.TestCase):
 
 
 def profile_file():
-    from app.config import settings
+    from webpage_agent.core.config import settings
     return str(settings.profile_path)
 
 
@@ -2764,12 +2784,12 @@ class PlannerProfileTests(unittest.IsolatedAsyncioTestCase):
     """规划器也会记用户信息：这条能力不能随重写丢掉。"""
 
     async def test_plan_merges_profile_updates(self):
-        from app import nodes
-        from app import profile
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
+        from webpage_agent.agent import nodes
+        from webpage_agent.core import profile
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
 
         async def fake_catalog(context=None):
             return tool_module.BUILTIN_TOOLS
@@ -2796,14 +2816,14 @@ class SmallTalkFilterTests(unittest.IsolatedAsyncioTestCase):
     """本地寒暄筛选：明显是寒暄就直接回答，省掉一次规划调用。"""
 
     async def test_recognises_plain_small_talk(self):
-        from app.services import is_small_talk
+        from webpage_agent.core.services import is_small_talk
         for text in ['你好', '您好！', '你好呀', '在吗', '谢谢', '好的谢谢',
                      '嗯嗯', 'ok', 'OK!', 'hello', 'thanks', 'thank you',
                      '早上好', '晚安', '再见', '好的，谢谢啦', '收到']:
             self.assertTrue(is_small_talk(text), text)
 
     async def test_leaves_real_tasks_to_the_model(self):
-        from app.services import is_small_talk
+        from webpage_agent.core.services import is_small_talk
         # 误把任务当寒暄，会让该检索的请求变成闲聊；比多花一次调用糟得多，所以宁可漏判。
         for text in ['帮我查一下 SQLite 的适用场景',
                      '你好，帮我查一下 SQLite 的适用场景',
@@ -2816,11 +2836,11 @@ class SmallTalkFilterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_link_is_never_treated_as_small_talk(self):
         """带链接就必须走规划与检索，不能因为句子短就被当成寒暄。"""
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
         called = {}
 
         async def fake_catalog(context=None):
@@ -2844,12 +2864,12 @@ class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
     """整图跑通：寒暄不检索，规划出来的步骤被逐步执行。"""
 
     async def test_small_talk_answers_without_searching(self):
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
-        from app.graph import build_graph
-        from app.tools import Tool
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
+        from webpage_agent.agent.graph import build_graph
+        from webpage_agent.tools.core import Tool
         touched = {'searched': False}
 
         async def fake_answer(args, state):
@@ -2871,20 +2891,20 @@ class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
             result = await build_graph().ainvoke({
                 'task_id': 'x', 'user_input': '你好', 'documents': [],
                 'errors': [], 'usage': [], 'step_index': 0, 'mcp_calls': []})
-        from app import outcome
+        from webpage_agent.core import outcome
         self.assertEqual(result['status'], 'succeeded')     # 状态机里的通用值
         self.assertEqual(outcome.label(result['status'], result), 'answered')
         self.assertEqual(result['outcome']['kind'], 'answer')
         self.assertFalse(touched['searched'])
 
     async def test_plan_steps_run_in_order(self):
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities import publishing as publishing_cap
-        from app.capabilities import export as export_cap
-        from app.capabilities import web as web_cap
-        from app.graph import build_graph
-        from app.tools import Tool
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import publishing as publishing_cap
+        from webpage_agent.capabilities import export as export_cap
+        from webpage_agent.capabilities import web as web_cap
+        from webpage_agent.agent.graph import build_graph
+        from webpage_agent.tools.core import Tool
         order = []
 
         def make(name, label):
@@ -2959,7 +2979,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         await 必须在 with 块里面：否则协程在 patch 退出后才执行，mock 失效、
         直接打到真实 API（这个坑踩过一次，表现为测试里 usage 大得离谱）。
         """
-        from app import services
+        from webpage_agent.core import services
         calls = calls if calls is not None else []
         with patch.object(services, 'new_llm',
                           lambda model=None, disable_thinking=False:
@@ -2997,7 +3017,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
 
         重试只会把等待时间翻倍，而超时通常意味着模型/网关本身慢，重试收益低。
         """
-        from app import services
+        from webpage_agent.core import services
         calls = []
 
         class HangingLLM:
@@ -3025,7 +3045,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeout_does_not_swallow_user_cancel(self):
         """外部取消（用户点停止）必须继续抛 CancelledError，不能被当成超时。"""
-        from app import services
+        from webpage_agent.core import services
 
         class BlockingLLM:
             def bind_tools(self, tools, tool_choice=None):
@@ -3048,7 +3068,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
                 await task
 
     async def test_draft_callback_clears_then_streams_partials(self):
-        from app import services
+        from webpage_agent.core import services
         calls, drafts = [], []
         partial = self.FakeChunk(
             tool_call_chunks=[{'args':
@@ -3079,7 +3099,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         否则字段还没凑齐时会退化成"每个分片都重试一次"，对不断增长的缓冲区
         反复做解析与校验，O(n²) 会把事件循环堵死（这个 bug 真在服务里卡死过一次）。
         """
-        from app import services
+        from webpage_agent.core import services
         calls, drafts = [], []
         # 只有分片、没有完整 tool_calls —— 每次解析都失败，最终也失败
         unparsable = [self.FakeChunk(tool_call_chunks=[{'args': '{"topic": ' + 'x' * 200}])
@@ -3103,7 +3123,7 @@ class StructuredRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed_count['n'], 1)
 
     async def test_draft_clear_before_each_retry(self):
-        from app import services
+        from webpage_agent.core import services
         calls, drafts = [], []
         partial = self.FakeChunk(
             tool_call_chunks=[{'args': '{"steps": [{"tool": "web_search",'
@@ -3137,7 +3157,7 @@ class ExecutionPathTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def hub(store=None):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(store if store is not None else new_store())
 
     @staticmethod
@@ -3153,7 +3173,7 @@ class ExecutionPathTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_inline_execution_holds_a_lease_so_worker_cannot_steal(self):
         """API 就地执行也要占租约，否则 Worker 会把这条 running 当孤儿再跑一遍。"""
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         hub = self.hub()
         with patch.object(hub_module, 'run_task', self.stub(delay=0.2)):
             record = await hub.start('做点事')
@@ -3168,7 +3188,7 @@ class ExecutionPathTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_reconcile_spares_runs_held_by_another_instance(self):
         """第二个副本启动时不能替别人正在跑的 run 判死。"""
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         first = self.hub()
         with patch.object(hub_module, 'run_task', self.stub(delay=0.3)):
             record = await first.start('长任务')
@@ -3199,7 +3219,7 @@ class ExecutionPathTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_resume_works_after_restart(self):
         """杀进程 → 新 Hub → 续跑：resume 必须回库，而不是只查内存。"""
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'a.db'
             first = self.hub(new_store())
@@ -3245,11 +3265,11 @@ class BackendJobTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def hub(self):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(new_store())
 
     async def test_failed_job_is_requeued_with_backoff(self):
-        from app import memory as memory_module
+        from webpage_agent.core import memory as memory_module
         from scripts.run_worker import drain_jobs
         hub = self.hub()
         await hub.store.enqueue_job('j1', 'session_summary', 's1:r1',
@@ -3271,7 +3291,7 @@ class BackendJobTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_summary_job_actually_compacts_memory(self):
         """以前 asyncio.run() 在运行中的事件循环里必炸，摘要从来没成功过。"""
-        from app import memory as memory_module
+        from webpage_agent.core import memory as memory_module
         from scripts.run_worker import drain_jobs
         hub = self.hub()
         for index in range(14):
@@ -3296,8 +3316,8 @@ class KernelCorrectnessTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_bad_plan_stops_instead_of_executing(self):
         """两轮修不好就停：不能带着坏依赖去执行一份残缺计划。"""
-        from app import nodes
-        from app import tools as tool_module
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
 
         async def fake_catalog(context=None):
             return tool_module.BUILTIN_TOOLS
@@ -3315,13 +3335,13 @@ class KernelCorrectnessTests(unittest.IsolatedAsyncioTestCase):
         # 图必须直接收尾，不能因为"计划为空"又走进 run_step
         self.assertEqual(nodes.next_step(result), 'stop')
         # 停下来的任务也要给用户一句人话
-        from app.messages import reply_text
+        from webpage_agent.core.messages import reply_text
         self.assertIn('先停在这里', reply_text(result))
 
     async def test_planner_prompt_is_split_by_capability(self):
         """业务规则归能力包：没有部署工具时，提示词里就不该教怎么部署。"""
-        from app import tools as tool_module
-        from app.integrations import mcp_servers
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.integrations import mcp_servers
         deploy = tool_module._deploy_tool(
             mcp_servers.Server(id='publishing', url='https://a/mcp',
                                deploy_tool='deploy_site', default=True),
@@ -3346,10 +3366,10 @@ class McpPromptRuleTests(unittest.IsolatedAsyncioTestCase):
     """MCP 规划规则不点名某一家的工具。业务说法随那一家的配置走。"""
 
     async def test_kernel_rules_stay_generic_until_a_server_brings_its_own(self):
-        from app import nodes
-        from app import tools as tool_module
-        from app.capabilities.registry import Tool
-        from app.integrations import mcp_servers
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities.registry import Tool
+        from webpage_agent.integrations import mcp_servers
 
         plain = mcp_servers.Server(id='inventory', transport='streamable_http',
                                    url='https://inventory.example/mcp')
@@ -3389,7 +3409,7 @@ class McpPromptRuleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('video_analyzer', inventory_only)
 
     def test_prompt_rules_come_from_server_config(self):
-        from app.integrations import mcp_servers
+        from webpage_agent.integrations import mcp_servers
         raw = json.dumps([{
             'id': 'openmontage', 'url': 'https://montage.example/mcp',
             'prompt_rules': '  生成用 video_generation。  ',
@@ -3408,7 +3428,7 @@ class ResultLocusTests(unittest.TestCase):
     """结果落点：公开网页、平台上的数据、平台上的修改，三条路不能混用。"""
 
     def catalog(self):
-        from app.capabilities.registry import Tool
+        from webpage_agent.capabilities.registry import Tool
         return [
             Tool('web_search', '检索', 'd', {'type': 'object'}, None,
                  scope='public', effect='read'),
@@ -3423,7 +3443,7 @@ class ResultLocusTests(unittest.TestCase):
         ]
 
     def codes(self, locus, steps, criteria=None):
-        from app import nodes
+        from webpage_agent.agent import nodes
         return {item['code'] for item in nodes.check_result_locus(
             locus, steps, self.catalog(), criteria or [])}
 
@@ -3462,7 +3482,7 @@ class ResultLocusTests(unittest.TestCase):
         self.assertEqual(self.codes('', [{'tool': 'answer_directly'}]), set())
 
     def test_scene_brief_uses_the_signed_context(self):
-        from app import nodes
+        from webpage_agent.agent import nodes
         self.assertEqual(nodes._scene_brief(None), '无')
         self.assertEqual(nodes._scene_brief({'context': {}}), '无')
         text = nodes._scene_brief({
@@ -3478,8 +3498,8 @@ class ApiOwnershipTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await reset_db()
         import httpx
-        import app.api as api_module
-        from app.api_hub import Hub
+        import webpage_agent.api.routes as api_module
+        from webpage_agent.api.api_hub import Hub
         self._saved_hub = api_module.hub
         api_module.hub = Hub(new_store())
         self.api_module = api_module
@@ -3499,7 +3519,7 @@ class ApiOwnershipTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
     async def _create(self, message='你好'):
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
 
         async def fake(text, progress=None, on_event=None, history=None,
                        on_start=None, prior=None, memory=None, ledger=None,
@@ -3532,7 +3552,7 @@ class ApiOwnershipTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(res.status_code, 404, path)
 
     async def test_profile_is_scoped_per_user(self):
-        from app import profile
+        from webpage_agent.core import profile
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / 'USER.md'
             with patch.object(profile, 'settings',
@@ -3568,7 +3588,7 @@ class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
         return SimpleNamespace(tenant_id='default', user_id=user)
 
     async def test_same_key_and_body_replays_the_same_task(self):
-        from app import idempotency
+        from webpage_agent.store import idempotency
         store = new_store()
         body = {'message': '做个报告', 'session_id': None}
         first = await idempotency.reserve(store, principal=self.principal(),
@@ -3585,7 +3605,7 @@ class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await again.response)['task_id'], 't1')
 
     async def test_same_key_with_different_body_conflicts(self):
-        from app import idempotency
+        from webpage_agent.store import idempotency
         store = new_store()
         await idempotency.reserve(store, principal=self.principal(),
                             endpoint='tasks.create', client_key='k1',
@@ -3597,7 +3617,7 @@ class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_concurrent_duplicate_is_reported_as_in_flight(self):
         """并发的重复请求只能有一个赢家；另一个不能顺手又建一个任务。"""
-        from app import idempotency
+        from webpage_agent.store import idempotency
         store = new_store()
         await idempotency.reserve(store, principal=self.principal(),
                             endpoint='tasks.create', client_key='k1',
@@ -3609,7 +3629,7 @@ class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_key_is_scoped_per_user(self):
         """同一个键给不同用户用，不该互相顶掉。"""
-        from app import idempotency
+        from webpage_agent.store import idempotency
         store = new_store()
         await idempotency.reserve(store, principal=self.principal('u1'),
                             endpoint='tasks.create', client_key='k1',
@@ -3631,7 +3651,7 @@ class IdempotencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row['fingerprint'], 'new')
 
     async def test_release_allows_retry_after_failure(self):
-        from app import idempotency
+        from webpage_agent.store import idempotency
         store = new_store()
         reservation = await idempotency.reserve(
             store, principal=self.principal(), endpoint='tasks.create',
@@ -3649,8 +3669,8 @@ class ApiIdempotencyTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await reset_db()
         import httpx
-        import app.api as api_module
-        from app.api_hub import Hub
+        import webpage_agent.api.routes as api_module
+        from webpage_agent.api.api_hub import Hub
         self._saved_hub = api_module.hub
         api_module.hub = Hub(new_store())
         self.api_module = api_module
@@ -3670,7 +3690,7 @@ class ApiIdempotencyTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
     async def _post(self, message='做个报告', key='k1', user='u1'):
-        import app.api_hub as hub_module
+        import webpage_agent.api.api_hub as hub_module
 
         async def fake(text, progress=None, on_event=None, history=None,
                        on_start=None, prior=None, memory=None, ledger=None,
@@ -3720,7 +3740,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _tools(calls):
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
 
         async def deploy(args, state):
             calls.append(('deploy', dict(args)))
@@ -3755,7 +3775,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_compensation_is_a_warning_not_a_blocker(self):
         """补偿工具写错不该把整份计划判死，但必须留痕。"""
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         steps, issues = nodes.validate_plan([
             {'tool': 'render_sources_html', 'step_id': 's1', 'args': {},
              'compensate': {'tool': 'ghost_tool', 'args': {}}},
@@ -3766,7 +3786,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(issues[0]['severity'], 'warning')
 
     async def test_compensation_is_kept_and_bound_to_a_real_tool(self):
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         steps, issues = nodes.validate_plan([
             {'tool': 'web_search', 'step_id': 's1', 'args': {'query': 'q'},
              'compensate': {'tool': 'render_sources_html', 'args': {}}},
@@ -3777,7 +3797,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failure_rolls_back_succeeded_writes_in_reverse(self):
         """前面成功、后面失败 → 逆序撤销已成功的写操作，并把明细写进状态。"""
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         calls = []
         tools = self._tools(calls)
         plan = {'steps': [
@@ -3808,7 +3828,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_rollback_is_reported_as_partial(self):
         """撤销失败不能只说"失败"：线上可能还留着一个站点。"""
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         calls = []
         tools = self._tools(calls)
 
@@ -3836,7 +3856,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unknown_action_is_not_compensated_blindly(self):
         """结果未定的写操作不能自动去撤：那是基于猜测再发一次写请求。"""
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         calls = []
         tools = self._tools(calls)
 
@@ -3868,8 +3888,8 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_manual_compensation_creates_its_own_run(self):
         """手工补偿是一次独立运行，原运行只记 compensated_at。"""
-        import app.api_hub as hub_module
-        from app.api_hub import Hub
+        import webpage_agent.api.api_hub as hub_module
+        from webpage_agent.api.api_hub import Hub
         hub = Hub(new_store())
         await hub.store.create_task('t1', 's1', '发布页面')
         await hub.store.ensure_task_meta('t1', session_id='s1', goal='发布页面')
@@ -3907,7 +3927,7 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
             await hub.compensate('r1')
 
     async def test_compensation_skips_steps_that_never_succeeded(self):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         hub = Hub(new_store())
         await hub.store.create_task('t1', 's1', 'g')
         await hub.store.ensure_task_meta('t1', session_id='s1', goal='g')
@@ -3923,6 +3943,12 @@ class CompensationTests(unittest.IsolatedAsyncioTestCase):
 class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
     """多 MCP Server：工具命名、路由、失败隔离。"""
 
+    def setUp(self):
+        from webpage_agent.capabilities import publishing
+        fixture = patch.object(publishing, 'settings', replace(publishing.settings, deploy_enabled=True))
+        fixture.start()
+        self.addCleanup(fixture.stop)
+
     MULTI = json.dumps([
         {'id': 'publishing', 'url': 'https://a.example/mcp',
          'deploy_tool': 'deploy_site', 'default': True},
@@ -3930,7 +3956,7 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
     ])
 
     async def test_single_server_keeps_legacy_tool_names(self):
-        from app.integrations import mcp_servers
+        from webpage_agent.integrations import mcp_servers
         with patch.dict(os.environ, {'MCP_SERVERS': '',
                                      'MCP_URL': 'https://a.example/mcp'}, clear=False):
             servers = mcp_servers.servers()
@@ -3940,7 +3966,7 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(mcp_servers.deploy_server().default)
 
     async def test_multiple_servers_qualify_tool_names(self):
-        from app.integrations import mcp_servers
+        from webpage_agent.integrations import mcp_servers
         with patch.dict(os.environ, {'MCP_SERVERS': self.MULTI,
                                      'MCP_URL': ''}, clear=False):
             servers = mcp_servers.servers()
@@ -3954,7 +3980,7 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mcp_servers.deploy_server().id, 'publishing')
 
     async def test_invalid_entries_are_skipped_not_fatal(self):
-        from app.integrations import mcp_servers
+        from webpage_agent.integrations import mcp_servers
         raw = json.dumps([
             {'id': 'ok', 'url': 'https://a/mcp'},
             {'id': '', 'url': 'https://b/mcp'},
@@ -3966,7 +3992,7 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([s.id for s in mcp_servers.servers()], ['ok'])
 
     async def test_discovery_is_isolated_per_server(self):
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         seen = []
 
         async def fake_list(server):
@@ -3993,8 +4019,8 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([t.name for t in deploy], ['deploy_site'])
 
     async def test_runner_calls_the_server_it_belongs_to(self):
-        from app import tools as tool_module
-        from app.integrations import mcp_servers
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.integrations import mcp_servers
         with patch.dict(os.environ, {'MCP_SERVERS': self.MULTI,
                                      'MCP_URL': ''}, clear=False):
             target = mcp_servers.by_id('ops')
@@ -4014,7 +4040,7 @@ class McpRoutingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_old_tool_name_resolves_after_prefix_change(self):
         """旧计划里只有 mcp__<tool>，服务端变多后要能按尾部唯一匹配回去。"""
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         legacy = tool_module.Tool('mcp__ops__list_sites', 'MCP·list_sites',
                                   '', {}, None, tool_key='mcp:ops:list_sites')
 
@@ -4035,7 +4061,7 @@ class McpBusinessFailureTests(unittest.IsolatedAsyncioTestCase):
     """
 
     def test_failure_envelope_is_detected(self):
-        from app.integrations import mcp_adapter
+        from webpage_agent.integrations import mcp_adapter
         self.assertTrue(mcp_adapter.failure_of(
             {'status': 'error', 'code': 'E_RESOURCE_NOT_FOUND',
              'message': 'tool generate_script not found'}))
@@ -4049,7 +4075,7 @@ class McpBusinessFailureTests(unittest.IsolatedAsyncioTestCase):
 
     def test_result_payload_raises_on_error_envelope(self):
         from types import SimpleNamespace as NS
-        from app.integrations import mcp_adapter
+        from webpage_agent.integrations import mcp_adapter
 
         block = NS(type='text', text='{"status": "error", '
                                     '"code": "E_RESOURCE_NOT_FOUND", '
@@ -4065,7 +4091,7 @@ class McpBusinessFailureTests(unittest.IsolatedAsyncioTestCase):
 
     def test_mcp_iserror_preserves_confirmed_parameter_rejection(self):
         from types import SimpleNamespace as NS
-        from app.integrations import mcp_adapter
+        from webpage_agent.integrations import mcp_adapter
 
         rejected = NS(isError=True, structuredContent=None, content=[NS(
             type='text', text='{"reason":"invalid_parameter",'
@@ -4093,7 +4119,7 @@ class McpBusinessFailureTests(unittest.IsolatedAsyncioTestCase):
         真踩过：拿全等去比，于是整台服务端被判成"什么都不能做"，计划里的执行
         步骤被全部拦掉。
         """
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         self.assertTrue(tool_module._is_available('ToolStatus.AVAILABLE'))
         self.assertTrue(tool_module._is_available('available'))
         self.assertTrue(tool_module._is_available(''))
@@ -4114,10 +4140,10 @@ class McpBusinessFailureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_runner_turns_business_failure_into_step_failure(self):
         """status:error 的回执 → ToolError（带着服务端原话），不是"成功"。"""
-        from app import nodes
-        from app import tools as tool_module
-        from app.integrations import mcp_adapter, mcp_servers
-        from app.tools import Tool
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.integrations import mcp_adapter, mcp_servers
+        from webpage_agent.tools.core import Tool
 
         server = mcp_servers.Server(id='montage', transport='streamable_http',
                                     url='https://a.example/mcp')
@@ -4151,8 +4177,8 @@ class McpBusinessFailureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_inner_tool_name_must_come_from_discovery(self):
         """run_tool.name 不在发现结果里 → 本地就挡住，并把真实名字给出来。"""
-        from app import tools as tool_module
-        from app.integrations import mcp_servers
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.integrations import mcp_servers
 
         server = mcp_servers.Server(id='montage', transport='streamable_http',
                                     url='https://a.example/mcp',
@@ -4183,8 +4209,8 @@ class McpBusinessFailureTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_discovery_reads_the_capability_list(self):
         """发现阶段顺带读内部能力清单，并把名字告诉规划器（需求 1）。"""
-        from app import tools as tool_module
-        from app.integrations import mcp_servers
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.integrations import mcp_servers
 
         server = mcp_servers.Server(id='montage', transport='streamable_http',
                                     url='https://a.example/mcp',
@@ -4231,8 +4257,8 @@ class SessionSwitchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_switching_away_does_not_cancel_the_running_task(self):
         """切会话只是解绑前端事件流，服务端任务必须继续跑。"""
-        import app.api_hub as hub_module
-        from app.api_hub import Hub
+        import webpage_agent.api.api_hub as hub_module
+        from webpage_agent.api.api_hub import Hub
 
         started = asyncio.Event()
 
@@ -4259,8 +4285,8 @@ class SessionSwitchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeline_exposes_artifact_so_it_can_be_replayed(self):
         """切回来要能重新渲染视频：时间线必须带产物信息，而不是只有事件。"""
-        import app.api_hub as hub_module
-        from app.api_hub import Hub
+        import webpage_agent.api.api_hub as hub_module
+        from webpage_agent.api.api_hub import Hub
 
         with tempfile.TemporaryDirectory() as folder:
             mp4 = Path(folder) / 'final.mp4'
@@ -4292,8 +4318,8 @@ class SessionSwitchTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeline_reports_the_live_task_of_the_session(self):
         """会话里还有在跑的任务时，前端要能拿到 task_id 重新接上事件流。"""
-        import app.api_hub as hub_module
-        from app.api_hub import Hub
+        import webpage_agent.api.api_hub as hub_module
+        from webpage_agent.api.api_hub import Hub
 
         gate = asyncio.Event()
 
@@ -4319,7 +4345,7 @@ class SessionSwitchTests(unittest.IsolatedAsyncioTestCase):
     def test_frontend_switch_only_detaches_the_stream(self):
         """前端源码级约束：切会话/新会话不许调用 cancel 接口。"""
         from pathlib import Path as _Path
-        source = _Path('app/web/index.html').read_text(encoding='utf-8')
+        source = _Path('src/webpage_agent/api/web/index.html').read_text(encoding='utf-8')
 
         def body_of(name: str) -> str:
             start = source.index(f'async function {name}(')
@@ -4354,7 +4380,7 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     async def test_run_status_vocabulary_is_closed(self):
-        from app import outcome
+        from webpage_agent.core import outcome
         # 冻结契约：要加状态值，就得连这份清单一起改，是有意识的决定
         self.assertEqual(sorted(outcome.RUN_STATUSES), [
             'cancelled', 'failed', 'interrupted', 'needs_reconcile',
@@ -4367,7 +4393,7 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(word, outcome.LEGACY_STATUS, word)
 
     async def test_label_is_the_only_place_with_display_words(self):
-        from app import outcome
+        from webpage_agent.core import outcome
         cases = [
             ('succeeded', {'answer': 'hi'}, 'answered'),
             ('succeeded', {'artifact': {'html_path': '/x.html'}}, 'local_ready'),
@@ -4385,7 +4411,7 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(outcome.label(status, state), expected, status)
 
     async def test_legacy_business_status_normalizes(self):
-        from app import outcome
+        from webpage_agent.core import outcome
         self.assertEqual(outcome.normalize_status('local_ready'), 'succeeded')
         self.assertEqual(outcome.normalize_status('deploy_needs_check'),
                          'needs_reconcile')
@@ -4396,13 +4422,13 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_out_of_vocabulary_status_is_loud_not_silent(self):
         """以前 `RUN_STATUS_OF.get(status, status)` 会把业务词静默写进状态机。"""
-        from app import outcome
-        with self.assertLogs('app.outcome', level='ERROR'):
+        from webpage_agent.core import outcome
+        with self.assertLogs('webpage_agent.core.outcome', level='ERROR'):
             self.assertEqual(outcome.check_run_status('ticket_created'), 'failed')
         self.assertEqual(outcome.check_run_status('succeeded'), 'succeeded')
 
     async def test_outcome_records_produced_and_effects(self):
-        from app import outcome
+        from webpage_agent.core import outcome
         state = {
             'artifact': {'html_path': '/x/sources.html', 'kind': 'sources',
                          'sha256': 'abc', 'size_bytes': 10},
@@ -4443,9 +4469,9 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_status_is_a_stage_marker_not_a_run_status(self):
         """工具自报的 status 是阶段小结（searched/answered），不是 run 终态。"""
-        from app import nodes
-        from app import tools as tool_module
-        from app.tools import Tool
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.tools.core import Tool
 
         async def fake(args, state):
             return {'answer': '你好', 'status': 'answered'}
@@ -4464,8 +4490,8 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_hub_never_persists_a_business_status(self):
         """就算执行层交出旧词，落库的也必须是通用状态。"""
-        import app.api_hub as hub_module
-        from app.api_hub import Hub
+        import webpage_agent.api.api_hub as hub_module
+        from webpage_agent.api.api_hub import Hub
 
         async def fake_run_task(text, progress=None, on_event=None, history=None,
                                 on_start=None, prior=None, memory=None,
@@ -4490,7 +4516,7 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record.summary()['run_status'], 'succeeded')
 
     async def test_reply_for_needs_reconcile_shows_the_url_but_does_not_claim_success(self):
-        from app.messages import reply_text
+        from webpage_agent.core.messages import reply_text
         text = reply_text({'status': 'needs_reconcile',
                            'deployment': {'status': 'needs_check',
                                           'public_url': 'http://x/1/'}})
@@ -4538,7 +4564,7 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
     """
 
     async def test_registry_is_idempotent(self):
-        from app.capabilities import registry
+        from webpage_agent.capabilities import registry
         first = [tool.name for tool in registry.load()]
         second = [tool.name for tool in registry.load()]
         self.assertEqual(first, second)
@@ -4549,7 +4575,7 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
                                        key=lambda n: (specs[n].capability, n)))
 
     async def test_every_registered_tool_has_a_valid_spec(self):
-        from app.capabilities import registry
+        from webpage_agent.capabilities import registry
         for spec in registry.load():
             with self.subTest(tool=spec.name):
                 self.assertTrue(spec.label.strip())
@@ -4562,7 +4588,7 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_keys_are_stable_identity(self):
         """tool_key 已经写进账本与幂等键，换注册方式不能顺带改了身份。"""
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         self.assertEqual({name: spec.tool_key
                           for name, spec in tool_module.BUILTIN_BY_NAME.items()},
                          {'web_search': 'local:web:search',
@@ -4574,19 +4600,19 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
     async def test_kernel_does_not_import_business_packages(self):
         """内核（app/tools.py）不许 import 具体业务能力包——那是一切耦合的源头。"""
         import ast
-        source = Path('app/tools.py').read_text(encoding='utf-8')
+        source = Path('src/webpage_agent/tools/core.py').read_text(encoding='utf-8')
         imported = set()
         for node in ast.walk(ast.parse(source)):
             if isinstance(node, ast.ImportFrom):
                 module = node.module or ''
-                if module == 'app.capabilities':
-                    # from app.capabilities import web as x
+                if module == 'webpage_agent.capabilities':
+                    # from webpage_agent.capabilities import web as x
                     imported.update(alias.name for alias in node.names)
-                elif module.startswith('app.capabilities.'):
+                elif module.startswith('webpage_agent.capabilities.'):
                     imported.add(module.split('.')[-1])
             elif isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name.startswith('app.capabilities.'):
+                    if alias.name.startswith('webpage_agent.capabilities.'):
                         imported.add(alias.name.split('.')[-1])
         # 只允许注册器与共享底座。具体能力包通过钩子接入，内核不 import 它们。
         self.assertEqual(imported, {'registry', 'base'})
@@ -4599,11 +4625,11 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
         """
         import sys
         import types
-        from app import tools as tool_module
-        from app.capabilities import registry
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.capabilities import registry
 
         source = (
-            "from app.capabilities.registry import tool\n"
+            "from webpage_agent.capabilities.registry import tool\n"
             "CAPABILITY = 'demo'\n"
             "PROMPT_RULES = '【演示】用户要演示时才用 demo_ping。'\n"
             "@tool(name='demo_ping', label='演示工具', description='回一个 pong',\n"
@@ -4611,9 +4637,9 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
             "async def demo_ping(args, state):\n"
             "    return {'answer': 'pong'}\n"
         )
-        module = types.ModuleType('app.capabilities.demo')
-        module.__package__ = 'app.capabilities'
-        sys.modules['app.capabilities.demo'] = module
+        module = types.ModuleType('webpage_agent.capabilities.demo')
+        module.__package__ = 'webpage_agent.capabilities'
+        sys.modules['webpage_agent.capabilities.demo'] = module
         try:
             exec(compile(source, '<demo capability>', 'exec'), module.__dict__)
 
@@ -4628,7 +4654,7 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(found)
             self.assertEqual(found.tool_key, 'local:demo:demo_ping')
         finally:
-            sys.modules.pop('app.capabilities.demo', None)
+            sys.modules.pop('webpage_agent.capabilities.demo', None)
 
 
 class AsyncDriverTests(unittest.IsolatedAsyncioTestCase):
@@ -4639,7 +4665,7 @@ class AsyncDriverTests(unittest.IsolatedAsyncioTestCase):
 
     def test_repository_protocol_is_async(self):
         import inspect
-        from app.persistence import Repository
+        from webpage_agent.store.persistence import Repository
         sync_methods = [name for name in dir(Repository)
                         if not name.startswith('_')
                         and callable(getattr(Repository, name, None))
@@ -4648,7 +4674,7 @@ class AsyncDriverTests(unittest.IsolatedAsyncioTestCase):
 
     def test_only_postgres_is_supported(self):
         """没有 DATABASE_URL、或不是 PG 连接串时直接报错，不悄悄退回去。"""
-        from app.persistence import open_store
+        from webpage_agent.store.persistence import open_store
         with self.assertRaises(RuntimeError):
             open_store('')
         with self.assertRaises(RuntimeError):
@@ -4658,7 +4684,7 @@ class AsyncDriverTests(unittest.IsolatedAsyncioTestCase):
         """PG 侧用的是 psycopg 的**异步**连接池，不是同步连接 + 线程。"""
         import inspect
         from psycopg_pool import AsyncConnectionPool
-        from app.persistence import check_repository
+        from webpage_agent.store.persistence import check_repository
         store = new_store()
         try:
             self.assertIsInstance(store._pool, AsyncConnectionPool)
@@ -4696,8 +4722,8 @@ class PostgresPoolTests(unittest.IsolatedAsyncioTestCase):
     """
 
     async def asyncSetUp(self):
-        from app.pg_store import PostgresStore
-        if 'test' not in PG_DSN:
+        from webpage_agent.store.pg_store import PostgresStore
+        if not valid_test_dsn(PG_DSN):
             raise unittest.SkipTest('PG_TEST_DSN 必须指向测试库（库名含 test）')
         self.store = PostgresStore(PG_DSN)
         tables = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
@@ -4718,7 +4744,7 @@ class PostgresPoolTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(stats['max_size'], 2)
         self.assertEqual(stats['available'] + 0, stats['size'])
         # 仓储接口没被破坏
-        from app.persistence import check_repository
+        from webpage_agent.store.persistence import check_repository
         self.assertEqual(check_repository(self.store), [])
 
     async def test_concurrent_writers_get_unique_event_seqs(self):
@@ -4814,8 +4840,8 @@ class PlannerMistakeGuardTests(unittest.IsolatedAsyncioTestCase):
     """
 
     async def test_unresolved_placeholder_fails_fast_with_a_hint(self):
-        from app import nodes
-        from app import tools as tool_module
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
 
         called = []
 
@@ -4839,7 +4865,7 @@ class PlannerMistakeGuardTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_ref_binding_still_works(self):
         """正确写法（{"ref": {...}}）不受影响。"""
-        from app import nodes
+        from webpage_agent.agent import nodes
         outputs = {'s1': {'project_id': 'p-1', 'path': 'x'}}
         args = nodes.resolve_inputs(
             {'args': {'project_id': {'ref': {'step_id': 's1',
@@ -4853,17 +4879,17 @@ class DependencyDiagnosisTests(unittest.IsolatedAsyncioTestCase):
     """服务端缺依赖 vs 我们调度错：失败时要能分清并给出下一步。"""
 
     def test_dependency_signs_are_recognised(self):
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         note = tool_module._dependency_note('Piper failed (exit 1): ValueError: Unable to find voice: en_US-lessac-medium')
         self.assertIn('语音模型', note)
         self.assertIn('ffmpeg', tool_module._dependency_note('FileNotFoundError: ffmpeg: not found'))
         self.assertEqual(tool_module._dependency_note('项目不存在'), '')
 
     async def test_business_failure_carries_a_dependency_hint(self):
-        from app import nodes
-        from app import tools as tool_module
-        from app.integrations import mcp_adapter, mcp_servers
-        from app.tools import Tool
+        from webpage_agent.agent import nodes
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.integrations import mcp_adapter, mcp_servers
+        from webpage_agent.tools.core import Tool
 
         server = mcp_servers.Server(id='montage', transport='streamable_http',
                                     url='https://a.example/mcp')
@@ -4894,8 +4920,8 @@ class DependencyDiagnosisTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_hints_reach_the_planner_description(self):
         """本机特有用法（如 TTS 模型绝对路径）由配置提供，不靠模型猜。"""
-        from app import tools as tool_module
-        from app.integrations import mcp_servers
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.integrations import mcp_servers
 
         server = mcp_servers.Server(
             id='montage', transport='streamable_http', url='https://a.example/mcp',
@@ -4924,12 +4950,12 @@ class InnerToolParamGuardTests(unittest.IsolatedAsyncioTestCase):
     """内部工具的参数也要读出来并校验（用户报的第三次失败：'output_dir' is a required property）。"""
 
     async def asyncSetUp(self):
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         tool_module._MCP_CACHE['capabilities'] = {}
         self.addCleanup(lambda: tool_module._MCP_CACHE.update(capabilities={}))
 
     def test_required_params_are_exposed_to_the_planner(self):
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         capabilities = {
             'direct_clip_search': {'status': 'ToolStatus.AVAILABLE',
                                    'required': ['output_dir', 'queries'],
@@ -4942,8 +4968,8 @@ class InnerToolParamGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('tts_selector(必填:text)', line)
 
     def test_missing_required_input_fails_before_the_call(self):
-        from app import tools as tool_module
-        from app.integrations import mcp_servers
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.integrations import mcp_servers
 
         server = mcp_servers.Server(id='montage', transport='streamable_http',
                                     url='https://a.example/mcp',
@@ -4969,7 +4995,7 @@ class InnerToolParamGuardTests(unittest.IsolatedAsyncioTestCase):
             capabilities)
 
     def test_generation_tools_are_listed_before_analysis(self):
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         capabilities = {
             'video_analyzer': {'status': 'AVAILABLE', 'capability': 'analysis',
                                'required': ['source']},
@@ -4983,8 +5009,8 @@ class InnerToolParamGuardTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('被省略的仍然可用', line)
 
     async def test_discovery_records_required_and_params(self):
-        from app import tools as tool_module
-        from app.integrations import mcp_servers
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.integrations import mcp_servers
 
         server = mcp_servers.Server(id='montage', transport='streamable_http',
                                     url='https://a.example/mcp',
@@ -5018,7 +5044,7 @@ class InnerToolParamGuardTests(unittest.IsolatedAsyncioTestCase):
         真实报错：`'foggy city street' is not of type 'object'`——模型知道要传
         queries，但不知道每项得是 {query: "..."}。
         """
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         schema = {'type': 'object', 'required': ['output_dir', 'queries'],
                   'properties': {
                       'output_dir': {'type': 'string'},
@@ -5035,7 +5061,7 @@ class InnerToolParamGuardTests(unittest.IsolatedAsyncioTestCase):
 
     def test_validation_failure_does_not_claim_a_missing_dependency(self):
         """参数写错时别甩一句"装 ffmpeg"——schema 描述里就带 ffmpeg 字样。"""
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         text = ("input validation failed: 'output_dir' is a required property "
                 "Failed validating 'required' in schema: {'description': "
                 "'Directory where clips are written; requires FFmpeg'}")

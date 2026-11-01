@@ -20,7 +20,7 @@ from tests.exec_env import (install_main, install_plan, install_tools,
                             new_store, reset_db, seed_run)
 
 def publishing_tool_name() -> str:
-    from app.capabilities import publishing
+    from webpage_agent.capabilities import publishing
     return publishing.TOOL_NAME
 
 
@@ -36,14 +36,14 @@ class McpUncertaintyTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def server(self):
-        from app.integrations import mcp_servers
+        from webpage_agent.integrations import mcp_servers
         return mcp_servers.Server(id='pub', transport='streamable_http',
                                   url='https://mcp.example/mcp')
 
     def deploy_tool(self, run=None):
         """平台侧部署工具：身份仍是那个 MCP 工具（tool_key=mcp:<server>:<name>）。"""
-        from app import tools as tool_module
-        from app.tools import Tool
+        from webpage_agent.tools import core as tool_module
+        from webpage_agent.tools.core import Tool
         runner = run or tool_module._make_mcp_runner('deploy_site', self.server())
         return Tool(publishing_tool_name(), 'MCP·deploy_site', '部署站点',
                     {'type': 'object'}, runner,
@@ -52,8 +52,8 @@ class McpUncertaintyTests(unittest.IsolatedAsyncioTestCase):
     async def execute(self, store, call_tool, steps=STEPS):
         """走真实执行入口，只把 MCP 传输换成受控实现。"""
         import scripts.run_worker as worker
-        from app.api_hub import Hub
-        from app.integrations import mcp_adapter
+        from webpage_agent.api.api_hub import Hub
+        from webpage_agent.integrations import mcp_adapter
 
         hub = Hub(store, owner_id='w1')
         plan_patch, _ = install_plan(steps)
@@ -73,7 +73,7 @@ class McpUncertaintyTests(unittest.IsolatedAsyncioTestCase):
         await seed_run(store)
         calls = []
 
-        from app.integrations import mcp_adapter
+        from webpage_agent.integrations import mcp_adapter
 
         async def call_tool(name, arguments, artifact=None, server=None):
             calls.append(name)
@@ -111,8 +111,8 @@ class McpUncertaintyTests(unittest.IsolatedAsyncioTestCase):
     async def test_connect_error_means_not_executed(self):
         """连接都建不起来 → not_executed：这一步确实没发生，可以显式重试。"""
         import httpx
-        from app import nodes
-        from app.schemas import ObservationDecision
+        from webpage_agent.agent import nodes
+        from webpage_agent.core.schemas import ObservationDecision
 
         store = new_store()
         await seed_run(store)
@@ -137,13 +137,13 @@ class McpUncertaintyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_wrapped_error_keeps_its_certainty(self):
         """包装成 ToolError 之后确定性还在（以前按类型名猜，到这里必丢）。"""
-        from app.integrations import mcp_adapter
+        from webpage_agent.integrations import mcp_adapter
 
         store = new_store()
         await seed_run(store)
         seen = {}
         # 拿"未包装"的调用通道，自己包一层来观察异常类型
-        from app import tools as tool_module
+        from webpage_agent.tools import core as tool_module
         runner = tool_module._make_mcp_runner('deploy_site', self.server())
 
         async def call_tool(name, arguments, artifact=None, server=None):
@@ -161,7 +161,7 @@ class McpUncertaintyTests(unittest.IsolatedAsyncioTestCase):
         tool = self.deploy_tool(run=spy)
 
         import scripts.run_worker as worker
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         hub = Hub(store, owner_id='w1')
         plan_patch, _ = install_plan(STEPS)
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
@@ -187,7 +187,7 @@ class McpUncertaintyTests(unittest.IsolatedAsyncioTestCase):
         await self.execute(store, call_tool)
         self.assertEqual((await store.run('run1'))['status'], 'needs_reconcile')
 
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         hub = Hub(store, owner_id='w2')
         # 先把它挪到可恢复状态，再验证 resume 仍然拒绝（未知动作是硬门禁）
         await store.update_run('run1', status='paused', lease_owner=None,
@@ -208,7 +208,7 @@ class McpUncertaintyTests(unittest.IsolatedAsyncioTestCase):
             idempotency_key='k1', effect='write')
         await store.update_action('a1', status='in_flight')
 
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         hub = Hub(store, owner_id='w1')
         self.assertTrue(await hub._has_uncertain_actions('run1'))
         self.assertIsNone(await hub.resume('run1'))

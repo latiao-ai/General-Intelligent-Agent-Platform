@@ -9,7 +9,10 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
-from app import auth, policies, tool_authorization, tool_policy
+from webpage_agent.api import auth
+from webpage_agent.governance import policies
+from webpage_agent.tools import tool_authorization
+from webpage_agent.tools import tool_policy
 
 
 class PolicyRevocationTests(unittest.IsolatedAsyncioTestCase):
@@ -69,7 +72,7 @@ class PolicyRevocationTests(unittest.IsolatedAsyncioTestCase):
         context = SimpleNamespace(tenant_id='tenant', user_id='alice', role='member',
                                   platform_id='platform')
         with patch.object(tool_policy, 'enforcement_enabled', return_value=True), \
-                patch('app.mcp_connections.binding_for_server', AsyncMock(return_value=None)):
+                patch('webpage_agent.core.mcp_connections.binding_for_server', AsyncMock(return_value=None)):
             with self.assertRaises(tool_authorization.AuthorizationDenied) as raised:
                 await tool_authorization.authorize_call(
                     store, context, tool_key='mcp:s:delete', args={})
@@ -83,7 +86,7 @@ class PolicyRevocationTests(unittest.IsolatedAsyncioTestCase):
 
 class OperationsEndpointTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        from app import api
+        from webpage_agent.api import routes as api
         self.api = api
         self.old_store = getattr(api.app.state, 'store', None)
         self.store = SimpleNamespace(stats=AsyncMock(return_value={'runs_queued': 2}),

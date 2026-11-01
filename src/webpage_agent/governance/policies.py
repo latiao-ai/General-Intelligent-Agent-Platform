@@ -1,0 +1,104 @@
+"""身份与权限：把"谁在操作"这条缝留出来。
+
+**这条缝接上了真实认证**（`webpage_agent.api.auth`）：`AUTH_MODE=ticket` 时，业务接口只认
+"平台签票 → 中台换来的登录会话"，请求头里填什么都不影响身份。`AUTH_MODE=off`
+时退回单用户行为，本地开发与既有测试不受影响。
+
+分三层，各自职责不混：
+
+| 层 | 回答什么问题 | 在哪 |
+|---|---|---|
+| 认证 | 你是谁 | `webpage_agent.api.auth.resolve()` |
+| 对象权限 | 这条会话/任务/产物是不是你的 | `ensure_owner()` |
+| 能力与额度 | 你能不能调这个工具、还有没有钱 | 待接入（见《智能体中台说明书》） |
+
+`ensure_owner` 是**最后一道**拦截：所有按 ID 读取的接口都必须过它。漏掉一个入口，
+就等于那个入口可以靠猜 ID 拿到别人的上下文。
+"""
+from dataclasses import dataclass
+
+from fastapi import HTTPException, Request
+
+from webpage_agent.core.config import settings
+
+DEFAULT_TENANT = 'default'
+DEFAULT_USER = 'default'
+
+
+@dataclass(frozen=True)
+class Principal:
+    """一次请求的操作主体。
+
+    `user_id` 是**本地** ID，不是平台 openid/sub。平台标识变过、换过入口，
+    历史上下文都不会断——这是接认证时最容易做错的一步。
+
+    `authenticated` 表示身份来自**已验证的登录会话**；ticket 模式下所有业务
+    接口都要求它为真，"匿名兜底"只在 AUTH_MODE=off 的开发环境存在。
+    """
+    tenant_id: str = DEFAULT_TENANT
+    user_id: str = DEFAULT_USER
+    role: str = 'member'
+    platform_id: str = ''          # 这次登录来自哪个接入平台（排障/审计用）
+    auth_session_id: str = ''      # 中台登录会话 ID（撤销、踢人用）
+    authenticated: bool = False
+    connection_id: str = ''
+    subject: str = ''                 # 登录票中的外部用户编号，不是中台 user_id
+    identity_provider_id: str = ''
+
+    @property
+    def anonymous(self) -> bool:
+        """是否**没有**经过认证。ticket 模式下恒为 False（认证过的才拿得到请求）。"""
+        return not self.authenticated
+
+
+async def current_principal(request: Request) -> Principal:
+    """从请求解析主体。
+
+    实现全部在 `webpage_agent.api.auth`：这里只做转发，保证 20 多个 `Depends(...)` 调用点
+    不用改。要换认证方式只改 auth，不动业务代码。
+    """
+    from webpage_agent.api.auth import resolve
+    principal = await resolve(request)
+    if settings.api_rate_limit_enabled and not getattr(request.state, 'user_rate_checked', False):
+        store = request.app.state.store
+        try:
+            allowed, retry = await store.rate_limit(
+                f'user:{principal.tenant_id}:{principal.user_id}', settings.user_rate_limit_per_minute)
+        except Exception:
+            raise HTTPException(status_code=503, detail='限流服务暂不可用') from None
+        if not allowed:
+            raise HTTPException(status_code=429, detail='请求过于频繁，请稍后重试',
+                                headers={'Retry-After': str(retry)})
+        request.state.user_rate_checked = True
+    return principal
+
+
+def ensure_owner(resource: dict | None, principal: Principal,
+                 kind: str = '对象') -> dict:
+    """对象级权限检查：不同租户/用户之间不能交叉读取。
+
+    **不区分"不存在"和"无权限"**，统一 404：否则攻击者能靠状态码差异枚举出
+    哪些 ID 是真实存在的。
+
+    `POLICY_LEGACY_VISIBLE`（默认开）：`owner_user_id='default'` 的存量数据对所
+    有登录用户可见。这是单用户升级期的兼容——升级前的数据本来就只属于一个人。
+    **一旦有第二个真实用户，必须把它关掉**，否则等于所有历史数据公开。
+    """
+    if resource is None:
+        raise HTTPException(status_code=404, detail=f'{kind}不存在')
+    owner = resource.get('owner_user_id') or DEFAULT_USER
+    tenant = resource.get('tenant_id') or DEFAULT_TENANT
+    if not principal.authenticated and principal.user_id == DEFAULT_USER:
+        # 只有 AUTH_MODE=off 的本地单用户（没有任何身份声明）才跳过归属校验。
+        # 一旦有具体 user_id（认证过，或测试里显式构造），就必须按归属判断。
+        return resource
+
+    allowed_owners = {principal.user_id}
+    # 存量 default 数据的兼容可见性：**有第二个真实用户前必须关掉**。
+    # ticket 模式下默认关闭（见 config.policy_legacy_visible 的默认值）。
+    if settings.policy_legacy_visible and not principal.authenticated:
+        allowed_owners.add(DEFAULT_USER)
+
+    if tenant != principal.tenant_id or owner not in allowed_owners:
+        raise HTTPException(status_code=404, detail=f'{kind}不存在')
+    return resource

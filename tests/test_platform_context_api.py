@@ -5,7 +5,9 @@ from unittest.mock import patch, AsyncMock
 
 import httpx
 
-from app import auth_connections, policies, scene_context
+from webpage_agent.api import auth_connections
+from webpage_agent.governance import policies
+from webpage_agent.agent import scene_context
 from tests.test_scene_context import CONTEXT, _sign
 from tests.test_ticket_auth import connection
 
@@ -13,10 +15,10 @@ from tests.test_ticket_auth import connection
 class PlatformContextApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         # Import constructs a lazy PG pool; no startup/lifespan or database I/O.
-        from app.config import settings
-        with patch('app.config.settings', replace(
+        from webpage_agent.core.config import settings
+        with patch('webpage_agent.core.config.settings', replace(
                 settings, database_url='postgresql://unused:unused@127.0.0.1/unused_test')):
-            import app.api as api
+            import webpage_agent.api.routes as api
         self.api = api
         self.principal = policies.Principal(
             tenant_id='tenant-a', user_id='internal-user', subject='user-123',
@@ -68,7 +70,7 @@ class PlatformContextApiTests(unittest.IsolatedAsyncioTestCase):
 
 class PlatformSceneBudgetTests(unittest.TestCase):
     def test_context_budget_is_configurable_and_marks_truncation(self):
-        from app import nodes
+        from webpage_agent.agent import nodes
         scene = {'verified': True, 'context': {'document': 'x' * 2000}}
         with patch.object(nodes, 'settings', replace(nodes.settings, platform_context_max_chars=3000)):
             self.assertNotIn('已截断', nodes._scene_brief(scene))
@@ -78,7 +80,7 @@ class PlatformSceneBudgetTests(unittest.TestCase):
 
 class PlatformSceneAnswerTests(unittest.IsolatedAsyncioTestCase):
     async def test_answer_receives_the_same_host_scene_as_planner(self):
-        from app.capabilities import answers
+        from webpage_agent.capabilities import answers
         chat = AsyncMock(return_value='已读取现场')
         with patch.object(answers, 'chat_reply', chat):
             result = await answers._answer_directly({'question': '当前页面是什么'}, {
@@ -88,7 +90,8 @@ class PlatformSceneAnswerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['answer'], '已读取现场')
 
     async def test_missing_external_credentials_preserve_policy_filtered_local_tools(self):
-        from app import tools, credentials
+        from webpage_agent.tools import core as tools
+        from webpage_agent.core import credentials
         principal = object()
         local = list(tools.registry.registered())
         filtered = AsyncMock(return_value=local[:1])

@@ -24,13 +24,13 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def hub(self, store, **kwargs):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(store, **kwargs)
 
     async def test_worker_claims_and_executes_a_run_once(self):
         """领取 → 执行 → 收尾：远端只被调一次，上下文是库里的真实值。"""
         import scripts.run_worker as worker
-        from app import execution_control
+        from webpage_agent.governance import execution_control
 
         store = new_store()
         await seed_run(store)
@@ -45,7 +45,7 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
             seen['epoch'] = context.lease_epoch
             return {'answer': '已部署'}
 
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
         tool = Tool('deploy', '部署', '', {'type': 'object'}, spy,
                     tool_key='local:test:deploy', effect='write')
         plan_patch, plan_calls = install_plan(one_step_plan())
@@ -70,7 +70,7 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_two_workers_claiming_at_once_execute_once(self):
         """两个执行者抢同一条 run：只有一方拿到调用资格。"""
         import scripts.run_worker as worker
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
 
         store_a, store_b = new_store(), new_store()
         await seed_run(store_a)
@@ -100,8 +100,8 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_execution_error_does_not_kill_the_worker(self):
         """一次执行抛异常只影响这一条 run，Worker 还活着且能领下一条。"""
         import scripts.run_worker as worker
-        from app.tools import Tool
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
+        from webpage_agent.tools.core import Tool
 
         store = new_store()
         await seed_run(store, task_id='t1', run_id='r1', session_id='s1')
@@ -136,7 +136,7 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_stored_plan_is_not_treated_as_a_resume(self):
         """库里只有一份空计划：那是"没计划"，必须重新规划（旧代码的坑）。"""
         import scripts.run_worker as worker
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
 
         store = new_store()
         await seed_run(store)
@@ -199,7 +199,7 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
 
         root = Path(__file__).resolve().parents[1]
         env = {**os.environ, 'PG_TEST_DSN': PG_DSN,
-               'PYTHONPATH': str(root)}
+               'PYTHONPATH': str(root / 'src')}
         env.setdefault('HOME', str(root / '.conda-home'))
         proc = subprocess.run(
             [sys.executable, '-m', 'scripts.run_worker', '--jobs-only', '--once'],

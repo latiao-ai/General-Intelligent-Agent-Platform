@@ -15,8 +15,8 @@ import unittest
 
 from unittest.mock import patch
 
-from app import execution_control
-from app import run_inputs as run_inputs_module
+from webpage_agent.governance import execution_control
+from webpage_agent.agent import run_inputs as run_inputs_module
 from tests.exec_env import (Remote, install_main, install_plan, install_tools,
                             new_store, reset_db, seed_run)
 
@@ -78,7 +78,7 @@ class QuestionDedupeTests(unittest.TestCase):
     """追问去重和快照：同一组问题不能因为换了措辞就再问一轮。"""
 
     def test_near_duplicate_questions_are_dropped(self):
-        from app import nodes
+        from webpage_agent.agent import nodes
         self.assertTrue(nodes._same_question('画面主体是什么？', '画面主体是什么'))
         self.assertFalse(nodes._same_question('画面主体是什么', '视频要几秒'))
         fresh = nodes._fresh_questions(
@@ -90,7 +90,7 @@ class QuestionDedupeTests(unittest.TestCase):
         self.assertEqual(remembered, ['画面主体是什么？', '要横屏还是竖屏'])
 
     def test_snapshot_keeps_the_waiting_context(self):
-        from app import nodes
+        from webpage_agent.agent import nodes
         snap = nodes._snapshot_state({
             'asked_questions': ['画面主体是什么'],
             'clarification': '画面主体是什么',
@@ -104,7 +104,7 @@ class QuestionDedupeTests(unittest.TestCase):
         self.assertEqual(snap['processed_intent_version'], 2)
 
     def test_waiting_reply_does_not_repeat_the_question(self):
-        from app.messages import reply_text
+        from webpage_agent.core.messages import reply_text
         text = reply_text({
             'status': 'waiting_input',
             'failure': '画面主体是什么',
@@ -121,6 +121,28 @@ class QuestionDedupeTests(unittest.TestCase):
             known_tools={'render_html', 'deploy_site'})
         self.assertEqual([step['step_id'] for step in kept], ['p2_s1'])
         self.assertEqual(issues[0]['code'], 'overwrites_executed_step')
+
+    def test_revision_assigns_ids_when_the_model_omits_them(self):
+        """`PlanStep.step_id` 是可省略的：省略时补号，不能把这一步判死丢掉。"""
+        kept, issues = run_inputs_module.validate_revision(
+            [{'tool': 'render_html', 'args': {}},
+             {'tool': 'deploy_site', 'args': {}}],
+            plan_version=2, done_steps={'s1'}, unknown_steps=[],
+            known_tools={'render_html', 'deploy_site'})
+        self.assertEqual([step['step_id'] for step in kept],
+                         ['p2_s1', 'p2_s2'])
+        self.assertEqual(issues, [])
+
+    def test_revision_still_rejects_explicit_duplicate_and_executed_ids(self):
+        kept, issues = run_inputs_module.validate_revision(
+            [{'tool': 'render_html', 'step_id': 's1'},
+             {'tool': 'render_html', 'step_id': 'p2_s1'},
+             {'tool': 'render_html', 'step_id': 'p2_s1'}],
+            plan_version=2, done_steps={'s1'}, unknown_steps=[],
+            known_tools={'render_html'})
+        self.assertEqual([step['step_id'] for step in kept], ['p2_s1'])
+        self.assertEqual([item['code'] for item in issues],
+                         ['overwrites_executed_step', 'duplicate_step_id'])
 
     def test_revision_rejects_steps_depending_on_unknown_actions(self):
         kept, issues = run_inputs_module.validate_revision(
@@ -146,8 +168,8 @@ class QuestionDedupeTests(unittest.TestCase):
         self.assertIn('不要再问第二遍', rules)
 
     def test_question_context_survives_snapshot_and_reply(self):
-        from app.nodes import _fresh_questions, _snapshot_state
-        from app.messages import reply_text
+        from webpage_agent.agent.nodes import _fresh_questions, _snapshot_state
+        from webpage_agent.core.messages import reply_text
         asked = ['图片要写实、插画还是水彩？']
         fresh = _fresh_questions(
             ['图片要 16:9 写实摄影、插画还是卡通？', '要不要加字幕？'], asked)
@@ -171,7 +193,7 @@ class AcceptInputTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def hub(self, store, **kwargs):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(store, **kwargs)
 
     async def test_accepting_an_input_raises_the_intent_version_once(self):
@@ -279,6 +301,24 @@ class AcceptInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await store.run('r1'))['intent_version'], 1)
         await store.close()
 
+    async def test_run_pending_reconciliation_rejects_inputs_instead_of_swallowing_them(self):
+        """结果未定的运行不能再收补充：收了也没有执行者会来取。
+
+        真踩过：画布上那次 submit 被服务端拒绝后 run 停在 needs_reconcile，用户在
+        界面上连发三条「你好」，全部落库成 run_inputs 却永远不执行——看起来就是
+        "这个画布发不出消息了"。现在当场拒绝并给出可执行的提示。
+        """
+        store = new_store()
+        await seed_run(store, status='needs_reconcile')
+        hub = self.hub(store)
+        with self.assertRaises(run_inputs_module.InputRejected) as ctx:
+            await hub.append_run_input('run1', request_id='req-1', message='你好')
+        self.assertEqual(ctx.exception.code, 'run_needs_reconcile')
+        self.assertIn('核实', str(ctx.exception))
+        self.assertEqual(await store.run_inputs('run1'), [])
+        self.assertEqual((await store.run('run1'))['intent_version'], 1)
+        await store.close()
+
     async def test_backlog_limit_rejects_instead_of_dropping(self):
         store = new_store()
         await seed_run(store, status='running')
@@ -303,7 +343,7 @@ class IntentBlockingTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def hub(self, store, **kwargs):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(store, **kwargs)
 
     async def test_input_committed_before_admission_means_zero_remote_calls(self):
@@ -325,10 +365,10 @@ class IntentBlockingTests(unittest.IsolatedAsyncioTestCase):
                    'summary': '按新要求只跑第二步'}
 
         async def fake_revise(schema, system, user, **kwargs):
-            return __import__('app.schemas', fromlist=['x']).RevisedPlan \
+            return __import__('webpage_agent.core.schemas', fromlist=['x']).RevisedPlan \
                 .model_validate(revised), None
 
-        from app import nodes
+        from webpage_agent.agent import nodes
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
                 install_tools(tools), plan_patch, \
                 patch.object(nodes, 'structured_call', fake_revise):
@@ -439,7 +479,7 @@ class ResumeWithInputTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def hub(self, store, **kwargs):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(store, **kwargs)
 
     async def test_input_while_paused_does_not_resume_automatically(self):
@@ -471,8 +511,8 @@ class ResumeWithInputTests(unittest.IsolatedAsyncioTestCase):
 
             revised = {'steps': [{'tool': 'second', 'step_id': 'p2_s1', 'args': {}}],
                        'summary': '按新要求继续'}
-            from app import nodes
-            from app.schemas import RevisedPlan
+            from webpage_agent.agent import nodes
+            from webpage_agent.core.schemas import RevisedPlan
 
             async def fake_revise(schema, system, user, **kwargs):
                 return RevisedPlan.model_validate(revised), None
@@ -524,8 +564,8 @@ class RunInputApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await reset_db()
         import httpx
-        import app.api as api_module
-        from app.api_hub import Hub
+        import webpage_agent.api.routes as api_module
+        from webpage_agent.api.api_hub import Hub
         self._saved_hub = api_module.hub
         api_module.hub = Hub(new_store())
         self.api_module = api_module
@@ -604,7 +644,7 @@ class RunInputApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_feature_flag_off_hides_the_endpoint(self):
         from dataclasses import replace
         from unittest.mock import patch
-        from app.config import settings
+        from webpage_agent.core.config import settings
         with patch.object(self.api_module, 'settings',
                           replace(settings, run_inputs_enabled=False)):
             res = await self._post()

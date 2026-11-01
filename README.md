@@ -1,3 +1,17 @@
+### 局域网开发访问
+
+```sh
+python -m scripts.serve_api --lan --port 8000
+```
+
+启动时会显示本机局域网访问地址，同一网络的设备可直接打开该地址。
+此选项监听所有 IPv4 网卡，自动允许显示地址的浏览器写请求，并为 HTTP 联调关闭 Secure Cookie；现有票据登录仍然有效，不会绕过平台认证。
+如无法连接，请检查电脑防火墙和 Wi-Fi 的设备隔离设置。多网卡时可能显示默认路由所在网卡的地址。
+`APP_ENV=production` 不允许此 HTTP 联调选项，正式部署使用 HTTPS 代理。默认启动仍只允许本机访问。
+
+> 独立上线请先阅读 [生产部署与运维](docs/production-deployment.md)。发布包使用
+> `python -m scripts.package_release`，不要直接压缩当前工作目录。
+
 # 通用智能体执行中台
 
 中台目标、边界与对接合同见仓库根目录 [`智能体中台运行机制说明.md`](智能体中台运行机制说明.md)。
@@ -24,7 +38,7 @@
 **不是内置工具**——它就是服务端声明的那个部署工具，身份是 `mcp:<server>:<tool>`，
 和 `mcp__*` 走同一条调用通道（同一份账本记录、同样进 `mcp_calls`、同样的
 结果未定判定）。平台只为它多挂了一个适配器（调用前的开关/产物闸门 + 调用后的
-回执归一，见 `app/capabilities/publishing.py`）。
+回执归一，见 `src/webpage_agent/capabilities/publishing.py`）。
 
 > 结构化报告生成（compose/render 模板）已按需移除，内核仍保留通用的计划、
 > 账本、恢复等机制。
@@ -85,6 +99,10 @@ python --version             # Python 3.12.15
 | `MCP_SERVERS` | **多服务端**：JSON 数组，每项 `{id, transport, url, token, deploy_tool, default, capability_tool, tool_name_arg}`；设置后不再读上面的单项 `MCP_*` |
 | `capability_tool` | 服务端的"能力清单"工具名（如 `list_capabilities`）。有些服务端把动作藏在一个通用 `run_tool` 后面，配上它才能在规划前读到**真实内部工具名**，并在调用前校验 |
 | `tool_name_arg` | 那个通用调用工具里承载内部工具名的参数名（如 `name`） |
+| `idempotency_arg` | 服务端写工具的顶层幂等参数名，例如 `operationId`。仅当工具 schema 声明此字段时生效；执行账本按运行、计划版本、步骤、工具及业务参数生成编号，授权与调用使用同一份最终参数。规划器不填写此字段，同一步重试复用编号，新任务使用新编号 |
+| `deterministic_reasons` | 该服务端自己的“请求被拒、没落地”原因词数组。内核只认通用词（`invalid_*`、`*_conflict`、`forbidden` 等）；厂商专有词（如 BeefTV 的 `read_only_client`、`production_authorization_required`）不配在这里就会被当成“结果未定”，走人工对账。只放确实没执行的词 |
+| `confirmation_tools` | 必须由用户在平台上确认后才能执行的工具（付费下单、提交/下发）。同一片段里只要还出现它的**提议**步骤或该服务端写操作，规划校验就阻断（`confirmation_bypasses_user`）：提议后必须以 `after_segment=observe` 停下，确认后再单独成段提交 |
+| `proposal_tools` | 触发那次确认的提议工具（只登记提议、不执行），与 `confirmation_tools` 配对使用 |
 | `IDEMPOTENCY_TTL_SECONDS` | 创建任务幂等键的有效期，默认 86400（24 小时） |
 | `DATABASE_URL` | **必填**，PostgreSQL 连接串（`postgresql://…`）。SQLite 实现已删除，留空直接报错 |
 | `AUTH_MODE` | `off`（默认，本地单用户）/ `optional` / **`ticket`**（正式） |
@@ -148,7 +166,7 @@ stdio 会话现已在同一进程中复用，默认空闲 600 秒后关闭；
 
 ## 3.1 界面：过程可见、可停止、可追加要求、阶段实时计时
 
-技术栈是 **FastAPI + SSE + 原生 HTML/JS**（后端 `app/api.py`，前端 `app/web/index.html`）。
+技术栈是 **FastAPI + SSE + 原生 HTML/JS**（后端 `src/webpage_agent/api/routes.py`，前端 `src/webpage_agent/api/web/index.html`）。
 选它而不是 Streamlit，是因为后者在实时交互上处处受限：
 
 | | Streamlit | **FastAPI + SSE（当前）** |
@@ -161,7 +179,7 @@ stdio 会话现已在同一进程中复用，默认空闲 600 秒后关闭；
 
 ### 阶段耗时实时累加
 
-每个节点进出时由 `app/graph.py` 的包装层发出 `stage_start` / `stage_end` 事件。
+每个节点进出时由 `src/webpage_agent/agent/graph.py` 的包装层发出 `stage_start` / `stage_end` 事件。
 前端收到 `stage_start` 就开一行，并按**服务端给的开始时刻**每 100ms 刷新；收到
 `stage_end` 冻结为该阶段实际耗时：
 
@@ -201,7 +219,7 @@ stdio 会话现已在同一进程中复用，默认空闲 600 秒后关闭；
 
 ### 实时展示执行过程
 
-节点内部通过 `app/events.py` 的 `emit()` 发出动作事件：
+节点内部通过 `src/webpage_agent/observe/events.py` 的 `emit()` 发出动作事件：
 
 ```
 💭 我先帮你查找「SQLite 的适用场景和限制」相关资料，整理成概述、适用场景、限制…等章节。
@@ -363,7 +381,7 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
 脚本会逐表搬数据并**校验行数一致**，完成后复位 `messages.id` 的序列。
 本地实测迁移了 21 会话 / 139 消息 / 71 任务 / 1069 事件，行数校验通过。
 
-### 表一览（25 张）
+### 表一览（38 张：原有 35 张 + 生产治理 3 张）
 
 | 分组 | 表 | 内容 |
 |---|---|---|
@@ -380,6 +398,12 @@ python -m scripts.migrate_to_postgres --dsn "postgresql://user@127.0.0.1:5432/ag
 | 记忆库 | `memories` / `memory_tombstones` | 作用域化长期记忆与遗忘墓碑 |
 | 后台 | `background_jobs` | outbox 派生的异步任务（带去重键） |
 | 事件 | `events` | 每个任务的完整事件日志（带任务内自增 `seq`） |
+| 结果 | `tool_result_manifests` / `tool_result_parts` | 工具结果登记与分块 |
+| 工具治理 | `mcp_server_bindings` / `credential_bindings` / `tool_policies` / `tool_authorizations` | 服务端、凭据、政策与调用授权 |
+| 批准 | `approvals` / `approval_reservations` | 结构化批准与动作额度预留 |
+| 异步 | `external_tasks` | 远端任务查询与恢复 |
+| 迁移 | `schema_migrations` | 有序迁移版本，已应用版本不重复执行 |
+| 生产治理 | `api_rate_windows` / `tenant_usage_days` / `provider_charges` | 跨进程限流、租户日预算、provider 请求费用台账 |
 
 ### 内存与磁盘的分工
 
@@ -414,7 +438,7 @@ verify_completion → decide_next（可有限修复）| finalize（核对通过�
 **每个工具之后都跑一次程序观察**（不花模型请求），只有真正需要语义判断时才问模型。
 确定链路（读已知产物 → 打包 → 导出）因此一次模型请求都不多花。
 
-三条合同写在 `app/observation.py` 与 `app/schemas.py`：
+三条合同写在 `src/webpage_agent/observe/observation.py` 与 `src/webpage_agent/core/schemas.py`：
 
 | 合同 | 内容 |
 |---|---|
@@ -510,7 +534,7 @@ curl localhost:8010/api/runs/<run_id>/inputs?after_seq=0
   事件循环这件事也没了。）
 - **只留一种仓储实现**：SQLite 版已删除。它对"租约代次、`SKIP LOCKED` 领取、
   单事务内动作准入"这些东西只能做近似，而近似恰恰是执行可靠性最不能接受的部分。
-- 仓储接口见 `app/persistence.py`（全部 `async def`），`check_repository()`
+- 仓储接口见 `src/webpage_agent/store/persistence.py`（全部 `async def`），`check_repository()`
   会同时校验"方法齐备"和"实现确实是协程函数"（同步实现会在异步调用点返回一个
   没人 await 的协程，表现成"调了但什么都没发生"，最难查）。
 
@@ -537,19 +561,18 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
 
 ### 已知边界
 
-- **实时通知是进程内的**。事件先落库、再推给本进程的订阅者；别的实例写入的事件要靠
-  游标补发（`GET /api/tasks/{id}/events?after=<seq>` 或 `Last-Event-ID`）才能拿到，
-  跨实例实时推送需要消息总线。
+- **跨进程通知使用 PostgreSQL LISTEN/NOTIFY**。包括草稿和回答增量在内的事件先落库，
+  再通知各 API 副本按序号补读；通知丢失时约 15 秒后补读。重连支持 `after` / `Last-Event-ID`。
+  持续保持连接的客户端也能收到其他进程的事件，不依赖 sticky session。
 - **执行只有一条路径**：就地执行（API 进程）与 Worker 都走 `claim_run` 并写租约，
   同一 run 不会被领两次。  领取是 `… FOR UPDATE SKIP LOCKED`。执行期间由 `Hub._guard` 续租，
   租约过期才会被判定为"执行者已死"并接手。
 - **跨进程取消是协作式的**：取消请求写 `runs.cancel_requested_at`，持有租约的执行者
   在 2 秒轮询里发现后自行停止；进程已经死了的 run 会由对账按账本处理（有 in_flight
   动作标 `unknown` 等人工核实，没有就回到 `queued` 续跑）。
-- **异步驱动 + 连接池解决的是单进程吞吐，不是高可用**。多副本之间仍然只靠数据库
-  协作（租约/账本对账），**跨实例实时事件推送**还没做：副本 A 上的客户端看不到
-  副本 B 产生的实时事件（要靠重连 + `Last-Event-ID` 补发，事件本身不丢）。
-- **池大小是静态配置**，没有按负载自适应；借不到连接会直接报错而不是排队降级。
+- **多副本通过数据库协调**：运行领取、租约 fencing、共享限流与租户预算均在数据库中裁决。
+  每个副本需要访问同一 PostgreSQL 与产物/画像共享卷；跨机器共享卷须由部署方提供。
+- **池大小是静态配置**，没有按负载自适应；会在 `DB_POOL_TIMEOUT` 内等连接，超过时限后报错。
 - **执行权靠租约与代次，不靠"谁是最后一个写的"**：`runs.lease_owner` +
   `lease_epoch` 做 fencing，准入/结算/终态/续租全部带条件提交；租约过期或代次
   变化一律按失租处理（抛 `LeaseLost`，**不写任何业务状态**）。续租失败同理：
@@ -592,10 +615,10 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
 
 | 组件 | 文件 | 职责 |
 |---|---|---|
-| 登记表 | `app/auth_connections.py` | 谁可信、允许哪些企业/平台、公钥与 kid |
-| 票据验证 | `app/ticket_auth.py` | 票据 → 可信身份；只做这一件事 |
-| 兑换与会话 | `app/auth.py` | 验票 + 一次性登记 + 绑定身份 + 建会话（同一事务） |
-| 接口 | `app/api.py` | `POST /api/auth/exchange`、`GET /api/me`、`DELETE /api/auth/session` |
+| 登记表 | `src/webpage_agent/api/auth_connections.py` | 谁可信、允许哪些企业/平台、公钥与 kid |
+| 票据验证 | `src/webpage_agent/governance/ticket_auth.py` | 票据 → 可信身份；只做这一件事 |
+| 兑换与会话 | `src/webpage_agent/api/auth.py` | 验票 + 一次性登记 + 绑定身份 + 建会话（同一事务） |
+| 接口 | `src/webpage_agent/api/routes.py` | `POST /api/auth/exchange`、`GET /api/me`、`DELETE /api/auth/session` |
 
 几条硬约束（都有用例钉着）：
 
@@ -636,7 +659,7 @@ python -m scripts.mock_identity_platform --port 8090 --hub http://127.0.0.1:8010
 
 ## 4. 状态、outcome 与展示标签
 
-三层分工（实现见 `app/outcome.py`）：
+三层分工（实现见 `src/webpage_agent/core/outcome.py`）：
 
 | 层 | 存在哪 | 词汇 | 会不会随能力增长 |
 |---|---|---|---|
@@ -644,7 +667,7 @@ python -m scripts.mock_identity_platform --port 8090 --hub http://127.0.0.1:8010
 | outcome | `state.outcome`（随任务持久化、随接口返回） | `{kind, produced[], effects[], answered, unverified}` | 会。它是数据，可以有无穷多种组合 |
 | 展示标签 | 接口字段 `status` / 前端文案表 | `answered` `local_ready` `deployed` `deploy_needs_check` `compensated` … | 会，而且随便加——它不进状态机、不写库 |
 
-规矩只有一条：**要加展示词就改 `app/outcome.py:label()` 和前端文案表，不要往
+规矩只有一条：**要加展示词就改 `src/webpage_agent/core/outcome.py:label()` 和前端文案表，不要往
 `tasks.status` / `runs.status` 里加业务值。** `StatusVocabularyTests` 把这条钉住了
 （加一个业务终态会先让那组用例红）。
 
@@ -663,8 +686,8 @@ python -m scripts.migrate_status_vocabulary --apply    # 写库
 本地工具由能力包自己用 `@tool` 声明，内核只负责汇总。加一个能力 = 加一个文件：
 
 ```python
-# app/capabilities/notes.py —— 全部内容都在这一个文件里
-from app.capabilities.registry import tool
+# src/webpage_agent/capabilities/notes.py —— 全部内容都在这一个文件里
+from webpage_agent.capabilities.registry import tool
 
 CAPABILITY = 'notes'
 PROMPT_RULES = '【笔记】用户要记/查笔记时才用这些工具……'   # 自动拼进规划器提示词
@@ -676,16 +699,16 @@ async def save_note(args, state):
     ...
 ```
 
-重启进程即可：`app/capabilities/registry.py` 扫 `app/capabilities/*.py`，`@tool`
+重启进程即可：`src/webpage_agent/capabilities/registry.py` 扫 `src/webpage_agent/capabilities/*.py`，`@tool`
 登记的东西自动出现在规划器清单里，`tool_key` 默认 `local:<CAPABILITY>:<name>`。
-`app/tools.py`（内核）**一个字都不用改**，它也不 import 任何具体业务包
+`src/webpage_agent/tools/core.py`（内核）**一个字都不用改**，它也不 import 任何具体业务包
 （`CapabilityRegistryTests.test_kernel_does_not_import_business_packages` 盯着这条）。
 
 两条来源分得很清，别混：
 
 | 来源 | 谁提供 | 怎么来 | 身份 |
 |---|---|---|---|
-| 本地能力包 | `app/capabilities/*.py` 里的 `@tool` | import 即注册（静态） | `local:<能力>:<动作>` |
+| 本地能力包 | `src/webpage_agent/capabilities/*.py` 里的 `@tool` | import 即注册（静态） | `local:<能力>:<动作>` |
 | 远端 MCP 工具 | MCP 服务端 | 运行时发现（有 TTL、掉线、前缀） | `mcp:<server>:<tool>` |
 
 ## 6. 通用调用型 MCP 服务端（run_tool 形态）
@@ -834,3 +857,86 @@ DATABASE_URL="$PG_TEST_DSN" AUTH_MODE=off TOOL_POLICY_ENFORCED=false \
 把它提升成错误才能守住"Worker 真的在等结果"这件事。
 
 没有 `PG_TEST_DSN` 时数据库相关用例会逐条跳过（不会静默退回 SQLite——已经没有那个实现）。
+
+## 10. 标准 MCP Tasks 原语（实验，**默认关闭**）
+
+有些 MCP 服务端不走"自定义 `job_id` + 查询工具"的方言，而是用协议自带的任务声明。
+中台支持这条通道，但**默认不启用**，理由见下面的弃用说明。
+
+### 协议侧是什么
+
+服务端在工具元数据里声明 `Tool.execution.taskSupport`：
+
+| 取值 | 含义 |
+|---|---|
+| `forbidden` | 不支持按任务执行（**缺省值**） |
+| `optional` | 两种都收 |
+| `required` | 只接受任务式调用 |
+
+客户端把 `task={ttl}` 放进 callTool 请求，服务端回任务引用，之后用 `tasks/get`
+查状态、`tasks/cancel` 取消。中台的 `ClientSession` 初始化时已自动声明 tasks 能力。
+
+**协议已经把"这个工具能不能异步"说清楚了，所以这一类服务端不需要写合同。**
+合同（§3.3 与 `contracts/async_tools.json`）继续服务那些没有声明、只用自定义
+方言的服务端。
+
+### 为什么默认关闭
+
+`mcp` 库把这条通道标了弃用，原文：
+
+> The experimental tasks API is deprecated and will be removed in mcp 2.0:
+> tasks (SEP-1686) were removed from the MCP specification and are expected to
+> return as a separate MCP extension.
+
+三条具体后果：
+
+1. 访问 `session.experimental` 会抛 `DeprecationWarning`——**不要用 `-W error` 跑这个进程**，
+   否则任务通道会直接崩。
+2. `requirements.txt` 的 `mcp>=1.28,<2` 上界是当前唯一的保护。**不要放开到 2.x**，
+   升级前必须先确认任务通道的去留。
+3. 未来应改为对接官方 tasks 扩展。本实现在 `src/webpage_agent/integrations/mcp_tasks.py` 把
+   协议任务收敛成保留身份 `mcp-task`，和合同任务共用同一份账本、快照、对账与恢复；
+   扩展落地时只需要改 `mcp_adapter` 里的三个协议调用点，上层不用动。
+
+> 据 MCP 的 SEP 影响记录，tasks 已迁入 `io.modelcontextprotocol/tasks` 扩展
+> （SEP-2663），方法集调整为 `tasks/get` / `tasks/cancel` / `tasks/update`。
+> 本条来自二手资料，接入前请以官方扩展文档为准。
+
+### 开关
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MCP_TASKS_ENABLED` | `false` | 总开关。关着时声明 `required` 的工具也走普通调用 |
+| `MCP_TASKS_OPTIONAL_ASYNC` | `false` | 声明 `optional` 的工具是否也走任务通道 |
+| `MCP_TASKS_TTL_MS` | `3600000` | 请求服务端保留任务的时长（毫秒） |
+
+总开关打开后：`required` 一律走任务通道，`optional` 看第二个开关，`forbidden` 永远不走。
+
+### 通路与语义
+
+受理增量与合同路线**同形**（`execution_status=accepted`），因此下游的账本、
+步骤快照、对账、恢复都不区分两条路。轮询时靠 `contract_id == 'mcp-task'`
+分辨该用 `tasks/get` 还是合同里的状态查询工具。
+
+状态映射（`TaskStatus` → 中台状态）：
+
+| 协议状态 | 中台状态 | 说明 |
+|---|---|---|
+| `working` | `running` | 继续等 |
+| `input_required` | `accepted` | **已知缺口**：见下 |
+| `completed` | `succeeded` | 落盘并结算 |
+| `failed` | `failed` | |
+| `cancelled` | `cancelled` | |
+| 其它未知值 | `unknown` | 不猜成功 |
+
+**已知缺口**：`input_required` 表示服务端在等客户端补输入（task-augmented
+elicitation），本平台没有对应的交互通道，所以既不判成功也不判失败，留在
+"已受理"由 `deadline_seconds` 收口。
+
+### 验证边界
+
+`tests/test_mcp_tasks.py`（22 条）覆盖映射、开关、通道切换、轮询推进、默认值一致性
+与合同路线的回归保护。**但没有对真实的 Tasks 服务端跑过端到端**——当前接入的服务端
+（openmontage、beeftv）都没有声明 `taskSupport`，走的是 `forbidden`。
+首次接入声明了 `taskSupport` 的服务端时，必须补一次真实联调。
+

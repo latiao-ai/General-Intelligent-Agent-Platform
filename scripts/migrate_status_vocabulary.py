@@ -26,8 +26,8 @@ _ROOT = _Path(__file__).resolve().parents[1]
 if str(_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_ROOT))
 
-from app import outcome as outcome_module          # noqa: E402
-from app.config import settings                    # noqa: E402
+from webpage_agent.core import outcome as outcome_module
+from webpage_agent.core.config import settings
 
 # 迁移后应当只剩这些值；出现别的说明还有代码在写业务词
 TARGET_STATUSES = sorted(outcome_module.RUN_STATUSES)

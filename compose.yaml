@@ -1,0 +1,67 @@
+x-agent: &agent
+  build: .
+  image: webpage-agent:local
+  env_file: ${AGENT_ENV_FILE:-deploy/production.env}
+  environment:
+    APP_ENV: production
+    DB_AUTO_MIGRATE: 'false'
+    DATABASE_URL: postgresql://agent:${AGENT_DB_PASSWORD:?Set AGENT_DB_PASSWORD in the shell}@db:5432/agent
+    ARTIFACT_DIR: /data/artifacts
+    PROFILE_PATH: /data/profile/USER.md
+  volumes:
+    - artifacts:/data/artifacts
+    - profiles:/data/profile
+    - ./deploy/config:/config:ro
+  read_only: true
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+  init: true
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: agent
+      POSTGRES_USER: postgres
+      AGENT_DB_PASSWORD: ${AGENT_DB_PASSWORD:?Set AGENT_DB_PASSWORD in the shell}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the shell}
+    volumes:
+      - database:/var/lib/postgresql
+      - ./deploy/init-db.sh:/docker-entrypoint-initdb.d/10-agent.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U postgres -d agent']
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+  migrate:
+    <<: *agent
+    command: [python, -m, scripts.migrate]
+    healthcheck:
+      disable: true
+    depends_on:
+      db:
+        condition: service_healthy
+  api:
+    <<: *agent
+    ports:
+      - '127.0.0.1:8000:8000'
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+  worker:
+    <<: *agent
+    command: [python, -m, scripts.run_worker]
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+volumes:
+  database:
+  artifacts:
+  profiles:

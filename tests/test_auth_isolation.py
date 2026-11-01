@@ -23,7 +23,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import auth, policies, ticket_auth  # noqa: E402
+from webpage_agent.api import auth
+from webpage_agent.governance import policies
+from webpage_agent.governance import ticket_auth
 from tests.test_auth_exchange import (PG_DSN, new_store, reset_db)  # noqa: E402
 from tests.test_ticket_auth import (ISS, PRIVATE_A, PUBLIC_A,  # noqa: E402
                                     claims, connection, sign)
@@ -118,8 +120,8 @@ class ApiIsolationTests(unittest.IsolatedAsyncioTestCase):
     """HTTP 层隔离：A 建的一切，B 都拿不到。"""
 
     async def asyncSetUp(self):
-        import app.api as api_module
-        from app.api_hub import Hub
+        import webpage_agent.api.routes as api_module
+        from webpage_agent.api.api_hub import Hub
 
         self.store = new_store()
         await reset_db(self.store)
@@ -137,7 +139,7 @@ class ApiIsolationTests(unittest.IsolatedAsyncioTestCase):
 
         self._patches = [patch.object(ticket_auth.auth_connections, 'connections',
                                       lambda *a, **k: CONNECTIONS),
-                         patch('app.api_hub.run_task', fake_run_task)]
+                         patch('webpage_agent.api.api_hub.run_task', fake_run_task)]
         for module in (api_module, auth, policies, ticket_auth):
             self._patches.append(patch.object(module, 'settings', replaced))
         for item in self._patches:

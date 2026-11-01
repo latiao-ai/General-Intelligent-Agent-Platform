@@ -28,14 +28,22 @@ TEST_TABLES = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
                'session_summaries', 'messages', 'sessions', 'request_keys')
 
 
+def valid_test_dsn(dsn):
+    from psycopg.conninfo import conninfo_to_dict
+    try:
+        return 'test' in conninfo_to_dict(dsn).get('dbname', '').lower()
+    except Exception:
+        return False
+
+
 def new_store():
     """测试用仓储：真实 PostgreSQL（库名必须含 test，用例会 TRUNCATE）。"""
     import unittest
     if not PG_DSN:
         raise unittest.SkipTest('需要 PG_TEST_DSN（项目已不再支持 SQLite）')
-    if 'test' not in PG_DSN:
+    if not valid_test_dsn(PG_DSN):
         raise unittest.SkipTest('PG_TEST_DSN 必须指向一次性测试库（库名含 test）')
-    from app.pg_store import PostgresStore
+    from webpage_agent.store.pg_store import PostgresStore
     return PostgresStore(PG_DSN)
 
 
@@ -87,7 +95,7 @@ class Remote:
     def tool(self, name: str, *, effect: str = 'write',
              tool_key: str = '', output: dict | None = None,
              label: str = ''):
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
 
         async def run(args, state):
             self.calls.append((name, dict(args or {})))
@@ -110,7 +118,7 @@ def install_tools(tools_by_name: dict):
     连 `catalog()` 一起替换：修订计划时会用它判断"工具是否存在"，
     只换 `find_tool` 会让修订器以为工具清单是空的。
     """
-    from app import tools as tool_module
+    from webpage_agent.tools import core as tool_module
 
     async def fake_find(name, context=None):
         return tools_by_name.get(name)
@@ -130,7 +138,7 @@ def install_plan(steps: list[dict], summary: str = '测试计划'):
     返回 (patch, 记录表)。记录表里每次调用追加一条执行前的输入，用来断言
     "续跑不该重新规划"。
     """
-    from app import nodes
+    from webpage_agent.agent import nodes
     calls: list[str] = []
 
     async def fake_plan(state):
@@ -157,7 +165,7 @@ def install_main(artifact_dir):
     这里不伪造 run_task 本身——图、节点、账本、租约都是真的，只有模型与工具
     被换掉。否则测出来的只是"我的假函数能被调用"。
     """
-    from app import main as main_module
+    from webpage_agent.api import main as main_module
     fake_settings = SimpleNamespace(
         artifact_dir=Path(artifact_dir), task_timeout=30.0,
         graph_recursion_limit=60, deploy_enabled=False)
@@ -183,24 +191,24 @@ def one_step_plan(tool: str = 'deploy', tool_key: str = '',
 def override_settings(**changes):
     """临时改配置，**对所有直接 import 了 settings 的模块都生效**。
 
-    踩过的坑：`from app.config import settings` 在模块里是持有引用的，只
-    `patch('app.config.settings')` 对它们完全没用——测试会"改了个寂寞"，
+    踩过的坑：`from webpage_agent.core.config import settings` 在模块里是持有引用的，只
+    `patch('webpage_agent.core.config.settings')` 对它们完全没用——测试会"改了个寂寞"，
     然后拿着默认值跑出个看似合理的错误结论。
     """
     from dataclasses import replace
     from unittest.mock import patch
-    from app.config import settings as real_settings
+    from webpage_agent.core.config import settings as real_settings
 
     fake = replace(real_settings, **changes)
-    modules = ('app.api', 'app.api_hub', 'app.main', 'app.nodes', 'app.services',
-               'app.tools', 'app.context', 'app.memory', 'app.capabilities.base',
-               'app.capabilities.web', 'app.capabilities.export',
-               'app.capabilities.answers', 'app.capabilities.publishing',
-               'app.sources', 'app.auth', 'app.policies', 'app.files',
-               'app.observation', 'app.run_inputs', 'app.integrations.mcp_servers',
-               'app.integrations.mcp_adapter', 'app.profile', 'app.idempotency')
+    modules = ('webpage_agent.api.routes', 'webpage_agent.api.api_hub', 'webpage_agent.api.main', 'webpage_agent.agent.nodes', 'webpage_agent.core.services',
+               'webpage_agent.tools.core', 'webpage_agent.agent.context', 'webpage_agent.core.memory', 'webpage_agent.capabilities.base',
+               'webpage_agent.capabilities.web', 'webpage_agent.capabilities.export',
+               'webpage_agent.capabilities.answers', 'webpage_agent.capabilities.publishing',
+               'webpage_agent.core.sources', 'webpage_agent.api.auth', 'webpage_agent.governance.policies', 'webpage_agent.core.files',
+               'webpage_agent.observe.observation', 'webpage_agent.agent.run_inputs', 'webpage_agent.integrations.mcp_servers',
+               'webpage_agent.integrations.mcp_adapter', 'webpage_agent.core.profile', 'webpage_agent.store.idempotency')
     stack = ExitStack()
-    stack.enter_context(patch('app.config.settings', fake))
+    stack.enter_context(patch('webpage_agent.core.config.settings', fake))
     for name in modules:
         module = sys.modules.get(name)
         if module is not None and hasattr(module, 'settings'):

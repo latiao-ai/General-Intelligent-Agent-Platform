@@ -9,7 +9,7 @@ _ROOT = _Path(__file__).resolve().parents[1]
 if str(_ROOT) not in _sys.path:
     _sys.path.insert(0, str(_ROOT))
 
-from app.main import deploy_task
+from webpage_agent.api.main import deploy_task
 
 
 async def main():

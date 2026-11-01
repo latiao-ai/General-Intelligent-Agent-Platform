@@ -3,8 +3,10 @@ import os
 import unittest
 from unittest.mock import patch
 
-from app import credentials, mcp_connections, tool_policy
-from app.integrations import mcp_adapter
+from webpage_agent.core import credentials
+from webpage_agent.core import mcp_connections
+from webpage_agent.tools import tool_policy
+from webpage_agent.integrations import mcp_adapter
 
 
 class _Store:
@@ -94,7 +96,7 @@ class BearerResolutionTests(unittest.IsolatedAsyncioTestCase):
 
 class RevocationLookupTests(unittest.IsolatedAsyncioTestCase):
     async def test_lookup_failure_stops_the_send(self):
-        from app import tool_authorization
+        from webpage_agent.tools import tool_authorization
 
         class Broken:
             async def credential_bindings(self, **kwargs):

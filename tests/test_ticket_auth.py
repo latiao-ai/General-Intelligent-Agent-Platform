@@ -19,7 +19,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import auth_connections, ticket_auth  # noqa: E402
+from webpage_agent.api import auth_connections
+from webpage_agent.governance import ticket_auth
 
 AUD = 'agent-hub-login'
 ISS = 'https://platform-a.example.com'

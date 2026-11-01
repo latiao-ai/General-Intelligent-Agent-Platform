@@ -3,9 +3,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from app.config import settings
-from app.integrations import mcp_adapter
-from app.integrations.mcp_adapter import MCPToolFailure
+from webpage_agent.core.config import settings
+from webpage_agent.integrations import mcp_adapter
+from webpage_agent.integrations.mcp_adapter import MCPToolFailure
 
 
 class _StdioCM:
@@ -75,7 +75,8 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_StdioCM.live, 1)
 
     async def test_platform_customers_get_distinct_processes_and_transport_identity(self):
-        from app import execution_control, ledger
+        from webpage_agent.governance import execution_control
+        from webpage_agent.store import ledger
         from unittest.mock import AsyncMock
         server = _server()
         server.forward_subject = True
@@ -108,6 +109,42 @@ class StdioSessionTests(unittest.IsolatedAsyncioTestCase):
             pass
         self.assertEqual(_StdioCM.enters, 2)
         self.assertEqual(_StdioCM.live, 2)
+
+    async def test_configured_token_reaches_the_child_process(self):
+        """stdio 条目里配的 token 必须交给子进程，否则"配了鉴权"等于没配。"""
+        server = _server()
+        server.token = 'configured-key'
+        params_seen = []
+        def client(params):
+            params_seen.append(params)
+            return _StdioCM(params)
+        with patch.object(mcp_adapter, 'stdio_client', client):
+            async with mcp_adapter.connect_session(server):
+                pass
+        self.assertEqual(params_seen[0].env.get('MCP_BEARER_TOKEN'), 'configured-key')
+
+    async def test_explicit_token_wins_over_the_configured_one(self):
+        """按租户解析出来的钥匙优先于服务端配置里的共用钥匙。"""
+        server = _server()
+        server.token = 'configured-key'
+        params_seen = []
+        def client(params):
+            params_seen.append(params)
+            return _StdioCM(params)
+        with patch.object(mcp_adapter, 'stdio_client', client):
+            async with mcp_adapter.connect_session(server, token='tenant-key'):
+                pass
+        self.assertEqual(params_seen[0].env.get('MCP_BEARER_TOKEN'), 'tenant-key')
+
+    async def test_no_token_anywhere_stays_unauthenticated(self):
+        params_seen = []
+        def client(params):
+            params_seen.append(params)
+            return _StdioCM(params)
+        with patch.object(mcp_adapter, 'stdio_client', client):
+            async with mcp_adapter.connect_session(_server()):
+                pass
+        self.assertNotIn('MCP_BEARER_TOKEN', params_seen[0].env or {})
 
     async def test_business_failure_keeps_the_process(self):
         server = _server()

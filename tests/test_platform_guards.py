@@ -10,13 +10,20 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import jwt
 
-from app import (auth_connections, execution_control, idempotency, ledger,
-                 nodes, observation, policies, scene_context, tools)
-from app.api_hub import Hub
-from app.capabilities.registry import Tool
-from app.integrations.mcp_servers import Server
-from app.pg_store import SessionGoalConflict
-from app.schemas import ObservationDecision, RevisedPlan
+from webpage_agent.api import auth_connections
+from webpage_agent.governance import execution_control
+from webpage_agent.store import idempotency
+from webpage_agent.store import ledger
+from webpage_agent.agent import nodes
+from webpage_agent.observe import observation
+from webpage_agent.governance import policies
+from webpage_agent.agent import scene_context
+from webpage_agent.tools import core as tools
+from webpage_agent.api.api_hub import Hub
+from webpage_agent.capabilities.registry import Tool
+from webpage_agent.integrations.mcp_servers import Server
+from webpage_agent.store.pg_store import SessionGoalConflict
+from webpage_agent.core.schemas import ObservationDecision, RevisedPlan
 from tests.exec_env import new_store, reset_db
 from tests.test_ticket_auth import ISS, PRIVATE_A, connection
 
@@ -125,7 +132,7 @@ class GoalAdmissionTests(unittest.IsolatedAsyncioTestCase):
             await self.create('b', spec=self.spec('different'))
 
     async def test_api_returns_current_goal_and_survives_failure_before_dispatch(self):
-        from app import api
+        from webpage_agent.api import routes as api
         hub = Hub(self.store)
         principal = policies.Principal(tenant_id='ta', user_id='ua')
         api.app.dependency_overrides[policies.current_principal] = lambda: principal
@@ -147,7 +154,7 @@ class GoalAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(await self.store.messages('api')), 1)
 
     async def test_valid_idempotent_replay_does_not_require_a_fresh_scene_ticket(self):
-        from app import api
+        from webpage_agent.api import routes as api
         hub = Hub(self.store)
         principal = policies.Principal(tenant_id='tenant-a', user_id='local-a',
             authenticated=True, subject='alice', platform_id='pa',
@@ -218,7 +225,8 @@ class RevisionContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(checked['ok'], '没有真实修改回执不能通过验收')
 
     async def test_explicit_new_criteria_are_saved_without_erasing_old_criteria(self):
-        proposed = RevisedPlan(steps=[{'tool': 'update', 'step_id': 'p2_s1'}],
+        proposed = RevisedPlan(steps=[{'tool': 'update', 'step_id': 'p2_s1'},
+                                      {'tool': 'answer_directly', 'step_id': 'p2_s2'}],
             after_segment='observe', observation_goal='检查新状态',
             completion_criteria=[{'kind': 'answer_present'}])
         plan = (await self.revise(proposed))['plan']
@@ -333,7 +341,7 @@ class SceneBindingTests(unittest.TestCase):
                 self.verify(self.sign(**values))
 
     def test_api_checks_scene_against_external_subject_not_local_user_id(self):
-        from app import api
+        from webpage_agent.api import routes as api
         principal = policies.Principal(tenant_id='tenant-a', user_id='u_internal',
             authenticated=True, subject='alice', platform_id='pa',
             connection_id=connection().connection_id)
@@ -346,7 +354,8 @@ class SceneBindingTests(unittest.TestCase):
 
 class DiscoveryIsolationTests(unittest.IsolatedAsyncioTestCase):
     async def test_binding_scope_contains_subject_and_revision_without_secrets(self):
-        from app import mcp_connections, credentials
+        from webpage_agent.core import mcp_connections
+        from webpage_agent.core import credentials
         context = execution_control.ExecutionContext('run-a', lease_epoch=1)
         store = SimpleNamespace(run=AsyncMock(return_value={
             'tenant_id': 'tenant-a', 'owner_user_id': 'alice'}))
@@ -386,8 +395,8 @@ class DiscoveryIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(tools._SCOPED_MCP_CACHES.clear)
         with patch.object(tools, 'settings', replace(tools.settings, tool_policy_enforced=True)), \
                 patch.object(tools.mcp_servers, 'servers', return_value=[server]), \
-                patch('app.mcp_connections.discovery_scope', scope), \
-                patch('app.mcp_connections.discoverable_servers', AsyncMock(return_value=[server])), \
+                patch('webpage_agent.core.mcp_connections.discovery_scope', scope), \
+                patch('webpage_agent.core.mcp_connections.discoverable_servers', AsyncMock(return_value=[server])), \
                 patch.object(tools, '_subject_token', token), \
                 patch.object(tools, '_discover', AsyncMock(side_effect=discover)) as calls, \
                 patch.object(tools, '_discover_capabilities', capabilities):

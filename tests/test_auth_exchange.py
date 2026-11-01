@@ -1,3 +1,4 @@
+from tests.exec_env import valid_test_dsn
 """票据兑换与登录会话：一次性、并发、事务、身份绑定、撤销。
 
 只测这些，不调模型、不碰 MCP。数据库用 `PG_TEST_DSN` 指向的一次性测试库。
@@ -29,7 +30,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app import auth, auth_connections, ticket_auth  # noqa: E402
+from webpage_agent.api import auth
+from webpage_agent.api import auth_connections
+from webpage_agent.governance import ticket_auth
 from tests.test_ticket_auth import (AUD, ISS, PRIVATE_A, PRIVATE_B,  # noqa: E402
                                     PUBLIC_A, claims, connection, sign)
 
@@ -44,9 +47,9 @@ TABLES = ('auth_sessions', 'ticket_redemptions', 'identities', 'app_users',
 def new_store():
     if not PG_DSN:
         raise unittest.SkipTest('需要 PG_TEST_DSN（一次性测试库）')
-    if 'test' not in PG_DSN:
+    if not valid_test_dsn(PG_DSN):
         raise unittest.SkipTest('PG_TEST_DSN 必须指向测试库（库名含 test）')
-    from app.pg_store import PostgresStore
+    from webpage_agent.store.pg_store import PostgresStore
     return PostgresStore(PG_DSN)
 
 
@@ -205,8 +208,8 @@ class ApiExchangeTests(unittest.IsolatedAsyncioTestCase):
     """HTTP 层：兑换 / me / 退出，以及"票据不能当业务凭证"。"""
 
     async def asyncSetUp(self):
-        import app.api as api_module
-        from app.api_hub import Hub
+        import webpage_agent.api.routes as api_module
+        from webpage_agent.api.api_hub import Hub
 
         self.store = new_store()
         await reset_db(self.store)
@@ -227,7 +230,7 @@ class ApiExchangeTests(unittest.IsolatedAsyncioTestCase):
             patch.object(ticket_auth.auth_connections, 'connections',
                          lambda *a, **k: CONNECTIONS),
         ]
-        from app import policies as policies_module
+        from webpage_agent.governance import policies as policies_module
         for module in (api_module, auth, policies_module, ticket_auth):
             self._patches.append(patch.object(module, 'settings', replaced))
         for item in self._patches:

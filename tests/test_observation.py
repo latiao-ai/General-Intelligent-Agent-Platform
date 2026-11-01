@@ -16,9 +16,9 @@ import unittest
 
 from unittest.mock import patch
 
-from app import observation as obs
-from app import observation as observation_module
-from app.schemas import ExecutionPlan, ObservationDecision, RevisedPlan
+from webpage_agent.observe import observation as obs
+from webpage_agent.observe import observation as observation_module
+from webpage_agent.core.schemas import ExecutionPlan, ObservationDecision, RevisedPlan
 from tests.exec_env import (Remote, install_main, install_tools, new_store,
                             override_settings, reset_db, seed_run)
 
@@ -144,7 +144,7 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def hub(self, store, **kwargs):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(store, **kwargs)
 
     async def run_plan(self, *, plan, tools, decisions=None, revisions=None,
@@ -160,7 +160,7 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
         model = FakeModel(plan=plan, decisions=decisions, revisions=revisions)
         hub = self.hub(store, owner_id='w1')
         stack = install_tools(tools or {})
-        from app import nodes as nodes_module
+        from webpage_agent.agent import nodes as nodes_module
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
                 stack, patch.object(nodes_module, 'structured_call', model), \
                 override_settings(observe_enabled=observe_enabled):
@@ -169,7 +169,7 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_deterministic_chain_never_calls_the_observation_model(self):
         """读取已知产物 → 打包 → 导出：观察模型请求必须是 0。"""
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
 
         calls = []
 
@@ -208,7 +208,7 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_observe_segment_lets_the_model_pick_from_real_results(self):
         """先列清单、再挑片段：模型看到的是**真实返回**，不是它自己猜的 ID。"""
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
 
         listing = {'shots': [{'id': 'shot-a', 'seconds': 4},
                              {'id': 'shot-b', 'seconds': 9}], 'total': 2}
@@ -253,8 +253,8 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_full_result_is_stored_and_readable_by_reference(self):
         """结果完整落盘：摘要只给前几项，细节按引用受控读取。"""
-        from app import files as files_module
-        from app.tools import Tool
+        from webpage_agent.core import files as files_module
+        from webpage_agent.tools.core import Tool
 
         big = {'shots': [{'id': f'shot-{i}', 'seconds': i} for i in range(40)]}
 
@@ -283,9 +283,47 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('shot-39', full['text'])
         await store.close()
 
+    async def test_missing_created_node_reference_repairs_only_unexecuted_write(self):
+        from webpage_agent.tools.core import Tool
+        calls = []
+
+        async def create(args, state):
+            calls.append(('create', args))
+            return {'payload': {'result': {'created': [{'id': 'node-real'}], 'revision': 5}}}
+
+        async def prompt(args, state):
+            calls.append(('prompt', args))
+            return {'answer': '已写入提示词'}
+
+        tools = {'create': Tool('create', '创建节点', '', {}, create,
+                    tool_key='local:test:create', effect='write'),
+                 'prompt': Tool('prompt', '写提示词', '', {}, prompt,
+                    tool_key='local:test:prompt', effect='write')}
+        first = {'tool': 'create', 'step_id': 's1', 'args': {}}
+        second = {'tool': 'prompt', 'step_id': 's2', 'depends_on': ['s1'],
+                  'args': {'nodeId': {'ref': {'step_id': 's1', 'pointer': '/result/nodes/0/id'}},
+                           'prompt': '故宫提示词'}}
+        plan = {'steps': [first, second], 'completion_criteria': [
+            {'kind': 'tool_succeeded', 'target': 's1'}, {'kind': 'tool_succeeded', 'target': 's2'}]}
+        fixed = {**second, 'args': {**second['args'],
+            'nodeId': {'ref': {'step_id': 's1', 'pointer': '/result/created/0/id'}}}}
+        store, _, model = await self.run_plan(plan=plan, tools=tools,
+            decisions=[{'kind': 'revise', 'steps': [fixed], 'reason': '按真实回执修正引用'}])
+        try:
+            self.assertEqual(calls, [('create', {}), ('prompt', {'nodeId': 'node-real', 'prompt': '故宫提示词'})])
+            run = await store.run('run1')
+            self.assertEqual(run['status'], 'succeeded')
+            self.assertEqual(run['plan_version'], 2)
+            actions = await store.actions_of('run1')
+            self.assertEqual(len(actions), 2)
+            self.assertEqual({row['plan_version'] for row in actions}, {1, 2})
+            self.assertIn('/result/created/0/id', model.decision_inputs[0])
+        finally:
+            await store.close()
+
     async def test_empty_continue_is_rejected_instead_of_spinning(self):
         """片段结束又没有剩余步骤时，continue 就是空转：直接去核对完成条件。"""
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
 
         async def only(args, state):
             return {'answer': '做完了'}
@@ -307,7 +345,7 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
         await store.close()
 
     async def test_wait_input_stops_and_asks_the_user(self):
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
 
         async def listing(args, state):
             return {'payload': {'shots': []}}
@@ -328,7 +366,7 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_finish_without_evidence_is_not_reported_as_success(self):
         """模型说"完成了"不算数：缺产物/回执时不能成功。"""
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
 
         async def nothing(args, state):
             return {'status': 'empty'}
@@ -351,7 +389,7 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_observe_disabled_keeps_the_old_deterministic_behaviour(self):
         """开关关闭：观察点不再叫模型，直接核对完成条件。"""
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
 
         async def listing(args, state):
             return {'payload': {'shots': [{'id': 'shot-a'}]}}
@@ -370,7 +408,7 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_decision_budget_stops_instead_of_spinning(self):
         """决策预算用完：保存已完成事实并停下，不是无限重试。"""
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
 
         async def listing(args, state):
             return {'payload': {'shots': [{'id': 'shot-a'}]}}
@@ -387,7 +425,7 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
         model = FakeModel(plan=plan, decisions=decisions)
         hub = self.hub(store, owner_id='w1')
         import scripts.run_worker as worker
-        from app import nodes as nodes_module
+        from webpage_agent.agent import nodes as nodes_module
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
                 install_tools(tools), \
                 patch.object(nodes_module, 'structured_call', model), \
@@ -421,11 +459,11 @@ class ProgressGuardTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     def hub(self, store, **kwargs):
-        from app.api_hub import Hub
+        from webpage_agent.api.api_hub import Hub
         return Hub(store, **kwargs)
 
     async def test_repeated_fingerprint_stops_the_loop(self):
-        from app.tools import Tool
+        from webpage_agent.tools.core import Tool
 
         store = new_store()
         await seed_run(store)
@@ -447,7 +485,7 @@ class ProgressGuardTests(unittest.IsolatedAsyncioTestCase):
         model = FakeModel(plan=plan, decisions=decisions)
         hub = self.hub(store, owner_id='w1')
         import scripts.run_worker as worker
-        from app import nodes as nodes_module
+        from webpage_agent.agent import nodes as nodes_module
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
                 install_tools(tools), \
                 patch.object(nodes_module, 'structured_call', model), \

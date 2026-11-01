@@ -25,10 +25,10 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from app import execution_control                # noqa: E402
-from app.api_hub import Hub                      # noqa: E402
-from app.config import settings                  # noqa: E402
-from app.logging_setup import setup_logging      # noqa: E402
+from webpage_agent.governance import execution_control
+from webpage_agent.api.api_hub import Hub
+from webpage_agent.core.config import settings
+from webpage_agent.observe.logging_setup import setup_logging
 
 logger = logging.getLogger('worker')
 
@@ -123,9 +123,15 @@ async def drain_jobs(hub: Hub, worker_id: str, limit: int = 5) -> int:
             break
         try:
             if job['kind'] == 'session_summary':
-                from app import memory as memory_module
-                await memory_module.compact(
-                    hub.store, job['payload'].get('session_id', ''))
+                from webpage_agent.core import memory as memory_module
+                from webpage_agent.governance import core as governance
+                session_id = job['payload'].get('session_id', '')
+                session = await hub.store.session(session_id) or {}
+                token = governance.bind(hub.store, session.get('tenant_id', 'default'))
+                try:
+                    await memory_module.compact(hub.store, session_id)
+                finally:
+                    governance.unbind(token)
             else:
                 raise RuntimeError(f'未知后台作业 {job["kind"]}')
             await hub.store.finish_job(job['job_id'])
@@ -143,6 +149,10 @@ async def drain_jobs(hub: Hub, worker_id: str, limit: int = 5) -> int:
 
 async def main_loop(hub: Hub, worker_id: str, once: bool,
                     jobs_only: bool, interval: float) -> None:
+    from webpage_agent.observe import runtime_check
+    problems = runtime_check.issues()
+    if problems:
+        raise RuntimeError('; '.join(problems))
     logger.info('启动 worker_id=%s', worker_id)
     print(f'[worker] 启动 worker_id={worker_id}')
     ready = getattr(hub.store, 'ready', None)
@@ -155,7 +165,7 @@ async def main_loop(hub: Hub, worker_id: str, once: bool,
     while True:
         worked = await drain_jobs(hub, worker_id)
         if settings.async_tool_runtime_enabled:
-            from app import external_tasks
+            from webpage_agent.core import external_tasks
             try:
                 worked += await external_tasks.poll_due(
                     hub.store, worker_id=worker_id)
@@ -183,7 +193,7 @@ async def run_worker(worker_id: str, once: bool, jobs_only: bool,
     try:
         await main_loop(hub, worker_id, once, jobs_only, interval)
     finally:
-        from app.integrations.mcp_adapter import close_stdio_sessions
+        from webpage_agent.integrations.mcp_adapter import close_stdio_sessions
         await close_stdio_sessions()
         await hub.store.close()
 

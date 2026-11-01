@@ -17,8 +17,10 @@ if str(_ROOT) not in sys.path:
 
 import jwt
 
-from app import auth_connections, scene_context, ticket_auth
-from app.integrations import mcp_adapter
+from webpage_agent.api import auth_connections
+from webpage_agent.agent import scene_context
+from webpage_agent.governance import ticket_auth
+from webpage_agent.integrations import mcp_adapter
 from tests.test_ticket_auth import ISS, PRIVATE_A, connection, sign
 
 
