@@ -5,8 +5,8 @@
 
 ```bash
 python -m scripts.list_capabilities                    # 全部服务端
-python -m scripts.list_capabilities --server openmontage
-python -m scripts.list_capabilities --server openmontage --only-unavailable
+python -m scripts.list_capabilities --server <server_id>
+python -m scripts.list_capabilities --server <server_id> --only-unavailable
 ```
 """
 import argparse

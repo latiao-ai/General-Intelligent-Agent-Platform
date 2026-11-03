@@ -119,36 +119,6 @@ python --version             # Python 3.12.15
 > 改了 `.env` 必须重启进程才生效。
 > `LLM_MODEL` 必须与网关实际可用模型名完全一致（`model_not_found` 多为名称不匹配）。
 
-### 接入本机 OpenMontage
-
-客户端已支持 `stdio`：由客户端启动 OpenMontage 子进程，通过标准输入输出通信。
-在 `.env` 的 `MCP_SERVERS` 数组中追加以下对象；原有发布服务条目和默认服务设置继续保留：
-
-```json
-{
-  "id": "openmontage",
-  "title": "OpenMontage 本地视频制作",
-  "transport": "stdio",
-  "stdio_command": "/opt/anaconda3/bin/conda",
-  "stdio_args": [
-    "run", "--no-capture-output", "-n", "openmontage",
-    "python", "-m", "openmontage_mcp.server",
-    "--project-dir", "/Users/latiao/Desktop/demo demo/webpage-agent-demo/openmontage-zh-mcp"
-  ]
-}
-```
-
-`.env` 中 `MCP_SERVERS` 的实际值是完整 JSON 数组，须放在同一行。
-`conda run` 让 Server 使用独立的 `openmontage` 环境；客户端继续使用 `demo` 环境。
-`--no-capture-output` 保证 MCP 消息直接通过输入输出传递。换机器时修改 Conda 和项目路径。
-无需在另一个终端手动启动 Server。更新配置后重启客户端，然后执行
-`python -m scripts.list_mcp_tools`，应能在 `openmontage` 下发现 9 个业务工具。
-多个服务端同时配置时，模型看到的工具名如 `mcp__openmontage__list_capabilities`。
-
-stdio 会话现已在同一进程中复用，默认空闲 600 秒后关闭；
-`STDIO_SESSION_IDLE_SECONDS=0` 才恢复每次调用结束关闭。OpenMontage 的异步任务若只保存在
-子进程内存中，空闲回收或进程重启后仍不能继续查询；正式恢复需要服务端持久任务号和匹配的异步查询合同。
-
 ## 3. 运行
 
 ### 视频类需求走 MCP（本地能力包已移除）
@@ -718,7 +688,7 @@ async def save_note(args, state):
 这种服务端必须多配两项，否则模型只能**猜**内部工具名：
 
 ```jsonc
-{"id": "openmontage", "transport": "stdio", ...,
+{"id": "video_tools", "transport": "stdio", ...,
  "capability_tool": "list_capabilities",   // 清单工具
  "tool_name_arg": "name"}                  // 内部工具名参数
 ```
@@ -739,7 +709,7 @@ async def save_note(args, state):
 不用让模型猜：
 
 ```jsonc
-{"id": "openmontage", ..., "tool_hints": {
+{"id": "video_tools", ..., "tool_hints": {
    "piper_tts": "model 要传语音模型绝对路径（~/.piper-voices/zh_CN-huayan-medium.onnx）"}}
 ```
 
@@ -754,10 +724,10 @@ async def save_note(args, state):
 远端产物不要用 `artifact_exists` 当完成条件。
 
 某一家自己的说法写在该服务端的 `prompt_rules` 里，只在它的工具进入本轮清单时拼进
-规划提示词。例如 OpenMontage：
+规划提示词。例如某个视频制作服务端：
 
 ```jsonc
-{"id": "openmontage", ..., "prompt_rules":
+{"id": "video_tools", ..., "prompt_rules":
  "用户要生成新视频、图片或声音时，用生成或合成能力（video_generation、image_generation、video_post）。analysis 工具（如 video_analyzer）只分析已有视频，不能凭空生成。render_video 调度前先确认内部的合成、字幕工具可用。"}
 ```
 
@@ -938,6 +908,6 @@ elicitation），本平台没有对应的交互通道，所以既不判成功也
 
 `tests/test_mcp_tasks.py`（22 条）覆盖映射、开关、通道切换、轮询推进、默认值一致性
 与合同路线的回归保护。**但没有对真实的 Tasks 服务端跑过端到端**——当前接入的服务端
-（openmontage、beeftv）都没有声明 `taskSupport`，走的是 `forbidden`。
+（beeftv）没有声明 `taskSupport`，走的是 `forbidden`。
 首次接入声明了 `taskSupport` 的服务端时，必须补一次真实联调。
 

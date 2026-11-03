@@ -138,11 +138,10 @@ class ProtocolContractTests(unittest.TestCase):
         self.assertIsNone(async_contracts.match_id(mcp_tasks.PROTOCOL_CONTRACT_ID, 99))
 
     def test_real_contracts_still_load(self):
-        """保留身份不能把出厂合同顶掉：openmontage 的两份还在。"""
+        """协议保留身份不能混入出厂合同清单。"""
         loaded = async_contracts.load()
         ids = {row.contract_id for row in loaded}
         self.assertNotIn(mcp_tasks.PROTOCOL_CONTRACT_ID, ids)
-        self.assertIn('openmontage-video-v1', ids)
 
 
 class _AdapterSpy:
@@ -323,8 +322,11 @@ class ProtocolPollTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(results[0]['execution_status'], 'failed')
 
     async def test_contract_route_is_untouched(self):
-        """回归保护：合同路线仍然走状态查询工具，且不会被协议分支顶掉。"""
-        store = _PollStore('openmontage-video-v1', tool_key='mcp:openmontage:render_video')
+        """回归保护：合同路线仍然走状态查询工具，且不会被协议分支顶掉。
+
+        出厂合同文件当前为空，这里用一份临时合同验证合同路由机制本身。
+        """
+        store = _PollStore('probe-video-v1', tool_key='mcp:probe:render_video')
         called = {}
 
         async def fake_get_task(*a, **kw):
@@ -347,7 +349,18 @@ class ProtocolPollTests(unittest.IsolatedAsyncioTestCase):
             with tempfile.TemporaryDirectory() as folder, \
                     assigned(settings, async_tool_runtime_enabled=True,
                              artifact_dir=Path(folder)):
-                await external_tasks.poll_due(store, worker_id='w1')
+                contract_file = Path(folder) / 'async_tools.json'
+                contract_file.write_text(
+                    '{"contracts": [{"contract_id": "probe-video-v1", '
+                    '"version": 1, "submit_tool_key": "mcp:probe:render_video", '
+                    '"remote_id_pointer": "/job_id", '
+                    '"status_tool_key": "mcp:probe:get_job_status", '
+                    '"status_id_argument": "job_id", '
+                    '"status_pointer": "/status", '
+                    '"status_map": {"completed": "succeeded"}, '
+                    '"recoverable": true}]}', encoding='utf-8')
+                with assigned(settings, async_contracts_file=str(contract_file)):
+                    await external_tasks.poll_due(store, worker_id='w1')
         finally:
             (mcp_adapter.task_status, mcp_adapter.call_tool,
              mcp_connections.bearer_for) = originals
