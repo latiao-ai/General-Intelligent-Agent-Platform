@@ -153,6 +153,22 @@ async def collect(dsn: str, days: int | None) -> dict:
             f'FROM run_decisions{err_where} GROUP BY 1 ORDER BY 2 DESC LIMIT 10'), params)
         out['planning']['decision_errors'] = [
             {'error_code': str(r[0]), 'count': int(r[1])} for r in rows]
+
+        # 假阴性护栏：窗口内 0 行但全表非空 → 时间过滤失效（格式/时区不一致）。
+        # 绝不能静默显示成"无记录"，那会被读成"一切正常"。
+        if days:
+            warnings = []
+            for table, hit in (
+                    ('external_tasks', out['external_tasks']['total']),
+                    ('run_decisions', out['planning']['runs_with_decisions'])):
+                rows = await _fetch(conn, f'SELECT count(*) FROM {table}', [])
+                everything = int(rows[0][0]) if rows else 0
+                if everything and not hit:
+                    warnings.append(
+                        f'{table} 全表 {everything} 行，但最近 {days} 天窗口内 0 行，'
+                        '时间过滤可能失效（created_at 格式/时区不一致）')
+            if warnings:
+                out['warnings'] = warnings
     return out
 
 
