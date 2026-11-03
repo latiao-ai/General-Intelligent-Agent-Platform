@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 # 读到空环境 → 解析出 0 个服务端，而且 `LAST_ERROR` 仍为空串，属于最难查的
 # 那类"静默为空"。生产不受影响（APP_ENV=production 本来就不读 .env），
 # 但开发/联调用例会被这一行差异坑到。见 tests/test_mcp_env_loading.py。
-from webpage_agent.core.config import settings
+from webpage_agent.core.config import settings  # noqa: F401  # 导入即触发 .env 加载
 
 logger = logging.getLogger(__name__)
 

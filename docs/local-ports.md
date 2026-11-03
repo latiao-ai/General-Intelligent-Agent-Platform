@@ -16,6 +16,24 @@ python -m scripts.serve_frontend
 
 两个命令分别在终端运行。8001 页面和画布会话 API 通过 BeeFTV 8004 的 `/api/hub/workbench/` 身份代理访问中台 8002，沿用 BeeFTV 的 HttpOnly 登录 Cookie；中台 Cookie 留在平台服务端。8001 的 `/healthz` 直接转发到 8002。
 
+一键起后端 + Worker（+ 前端代理）：
+
+```sh
+python -m scripts.serve_dev --with-frontend
+```
+
+端口被占用（上一次没退干净、孤儿进程还占着 8001/8002）时：
+
+```sh
+python -m scripts.serve_dev --with-frontend --force       # 结束本项目残留进程（含残留 Worker）后重启
+python -m scripts.serve_dev --with-frontend --auto-port   # 不动任何进程，自动换到后一个空闲端口
+python -m scripts.serve_dev --with-frontend --force-any   # 连非本项目的占用进程也结束（确认过再用）
+```
+
+`--force` 只认命令行里带 `scripts.serve_api` / `serve_frontend` / `serve_dev` / `run_worker`、
+且工作目录是本仓库的进程；遇到别人的进程会打印 pid 与命令后拒绝。`--auto-port` 不结束任何
+进程，结束时打印实际使用的地址。
+
 先在 8003 登录，再打开 8001。页面会选择最近对话对应的画布，也可用 `?workspace_id=画布ID` 指定画布。侧栏和独立页面使用同一画布会话；独立页面每三秒检查外部新增消息，运行中的任务继续使用事件流。平台允许的前端来源应包含 `http://127.0.0.1:8001`。此页面显示对话、工具执行记录和画布上下文，画布可视化仍在 BeeFTV 中展示。
 
 在 BeeFTV 项目目录运行 `./start.sh`，默认启动 8003 和 8004。

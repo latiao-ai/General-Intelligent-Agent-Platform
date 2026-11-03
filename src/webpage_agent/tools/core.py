@@ -527,7 +527,7 @@ def unusable_reason(server_id: str) -> str:
     if usable:
         return ''
     hints = []
-    for name, item in caps.items():
+    for item in caps.values():
         install = (item.get('install') or '').strip()
         if install and install not in hints:
             hints.append(install)
@@ -679,10 +679,32 @@ def mcp_status() -> dict:
             'servers': mcp_servers.status()}
 
 
-# 这些键属于图状态本身，回执里的同名字段不能覆盖它们
-_STATE_KEYS = frozenset({'status', 'answer', 'artifact', 'documents', 'plan',
-                         'errors', 'usage', 'deployment', 'mcp_calls', 'outcome',
-                         'failure', 'step_outputs', 'step_index', 'documents'})
+# 这些键属于图状态本身，回执里的同名字段不能覆盖它们。
+#
+# 覆盖范围 = `AgentState` 里所有**标量**字段（str/int/bool/float）。非标量字段
+# （documents/plan/usage…）本来就过不了下面那层 `isinstance` 判断，列在这里只是
+# 多一层防御。曾经漏了 22 个标量键（run_id / task_id / plan_version / intent_version
+# 都在其中）——服务端回执里只要带同名标量，就会被提到步骤输出并 `merged.update()`
+# 进图状态，等于外部可以改写本次运行的运行号与计划版本（CAS 的比较基准）。
+# `tests/test_state_key_guard.py` 会把"漏键"钉住，别手工删。
+_STATE_KEYS = frozenset({
+    # 非标量（防御性保留）
+    'plan', 'documents', 'artifact', 'deployment', 'mcp_calls', 'errors',
+    'usage', 'outcome', 'step_outputs',
+    # 结果与展示
+    'status', 'answer', 'failure',
+    # 运行身份与游标
+    'task_id', 'run_id', 'artifact_dir', 'step_index', 'step_label',
+    'original_goal', 'user_input', 'entry_route',
+    # 版本与补充输入
+    'intent_version', 'processed_intent_version', 'plan_version',
+    'intent_changed', 'revision_count',
+    # 决策与观察
+    'decision_id', 'decision_kind', 'decision_reason', 'next_route',
+    'no_progress', 'no_progress_limit', 'observation_seq', 'needs_reconciliation',
+    'elapsed_seconds', 'asked_questions', 'clarification', 'pending_inputs',
+    'resume_plan', 'timings',
+})
 
 
 # 这些字样说明失败原因是"服务端缺依赖/缺资源"，而不是我们的参数写错。

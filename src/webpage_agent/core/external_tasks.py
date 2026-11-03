@@ -239,7 +239,7 @@ async def poll_due(store, *, worker_id: str, querier=None, limit: int | None = N
             continue
         try:
             payload = await ask(task, contract)
-        except Exception as exc:                     # noqa: BLE001
+        except Exception:                            # noqa: BLE001  查询失败要重试，不判结论
             logger.warning('查询外部任务失败 id=%s', task.get('external_task_id'),
                            exc_info=True)
             version = int(task.get('version') or 1)

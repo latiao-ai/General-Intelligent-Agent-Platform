@@ -57,10 +57,33 @@ ANSWER_USING_TOOL_RESULTS_SYSTEM = (
 async def _answer_directly(args: dict, state: dict) -> dict:
     question = str(args.get('question') or state.get('user_input') or '')
     results = tool_results_text(state)
+    # 本地能力包（fetch_pages / web_search / render_sources_html）的产物**不进**
+    # `mcp_calls`——那个列表只装远端 MCP 调用。只看 `tool_results_text` 会把
+    # “本轮已经抓到正文”误判成“本轮没联网”，于是如实回答变成如实撒谎：
+    # 实测 run 里 fetch_pages 拿到 14908 字符正文、HTML 也生成了，回答却说
+    # “我无法读取网页内容”。所以这里补一道正文兜底（与 answer_with_sources 同源）。
+    documents, origin = usable_documents(state)
     if results:
         system = ANSWER_USING_TOOL_RESULTS_SYSTEM
         prefix = f'工具返回的数据：\n{results}\n\n问题：{question}'
         emit(action('直接回答', '基于本轮工具返回的数据', '💬'))
+    elif documents:
+        # 有正文就必须基于正文说话；“不主动检索”的语义不变，只是不否认已有事实。
+        selected, _ = _select_sources(state, documents)
+        material = '\n\n'.join(
+            f'《{item["title"]}》\n{item["text"]}' for item in selected)
+        truncated_notes = [f'《{item["title"]}》原文 {item["chars_full"]} 字，'
+                           f'仅取前 {len(item["text"])} 字'
+                           for item in selected if item.get('truncated')]
+        if truncated_notes:
+            material += ('\n\n[注意] 以下资料被截断，回答时不要把这些片段'
+                         '当成全文，必要时说明：\n' + '\n'.join(truncated_notes))
+        system = ANSWER_USING_TOOL_RESULTS_SYSTEM
+        prefix = f'资料：\n{material}\n\n问题：{question}'
+        # 沿用上一轮的正文时不能说“本轮已取得”，那是两件事
+        detail = (f'沿用上一轮的 {len(selected)} 个来源' if origin
+                  else f'基于本轮已取得的 {len(selected)} 个来源')
+        emit(action('直接回答', detail, '💬'))
     else:
         system = ANSWER_SYSTEM
         prefix = f'问题：{question}'
