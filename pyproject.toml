@@ -33,6 +33,8 @@ files = [
     "src/webpage_agent/observe/telemetry.py",
     "src/webpage_agent/store/migrations.py",
     "scripts/package_release.py",
+    "src/webpage_agent/governance",
+    "src/webpage_agent/tools/tool_policy.py",
 ]
 follow_imports = "skip"
 ignore_missing_imports = true
