@@ -635,11 +635,11 @@ python -m scripts.mock_identity_platform --port 8090 --hub http://127.0.0.1:8010
 
 ## 4. 状态、outcome 与展示标签
 
-三层分工（实现见 `src/webpage_agent/core/outcome.py`）：
+三层分工（实现见 `src/webpage_agent/core/outcome.py`）。每个状态如何进入和离开、四种版本计数器、三套失败分段，见 [运行状态机](state-machine.md)。
 
 | 层 | 存在哪 | 词汇 | 会不会随能力增长 |
 |---|---|---|---|
-| 状态机 | `tasks.status` / `runs.status` | 11 个通用值：`queued` `running` `reconciling` `waiting_input` `waiting_approval` `succeeded` `partially_succeeded` `needs_reconcile` `failed` `cancelled` `interrupted` | **不会**。接第 N 个 MCP Server 只让 `tool_key` 的行数变多 |
+| 状态机 | `tasks.status` / `runs.status` | 12 个通用值：`queued` `running` `reconciling` `waiting_input` `waiting_approval` `paused` `succeeded` `partially_succeeded` `needs_reconcile` `failed` `cancelled` `interrupted` | **不会**。接第 N 个 MCP Server 只让 `tool_key` 的行数变多 |
 | outcome | `state.outcome`（随任务持久化、随接口返回） | `{kind, produced[], effects[], answered, unverified}` | 会。它是数据，可以有无穷多种组合 |
 | 展示标签 | 接口字段 `status` / 前端文案表 | `answered` `local_ready` `deployed` `deploy_needs_check` `compensated` … | 会，而且随便加——它不进状态机、不写库 |
 
