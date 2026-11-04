@@ -3,15 +3,19 @@ import hashlib
 import math
 import time
 import uuid
+from abc import ABC, abstractmethod
 from contextvars import ContextVar
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 import logging
 from datetime import datetime, timezone
 
 from webpage_agent.core.config import settings
 
 logger = logging.getLogger(__name__)
-_scope = ContextVar('provider_scope', default=None)
+# bind() 写入 (store, tenant_id, run_id)；没绑定时是 None。
+# 不标类型的话，default=None 会把变量收成 ContextVar[None]，set 元组就对不上。
+_scope: ContextVar['tuple[GovernanceStore, str, str] | None'] = ContextVar(
+    'provider_scope', default=None)
 
 
 class QuotaExceeded(RuntimeError):
@@ -113,7 +117,37 @@ async def metered(**kwargs):
         await finish(reservation, succeeded=success)
 
 
-class GovernanceStore:
+class GovernanceStore(ABC):
+    """额度、限流和用量查询。
+
+    借连接、取行、执行语句不写在这个类里：那是具体仓储的事，目前只有
+    `PostgresStore`。下面四个方法是这些查询的依赖，声明在基类上，子类必须实现。
+    这样方法体能通过类型检查，也不会再假装基类自己有一套连接实现。
+    """
+
+    @abstractmethod
+    def _lease(self, *, bootstrap: bool = False) -> AbstractAsyncContextManager[object]:
+        """借一条连接：正常结束提交，异常回滚。`bootstrap` 为真时跳过就绪检查。"""
+        raise NotImplementedError
+
+    @staticmethod
+    @abstractmethod
+    async def _one(conn, sql: str, params=()):
+        """执行语句并取第一行；没有行时返回 None。"""
+        raise NotImplementedError
+
+    @staticmethod
+    @abstractmethod
+    async def _all(conn, sql: str, params=()):
+        """执行语句并取全部行。"""
+        raise NotImplementedError
+
+    @staticmethod
+    @abstractmethod
+    async def _run(conn, sql: str, params=()):
+        """执行语句。要 rowcount 时用返回的游标。"""
+        raise NotImplementedError
+
     async def rate_limit(self, scope: str, limit: int, *, now_ts=None) -> tuple[bool, int]:
         current = time.time() if now_ts is None else now_ts
         window = int(current // 60) * 60

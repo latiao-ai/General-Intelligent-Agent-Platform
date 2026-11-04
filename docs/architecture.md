@@ -73,6 +73,10 @@ python -m scripts.serve_dev --with-frontend
 bash scripts/run_tests.sh
 ```
 
+`python -m mypy` 不带参数时按 `pyproject.toml` 的 `[tool.mypy] files` 检查。
+目前是 `observe/telemetry.py`、`store/migrations.py`、`scripts/package_release.py`、
+整个 `governance/`，以及 `tools/tool_policy.py`。
+
 单进程分别启动（调试用）：
 
 ```bash

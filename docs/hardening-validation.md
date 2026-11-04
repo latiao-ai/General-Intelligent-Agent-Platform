@@ -22,7 +22,7 @@
 ## 静态与依赖检查
 
 - Ruff 正确性规则覆盖 app、scripts、tests：通过。
-- 渐进式 mypy 检查 telemetry、migrations、package_release 三个模块：通过；没有声称全仓已完成严格类型标注。
+- 渐进式 mypy：当时检查 telemetry、migrations、package_release 三个模块并通过；没有声称全仓已完成严格类型标注。当前范围以 `pyproject.toml` 的 `[tool.mypy] files` 为准，已加上 `src/webpage_agent/governance/` 与 `src/webpage_agent/tools/tool_policy.py`。
 - Python 全仓 compileall、浏览器内联 JavaScript 的 `node --check`：通过。
 - 本机与 Linux 镜像内 `pip check`：无依赖冲突。
 - `git diff --check`：通过。

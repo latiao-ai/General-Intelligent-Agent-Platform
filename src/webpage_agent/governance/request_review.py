@@ -50,6 +50,10 @@ def readback_issues(steps, catalog):
     last_write, last_read = {}, {}
     for index, step in enumerate(steps):
         tool = by_name.get(step.get('tool'))
+        # 字典里没有这个工具时 get 得到 None。getattr(None, ..., '') 本来就会
+        # 落到下面的 continue，这里先写明，避免对 None 取 effect。
+        if tool is None:
+            continue
         server = getattr(tool, 'server_id', '')
         if not server:
             continue
@@ -74,9 +78,12 @@ def bounded(value, depth=0):
         if len(value) > 40: result['__omitted_fields'] = len(value) - 40
         return result
     if isinstance(value, list):
-        result = [bounded(v, depth + 1) for v in value[:16]]
-        if len(value) > 16: result.append({'omitted_items': len(value) - 16})
-        return result
+        # 不跟上面的 dict 分支共用 `result`：mypy 会把两次赋值收成同一个变量，
+        # 先看到 dict 再给 list 就报赋值冲突，接着 append 也对不上。
+        items = [bounded(v, depth + 1) for v in value[:16]]
+        if len(value) > 16:
+            items.append({'omitted_items': len(value) - 16})
+        return items
     return value
 
 
@@ -133,7 +140,9 @@ def contradicts_contract(detail, provable, outputs):
 def contract_contradictions(issues, steps, catalog):
     """剔掉与工具合同矛盾的审查否决，并降级成 warning 留档。"""
     by_name = {tool.name: tool for tool in catalog}
-    declared, used, outputs = set(), set(), []
+    declared: set[str] = set()
+    used: set[str] = set()
+    outputs = []
     for step in steps or ():
         tool = by_name.get(step.get('tool'))
         if tool is None:
