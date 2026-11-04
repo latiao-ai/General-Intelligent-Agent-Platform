@@ -11,7 +11,7 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from webpage_agent.agent import nodes
+from webpage_agent.agent import nodes, refs
 from webpage_agent.observe import observation
 
 
@@ -88,7 +88,7 @@ class ZipStrictnessTests(unittest.TestCase):
                         'resolved': False}],
             'step_outputs': {},
         }
-        with patch.object(nodes, '_align_repair_steps',
+        with patch.object(refs, '_align_repair_steps',
                           return_value=[{'step_id': 's1', 'tool': 'a', 'args': {}}]):
             with self.assertRaises(ValueError):
                 nodes._prepared_reference_steps(state, [])

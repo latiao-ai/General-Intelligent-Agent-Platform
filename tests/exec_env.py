@@ -212,7 +212,7 @@ def override_settings(**changes):
     from webpage_agent.core.config import settings as real_settings
 
     fake = replace(real_settings, **changes)
-    modules = ('webpage_agent.api.routes', 'webpage_agent.api.api_hub', 'webpage_agent.api.main', 'webpage_agent.agent.nodes', 'webpage_agent.core.services',
+    modules = ('webpage_agent.api.routes', 'webpage_agent.api.api_hub', 'webpage_agent.api.main', 'webpage_agent.agent.nodes', 'webpage_agent.agent.decide', 'webpage_agent.agent.plan_validate', 'webpage_agent.agent.refs', 'webpage_agent.core.services',
                'webpage_agent.tools.core', 'webpage_agent.agent.context', 'webpage_agent.core.memory', 'webpage_agent.capabilities.base',
                'webpage_agent.capabilities.web', 'webpage_agent.capabilities.export',
                'webpage_agent.capabilities.answers', 'webpage_agent.capabilities.publishing',

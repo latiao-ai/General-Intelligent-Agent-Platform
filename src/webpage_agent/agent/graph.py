@@ -30,7 +30,11 @@ import time
 from langgraph.graph import StateGraph, START, END
 from webpage_agent.observe.events import emit, stage_end, stage_start
 from webpage_agent.core.schemas import AgentState
+from webpage_agent.agent import decide
 from webpage_agent.agent import nodes
+
+# 观察、决策、异步等待的实现在 decide.py。图仍用原来的节点名接线。
+_DECIDE_NODES = frozenset({'observe_result', 'decide_next', 'wait_async'})
 
 # 节点清单；执行器计时与前端耗时表都以此为准。
 # run_step 会自我循环，每次只跑计划里的一步——故意**不**套 instrument，
@@ -137,7 +141,7 @@ def build_graph(checkpointer_=None):
     """规划 → 执行 → 观察 → （决策）→ 核对：中途可纳入补充、也可按结果调整。"""
     graph = StateGraph(AgentState)
     for name in NODE_NAMES:
-        node = getattr(nodes, name)
+        node = getattr(decide if name in _DECIDE_NODES else nodes, name)
         graph.add_node(name, node if name in PLAIN_NODES
                        else instrument(name, node))
     graph.add_edge(START, 'intake')
@@ -150,10 +154,10 @@ def build_graph(checkpointer_=None):
                                 _map('persist_plan', 'verify_completion'))
     # 每个工具之后都做程序观察：便宜、无模型请求；要不要叫模型由观察决定
     graph.add_edge('run_step', 'observe_result')
-    graph.add_conditional_edges('observe_result', nodes.route_after_observation,
+    graph.add_conditional_edges('observe_result', decide.route_after_observation,
                                 _map('run_step', 'revise_plan', 'decide_next',
                                      'verify_completion', 'wait_async'))
-    graph.add_conditional_edges('decide_next', nodes.route_after_decision,
+    graph.add_conditional_edges('decide_next', decide.route_after_decision,
                                 _map('run_step', 'persist_plan',
                                      'verify_completion'))
     graph.add_conditional_edges('verify_completion', _next_after_verify,
