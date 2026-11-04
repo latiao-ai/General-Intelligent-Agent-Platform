@@ -20,7 +20,7 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from webpage_agent.store import idempotency
 from webpage_agent.core import memory as memory_module
@@ -152,19 +152,30 @@ async def guard_origin(request: Request, call_next):
         telemetry.trace_id.reset(trace)
 
 
-class ProfileRequest(BaseModel):
+class StrictBody(BaseModel):
+    """请求体的公共基类：未知字段一律拒绝。
+
+    默认的 pydantic 行为是把不认识的字段静默丢掉，于是客户端把 `message` 写成
+    `mesage`、或者把该放请求头的键塞进请求体，服务端都"照常"受理，问题要等到
+    业务结果不对才被发现。这类静默容错在内部调用里尤其危险：调用方以为参数
+    生效了。这里统一改成 422，让契约不符在第一次请求就现形。
+    """
+    model_config = ConfigDict(extra='forbid')
+
+
+class ProfileRequest(StrictBody):
     # 画像就是一份 Markdown，直接收原文：手改、粘贴、整段重写都走同一条路。
     text: str = Field(default='', max_length=20000)
     version: int | None = None
 
 
-class MemoryRequest(BaseModel):
+class MemoryRequest(StrictBody):
     summary: str = Field(default='', max_length=4000)
     # 关键事实用「键：值」多行文本编辑，与画像保持同一种手感
     facts: str = Field(default='', max_length=4000)
 
 
-class RunInputRequest(BaseModel):
+class RunInputRequest(StrictBody):
     """给**当前任务**的补充要求。
 
     `request_id` 由客户端生成并持久保存：响应丢失时用同一个 ID 重发，服务端会
@@ -179,7 +190,7 @@ class RunInputRequest(BaseModel):
     task_id: str | None = Field(default=None, max_length=64)
 
 
-class PlatformContextRequest(BaseModel):
+class PlatformContextRequest(StrictBody):
     """Any registered platform can preview its signed scene without starting work."""
     context: dict | None = None
     context_assertion: str | None = Field(default=None, max_length=8192)
@@ -188,6 +199,13 @@ class PlatformContextRequest(BaseModel):
 class TaskRequest(PlatformContextRequest):
     message: str = Field(min_length=1, max_length=10000)
     session_id: str | None = None
+    # 这两个字段不是中台的输入，是给**宿主代理**读的：宿主据此确定目标对象、
+    # 校验归属，再自己生成 context_assertion。中台只认签名过的 context，
+    # 不采信这里的值（docs/platform-integration.md 明确写了不得直接转为可信现场）。
+    # 之所以声明出来而不是当未知字段拒掉：代理可能原样转发，收紧后会把宿主
+    # 接入模式的请求打成 422，而这两个字段本身不承载任何信任。
+    workspace_id: str | None = Field(default=None, max_length=200)
+    selected_ids: list[str] | None = Field(default=None, max_length=500)
     # 也可以放在 Idempotency-Key 头里；两处都给时以头为准。
     idempotency_key: str | None = Field(default=None, max_length=200)
     # 平台后端签名过的当前项目 / 选中对象。ticket 模式下必须带 context_assertion。
@@ -198,7 +216,7 @@ def sse(event: dict) -> str:
     return f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
-class ExchangeRequest(BaseModel):
+class ExchangeRequest(StrictBody):
     """平台后端签发的**登录票据**（JWT，一次性、短期）。
 
     注意：票据只能拿来兑换，**不能**当业务接口的凭证用。
@@ -973,7 +991,7 @@ def _reject_reserved_scope(tenant_id: str, platform_id: str = '') -> None:
             detail='通用（platforms=["*"]）绑定只能由运维脚本登记，不能经管理 API 创建')
 
 
-class ServerBindingRequest(BaseModel):
+class ServerBindingRequest(StrictBody):
     tenant_id: str = Field(min_length=1, max_length=80)
     server_id: str = Field(min_length=1, max_length=80)
     transport: str = 'streamable_http'
@@ -981,7 +999,7 @@ class ServerBindingRequest(BaseModel):
     enabled: bool = True
 
 
-class CredentialBindingRequest(BaseModel):
+class CredentialBindingRequest(StrictBody):
     tenant_id: str = Field(min_length=1, max_length=80)
     server_id: str = Field(min_length=1, max_length=80)
     subject_kind: str = 'tenant'
@@ -990,7 +1008,7 @@ class CredentialBindingRequest(BaseModel):
     platform_id: str = Field(default='', max_length=80)
 
 
-class ToolPolicyRequest(BaseModel):
+class ToolPolicyRequest(StrictBody):
     tenant_id: str = Field(min_length=1, max_length=80)
     tool_key: str = Field(min_length=1, max_length=200)
     role: str = ''
@@ -999,7 +1017,7 @@ class ToolPolicyRequest(BaseModel):
     enabled: bool = True
 
 
-class ApproveRequest(BaseModel):
+class ApproveRequest(StrictBody):
     manifest_hash: str = Field(min_length=16, max_length=128)
 
 
