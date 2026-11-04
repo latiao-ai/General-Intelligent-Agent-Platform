@@ -9,14 +9,14 @@ python -m scripts.serve_api --lan --port 8000
 如无法连接，请检查电脑防火墙和 Wi-Fi 的设备隔离设置。多网卡时可能显示默认路由所在网卡的地址。
 `APP_ENV=production` 不允许此 HTTP 联调选项，正式部署使用 HTTPS 代理。默认启动仍只允许本机访问。
 
-> 独立上线请先阅读 [生产部署与运维](docs/production-deployment.md)。发布包使用
+> 独立上线请先阅读 [生产部署与运维](production-deployment.md)。发布包使用
 > `python -m scripts.package_release`，不要直接压缩当前工作目录。
 
 # 通用智能体执行中台
 
-中台目标、边界与对接合同见仓库根目录 [`智能体中台运行机制说明.md`](智能体中台运行机制说明.md)。
+中台目标、边界与对接合同见仓库根目录 [`智能体中台运行机制说明.md`](../智能体中台运行机制说明.md)。
 
-规划故障如何恢复、完整模型请求如何限制上下文，见 [模型请求与恢复策略](docs/model-request-policy.md)。
+规划故障如何恢复、完整模型请求如何限制上下文，见 [模型请求与恢复策略](model-request-policy.md)。
 
 按用户目标生成计划、从已接入的能力里选工具、逐步执行并记录每一次外部调用的中台。
 执行内核与业务解耦：**网页检索、资料转 HTML、发布到 MCP 服务器**只是当前接入的
@@ -602,7 +602,7 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
 - `AUTH_MODE=ticket` 时业务接口一律要求中台会话，**改 `X-DSH-User` 无效**；
 - 退出登录撤销数据库会话；已连上的 SSE 会按 `AUTH_SSE_RECHECK` 周期复查并断开。
 
-> **给客户平台研发的对接合同**：[`智能体中台运行机制说明.md`](智能体中台运行机制说明.md) 第 18 节；具体接入步骤见 [通用宿主平台接入](docs/platform-integration.md)。
+> **给客户平台研发的对接合同**：[`智能体中台运行机制说明.md`](../智能体中台运行机制说明.md) 第 18 节；具体接入步骤见 [通用宿主平台接入](platform-integration.md)。
 > —— 签什么票、怎么换会话、错误码、续期/退出，都在那份里。
 
 ### 本地跑通（两个模拟平台）
