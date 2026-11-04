@@ -112,7 +112,7 @@ python --version             # Python 3.12.15
 | `AUTH_SESSION_COOKIE` / `AUTH_COOKIE_SAMESITE` / `AUTH_COOKIE_SECURE` | 会话 cookie 参数 |
 | `AUTH_SSE_RECHECK` | 长连 SSE 复查登录态的周期，默认 20 秒 |
 | `POLICY_LEGACY_VISIBLE` | 存量 `default` 数据是否对所有登录用户可见，**ticket 模式必须 false** |
-| `DB_POOL_SIZE` | PostgreSQL 连接池上限，默认 4（别超过服务端 `max_connections` ÷ 副本数） |
+| `DB_POOL_SIZE` | PostgreSQL 连接池上限，默认 8（别超过服务端 `max_connections` ÷ 副本数）。一次运行只在写账本和写事件时借连接，但池 4 配并发 16 时突发写入会排到等待超时 |
 | `DB_POOL_TIMEOUT` | 从池里借连接的等待上限（秒），默认 10；等不到就报错，不会无限期挂住请求 |
 | `PROFILE_PATH` | 用户画像文件，默认 `profile/USER.md`（见 3.1.2） |
 
@@ -427,9 +427,14 @@ verify_completion → decide_next（可有限修复）| finalize（核对通过�
 - **结果未定不许猜**。写操作 `in_flight/unknown` 直接转 `needs_reconcile`，
   观察层根本不会走到模型决策；权限拒绝、暂停、失租同样优先走既有门禁。
 
-预算与无进展保护落在库里（`runs.consumed_json`，跨重启累计）：
-`RUN_MAX_PROVIDER_REQUESTS`（含结构化解析重试）、`RUN_MAX_TOOL_CALLS`、
+次数与无进展保护落在库里（`runs.consumed_json`，跨重启累计）：
+`RUN_MAX_PROVIDER_REQUESTS`（默认 32，含结构化解析重试）、`RUN_MAX_TOOL_CALLS`、
 `RUN_MAX_DECISIONS`、`RUN_MAX_REPAIRS`、`RUN_MAX_NO_PROGRESS`。
+token 不进 `consumed_json`：结算时没有执行租约，写 runs 就是没有门禁的越权写。
+每次请求的输入/输出和用途记在 `provider_charges`，运行总量用 SUM 现算。
+`RUN_MAX_TOKENS`（默认 1000000，输入加输出）在下一次模型请求前检查已记账的量，
+超限停在 `waiting_input`（`E_RUN_BUDGET`）。失败请求拿不到 usage 时按上下文窗口
+加上输出上限估算，并用 `tokens_estimated` 标出来。
 "没有进展"按**同查询 + 同结果**判定并停下，不靠文字摘要猜。
 决策本身有台账（`run_decisions`：预留 → 调模型 → 校验 → CAS 提交），
 同一观察的重复执行按稳定 `decision_key` 去重，换 ID 绕不过预算。

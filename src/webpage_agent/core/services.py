@@ -304,11 +304,17 @@ async def structured_call(
     timeout = timeout if timeout and timeout > 0 else None
 
     usages = []
+    # 与 agent.context 的预算用途同一套词，记账不再另起名字。
+    # 工具筛选、请求审查没有单独的预算用途，沿用 transform。
     purpose = {'ExecutionPlan': 'plan', 'RevisedPlan': 'replan',
                'ObservationDecision': 'observe', 'SessionMemory': 'memory_extract'}.get(
                    schema.__name__, 'transform')
     request = user
+    # 结构没过再请求一次才是「修复」。上下文预算仍用原来的用途：
+    # 换一套窗口会把这次还要用的材料裁掉。落账必须分开，否则对账里分不出修格式。
+    repairing = False
     for attempt in range(max(1, attempts)):
+        charge_purpose = 'repair' if repairing else purpose
         messages = _prepare(system, [('user', request)], schema=schema, purpose=purpose)
         if on_draft:
             on_draft(None)
@@ -318,7 +324,8 @@ async def structured_call(
         except OpenAIError:
             raise ModelRequestError('模型配置或认证不可用，请联系管理员检查后恢复任务。') from None
         await _note_provider_request()
-        reservation = await governance.reserve(model=model or settings.llm_model)
+        reservation = await governance.reserve(model=model or settings.llm_model,
+                                               purpose=charge_purpose)
         accumulated = None
         complete = False
         buf = ''                 # 增量累积工具调用参数，避免每次重新拼接全部分片
@@ -375,6 +382,7 @@ async def structured_call(
             if on_draft:
                 on_draft(parsed)
             return parsed, _combine_usage(usages)
+        repairing = True
         repair = ('上次输出未通过结构校验。请按 ' + schema.__name__
                   + ' 的参数定义返回完整对象，补齐必填字段；保留原目标、权限、'
                   '结果落点和完成条件。')
@@ -406,7 +414,8 @@ async def chat_reply(system: str, messages: list[dict], model: str | None = None
         parts = []
         accumulated = None
         complete = False
-        reservation = await governance.reserve(model=model or settings.llm_model)
+        reservation = await governance.reserve(model=model or settings.llm_model,
+                                               purpose='final_answer')
         try:
             timeout = settings.llm_attempt_timeout
             async with asyncio.timeout(timeout if timeout > 0 else None):

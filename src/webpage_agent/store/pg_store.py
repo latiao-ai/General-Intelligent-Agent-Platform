@@ -660,6 +660,24 @@ ALTER TABLE actions ADD COLUMN IF NOT EXISTS external_task_id TEXT NOT NULL DEFA
 -- 已验证的现场上下文（当前项目 / 选中对象）。浏览器自报的 JSON 不能直接当它用。
 ALTER TABLE tasks_meta ADD COLUMN IF NOT EXISTS scene_context_json TEXT NOT NULL DEFAULT '';
 
+-- 费用明细的完整快照。v2 里那张表是给「已经记过基线、还没有这张表」的存量库建的，
+-- 而且建完就不再执行。用途和估算标记必须写在这里，verify_schema 才认得出
+-- 「只改了升级脚本、快照没跟上」。全新库先建这张完整的表，v2 用 IF NOT EXISTS
+-- 让开；已经有旧表的库不重跑 v2，靠 v4_provider_usage_detail 补列和按 run 的索引。
+CREATE TABLE IF NOT EXISTS provider_charges (
+    charge_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, day TEXT NOT NULL,
+    run_id TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+    reserved_micros BIGINT NOT NULL, charged_micros BIGINT NOT NULL,
+    input_tokens BIGINT, output_tokens BIGINT, status TEXT NOT NULL DEFAULT 'reserved',
+    created_at DOUBLE PRECISION NOT NULL, duration_seconds DOUBLE PRECISION,
+    trace_id TEXT NOT NULL DEFAULT '',
+    purpose TEXT NOT NULL DEFAULT '',
+    tokens_estimated BOOLEAN NOT NULL DEFAULT false
+);
+CREATE INDEX IF NOT EXISTS idx_provider_charges_tenant_day ON provider_charges(tenant_id, day);
+-- 按 run 汇总是运营的主路径。只有 (tenant_id, day) 时，这条查询是全表扫。
+CREATE INDEX IF NOT EXISTS idx_provider_charges_run ON provider_charges(run_id);
+
 -- ---------- M6：迁移版本记录 ----------
 CREATE TABLE IF NOT EXISTS schema_migrations (
     migration_id  TEXT PRIMARY KEY,
@@ -1456,6 +1474,9 @@ class PostgresStore(GovernanceStore):
         领不到它）；不给就按入队顺序领一条。子查询上的
         `FOR UPDATE SKIP LOCKED` 是文档 §9.2 明确要求的：两个 Worker 并发
         领取时，第二个直接跳过被锁住的行，而不是等锁再抢同一条。
+
+        这里仍是「每个进程各算各的」：并发上限不跨副本，重租户可以占满一个
+        进程。改领取条件做集群级公平调度是另一量级的改动，这一轮不动。
         """
         stamp = now()
         current = now_ts if now_ts is not None else time.time()

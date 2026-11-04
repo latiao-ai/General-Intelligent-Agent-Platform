@@ -790,14 +790,20 @@ class Hub:
         context_token = execution_control.bind(context)
 
         async def bill_provider_request() -> None:
-            """每次真实的模型请求前扣一次预算（重试也算）。
+            """每次真实模型请求前先扣一次次数，紧接着按已记账 token 决定还能不能发。
 
-            预算落在 `runs.consumed_json` 而不是内存里的 state.usage：
-            进程重启后要接着累计，否则"重启就重置预算"等于没有预算。
+            次数落在 `runs.consumed_json`：进程重启后要接着累计。token 不写进这列——
+            结算发生在请求结束之后，手上没有执行租约（owner 与 epoch），写 runs
+            就是一次没有门禁的越权写。token 只留在 provider_charges，这里用 SUM 读。
+
+            流式 usage 在最后一个分片才到，所以这是事后记账、下一次请求前拦截，
+            不是按最坏情况预留。次数闸先跑、token 闸后跑，谁先超限算谁。
+            重试也走这个钩子，不另开一条路径。
             """
             await self.store.consume_budget(
                 context, run_id=record.run_id, key='provider_requests',
                 limit=settings.run_max_provider_requests)
+            await self.store.enforce_run_token_budget(record.run_id)
 
         budget_token = services.bind_budget(bill_provider_request)
 

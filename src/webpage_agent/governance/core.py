@@ -29,50 +29,71 @@ def unbind(token):
     _scope.reset(token)
 
 
-async def reserve(*, provider='llm', model=''):
-    if not settings.tenant_budget_enabled:
+def _measured_tokens(usage):
+    """只有明确的非负整数输入/输出才算实测。缺字段不能当成 0，否则失败请求会显示成没花钱。"""
+    if not isinstance(usage, dict):
         return None
-    scope = _scope.get()
-    if scope is None:
-        raise RuntimeError('Provider request has no trusted tenant billing scope')
+    incoming, outgoing = usage.get('input_tokens'), usage.get('output_tokens')
+    if type(incoming) is int and type(outgoing) is int and incoming >= 0 and outgoing >= 0:
+        return incoming, outgoing
+    return None
+
+
+def _reservation_micros(provider: str) -> int:
     if provider == 'llm':
-        cost = (settings.llm_context_window * settings.llm_input_price_micros_per_million
-                + settings.llm_output_tokens * settings.llm_output_price_micros_per_million + 999_999) // 1_000_000
-    else:
-        cost = settings.search_request_cost_micros
+        return (settings.llm_context_window * settings.llm_input_price_micros_per_million
+                + settings.llm_output_tokens * settings.llm_output_price_micros_per_million
+                + 999_999) // 1_000_000
+    return settings.search_request_cost_micros
+
+
+async def reserve(*, provider='llm', model='', purpose=''):
+    scope = _scope.get()
+    # 日额度关掉时，没绑运行的直接调用仍不落账，避免单测和本地试跑写进共享库。
+    # 绑了运行就要记账：token 闸和按次查询只读 provider_charges，额度开关不该把用量一起关掉。
+    if scope is None:
+        if settings.tenant_budget_enabled:
+            raise RuntimeError('Provider request has no trusted tenant billing scope')
+        return None
     store, tenant, run_id = scope
     charge_id = uuid.uuid4().hex
     from webpage_agent.observe.telemetry import trace_id, span_id
     await store.reserve_provider_charge(
         charge_id, tenant_id=tenant, run_id=run_id, provider=provider,
-        model=model or settings.llm_model, cost_micros=cost,
+        model=model or settings.llm_model, cost_micros=_reservation_micros(provider),
         max_requests=settings.tenant_daily_provider_requests,
         max_cost_micros=settings.tenant_daily_cost_micros,
-        trace_id=trace_id.get())
+        trace_id=trace_id.get(), purpose=purpose or '',
+        enforce_quota=settings.tenant_budget_enabled)
     parent_span = span_id.get()
     token = span_id.set(uuid.uuid4().hex[:16])
-    logger.info('provider_span_start charge=%s provider=%s model=%s parent_span=%s', charge_id, provider, model or settings.llm_model, parent_span)
-    return store, charge_id, time.monotonic(), token
+    logger.info('provider_span_start charge=%s provider=%s model=%s purpose=%s parent_span=%s',
+                charge_id, provider, model or settings.llm_model, purpose or '', parent_span)
+    return store, charge_id, time.monotonic(), token, provider
 
 
 async def finish(reservation, *, usage=None, succeeded=False):
     if reservation is None:
         return
-    store, charge_id, started, span_token = reservation
-    # Failed/cancelled requests can still be billed. Missing usage keeps the upper bound.
-    tokens = None
-    if succeeded and isinstance(usage, dict):
-        a, b = usage.get('input_tokens'), usage.get('output_tokens')
-        if type(a) is int and type(b) is int and a >= 0 and b >= 0:
-            tokens = a, b
+    store, charge_id, started, span_token, provider = reservation
+    # 失败、取消、超时仍按预留金额保留。有实测 token 就记实测；拿不到才按配置上界估算，
+    # 并用 tokens_estimated 分开。不标的话，最贵的失败在 SUM 里是 NULL，闸门完全看不见。
+    # 搜索与抓取没有 token，不能拿模型窗口去填，否则对账会把检索算成一次满窗口调用。
+    measured = _measured_tokens(usage)
+    estimated = False
+    tokens = measured
+    if tokens is None and provider == 'llm':
+        tokens = (settings.llm_context_window, settings.llm_output_tokens)
+        estimated = True
     actual = None
-    if tokens:
-        actual = (tokens[0] * settings.llm_input_price_micros_per_million
-                  + tokens[1] * settings.llm_output_price_micros_per_million + 999_999) // 1_000_000
+    if succeeded and measured is not None:
+        actual = (measured[0] * settings.llm_input_price_micros_per_million
+                  + measured[1] * settings.llm_output_price_micros_per_million
+                  + 999_999) // 1_000_000
     try:
         await store.settle_provider_charge(charge_id, actual_micros=actual,
             tokens=tokens, duration=time.monotonic() - started,
-            status='succeeded' if succeeded else 'uncertain')
+            status='succeeded' if succeeded else 'uncertain', estimated=estimated)
         logger.info('provider_span_end charge=%s succeeded=%s duration_seconds=%.6f',
                     charge_id, succeeded, time.monotonic() - started)
     finally:
@@ -109,34 +130,38 @@ class GovernanceStore:
 
     async def reserve_provider_charge(self, charge_id, *, tenant_id, run_id,
                                       provider, model, cost_micros, max_requests,
-                                      max_cost_micros, trace_id=''):
+                                      max_cost_micros, trace_id='', purpose='',
+                                      enforce_quota=True):
         if min(cost_micros, max_cost_micros) < 0 or max_requests < 1:
             raise ValueError('Invalid tenant billing limits')
         day = datetime.now(timezone.utc).date().isoformat()
         async with self._lease() as conn:
-            # Conditional UPSERT serializes all requests for this tenant/day.
-            row = await self._one(conn,
-                'INSERT INTO tenant_usage_days (tenant_id,day,requests,charged_micros) '
-                'SELECT %s,%s,1,%s WHERE %s <= %s '
-                'ON CONFLICT (tenant_id,day) DO UPDATE '
-                'SET requests=tenant_usage_days.requests+1, '
-                'charged_micros=tenant_usage_days.charged_micros+EXCLUDED.charged_micros '
-                'WHERE tenant_usage_days.requests < %s AND '
-                'tenant_usage_days.charged_micros+EXCLUDED.charged_micros <= %s '
-                'RETURNING requests',
-                (tenant_id, day, cost_micros, cost_micros, max_cost_micros,
-                 max_requests, max_cost_micros))
-            if row is None:
-                raise QuotaExceeded()
+            if enforce_quota:
+                # Conditional UPSERT serializes all requests for this tenant/day.
+                # 日额度关掉时不写这张表：token 明细不该把已经明确不做的日上限又打开。
+                row = await self._one(conn,
+                    'INSERT INTO tenant_usage_days (tenant_id,day,requests,charged_micros) '
+                    'SELECT %s,%s,1,%s WHERE %s <= %s '
+                    'ON CONFLICT (tenant_id,day) DO UPDATE '
+                    'SET requests=tenant_usage_days.requests+1, '
+                    'charged_micros=tenant_usage_days.charged_micros+EXCLUDED.charged_micros '
+                    'WHERE tenant_usage_days.requests < %s AND '
+                    'tenant_usage_days.charged_micros+EXCLUDED.charged_micros <= %s '
+                    'RETURNING requests',
+                    (tenant_id, day, cost_micros, cost_micros, max_cost_micros,
+                     max_requests, max_cost_micros))
+                if row is None:
+                    raise QuotaExceeded()
             await self._run(conn,
                 'INSERT INTO provider_charges (charge_id,tenant_id,day,run_id,provider,model,'
-                'reserved_micros,charged_micros,created_at,trace_id) '
-                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                'reserved_micros,charged_micros,created_at,trace_id,purpose) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
                 (charge_id, tenant_id, day, run_id, provider, model,
-                 cost_micros, cost_micros, time.time(), trace_id))
+                 cost_micros, cost_micros, time.time(), trace_id, purpose or ''))
 
     async def settle_provider_charge(self, charge_id, *, actual_micros=None,
-                                     tokens=None, duration=0, status='uncertain'):
+                                     tokens=None, duration=0, status='uncertain',
+                                     estimated=False):
         async with self._lease() as conn:
             row = await self._one(conn,
                 "SELECT * FROM provider_charges WHERE charge_id=%s FOR UPDATE", (charge_id,))
@@ -149,9 +174,9 @@ class GovernanceStore:
                 (charged-row['charged_micros'], row['tenant_id'], row['day']))
             await self._run(conn,
                 'UPDATE provider_charges SET charged_micros=%s,input_tokens=%s,output_tokens=%s,'
-                'duration_seconds=%s,status=%s WHERE charge_id=%s',
+                'duration_seconds=%s,status=%s,tokens_estimated=%s WHERE charge_id=%s',
                 (charged, tokens[0] if tokens else None, tokens[1] if tokens else None,
-                 duration, status, charge_id))
+                 duration, status, bool(estimated), charge_id))
 
     async def billing_stats(self):
         async with self._lease() as conn:
@@ -163,3 +188,90 @@ class GovernanceStore:
                 'count(*) FILTER (WHERE status=\'reserved\') AS provider_unsettled_requests '
                 'FROM provider_charges')
             return {key: int(value) for key, value in row.items()}
+
+    async def run_usage(self, run_id: str) -> dict:
+        """按用途汇总一次运行。普通 SELECT，不加锁。
+
+        查询接口若把行锁住，会堵住正在结算的那次请求。要的是当前读得到的账。
+        """
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn, _USAGE_SELECT + ' WHERE run_id=%s GROUP BY 1 ORDER BY 1',
+                (run_id,))
+        grouped = [_usage_row(row) for row in rows]
+        return {'run_id': run_id, 'by_purpose': grouped, 'total': _usage_total(grouped)}
+
+    async def tenant_usage(self, *, tenant_id: str = '', day_from: str = '',
+                           day_to: str = '') -> dict:
+        """按租户和日期区间汇总，给运营对账与导出。同样不加锁。"""
+        clauses: list[str] = []
+        params: list[str] = []
+        if tenant_id:
+            clauses.append('tenant_id=%s')
+            params.append(tenant_id)
+        if day_from:
+            clauses.append('day>=%s')
+            params.append(day_from)
+        if day_to:
+            clauses.append('day<=%s')
+            params.append(day_to)
+        where = (' WHERE ' + ' AND '.join(clauses)) if clauses else ''
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn, _USAGE_SELECT + where + ' GROUP BY 1 ORDER BY 1', tuple(params))
+        grouped = [_usage_row(row) for row in rows]
+        return {'tenant_id': tenant_id, 'day_from': day_from, 'day_to': day_to,
+                'by_purpose': grouped, 'total': _usage_total(grouped)}
+
+    async def enforce_run_token_budget(self, run_id: str) -> int:
+        """下一次模型请求前，用已经记账的量决定还能不能再发。返回计入的 token 数。
+
+        已结算行加的是输入加输出（实测或估算）。仍是 reserved 的行还没有 token，
+        但请求已经在别的执行者手上：只读已结算会把它漏掉，于是按单次上界
+        （窗口 + 输出上限）计一行。搜索行没有 token，不进这个和。
+
+        不加锁，也不写 runs。结算发生在请求结束之后，手上没有 owner 与 epoch，
+        写 runs 就是没有门禁的越权写。总量用 SUM 现算。
+        """
+        from webpage_agent.store.pg_store import BudgetExceeded
+
+        ceiling = settings.llm_context_window + settings.llm_output_tokens
+        async with self._lease() as conn:
+            row = await self._one(conn, _TOKEN_SPEND_SQL, ('reserved', run_id, 'llm'))
+        used = (int(row['input_tokens']) + int(row['output_tokens'])
+                + int(row['reserved_requests']) * ceiling)
+        limit = int(settings.run_max_tokens)
+        if used >= limit:
+            raise BudgetExceeded(f'本次运行的 token 已用 {used}，上限 {limit}')
+        return used
+
+
+# 按用途分组。GROUP BY 1 跟着 SELECT 里的 COALESCE，避免空用途被拆成两堆。
+# 语句里没有 FOR UPDATE：按 run / 按租户查询都不能挡住正在写的结算。
+_USAGE_SELECT = (
+    "SELECT COALESCE(purpose, '') AS purpose, COUNT(*) AS requests, "
+    'COALESCE(SUM(input_tokens),0) AS input_tokens, '
+    'COALESCE(SUM(output_tokens),0) AS output_tokens, '
+    'COUNT(*) FILTER (WHERE tokens_estimated) AS estimated_requests '
+    'FROM provider_charges'
+)
+
+_TOKEN_SPEND_SQL = (
+    'SELECT COALESCE(SUM(input_tokens),0) AS input_tokens, '
+    'COALESCE(SUM(output_tokens),0) AS output_tokens, '
+    "COUNT(*) FILTER (WHERE status=%s) AS reserved_requests "
+    'FROM provider_charges WHERE run_id=%s AND provider=%s'
+)
+
+
+def _usage_row(row) -> dict:
+    return {'purpose': row['purpose'] or '',
+            'requests': int(row['requests']),
+            'input_tokens': int(row['input_tokens']),
+            'output_tokens': int(row['output_tokens']),
+            'estimated_requests': int(row['estimated_requests'])}
+
+
+def _usage_total(rows: list[dict]) -> dict:
+    keys = ('requests', 'input_tokens', 'output_tokens', 'estimated_requests')
+    return {key: sum(row[key] for row in rows) for key in keys}
