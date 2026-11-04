@@ -1,14 +1,38 @@
-"""启动时核对正式模式是否把治理链配齐。
+"""启动时核对进程能否真的干活。
+
+三件事：模型与检索凭据是否齐全（除了 test 环境）、正式模式是否把治理链配齐、
+结果目录是否可写。任何一条不满足都抛在启动阶段，而不是等第一个请求进来才炸。
 
 本地单用户（AUTH_MODE=off）保持兼容路径。ticket 模式且未开开发兼容时，
 三个开关已在配置里打开；这里再核对一次，避免进程里被改回去之后仍对外接待。
-结果目录不可写时拒绝启动。
 """
 from webpage_agent.core.config import settings
 
 
+def credential_issues() -> list[str]:
+    """模型/检索凭据缺失或仍是占位符。
+
+    以前这份判定只写在 run_task() 里：POST /api/tasks 先回 200 + running，任务
+    随后 failed，用户看到的是"跑起来了又失败"，日志里一坨 traceback。现在
+    提到启动阶段，配错的进程根本起不来，问题在部署那一刻就暴露。
+
+    test 环境不带真实凭据、也不该连真模型，所以由 issues() 按环境决定是否调用，
+    这里不做环境判断——那样调用方就没法单独测这条规则了。
+    """
+    from webpage_agent.core.config import missing_runtime_keys
+    missing = missing_runtime_keys()
+    if not missing:
+        return []
+    return ['缺少或仍是占位符的凭据：' + ', '.join(missing)]
+
+
 def issues() -> list[str]:
     found = []
+    # 凭据是"能不能干活"的前提，与治理链无关，非 test 环境都要查。
+    # test 环境（APP_ENV=test）不查：用例本来就不带真 key，查了会让整套测试在
+    # 启动阶段就红，而那不是它们要验证的东西。
+    if settings.app_env != 'test':
+        found.extend(credential_issues())
     if settings.app_env == 'production':
         found.extend(production_issues())
     if settings.auth_mode != 'ticket':
@@ -92,9 +116,6 @@ def production_issues() -> list[str]:
             settings.search_request_cost_micros) > 0,
         'METRICS_FORMAT=json|prometheus': settings.metrics_format in ('json', 'prometheus'),
     }
-    required['non-placeholder LLM and search credentials'] = all(
-        value and not value.lower().startswith(('replace-', 'your-', 'changeme'))
-        for value in (settings.llm_key, settings.deepseek_api_key, settings.llm_model))
     try:
         from webpage_agent.api.auth_connections import load_connections
         from cryptography.hazmat.primitives.serialization import load_pem_public_key

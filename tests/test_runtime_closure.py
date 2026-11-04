@@ -176,6 +176,65 @@ class PathAndStartupTests(unittest.TestCase):
                 'GET', 'https://evil.example'))
 
 
+class StartupCredentialCheckTests(unittest.TestCase):
+    """凭据缺失必须在启动阶段就拒，而不是先 200 再 failed。
+
+    判定本身与 APP_ENV 无关（credential_issues），是否执行由 issues() 按环境决定：
+    test 环境不查，否则整套用例会在 lifespan 里挂掉。
+    """
+
+    COMPLETE = dict(llm_key='sk-live-123', llm_model='deepseek-chat',
+                    deepseek_api_key='ds-456')
+
+    def test_complete_credentials_report_nothing(self):
+        with assigned(settings, **self.COMPLETE):
+            self.assertEqual(runtime_check.credential_issues(), [])
+
+    def test_missing_llm_key_is_reported(self):
+        with assigned(settings, **{**self.COMPLETE, 'llm_key': ''}):
+            found = runtime_check.credential_issues()
+        self.assertEqual(len(found), 1)
+        self.assertIn('LLM_API_KEY', found[0])
+        self.assertNotIn('LLM_MODEL', found[0])
+
+    def test_missing_search_key_is_reported(self):
+        with assigned(settings, **{**self.COMPLETE, 'deepseek_api_key': ''}):
+            found = runtime_check.credential_issues()
+        self.assertEqual(len(found), 1)
+        self.assertIn('DEEPSEEK_API_KEY', found[0])
+
+    def test_placeholder_values_are_not_accepted(self):
+        # .env.example 原样抄成 .env 就是这种状态：字段非空，但一定是错的
+        with assigned(settings, llm_key='replace-me',
+                      llm_model='replace-with-your-model-id',
+                      deepseek_api_key='changeme'):
+            found = runtime_check.credential_issues()
+        self.assertEqual(len(found), 1)
+        for name in ('LLM_API_KEY', 'LLM_MODEL', 'DEEPSEEK_API_KEY'):
+            self.assertIn(name, found[0])
+
+    def test_issues_runs_the_check_outside_test_env(self):
+        with assigned(settings, app_env='development', auth_mode='off',
+                      **{**self.COMPLETE, 'llm_key': ''}):
+            found = runtime_check.issues()
+        self.assertTrue(any('LLM_API_KEY' in issue for issue in found), found)
+
+    def test_issues_skips_the_check_in_test_env(self):
+        # 用例不带真 key，test 环境必须放行，否则全套测试在启动阶段就红
+        with assigned(settings, app_env='test', auth_mode='off',
+                      **{**self.COMPLETE, 'llm_key': ''}):
+            self.assertEqual(runtime_check.issues(), [])
+
+    def test_production_reports_credentials_once(self):
+        # 生产分支原来另有一条同类检查；去重后同一个缺失不该出现在两条理由里
+        with assigned(settings, app_env='production', auth_mode='ticket',
+                      auth_dev_compat=False, llm_key='', deepseek_api_key='',
+                      llm_model=''):
+            found = runtime_check.issues()
+        mentions = [issue for issue in found if 'LLM_API_KEY' in issue]
+        self.assertEqual(len(mentions), 1, found)
+
+
 class _MemoryStore:
     def __init__(self):
         self.task = {

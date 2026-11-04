@@ -279,13 +279,37 @@ class Settings:
 
 settings = Settings()
 
-def check_runtime_keys():
+# 占位符前缀：把 .env.example 原样抄成 .env 时，这些值看起来"已经配上了"，
+# 实际一定在第一次模型/检索调用时失败。判定集中在这里，启动检查和运行时
+# 兜底才不会各算一套，出现"启动放行、运行炸"的缝。
+_PLACEHOLDER_PREFIXES = ('replace-', 'your-', 'changeme')
+
+
+def is_placeholder(value: str) -> bool:
+    """值为空、或仍是示例里的占位符，都算"没配"。"""
+    text = (value or '').strip().lower()
+    return not text or any(text.startswith(prefix) for prefix in _PLACEHOLDER_PREFIXES)
+
+
+def missing_runtime_keys() -> list:
+    """返回未配置或仍是占位符的必填项名字；空列表表示齐全。
+
+    只做判断不抛异常：启动校验要把名字拼成一条可读的拒绝理由，
+    运行期兜底要直接抛错，两边共用这份判定。
+    """
     missing = []
-    if not settings.deepseek_api_key:
+    # 检索 key 也要查占位符：deploy/production.env.example 里就是 replace-me，
+    # 只判空的话，把示例文件原样部署上去仍会"启动成功、第一次检索 401"。
+    if is_placeholder(settings.deepseek_api_key):
         missing.append('DEEPSEEK_API_KEY')
-    if not settings.llm_key or settings.llm_key == 'replace-me':
+    if is_placeholder(settings.llm_key):
         missing.append('LLM_API_KEY')
-    if not settings.llm_model or settings.llm_model.startswith('replace-'):
+    if is_placeholder(settings.llm_model):
         missing.append('LLM_MODEL')
+    return missing
+
+
+def check_runtime_keys():
+    missing = missing_runtime_keys()
     if missing:
         raise RuntimeError('请在 .env 设置：' + ', '.join(missing))
