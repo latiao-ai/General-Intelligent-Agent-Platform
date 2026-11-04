@@ -89,8 +89,8 @@ class ResultPart:
 class CapturedResult:
     """从 SDK 返回里**原样**采集到的东西。
 
-    没有业务判断：业务状态由适配器判定（见 `app/external_tasks.py` 与
-    `app/capabilities/publishing.py`），这里只负责"别把东西弄丢"。
+    没有业务判断：业务状态由适配器判定（见 `webpage_agent/core/external_tasks.py` 与
+    `webpage_agent/capabilities/publishing.py`），这里只负责"别把东西弄丢"。
     """
 
     structured: dict | None = None

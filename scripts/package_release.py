@@ -10,8 +10,9 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DIRECTORIES = ('src', 'scripts', 'contracts', 'docs', 'deploy', 'tests', '.github')
-FILES = ('.env.example', '.gitignore', 'README.md', 'requirements.txt', 'requirements.lock.txt',
-         'requirements-dev.txt', 'pyproject.toml', '智能体中台运行机制说明.md')
+FILES = ('.env.example', '.gitignore', 'THIRD-PARTY-NOTICES.md', 'requirements.txt',
+         'requirements.lock.txt', 'requirements-dev.txt', 'pyproject.toml',
+         '智能体中台运行机制说明.md')
 SECRET = re.compile(rb'(?:-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|sk-[A-Za-z0-9_-]{24,})')
 
 

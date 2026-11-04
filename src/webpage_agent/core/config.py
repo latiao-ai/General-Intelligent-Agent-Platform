@@ -111,7 +111,7 @@ class Settings:
         os.getenv('PLATFORM_CONTEXT_MAX_CHARS', '12000'))))
     artifact_dir: Path = PROJECT_ROOT / os.getenv('ARTIFACT_DIR', 'artifacts')
     # 数据库：**只支持 PostgreSQL**（SQLite 实现已删除）。仓储接口见
-    # app/persistence.py；留空会在 open_store() 里直接报错，不静默退回本地文件库。
+    # webpage_agent/store/persistence.py；留空会在 open_store() 里直接报错，不静默退回本地文件库。
     database_url: str = os.getenv('DATABASE_URL', '').strip()
     # PostgreSQL 连接池大小。一个进程最多同时占用这么多条连接：SSE 写入、
     # 后台作业、接口查询各自借各自的，不再被一把进程内的锁串行化。
@@ -179,7 +179,7 @@ class Settings:
     run_max_no_progress: int = max(1, int(
         os.getenv('RUN_MAX_NO_PROGRESS', '2')))
 
-    # ---------- 身份（app/auth.py / app/ticket_auth.py） ----------
+    # ---------- 身份（webpage_agent/api/auth.py / webpage_agent/governance/ticket_auth.py） ----------
     # off      = 不介入，保持单用户行为（默认，本地开发与既有测试不受影响）
     # optional = 有中台会话就按会话，没有就匿名（灰度期）
     # ticket   = **平台签票 → 中台换会话**。所有业务接口必须带有效会话，否则 401
@@ -279,13 +279,37 @@ class Settings:
 
 settings = Settings()
 
-def check_runtime_keys():
+# 占位符前缀：把 .env.example 原样抄成 .env 时，这些值看起来"已经配上了"，
+# 实际一定在第一次模型/检索调用时失败。判定集中在这里，启动检查和运行时
+# 兜底才不会各算一套，出现"启动放行、运行炸"的缝。
+_PLACEHOLDER_PREFIXES = ('replace-', 'your-', 'changeme')
+
+
+def is_placeholder(value: str) -> bool:
+    """值为空、或仍是示例里的占位符，都算"没配"。"""
+    text = (value or '').strip().lower()
+    return not text or any(text.startswith(prefix) for prefix in _PLACEHOLDER_PREFIXES)
+
+
+def missing_runtime_keys() -> list:
+    """返回未配置或仍是占位符的必填项名字；空列表表示齐全。
+
+    只做判断不抛异常：启动校验要把名字拼成一条可读的拒绝理由，
+    运行期兜底要直接抛错，两边共用这份判定。
+    """
     missing = []
-    if not settings.deepseek_api_key:
+    # 检索 key 也要查占位符：deploy/production.env.example 里就是 replace-me，
+    # 只判空的话，把示例文件原样部署上去仍会"启动成功、第一次检索 401"。
+    if is_placeholder(settings.deepseek_api_key):
         missing.append('DEEPSEEK_API_KEY')
-    if not settings.llm_key or settings.llm_key == 'replace-me':
+    if is_placeholder(settings.llm_key):
         missing.append('LLM_API_KEY')
-    if not settings.llm_model or settings.llm_model.startswith('replace-'):
+    if is_placeholder(settings.llm_model):
         missing.append('LLM_MODEL')
+    return missing
+
+
+def check_runtime_keys():
+    missing = missing_runtime_keys()
     if missing:
         raise RuntimeError('请在 .env 设置：' + ', '.join(missing))

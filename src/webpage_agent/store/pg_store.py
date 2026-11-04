@@ -11,7 +11,7 @@
 - **事务边界显式写在每个方法里**（`_lease()` 里提交/回滚），不依赖连接池的
   隐式提交；
 - **事件日志以数据库为准，内存只负责实时投递**：这样进程重启后客户端仍能拿到
-  完整的执行过程（见 app/api_hub.py 的 subscribe/去重逻辑）；
+  完整的执行过程（见 webpage_agent/api/api_hub.py 的 subscribe/去重逻辑）；
 - 启动时把库里遗留的 `running` 运行交给对账（`reconcile_orphan_runs`）——
   进程重启后不可能还有任务在跑，否则前端会一直等一个永远不会结束的任务。
 """
@@ -274,7 +274,7 @@ CREATE INDEX IF NOT EXISTS idx_request_keys_expiry ON request_keys(expires_at);
 -- 所以升级语句可以和建表放在一起，启动时幂等执行。
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS compensated_at TEXT;
 
--- ---------- 身份：平台身份 → 本地主体（app/auth.py、文档 §3.1） ----------
+-- ---------- 身份：平台身份 → 本地主体（webpage_agent/api/auth.py、文档 §3.1） ----------
 -- 本地用户是业务外键的唯一目标；平台标识（openid / sub / 邮箱）只用于"找到它"。
 -- 为什么不让业务表直接挂 openid：微信 openid 按 appid 隔离、部分平台的 sub 会
 -- 轮换，一旦变了，用户的历史会话、任务、产物就全部对不上人。
@@ -820,7 +820,7 @@ class PostgresStore(GovernanceStore):
             else:
                 await migrations.require_current(conn)
 
-    # ---------- 身份（app/auth.py） ----------
+    # ---------- 身份（webpage_agent/api/auth.py） ----------
 
     async def bind_identity(self, provider: str, subject: str, *,
                             email: str = '', display_name: str = '',
@@ -2786,7 +2786,7 @@ class PostgresStore(GovernanceStore):
         """凭据绑定列表（按主体与服务端过滤）。
 
         返回的是**元信息**（没有明文密钥）：明文由
-        `app/credentials.py` 按 `credential_ref` 在传输层短时取出。
+        `webpage_agent/core/credentials.py` 按 `credential_ref` 在传输层短时取出。
         """
         sql = 'SELECT * FROM credential_bindings WHERE tenant_id=%s'
         params: list = [tenant_id]

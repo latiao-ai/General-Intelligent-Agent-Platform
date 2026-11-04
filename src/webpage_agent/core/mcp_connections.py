@@ -1,6 +1,6 @@
 """按租户解析「这次 MCP 调用用哪把钥匙」。
 
-连接定义仍在 `app/mcp_servers.py`（地址、传输、工具名）。本模块只回答：
+连接定义仍在 `webpage_agent/integrations/mcp_servers.py`（地址、传输、工具名）。本模块只回答：
 当前主体在这个 `server_id` 上有没有凭据绑定。明文只在返回前短时取出，
 不放进可序列化的连接对象。
 

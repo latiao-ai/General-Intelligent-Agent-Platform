@@ -179,7 +179,7 @@ class AgentState(TypedDict, total=False):
     errors: list[dict]
     usage: list[dict]
     # 终态（**通用**状态：succeeded / failed / needs_reconcile …）。
-    # `answered` / `local_ready` 这类展示词由 app/outcome.py 派生，不入状态。
+    # `answered` / `local_ready` 这类展示词由 webpage_agent/core/outcome.py 派生，不入状态。
     status: str
     # 本轮产出的结构化记录：{kind, produced[], effects[], answered, unverified}
     outcome: dict
@@ -244,7 +244,7 @@ class AgentState(TypedDict, total=False):
     no_progress_limit: int
     # 无进展检测：最近几次"查询+结果"签名
     progress_seen: list[str]
-    # 各节点耗时，由执行器写入（见 app/main.py）。
+    # 各节点耗时，由执行器写入（见 webpage_agent/api/main.py）。
     timings: list[dict]
     elapsed_seconds: float
     # 多轮对话历史 [{'role','content'}]，供规划阶段理解指代型追加要求。

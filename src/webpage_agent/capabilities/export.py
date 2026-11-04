@@ -59,7 +59,7 @@ MAX_PAGE_SOURCE_CHARS = 100_000
 def _sources_page(title: str, documents: list[dict]) -> str:
     """把来源列表渲染成一份可独立打开的 HTML。
 
-    来源是任意网页，正文一律先转义再转标签（见 app/md.py）；
+    来源是任意网页，正文一律先转义再转标签（见 webpage_agent/core/md.py）；
     这里只负责拼装骨架与元信息。
     """
     cards = []

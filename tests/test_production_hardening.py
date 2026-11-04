@@ -1,6 +1,5 @@
 """Production boundaries: real PostgreSQL, fake providers, isolated filesystems."""
 import asyncio
-import io
 import json
 import os
 from pathlib import Path
@@ -354,8 +353,9 @@ class DatabaseGovernanceTests(unittest.IsolatedAsyncioTestCase):
                 (root / name / 'output.txt').write_text('synthetic')
             await self.store.update_task('task1', artifact_id=expired_name)
             await self.store.update_task('paused-task', artifact_id=paused_name)
-            staged = tool_results.stage_result(root, tool_results.CapturedResult(structured={'value': 1}),
-                                                tenant_id='default', result_id='expired-result')
+            # 结果必须真的落盘：下面要断言"过期目录被清掉"，光写元数据不够
+            tool_results.stage_result(root, tool_results.CapturedResult(structured={'value': 1}),
+                                      tenant_id='default', result_id='expired-result')
             result_folder = tool_results.result_dir(root, 'default', 'expired-result')
             async with self.store._lease() as conn:
                 await conn.execute("INSERT INTO tool_result_manifests (result_id,tenant_id,run_id,created_at) VALUES (%s,%s,%s,%s)",

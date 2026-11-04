@@ -958,8 +958,9 @@ async function postRunInput(text, requestId) {
   const options = {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
+    // run_id 只在 URL 里：请求体开了 extra='forbid'，多带一个字段就 422
     body: JSON.stringify({request_id: requestId, message: text,
-                          task_id: S.taskId, run_id: S.runId}),
+                          task_id: S.taskId}),
   };
   const url = `${API_PREFIX}/runs/${S.runId}/inputs`;
   try {

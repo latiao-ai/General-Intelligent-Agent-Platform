@@ -10,7 +10,7 @@
 两条来源必须分开：本地能力是进程内的静态声明（import 即注册），MCP 工具是运行时
 发现（有 TTL、掉线、服务端前缀命名）。把它们混成一个注册表，"谁负责刷新"就说不清了。
 
-加一个本地能力 = 在 `app/capabilities/` 下加一个文件，这个文件一个字都不用改。
+加一个本地能力 = 在 `webpage_agent/capabilities/` 下加一个文件，这个文件一个字都不用改。
 远端工具若需要平台侧适配（调用前闸门、回执翻译），由该能力包的
 `adapt_mcp_tool` 认领，内核不点名是哪一种业务。
 """
@@ -24,9 +24,10 @@ from webpage_agent.integrations import mcp_adapter, mcp_servers
 from webpage_agent.capabilities import registry
 from webpage_agent.tools import tool_policy as tool_policy_module
 from webpage_agent.core import credentials as credentials_module
-# 这几个是既有调用点仍在用的：`nodes` 用 usable_documents 判断"手上有没有料"，
-# 测试用 _select_sources 校验预算截断。
-from webpage_agent.capabilities.base import ToolError, usable_documents, _select_sources
+# _select_sources 是**再导出**：既有用例按 `tool_module._select_sources(...)`
+# 校验预算截断，删掉这个导入会让它变成 AttributeError，而不是"未用 import"。
+# ToolError 在本模块内直接用。
+from webpage_agent.capabilities.base import ToolError, _select_sources  # noqa: F401
 # Tool 定义搬到了注册器里（内核与能力包共用一份）；这里重新导出，
 # 旧调用点与既有用例 `from webpage_agent.tools.core import Tool` 继续可用。
 from webpage_agent.capabilities.registry import Tool

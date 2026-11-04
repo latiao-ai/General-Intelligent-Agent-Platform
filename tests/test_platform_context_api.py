@@ -7,7 +7,6 @@ import httpx
 
 from webpage_agent.api import auth_connections
 from webpage_agent.governance import policies
-from webpage_agent.agent import scene_context
 from tests.test_scene_context import CONTEXT, _sign
 from tests.test_ticket_auth import connection
 
@@ -66,6 +65,61 @@ class PlatformContextApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post('/api/context/verify', json={
             'context': CONTEXT, 'context_assertion': _sign(CONTEXT)})
         self.assertEqual(response.status_code, 401)
+
+
+class StrictRequestBodyTests(unittest.IsolatedAsyncioTestCase):
+    """请求体不许多带字段：拼错的键必须 422，不能被静默丢掉。
+
+    未知字段静默忽略时，客户端把 `message` 写成 `mesage` 也照样拿到 200，
+    问题要等到业务结果不对才暴露。
+    """
+
+    async def asyncSetUp(self):
+        from webpage_agent.core.config import settings
+        with patch('webpage_agent.core.config.settings', replace(
+                settings, database_url='postgresql://unused:unused@127.0.0.1/unused_test')):
+            import webpage_agent.api.routes as api
+        self.api = api
+        self.principal = policies.Principal(
+            tenant_id='tenant-a', user_id='internal-user', subject='user-123',
+            platform_id='pa', connection_id='conn-a', authenticated=True)
+        self.api.app.dependency_overrides[policies.current_principal] = lambda: self.principal
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api.app), base_url='http://test')
+
+    async def asyncTearDown(self):
+        self.api.app.dependency_overrides.clear()
+        await self.client.aclose()
+
+    async def test_task_request_rejects_an_unknown_field(self):
+        response = await self.client.post('/api/tasks', json={
+            'message': '查一下', 'mesage': '拼错的键'})
+        self.assertEqual(response.status_code, 422, response.text)
+
+    async def test_task_request_still_accepts_host_proxy_fields(self):
+        # 宿主代理会在请求体里带这两个字段；它们不承载信任，但必须能收下，
+        # 否则关闭 extra 之后会把宿主接入模式整个打成 422。
+        payload = api_payload()
+        model = self.api.TaskRequest(**payload)
+        self.assertEqual(model.workspace_id, payload['workspace_id'])
+
+    async def test_profile_and_memory_reject_unknown_fields(self):
+        for path, body in (('/api/profile', {'text': 'x', 'extra': 1}),
+                           ('/api/sessions/s1/memory', {'summary': 's', 'extra': 1})):
+            response = await self.client.put(path, json=body)
+            self.assertEqual(response.status_code, 422, (path, response.text))
+
+    async def test_unknown_field_does_not_become_a_500(self):
+        # 校验失败要停在 422，而不是进到业务代码里再炸
+        response = await self.client.post('/api/context/verify', json={
+            'context': CONTEXT, 'context_assertion': _sign(CONTEXT), 'nope': True})
+        self.assertEqual(response.status_code, 422, response.text)
+
+
+def api_payload() -> dict:
+    """TaskRequest 的最小合法载荷，外加宿主代理会带的两个目标字段。"""
+    return {'message': '查一下', 'session_id': 's1',
+            'workspace_id': 'ws-1', 'selected_ids': ['n1', 'n2']}
 
 
 class PlatformSceneBudgetTests(unittest.TestCase):

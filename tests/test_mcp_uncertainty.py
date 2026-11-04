@@ -2,7 +2,7 @@
 
 三条纪律：
 
-1. **确定性由最了解现场的那一层标注**（`app/errors.py`），不是按异常类名猜——
+1. **确定性由最了解现场的那一层标注**（`webpage_agent/observe/errors.py`），不是按异常类名猜——
    包装过的异常类型名必然丢失；
 2. 业务失败（服务端回了 `status: error`）是 `failed_confirmed`：允许重试；
 3. 超时/断流是 `unknown`：账本置 unknown，续跑必须停下来等人核实，不能自动再发。

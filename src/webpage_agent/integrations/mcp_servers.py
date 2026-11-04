@@ -83,7 +83,7 @@ class Server:
     # `forward_subject` 在 stdio 上用环境变量传主体（子进程是我们自己起的，可信）。
     # HTTP/SSE 是跨机器的通道，明文主体头既不能被对端当依据、又会被"拿到 token 的人"伪造，
     # 所以改为签发短期签名断言：密钥引用走 env:/file:/literal:，密钥本身不进配置。
-    # 见 app/integrations/mcp_subject.py。
+    # 见 webpage_agent/integrations/mcp_subject.py。
     forward_subject: bool = False
     subject_secret_ref: str = ''
     subject_header: str = ''            # 空 = mcp_subject.DEFAULT_HEADER

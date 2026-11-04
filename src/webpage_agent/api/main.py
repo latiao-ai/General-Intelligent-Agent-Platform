@@ -155,7 +155,7 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         # - 图内部只写通用状态（succeeded / failed / waiting_input …）；
         # - 中途退出（图没跑到收尾）留下的 planned/created 之类不是终态，
         #   按"到底产出了什么"补一个；
-        # - outcome 是记录，展示标签由它在读取时派生（app/outcome.py）。
+        # - outcome 是记录，展示标签由它在读取时派生（webpage_agent/core/outcome.py）。
         status = outcome_module.normalize_status(state.get('status'))
         # 控制状态优先：**有部分产物也不能把 paused / cancelled / needs_reconcile
         # 重算成 succeeded**（文档 §7.3）。只有"中途退出、没有任何终态"时才按产出补。

@@ -211,7 +211,7 @@ def read_secret_ref(ref: str) -> str:
     """按 `env:` / `file:` / `literal:` 取明文（公开入口）。
 
     `_read_secret` 原本只服务凭据绑定。签名断言用的共享密钥（
-    `app/integrations/mcp_subject.py`）用的是同一种引用语法，这里把解析入口
+    `webpage_agent/integrations/mcp_subject.py`）用的是同一种引用语法，这里把解析入口
     公开出去，**不复制第二套解析规则**——两套规则迟早会不一致，而不一致的表现
     是"某个环境的密钥永远取不到"，极难查。
     """

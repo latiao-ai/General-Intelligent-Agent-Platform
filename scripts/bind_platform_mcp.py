@@ -6,7 +6,7 @@
 - `--audience global`：**通用服务**（部署、本地生成这类"谁都能用"的能力），
   绑定挂在 `SHARED_TENANT` 下，任意平台、任意租户的运行都能解析到它。
   这是一条运维专属通道，必须显式设置 `ALLOW_GLOBAL_BIND=true`，
-  管理 API 明确拒绝它（`app/api.py::_reject_reserved_scope`）。
+  管理 API 明确拒绝它（`webpage_agent/api/routes.py::_reject_reserved_scope`）。
 
 通用服务仍可收敛范围：`--tools` 限制外层工具，`--inner-tools` 限制
 `run_tool(name=…)` 的内层能力（不写 = 一个都不许，fail-closed）。

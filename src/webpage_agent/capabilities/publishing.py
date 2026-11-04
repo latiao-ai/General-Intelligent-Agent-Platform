@@ -139,7 +139,7 @@ class DeployAdapter:
     """执行链上部署工具的适配器：调用前闸门 + 调用后解释回执。
 
     适配器只碰"平台语义"，不碰传输：怎么连服务端、怎么把文件内容塞进参数，
-    都在 `app/integrations/mcp_adapter.py` 里，其它远端工具走同一套。
+    都在 `webpage_agent/integrations/mcp_adapter.py` 里，其它远端工具走同一套。
     """
     server: object = None
     tool_name: str = ''
@@ -168,7 +168,7 @@ class DeployAdapter:
                     deployment.get('public_url') or '结果待确认',
                     '✅' if deployment.get('status') == 'success' else '⚠️'))
         # 这里返回的 `status` 只是**这一步的阶段小结**（执行器会把它从 run 状态
-        # 里摘出来，只用于耗时行），run 终态由 app/outcome.py 统一判定。
+        # 里摘出来，只用于耗时行），run 终态由 webpage_agent/core/outcome.py 统一判定。
         return {'deployment': deployment, 'status': marker_of(deployment)}
 
 

@@ -1,7 +1,7 @@
 """MCP 客户端：连接、发现、调用。
 
 只负责"怎么跟一个 MCP 服务端说话"，**不负责选哪个服务端**——那是
-`app/mcp_servers.py` 的事。所有函数都接受一个 `server` 参数：
+`webpage_agent/integrations/mcp_servers.py` 的事。所有函数都接受一个 `server` 参数：
 
 - 传 `Server`：按它给的地址/传输/参数连；
 - 传 `None`：退回旧的单项环境变量（`MCP_URL` 等），保持既有调用点与测试可用。
@@ -25,7 +25,6 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 
 # 本模块直接读 os.environ，导入 config 触发 load_dotenv，
 # 避免单独调用 connect_session 时出现 KeyError: 'MCP_URL'。
-from webpage_agent.core import config as _config
 from webpage_agent.core.config import settings
 from webpage_agent.integrations import mcp_servers, mcp_subject
 from webpage_agent.core import credentials as credentials_module

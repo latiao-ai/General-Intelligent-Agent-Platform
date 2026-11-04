@@ -8,7 +8,6 @@
 - stdio 与 HTTP 共用同一个主体来源，但传输方式不同（环境变量 vs 签名头），
   两条都要钉住，避免以后改一条坏一条。
 """
-import time
 import unittest
 from contextlib import asynccontextmanager, ExitStack
 from types import SimpleNamespace

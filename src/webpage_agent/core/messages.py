@@ -5,7 +5,7 @@ CLI、会话层、FastAPI 任务中枢三处共用，避免文案与副作用判
 回执**按 outcome 与通用状态分支**，不按业务状态名：以前这里是
 `if status == 'answered' / 'local_ready' / 'deploy_needs_check'`，每加一类
 能力就得在文案里加一个分支，而且这些词还同时被塞进了任务状态机。
-现在"这一轮产出了什么"由 `app/outcome.py` 记录，文案只负责把它翻译成人话。
+现在"这一轮产出了什么"由 `webpage_agent/core/outcome.py` 记录，文案只负责把它翻译成人话。
 """
 import json
 

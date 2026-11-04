@@ -1,13 +1,14 @@
 """能力包注册器：**机制在内核，声明归能力包**。
 
-背景：以前加一个工具要改内核的 `app/tools.py` 两处（`BUILTIN_TOOLS` 列表 +
-`_LOCAL_META` 身份表），再加一段 `CAPABILITY_RULES`——同一件事记在三张手工表里，
-靠工具名对齐，改个名字就断。那是"内核知道业务"，与"通用中台"正好相反。
+背景：以前加一个工具要改内核两处（`BUILTIN_TOOLS` 列表 + `_LOCAL_META` 身份表），
+再加一段 `CAPABILITY_RULES`——同一件事记在三张手工表里，靠工具名对齐，改个名字
+就断。那是"内核知道业务"，与"通用中台"正好相反。
+（那批手工表原本在 `app/tools.py`，现已拆分：内核侧在 `webpage_agent/tools/core.py`。）
 
 现在工具由**能力包自己**用 `@tool(...)` 声明，内核只负责汇总：
 
 ```python
-# app/capabilities/notes.py  ← 加一个能力的全部内容就在这一个文件里
+# webpage_agent/capabilities/notes.py  ← 加一个能力的全部内容就在这一个文件里
 CAPABILITY = 'notes'
 PROMPT_RULES = '【笔记】用户要记/查笔记时用它……'
 
@@ -21,7 +22,7 @@ async def save_note(args, state):
 要留意的两条边界：
 
 1. **这里只注册本地能力**（进程内、无外部服务）。远端 MCP 工具是运行时发现
-   出来的，有 TTL、掉线和前缀命名语义，由 `app/tools.py` 的 `mcp_tools()` 负责，
+   出来的，有 TTL、掉线和前缀命名语义，由 `webpage_agent/tools/core.py` 的 `mcp_tools()` 负责，
    两者最后在 `catalog()` 汇成一份清单——**不要**把 MCP 工具塞进这个注册表。
 2. `PROMPT_RULES` 在**构建 Tool 时**才去模块上取，所以它写在文件哪个位置都行。
 """
