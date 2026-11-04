@@ -117,10 +117,17 @@ class TaskRecord:
         self._subscribers.clear()
 
     async def persist(self, **fields) -> None:
-        """更新内存状态并写回库。"""
+        """写回库并更新内存状态：**先落库，再改内存**。
+
+        顺序反过来会开一个窗口：`done`/`live` 这些判断读的是内存，库是另一份。
+        内存先置成终态、库要等下一条语句才写，这中间 `record.done` 已经是 True，
+        而 `store.task()` 还是旧的 `queued`/`running`。回放接口按库读，
+        于是"任务已完成但回放显示还在排队"——多进程下别的副本看到的也是旧值。
+        同文件的 `publish()` 早就按"先落库再投递"写，这里保持一致。
+        """
+        await self.store.update_task(self.task_id, **fields)
         for key, value in fields.items():
             setattr(self, key, value)
-        await self.store.update_task(self.task_id, **fields)
 
     def summary(self) -> dict:
         """接口视图。
@@ -1113,7 +1120,10 @@ class Hub:
             except execution_control.LeaseLost:
                 logger.warning('run %s 收尾时已失租，不写终态', record.run_id)
                 return
-            record.status = run_status
+            # 这里**只动 runs 行**，不动 record.status：`tasks` 行要等调用方的
+            # persist() 才写。提前把内存置成终态会开一个窗口——record.done 已经
+            # 为真、库里 tasks.status 还是 queued，回放接口按库读就显示"已完成
+            # 但还在排队"。内存状态统一由 persist() 在落库之后设置。
         else:
             await self.store.update_run(record.run_id, **fields)
         # outbox：业务事件与派生作业在同一处写入，消费者按 dedupe_key 幂等

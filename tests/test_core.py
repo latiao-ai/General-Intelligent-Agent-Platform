@@ -2197,6 +2197,41 @@ class RepositoryContractTests(unittest.TestCase):
         self.assertIn('claim_run', check_repository(Partial()))
 
 
+class StatusDurabilityTests(unittest.IsolatedAsyncioTestCase):
+    """内存终态不能早于库：否则回放接口会显示"已完成但还在排队"。
+
+    这条不变量以前是坏的：收尾时先把 record.status 置成终态，tasks 行要等
+    下一条 persist() 才写。测试轮询 record.done 看到 True 就去读库，读到的是
+    旧状态。多进程下别的副本读到的同样是旧值，不只是测试时序问题。
+    """
+
+    async def test_memory_status_never_runs_ahead_of_the_row(self):
+        from webpage_agent.api.api_hub import TaskRecord
+        await reset_db()
+        store = new_store()
+        await store.ready()
+        await store.create_task('sd1', 'sds1', 'x')
+        record = TaskRecord(task_id='sd1', session_id='sds1', message='x',
+                            store=store, status='queued')
+        # 让写库慢一点，把窗口放大到可观测
+        original = store.update_task
+
+        async def slow(task_id, **fields):
+            await asyncio.sleep(0.1)
+            await original(task_id, **fields)
+
+        with patch.object(store, 'update_task', slow):
+            task = asyncio.create_task(record.persist(status='succeeded'))
+            await asyncio.sleep(0.03)
+            # 库里还没写，内存就不能先"完成"
+            self.assertFalse(record.done, '库未落盘时内存不该已进终态')
+            self.assertEqual((await store.task('sd1'))['status'], 'running')
+            await task
+        self.assertTrue(record.done)
+        self.assertEqual((await store.task('sd1'))['status'], 'succeeded')
+        await store.close()
+
+
 class ApiTests(unittest.IsolatedAsyncioTestCase):
     """HTTP 接口与 SSE 端点。"""
 
