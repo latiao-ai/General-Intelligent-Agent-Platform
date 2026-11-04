@@ -36,3 +36,12 @@ class CheckTestDbTests(unittest.TestCase):
         self.assertIn('check_test_db.py', script)
         # 连不上时要 exit 2，不能只是打印一行就继续跑
         self.assertIn('exit 2', script)
+
+    def test_interpreter_is_not_pinned_to_one_machine(self):
+        # 硬编码某个人的 anaconda 路径会让换机器的人看到"连不上数据库"这种
+        # 误导性报错（真实原因是解释器不存在）。必须能回退到 PATH 上的 python3。
+        script = (ROOT / 'scripts' / 'run_tests.sh').read_text(encoding='utf-8')
+        self.assertNotIn('PYTHON="${PYTHON:-/opt/', script)
+        self.assertIn('command -v python3', script)
+        # 显式指定仍然优先
+        self.assertIn('[ -n "${PYTHON:-}" ]', script)

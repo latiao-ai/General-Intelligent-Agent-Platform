@@ -8,7 +8,20 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-PYTHON="${PYTHON:-/opt/anaconda3/envs/demo/bin/python}"
+# 解释器：优先用显式指定的 PYTHON；没指定时用本机一个真的存在的 python3。
+# 以前这里硬编码了某台机器上的 `/opt/anaconda3/envs/demo/bin/python`，换台机器
+# 就变成"找不到解释器"，而下面的预检会把它误报成"连不上数据库"，更难查。
+if [ -n "${PYTHON:-}" ]; then
+  :
+elif [ -x /opt/anaconda3/envs/demo/bin/python ]; then
+  PYTHON=/opt/anaconda3/envs/demo/bin/python
+else
+  PYTHON="$(command -v python3 || command -v python || true)"
+fi
+if [ -z "${PYTHON:-}" ]; then
+  echo "[run_tests] 找不到 Python 解释器，请用 PYTHON=/path/to/python 指定。" >&2
+  exit 2
+fi
 export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
 export APP_ENV=test
 export AUTH_MODE=off
