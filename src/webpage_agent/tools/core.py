@@ -442,12 +442,16 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
     # 规划器要能看到真实名字，执行前也要能校验（见 _check_inner_name）
     capability_lists = await asyncio.gather(
         *(_discover_capabilities(server) for server in servers)) if servers else []
+    # 两个 gather 都以 `servers` 为准，长度必须一致；不等就是发现流程出了 bug，
+    # 静默截断会让某个服务端的能力清单凭空消失（它的工具于是永远被当成"未知名字"）。
     capabilities = {server.id: caps
-                    for server, caps in zip(servers, capability_lists) if caps}
+                    for server, caps in zip(servers, capability_lists, strict=True)
+                    if caps}
     total = len(mcp_servers.servers())
     tools: list[Tool] = []
     errors: dict[str, str] = {}
-    for server, (items, error) in zip(servers, discovered):
+    # 同上：`discovered` 是 `[_discover(server) for server in servers]` 的 gather 结果
+    for server, (items, error) in zip(servers, discovered, strict=True):
         if error:
             errors[server.id] = error
             continue
