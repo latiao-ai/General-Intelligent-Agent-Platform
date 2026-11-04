@@ -26,7 +26,8 @@
 - Python 全仓 compileall、浏览器内联 JavaScript 的 `node --check`：通过。
 - 本机与 Linux 镜像内 `pip check`：无依赖冲突。
 - `git diff --check`：通过。
-- 已新增 GitHub Actions CI，包含数据库测试、静态检查、打包检查和 Docker 构建；尚未在远端触发该工作流。
+- 已新增 GitHub Actions CI，包含数据库测试、静态检查与打包检查；尚未在远端触发该工作流。
+  （当时 CI 还包含 Docker 构建，该步骤已随容器部署文件一并移除，见文首说明。）
 
 ## 部署工程验证
 

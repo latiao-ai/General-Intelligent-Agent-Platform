@@ -4,7 +4,7 @@
 `deployed` / `deploy_needs_check` / `compensated`。这些是**展示词**，不该进
 状态机——每加一类能力就得往里加一个值。现在：
 
-- 库里只存通用状态（`app/outcome.py:RUN_STATUSES`）；
+- 库里只存通用状态（`webpage_agent/core/outcome.py:RUN_STATUSES`）；
 - 展示标签在读取时由 outcome 派生；
 - 本脚本把旧行改写成通用值，并把 `deploy_needs_check` 那批被折成 `failed`
   的 run 纠正成 `needs_reconcile`（那是"结果待核实"，不是失败）。

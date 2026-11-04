@@ -6,7 +6,7 @@
 |---|---|
 | 认证 | 你是谁（`webpage_agent.api.auth`，不在这里） |
 | 授权 | 你能用哪个服务端的哪个工具（**本模块**） |
-| 额度 | 还有没有钱/次数（`app/approvals.py` 的预留 + 钱包） |
+| 额度 | 还有没有钱/次数（`webpage_agent/governance/approvals.py` 的预留 + 钱包） |
 
 **授权必须落在代码里，不能落在提示词里。** `MCP_PROMPT_RULES` 是给模型的
 提醒，模型不遵守照样出事：上游偷偷加一个 `delete_*`，规划器看到了就会用。

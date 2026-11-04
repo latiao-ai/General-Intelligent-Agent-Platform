@@ -793,7 +793,8 @@ python -m scripts.list_mcp_tools
 代理/CONNECT 不可用时，**所有模型与检索调用**会报 `APIConnectionError` /
 `ConnectError`。DeepSeek 官方接口与 MCP 服务端都走网络，排查时先用 `curl` 直连确认。
 
-通用中台改进的迁移范围、配置兼容和验证说明见 [迁移记录](docs/general-platform-merge.md)。
+通用中台改进的迁移范围、配置兼容和验证说明原在 `docs/general-platform-merge.md`，该文件已随内容并入主文档而从仓库移除；需要查阅时从历史里取回：
+`git log --diff-filter=D -- docs/general-platform-merge.md`。
 
 ## 9. 测试
 

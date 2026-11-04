@@ -20,7 +20,7 @@ STAGE_LABELS = {
     'wait_async': '等待外部任务',
     'verify_completion': '核对完成条件',
     'run_step': '执行步骤',
-    # 工具（与 app/tools.py 的 Tool.label 对应）
+    # 工具（与 capabilities/registry.py 里 Tool.label 对应）
     'web_search': '检索来源',
     'fetch_pages': '抓取正文',
     'render_sources_html': '资料转 HTML',

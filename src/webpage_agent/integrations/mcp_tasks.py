@@ -8,7 +8,7 @@ MCP 1.30 起协议自带任务语义，**不需要异步合同**：
 - 之后用 `tasks/get`、`tasks/cancel` 查询与取消，`tasks/result` 取结果；
 - `ClientSession` 初始化时已自动声明 tasks 能力，无需额外协商。
 
-合同（`app/async_contracts.py`）继续服务那些**没有**实现该原语、只用自定义
+合同（`webpage_agent/core/async_contracts.py`）继续服务那些**没有**实现该原语、只用自定义
 `job_id` + 查询工具方言语的服务端（openmontage 就是这一类）。两条路产出的
 "已受理"增量同形，所以下游的账本、快照、对账、恢复都不用改。
 

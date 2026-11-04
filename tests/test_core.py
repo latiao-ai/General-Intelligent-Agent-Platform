@@ -4587,7 +4587,7 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
                           'answer_directly': 'local:answers:direct'})
 
     async def test_kernel_does_not_import_business_packages(self):
-        """内核（app/tools.py）不许 import 具体业务能力包——那是一切耦合的源头。"""
+        """内核（tools/core.py）不许 import 具体业务能力包——那是一切耦合的源头。"""
         import ast
         source = Path('src/webpage_agent/tools/core.py').read_text(encoding='utf-8')
         imported = set()
@@ -4609,7 +4609,7 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_new_capability_is_just_a_new_file(self):
         """模拟"加一个能力包"：只写一个文件，内核与清单一个字都不改。
 
-        用 exec 一个独立模块来模拟 `app/capabilities/demo.py`：它自己声明
+        用 exec 一个独立模块来模拟 `webpage_agent/capabilities/demo.py`：它自己声明
         CAPABILITY / PROMPT_RULES / @tool，注册器立刻能看见它。
         """
         import sys

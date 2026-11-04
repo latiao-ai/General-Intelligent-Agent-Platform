@@ -111,7 +111,7 @@ class Settings:
         os.getenv('PLATFORM_CONTEXT_MAX_CHARS', '12000'))))
     artifact_dir: Path = PROJECT_ROOT / os.getenv('ARTIFACT_DIR', 'artifacts')
     # 数据库：**只支持 PostgreSQL**（SQLite 实现已删除）。仓储接口见
-    # app/persistence.py；留空会在 open_store() 里直接报错，不静默退回本地文件库。
+    # webpage_agent/store/persistence.py；留空会在 open_store() 里直接报错，不静默退回本地文件库。
     database_url: str = os.getenv('DATABASE_URL', '').strip()
     # PostgreSQL 连接池大小。一个进程最多同时占用这么多条连接：SSE 写入、
     # 后台作业、接口查询各自借各自的，不再被一把进程内的锁串行化。
@@ -179,7 +179,7 @@ class Settings:
     run_max_no_progress: int = max(1, int(
         os.getenv('RUN_MAX_NO_PROGRESS', '2')))
 
-    # ---------- 身份（app/auth.py / app/ticket_auth.py） ----------
+    # ---------- 身份（webpage_agent/api/auth.py / webpage_agent/governance/ticket_auth.py） ----------
     # off      = 不介入，保持单用户行为（默认，本地开发与既有测试不受影响）
     # optional = 有中台会话就按会话，没有就匿名（灰度期）
     # ticket   = **平台签票 → 中台换会话**。所有业务接口必须带有效会话，否则 401

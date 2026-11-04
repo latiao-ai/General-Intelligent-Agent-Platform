@@ -2,7 +2,7 @@
 
 分工：
 
-- **PostgreSQL（`app/pg_store.py`）**：会话消息、任务状态、事件日志的**权威来源**。
+- **PostgreSQL（`webpage_agent/store/pg_store.py`）**：会话消息、任务状态、事件日志的**权威来源**。
   进程重启后会话与历史事件都还在。
 - **内存**：只负责"实时投递"——订阅者队列与正在跑的 asyncio 任务。这两样天然
   不可能持久化：一个 asyncio.Task 是活着的进程状态，队列是连接级的。
@@ -10,8 +10,8 @@
 因此晚连上来的、甚至重启之后再连上来的客户端，都能从库里补发完整执行过程，
 而正在跑的客户端拿到的是内存直投的零延迟事件。用事件序号（seq）去重。
 
-与 `app/session.py` 的区别：那个服务 Streamlit（脚本执行会阻塞 UI，所以用后台
-线程 + 轮询），这里服务 FastAPI，直接跑在服务器事件循环上。
+服务对象是 FastAPI：订阅与投递直接跑在服务器事件循环上，不需要额外的后台线程
+与轮询（早期 Streamlit 版本那份实现已随 UI 迁移删除）。
 """
 import asyncio
 import logging
@@ -39,7 +39,7 @@ from webpage_agent.store.pg_store import PostgresStore, now
 
 logger = logging.getLogger(__name__)
 
-# 状态机词汇只有一套，在 app/outcome.py 里定义：run/task 层只存通用状态，
+# 状态机词汇只有一套，在 webpage_agent/core/outcome.py 里定义：run/task 层只存通用状态，
 # 界面看的 `answered` / `local_ready` / `deployed` 是**派生**出来的展示标签。
 # 以前这里有 TERMINAL_STATUS + RUN_STATUS_OF 两张手工表，收尾时
 # `RUN_STATUS_OF.get(status, status)` 兜底会把手写业务词静默写进 runs.status。
@@ -102,7 +102,7 @@ class TaskRecord:
         """返回 (队列, 历史快照)。
 
         注册订阅与读取快照之间可能插入新事件（两者之间无法做到原子），
-        因此投递给订阅者的是 `(seq, event)`，由消费端按 seq 去重（见 app/api.py）。
+        因此投递给订阅者的是 `(seq, event)`，由消费端按 seq 去重（见 webpage_agent/api/routes.py）。
         """
         queue: asyncio.Queue = asyncio.Queue()
         self._subscribers.add(queue)

@@ -1,7 +1,7 @@
 """项目测试包，确保标准 unittest 发现及 tests.* 夹具导入指向本仓库。
 
 **在这里钉住与 CI 等价的环境默认值**（`.github/workflows/ci.yml` 的 env 段）。
-原因：`app/config.py` 在 `APP_ENV != production` 时会读仓库里的 `.env`，而本机 `.env`
+原因：`core/config.py` 在 `APP_ENV != production` 时会读仓库里的 `.env`，而本机 `.env`
 是 ticket 模式（会打开 `tool_policy_enforced` / `result_envelope_v2`）。不钉住的话，
 同一套用例在本机跑会因为"身份仓储未就绪 503"和"政策强制拒绝无绑定调用"整批变红，
 看起来像代码坏了，其实只是环境不同。

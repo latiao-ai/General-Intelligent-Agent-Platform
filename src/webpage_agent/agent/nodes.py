@@ -1,11 +1,15 @@
-"""Planner-Executor 编排。
+"""Planner-Executor 编排（各节点的实现）。
 
-控制流只有两步：
+**控制流不在这里**，见 `webpage_agent/agent/graph.py` 的模块文档；节点之间的
+边、条件分支与循环都由那张图定义，本文件只提供节点函数：
 
-    START → plan → run_step ↺ → END
+    intake → plan → persist_plan → run_step ↺ → observe_result
+           → decide_next → verify_completion → finalize
 
-`plan` 让模型看着工具清单给出一个步骤序列；`run_step` 每次只执行**一步**，
-所以每一步都有独立的阶段事件与耗时。工具本身在 `app/tools.py`。
+`run_step` 每次只执行**一步**，所以每一步都有独立的阶段事件与耗时。
+工具定义已从旧的 `app/tools.py` 拆分：定义与注册在
+`webpage_agent/tools/core.py` 与 `webpage_agent/capabilities/registry.py`，
+具体能力在 `webpage_agent/capabilities/` 各模块里。
 
 与旧版固定流水线的差别：走哪条路、搜几次、要不要出报告、要不要部署，
 都由模型按输入决定，而不是写死在图的边里。
@@ -2572,7 +2576,7 @@ async def finalize(state):
 def final_status(state: dict) -> str:
     """本轮收尾后的**通用**状态（`answered`/`local_ready` 这类展示词不在这一层）。
 
-    判定逻辑在 `app/outcome.py`：状态机词汇封闭、业务结果进 outcome、
+    判定逻辑在 `webpage_agent/core/outcome.py`：状态机词汇封闭、业务结果进 outcome、
     展示标签由 `outcome.label()` 派生。
     """
     return outcome_module.final_status(state)
@@ -2782,7 +2786,7 @@ async def run_step(state):
     1. **准入在动远程之前**：`store.admit_action` 一次事务完成"校验租约与控制请求 +
        建 action + 建 attempt + 置 in_flight"；
     2. **结算是原子推进**：动作、attempt、步骤、快照一次提交；提交失败不推进游标；
-    3. **确定性来自显式标注**（`app/errors.py`），不再按异常类名猜"结果未定"。
+    3. **确定性来自显式标注**（`webpage_agent/observe/errors.py`），不再按异常类名猜"结果未定"。
     """
     steps = (state.get('plan') or {}).get('steps') or []
     index = state.get('step_index', 0)

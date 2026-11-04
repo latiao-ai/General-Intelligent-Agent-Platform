@@ -13,7 +13,7 @@
 1. **准入与结算各自是一个事务**。以前准入要提交两次（建 action、置 in_flight），
    中间崩溃就留下一条 `prepared` 的"不知道发没发"的记录；现在
    `admit_action` 一次事务完成，`settle_action` 一次事务完成。
-2. **执行确定性显式携带**（`app/errors.py`），不再按异常类名猜 unknown。
+2. **执行确定性显式携带**（`webpage_agent/observe/errors.py`），不再按异常类名猜 unknown。
 
 账本通过 ContextVar 传递：它是活对象（持有 Store 与执行上下文），不能塞进
 graph state（那个会被 json 序列化落盘）。没有账本时（单元测试、CLI 直调）
