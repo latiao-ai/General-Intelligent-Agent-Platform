@@ -11,7 +11,6 @@
 
 为此用例直接往库里写这些行，再走**真实**的执行入口，看远端调用次数和最终状态。
 """
-import asyncio
 import tempfile
 import unittest
 
@@ -19,7 +18,7 @@ from unittest.mock import patch
 
 from webpage_agent.store import ledger as ledger_module
 from tests.exec_env import (Remote, install_main, install_plan, install_tools,
-                            new_store, one_step_plan, reset_db, seed_run)
+                            new_store, reset_db, seed_run)
 
 STEPS = [{'tool': 'deploy', 'step_id': 's1', 'args': {},
           'tool_key': 'local:test:deploy', 'effect': 'write'}]

@@ -24,9 +24,10 @@ from webpage_agent.integrations import mcp_adapter, mcp_servers
 from webpage_agent.capabilities import registry
 from webpage_agent.tools import tool_policy as tool_policy_module
 from webpage_agent.core import credentials as credentials_module
-# 这几个是既有调用点仍在用的：`nodes` 用 usable_documents 判断"手上有没有料"，
-# 测试用 _select_sources 校验预算截断。
-from webpage_agent.capabilities.base import ToolError, usable_documents, _select_sources
+# _select_sources 是**再导出**：既有用例按 `tool_module._select_sources(...)`
+# 校验预算截断，删掉这个导入会让它变成 AttributeError，而不是"未用 import"。
+# ToolError 在本模块内直接用。
+from webpage_agent.capabilities.base import ToolError, _select_sources  # noqa: F401
 # Tool 定义搬到了注册器里（内核与能力包共用一份）；这里重新导出，
 # 旧调用点与既有用例 `from webpage_agent.tools.core import Tool` 继续可用。
 from webpage_agent.capabilities.registry import Tool

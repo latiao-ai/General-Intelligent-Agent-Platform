@@ -27,7 +27,7 @@ from webpage_agent.core.schemas import ExecutionPlan, RevisedPlan, ToolSelection
 
 from tests.exec_env import (Remote, install_main, install_tools, new_store,
                             reset_db, seed_run)
-from tests.test_revision_repair import (GOAL, SUPPLEMENT, catalog, corrected)
+from tests.test_revision_repair import (GOAL, SUPPLEMENT, catalog)
 
 
 TEMPLATE = '{{p2_s1.revision}}'

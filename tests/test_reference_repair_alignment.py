@@ -18,11 +18,9 @@ import copy
 import tempfile
 import unittest
 
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 from webpage_agent.agent import nodes
-from webpage_agent.capabilities.registry import Tool
 from webpage_agent.core.schemas import ExecutionPlan, ObservationDecision
 
 from tests.exec_env import (Remote, install_main, install_tools, new_store,

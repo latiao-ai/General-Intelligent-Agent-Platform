@@ -10,10 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from dataclasses import replace
 from unittest.mock import AsyncMock, patch
-from pydantic import ValidationError
-from webpage_agent.core.schemas import ExecutionPlan, PlanStep
+from webpage_agent.core.schemas import ExecutionPlan
 from webpage_agent.core.services import clean_public_url
-from webpage_agent.core.files import save_json
 from webpage_agent.integrations import mcp_adapter
 from webpage_agent.agent import nodes
 
@@ -133,7 +131,6 @@ class WorkingSetTests(unittest.IsolatedAsyncioTestCase):
         是实测一次真实任务才暴露的（NameError in fetch_pages）。
         """
         from webpage_agent.core import sources
-        from webpage_agent.tools import core as tool_module
         from webpage_agent.capabilities import web as web_cap
 
         async def fake_fetch(urls):
@@ -379,9 +376,7 @@ class SourcesHtmlToolTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_refuses_without_documents(self):
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
         from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
         with self.assertRaises(tool_module.ToolError):
             await export_cap._render_sources_html({}, {'documents': []})
 
@@ -546,9 +541,6 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
         """未知工具要**回报**而不是静默过滤——计划引用不存在的工具属于规划错误。"""
         from webpage_agent.agent import nodes
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
-        from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
         kept, dropped = nodes._valid_steps(
             [{'tool': 'web_search', 'args': {'query': 'q'}},
              {'tool': 'not_a_tool', 'args': {}},
@@ -567,9 +559,6 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
     async def test_plan_asks_the_model_and_keeps_its_steps(self):
         from webpage_agent.agent import nodes
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
-        from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
         captured = {}
 
         async def fake_catalog(context=None):
@@ -630,9 +619,6 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
     async def test_plan_falls_back_when_the_model_fails(self):
         from webpage_agent.agent import nodes
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
-        from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
 
         async def fake_catalog(context=None):
             return tool_module.BUILTIN_TOOLS
@@ -650,9 +636,6 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_step_runs_exactly_one_tool_and_advances(self):
         from webpage_agent.agent import nodes
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
-        from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
         from webpage_agent.tools.core import Tool
         seen = []
 
@@ -673,9 +656,6 @@ class OrchestratorTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_step_aborts_remaining_steps_on_error(self):
         from webpage_agent.agent import nodes
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
-        from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
         from webpage_agent.tools.core import Tool
 
         async def boom(args, state):
@@ -980,7 +960,6 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.get('usage', []), [])
 
     async def test_answer_directly_never_touches_documents(self):
-        from webpage_agent.tools import core as tool_module
         from webpage_agent.capabilities import answers as answers_cap
 
         async def fake_chat(system, messages, model=None, on_delta=None):
@@ -995,7 +974,6 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_answer_with_sources_returns_the_reply_verbatim(self):
         from webpage_agent.core import sources
-        from webpage_agent.tools import core as tool_module
         from webpage_agent.capabilities import answers as answers_cap
         with tempfile.TemporaryDirectory() as folder:
             fake = SimpleNamespace(artifact_dir=Path(folder))
@@ -1185,9 +1163,6 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_step_blocks_when_dependency_not_succeeded(self):
         from webpage_agent.agent import nodes
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
-        from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
         from webpage_agent.tools.core import Tool
 
         async def should_not_run(args, state):
@@ -1207,9 +1182,6 @@ class PlanContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_step_records_output_for_downstream_binding(self):
         from webpage_agent.agent import nodes
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
-        from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
         from webpage_agent.tools.core import Tool
 
         async def run(args, state):
@@ -1252,7 +1224,6 @@ class DeployGateTests(unittest.IsolatedAsyncioTestCase):
             self.server(), {'name': 'deploy_site', 'effect_type': effect})
 
     async def test_tool_takes_its_identity_from_mcp(self):
-        from webpage_agent.tools import core as tool_module
         tool = self.tool(effect='destructive')
         self.assertEqual(tool.name, 'deploy_site')
         self.assertEqual(tool.tool_key, 'mcp:publishing:deploy_site')
@@ -1496,15 +1467,16 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored[1][1]['label'], 'e1')
 
     async def test_orphan_running_task_marked_interrupted_on_reopen(self):
-        with tempfile.TemporaryDirectory() as folder:
-            first = new_store()
-            await first.create_task('t1', 's1', '中断前的任务')
-            await first.close()
-            # 重新打开：遗留的 running 任务必须被标记，否则前端会一直等下去。
-            second = new_store()
-            self.assertEqual((await second.task('t1'))['status'], 'interrupted')
-            self.assertEqual(second.interrupted, 1)
-            await second.close()
+        # 不再需要临时目录：库由 PG_TEST_DSN 指向的一次性测试库提供，
+        # 这里的 with TemporaryDirectory 是 SQLite 时代的残留，folder 从未被使用。
+        first = new_store()
+        await first.create_task('t1', 's1', '中断前的任务')
+        await first.close()
+        # 重新打开：遗留的 running 任务必须被标记，否则前端会一直等下去。
+        second = new_store()
+        self.assertEqual((await second.task('t1'))['status'], 'interrupted')
+        self.assertEqual(second.interrupted, 1)
+        await second.close()
 
     async def test_missing_task_returns_none(self):
         self.assertIsNone(await self.store().task('nope'))
@@ -1580,23 +1552,23 @@ class HubTests(unittest.IsolatedAsyncioTestCase):
         """模拟进程重启：新 Hub 打开同一个库，应能查到旧任务并补发事件。"""
         import webpage_agent.api.api_hub as hub_module
         from webpage_agent.api.api_hub import Hub
-        with tempfile.TemporaryDirectory() as folder:
-            first = Hub(new_store())
-            with patch.object(hub_module, 'run_task', self.stub()):
-                record = await first.start('老任务')
-                await asyncio.wait_for(record._task, timeout=10)
-            await first.store.close()
+        # 库由 PG_TEST_DSN 提供，folder 是 SQLite 时代的残留，从未被使用。
+        first = Hub(new_store())
+        with patch.object(hub_module, 'run_task', self.stub()):
+            record = await first.start('老任务')
+            await asyncio.wait_for(record._task, timeout=10)
+        await first.store.close()
 
-            second = Hub(new_store())
-            restored = await second.get(record.task_id)
-            self.assertIsNotNone(restored)
-            self.assertEqual(restored.status, 'succeeded')
-            self.assertEqual(restored.summary()['status'], 'local_ready')
-            self.assertFalse(restored.live)
-            self.assertFalse(await second.cancel(record.task_id))   # 重启后无法取消
-            _, history = await restored.subscribe()
-            self.assertTrue(any(e.get('label') == '已搜索网页' for _, e in history))
-            await second.store.close()
+        second = Hub(new_store())
+        restored = await second.get(record.task_id)
+        self.assertIsNotNone(restored)
+        self.assertEqual(restored.status, 'succeeded')
+        self.assertEqual(restored.summary()['status'], 'local_ready')
+        self.assertFalse(restored.live)
+        self.assertFalse(await second.cancel(record.task_id))   # 重启后无法取消
+        _, history = await restored.subscribe()
+        self.assertTrue(any(e.get('label') == '已搜索网页' for _, e in history))
+        await second.store.close()
 
     async def test_multi_turn_history_is_passed(self):
         import webpage_agent.api.api_hub as hub_module
@@ -2149,9 +2121,9 @@ class PostgresParityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await store.plan('r1'))['steps'][0]['step_id'], 's1')
         self.assertEqual(len(await store.steps_of('r1')), 1)
 
-        action = await store.create_action('a1', run_id='r1', plan_version=1,
-                                     step_id='s1', tool_key='local:web:search',
-                                     args_hash='h', idempotency_key='k1')
+        await store.create_action('a1', run_id='r1', plan_version=1,
+                                  step_id='s1', tool_key='local:web:search',
+                                  args_hash='h', idempotency_key='k1')
         self.assertEqual((await store.find_action('k1'))['action_id'], 'a1')
         await store.update_action('a1', status='in_flight')
         await store.add_attempt('att1', 'a1')
@@ -2671,9 +2643,6 @@ class ThinkingControlTests(unittest.IsolatedAsyncioTestCase):
     async def test_planner_passes_the_flag(self):
         from webpage_agent.agent import nodes
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
-        from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
         captured = {}
 
         async def fake_catalog(context=None):
@@ -2785,9 +2754,6 @@ class PlannerProfileTests(unittest.IsolatedAsyncioTestCase):
         from webpage_agent.agent import nodes
         from webpage_agent.core import profile
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
-        from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
 
         async def fake_catalog(context=None):
             return tool_module.BUILTIN_TOOLS
@@ -2836,9 +2802,6 @@ class SmallTalkFilterTests(unittest.IsolatedAsyncioTestCase):
         """带链接就必须走规划与检索，不能因为句子短就被当成寒暄。"""
         from webpage_agent.agent import nodes
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
-        from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
         called = {}
 
         async def fake_catalog(context=None):
@@ -2863,9 +2826,6 @@ class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_small_talk_answers_without_searching(self):
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
-        from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
         from webpage_agent.agent.graph import build_graph
         from webpage_agent.tools.core import Tool
         touched = {'searched': False}
@@ -2898,9 +2858,6 @@ class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
     async def test_plan_steps_run_in_order(self):
         from webpage_agent.agent import nodes
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.capabilities import publishing as publishing_cap
-        from webpage_agent.capabilities import export as export_cap
-        from webpage_agent.capabilities import web as web_cap
         from webpage_agent.agent.graph import build_graph
         from webpage_agent.tools.core import Tool
         order = []
@@ -3218,41 +3175,40 @@ class ExecutionPathTests(unittest.IsolatedAsyncioTestCase):
     async def test_resume_works_after_restart(self):
         """杀进程 → 新 Hub → 续跑：resume 必须回库，而不是只查内存。"""
         import webpage_agent.api.api_hub as hub_module
-        with tempfile.TemporaryDirectory() as folder:
-            path = Path(folder) / 'a.db'
-            first = self.hub(new_store())
-            with patch.object(hub_module, 'run_task', self.stub()):
-                record = await first.start('第一次')
-                await asyncio.wait_for(record._task, timeout=5)
-            # 模拟"计划已存、执行被暂停后进程被杀"
-            await first.store.save_plan(
-                record.run_id, 1, goal='g',
-                steps=[{'tool': 'render_html', 'step_id': 's1', 'args': {},
-                        'tool_key': 'local:reports:render'}])
-            await first.store.update_run(record.run_id, status='paused')
-            task_id, run_id = record.task_id, record.run_id
-            await first.store.close()
+        # 库由 PG_TEST_DSN 提供；folder/path 是 SQLite 时代的残留，从未被使用。
+        first = self.hub(new_store())
+        with patch.object(hub_module, 'run_task', self.stub()):
+            record = await first.start('第一次')
+            await asyncio.wait_for(record._task, timeout=5)
+        # 模拟"计划已存、执行被暂停后进程被杀"
+        await first.store.save_plan(
+            record.run_id, 1, goal='g',
+            steps=[{'tool': 'render_html', 'step_id': 's1', 'args': {},
+                    'tool_key': 'local:reports:render'}])
+        await first.store.update_run(record.run_id, status='paused')
+        task_id, run_id = record.task_id, record.run_id
+        await first.store.close()
 
-            second = self.hub(new_store())
-            seen = {}
+        second = self.hub(new_store())
+        seen = {}
 
-            async def fake(text, progress=None, on_event=None, history=None,
-                           on_start=None, prior=None, memory=None, ledger=None,
-                           run_id=None, resume_plan=None):
-                seen['plan'] = resume_plan
-                seen['history'] = history
-                return {'task_id': 'a1', 'status': 'local_ready', 'timings': [],
-                        'deployment': {}}
+        async def fake(text, progress=None, on_event=None, history=None,
+                       on_start=None, prior=None, memory=None, ledger=None,
+                       run_id=None, resume_plan=None):
+            seen['plan'] = resume_plan
+            seen['history'] = history
+            return {'task_id': 'a1', 'status': 'local_ready', 'timings': [],
+                    'deployment': {}}
 
-            with patch.object(hub_module, 'run_task', fake):
-                resumed = await second.resume(run_id)
-                self.assertIsNotNone(resumed, '重启后必须还能续跑')
-                await asyncio.wait_for(resumed._task, timeout=5)
-            self.assertEqual([s['step_id'] for s in seen['plan']['steps']], ['s1'])
-            # 续跑要带上历史，否则续出来的结果接不上前文
-            self.assertTrue(any(m['content'] == '第一次'
-                                for m in (seen['history'] or [])))
-            self.assertEqual((await second.store.task(task_id))['task_id'], task_id)
+        with patch.object(hub_module, 'run_task', fake):
+            resumed = await second.resume(run_id)
+            self.assertIsNotNone(resumed, '重启后必须还能续跑')
+            await asyncio.wait_for(resumed._task, timeout=5)
+        self.assertEqual([s['step_id'] for s in seen['plan']['steps']], ['s1'])
+        # 续跑要带上历史，否则续出来的结果接不上前文
+        self.assertTrue(any(m['content'] == '第一次'
+                            for m in (seen['history'] or [])))
+        self.assertEqual((await second.store.task(task_id))['task_id'], task_id)
 
 
 class BackendJobTests(unittest.IsolatedAsyncioTestCase):

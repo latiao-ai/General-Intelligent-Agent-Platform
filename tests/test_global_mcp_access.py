@@ -18,7 +18,6 @@ from webpage_agent.core import mcp_connections
 from webpage_agent.tools import core as tools
 from webpage_agent.tools import tool_authorization
 from webpage_agent.tools import tool_context
-from webpage_agent.tools import tool_policy
 from webpage_agent.capabilities.base import ToolError
 from webpage_agent.core.credentials import SHARED_TENANT, CredentialBinding
 from webpage_agent.integrations.mcp_servers import Server

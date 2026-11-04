@@ -25,7 +25,6 @@ from mcp.client.stdio import stdio_client, StdioServerParameters
 
 # 本模块直接读 os.environ，导入 config 触发 load_dotenv，
 # 避免单独调用 connect_session 时出现 KeyError: 'MCP_URL'。
-from webpage_agent.core import config as _config
 from webpage_agent.core.config import settings
 from webpage_agent.integrations import mcp_servers, mcp_subject
 from webpage_agent.core import credentials as credentials_module

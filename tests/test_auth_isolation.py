@@ -9,7 +9,6 @@
 - 两个平台各自的 `user-123` 是两个中台账号（身份源隔离）；
 - 同一企业不同用户之间也互相隔离。
 """
-import os
 import sys
 import time
 import unittest
@@ -27,7 +26,7 @@ from webpage_agent.api import auth
 from webpage_agent.governance import policies
 from webpage_agent.governance import ticket_auth
 from tests.test_auth_exchange import (PG_DSN, new_store, reset_db)  # noqa: E402
-from tests.test_ticket_auth import (ISS, PRIVATE_A, PUBLIC_A,  # noqa: E402
+from tests.test_ticket_auth import (ISS, PUBLIC_A,  # noqa: E402
                                     claims, connection, sign)
 
 # 平台 A：企业 tenant-a / 身份源 idp-a（两个用户）

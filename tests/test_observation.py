@@ -9,15 +9,12 @@
 因此这里的断言都盯着三件可数的事实：**模型请求次数**、**远端工具调用次数**、
 **库里的版本/水位**。不靠"看起来跑通了"。
 """
-import asyncio
-import json
 import tempfile
 import unittest
 
 from unittest.mock import patch
 
 from webpage_agent.observe import observation as obs
-from webpage_agent.observe import observation as observation_module
 from webpage_agent.core.schemas import ExecutionPlan, ObservationDecision, RevisedPlan
 from tests.exec_env import (Remote, install_main, install_tools, new_store,
                             override_settings, reset_db, seed_run)
@@ -421,7 +418,7 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
         decisions = [{'kind': 'wait_input', 'reason': 'x', 'questions': ['q']}]
         store = new_store()
         await seed_run(store)
-        remote = Remote()
+        # 这个用例断言"一次模型请求都没发"，用不到假远端，不构造。
         model = FakeModel(plan=plan, decisions=decisions)
         hub = self.hub(store, owner_id='w1')
         import scripts.run_worker as worker
@@ -467,7 +464,8 @@ class ProgressGuardTests(unittest.IsolatedAsyncioTestCase):
 
         store = new_store()
         await seed_run(store)
-        remote = Remote()
+        # 工具用本用例自建的 listing，install_tools 直接吃这个字典，
+        # 假远端在这里没有接线，构造了也不会有调用记录，故不构造。
 
         async def listing(args, state):
             return {'payload': {'shots': [{'id': 'shot-a'}]}}

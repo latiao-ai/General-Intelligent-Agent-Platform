@@ -9,7 +9,6 @@ CAS 的比较基准：一个服务端只要在回执里返回同名标量，就�
 1. `AgentState` 的每个**标量**字段都必须在 `_STATE_KEYS` 里（防止以后再漏）；
 2. 真的走一遍 runner，回执里的身份字段不得进状态增量。
 """
-import asyncio
 import typing
 import unittest
 

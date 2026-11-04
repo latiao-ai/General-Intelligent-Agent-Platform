@@ -1,6 +1,5 @@
 """中台接入边界：真实数据库并发、崩溃窗口、计划合同与主体隔离。"""
 import asyncio
-import json
 import time
 import unittest
 from dataclasses import replace

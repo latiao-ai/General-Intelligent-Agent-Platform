@@ -24,17 +24,15 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
-import jwt
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from webpage_agent.api import auth
-from webpage_agent.api import auth_connections
 from webpage_agent.governance import ticket_auth
-from tests.test_ticket_auth import (AUD, ISS, PRIVATE_A, PRIVATE_B,  # noqa: E402
-                                    PUBLIC_A, claims, connection, sign)
+from tests.test_ticket_auth import (PRIVATE_A, PRIVATE_B,  # noqa: E402
+                                    claims, connection, sign)
 
 PG_DSN = os.getenv('PG_TEST_DSN', '')
 TABLES = ('auth_sessions', 'ticket_redemptions', 'identities', 'app_users',

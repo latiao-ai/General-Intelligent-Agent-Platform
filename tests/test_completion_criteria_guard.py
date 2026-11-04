@@ -81,7 +81,6 @@ class LocalOutputTests(unittest.TestCase):
 
     def test_registered_export_tool_declares_local_output(self):
         """真实能力包必须自己声明，否则这条链会以为本地没有产物来源。"""
-        from webpage_agent import capabilities as capabilities_pkg
         from webpage_agent.capabilities import registry
         spec = {tool.name: tool for tool in registry.load()}.get(
             'render_sources_html')

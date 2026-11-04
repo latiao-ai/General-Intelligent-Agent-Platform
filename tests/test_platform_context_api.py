@@ -7,7 +7,6 @@ import httpx
 
 from webpage_agent.api import auth_connections
 from webpage_agent.governance import policies
-from webpage_agent.agent import scene_context
 from tests.test_scene_context import CONTEXT, _sign
 from tests.test_ticket_auth import connection
 

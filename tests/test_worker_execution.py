@@ -12,7 +12,6 @@ import tempfile
 import unittest
 
 from pathlib import Path
-from unittest.mock import patch
 
 from tests.exec_env import (Remote, install_main, install_plan, install_tools,
                             new_store, one_step_plan, reset_db, seed_run)
@@ -101,7 +100,6 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
         """一次执行抛异常只影响这一条 run，Worker 还活着且能领下一条。"""
         import scripts.run_worker as worker
         from webpage_agent.tools.core import Tool
-        from webpage_agent.tools.core import Tool
 
         store = new_store()
         await seed_run(store, task_id='t1', run_id='r1', session_id='s1')
@@ -136,7 +134,6 @@ class WorkerExecutionTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_stored_plan_is_not_treated_as_a_resume(self):
         """库里只有一份空计划：那是"没计划"，必须重新规划（旧代码的坑）。"""
         import scripts.run_worker as worker
-        from webpage_agent.tools.core import Tool
 
         store = new_store()
         await seed_run(store)
