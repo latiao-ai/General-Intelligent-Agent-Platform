@@ -427,7 +427,12 @@ def completion_state(criteria: list[dict], *, state: dict, results=None,
             # tool_key（`local:web:search`）。对上注册名和这次调用的公开名，
             # 不要拿冒号最后一截（`search`）凑合——那截不是工具名，对得上会放行，
             # 对不上就会把已经成功的检索判死。
-            def _matches(item: dict) -> bool:
+            # `target` 用默认参数绑死：这里本来就是"定义后同轮立即调用"，语义上
+            # 不可能拿到下一轮的 target（ruff B023 是静态规则的保守报警）。
+            # 但显式绑定让"这个闭包捕获的是本轮的值"写进代码，而不是靠读者
+            # 去数循环体里有没有延迟调用——将来谁把它塞进列表推导/回调，
+            # 也不会悄悄变成捕获最后一个 target 的 bug。
+            def _matches(item: dict, target=target) -> bool:
                 if item.get('execution_status') != 'succeeded':
                     return False
                 return bool(target) and target in _identity_keys(item)

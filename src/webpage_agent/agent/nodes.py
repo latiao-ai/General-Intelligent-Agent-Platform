@@ -488,8 +488,10 @@ def check_result_locus(locus: str, steps: list[dict], catalog,
         return [{'code': 'bad_result_locus',
                  'detail': 'result_locus 必须是 chat、platform_state 或 platform_change'}]
 
+    # 两边同源（都由 `names` 派生），长度必然相等：加 strict 是免费的自证
     public = [name for name, tool in zip(names, [
-        known.get(name) for name in names]) if tool is not None and _is_public(tool)]
+        known.get(name) for name in names], strict=True)
+              if tool is not None and _is_public(tool)]
     mcp_writes = [tool for tool in chosen if _is_mcp(tool) and _is_write(tool)]
     mcp_reads = [tool for tool in chosen if _is_mcp(tool) and tool.effect == 'read']
     explain_only = names == ['answer_directly']
@@ -673,11 +675,18 @@ def _scene_brief(scene: dict | None) -> str:
 
 
 async def _load_scene(store_, run_id: str) -> dict:
+    """读"现场上下文"（当前项目/选中对象）。
+
+    读取失败**不再静默转成空**：空现场会让规划器以为用户什么都没选，于是照着
+    通用模板排计划——用户看到的是"它没理解我在哪个页面"，而日志里什么都没有。
+    这里保留降级（返回空字典，规划照常进行），但必须留下堆栈。
+    """
     if store_ is None or not run_id or not hasattr(store_, 'scene_context'):
         return {}
     try:
         run = await store_.run(run_id)
     except Exception:                              # noqa: BLE001
+        logger.exception('读取 run 失败，本次按"无现场"规划 run=%s', run_id)
         return {}
     task_id = str((run or {}).get('task_id') or '')
     if not task_id:
@@ -685,6 +694,7 @@ async def _load_scene(store_, run_id: str) -> dict:
     try:
         scene = await store_.scene_context(task_id)
     except Exception:                              # noqa: BLE001
+        logger.exception('读取现场上下文失败，本次按"无现场"规划 task=%s', task_id)
         return {}
     return scene if isinstance(scene, dict) else {}
 
@@ -1253,6 +1263,9 @@ async def intake(state):
         snapshot = await store_.run_snapshot(run_id) or {}
         saved_state = dict(snapshot.get('state') or {})
     except Exception:                              # noqa: BLE001
+        # 降级是合理的（没有快照也能按已提交计划续跑），但"问过用户什么"
+        # 恰恰存在快照里：静默降级会让续跑把同一组问题再问一遍。
+        logger.exception('读取快照失败，续跑可能重复追问 run=%s', run_id)
         saved_state = {}
     saved_plan = saved_state.get('plan') if isinstance(saved_state.get('plan'), dict) else {}
     saved_locus = str(saved_plan.get('result_locus') or '')
@@ -1861,11 +1874,23 @@ async def observe_result(state):
     book = ledger_module.current_ledger()
     context_ = execution_control.require()
     control, actions = {}, []
+    # 观察输入读取失败要留痕：它会一路影响 route 判断，只写日志会让
+    # "这次为什么按无控制请求处理"在 state 里查不到。
+    observation_errors: list[dict] = []
     if book is not None and context_ is not None:
         try:
             control = await book.store.control_state(context_.run_id)
             actions = await book.store.actions_of(context_.run_id)
-        except Exception:                              # noqa: BLE001
+        except Exception as exc:                       # noqa: BLE001
+            observation_errors.append({
+                'stage': 'observe', 'type': type(exc).__name__,
+                'error_code': getattr(exc, 'error_code', 'E_OBSERVATION_INPUT'),
+                'message': '读取控制状态/动作失败，本次观察按无控制请求处理'})
+            # 降级保留（观察缺数据时按"无控制请求"处理，让流程继续而不是卡死），
+            # 但这会把"取消/暂停请求读不到"伪装成"没有控制请求"——一旦是数据库
+            # 故障，用户点了取消却毫无反应，而日志里一片干净。必须留堆栈。
+            logger.exception('读取控制状态/动作失败，本次观察按无控制请求处理 run=%s',
+                             context_.run_id)
             control, actions = {}, []
     plan = state.get('plan') or {}
     signals = observation_module.collect_observation(
@@ -1919,6 +1944,8 @@ async def observe_result(state):
         raise execution_control.ControlStopped('已请求暂停', 'paused')
     updates = {'observation': signals, 'next_route': route,
                'actions_snapshot': actions, **updates_fp}
+    if observation_errors:
+        updates['errors'] = list(state.get('errors') or []) + observation_errors
     if route == observation_module.ROUTE_DECIDE:
         emit(action('结果需要判断', why, '🔎'))
     elif signals.get('empty_results') or signals.get('incomplete_results'):
@@ -2008,7 +2035,8 @@ def _same_binding_arguments(original, candidate):
                 and all(_same_binding_arguments(value, candidate[key]) for key, value in original.items()))
     if isinstance(original, list):
         return (isinstance(candidate, list) and len(original) == len(candidate)
-                and all(_same_binding_arguments(a, b) for a, b in zip(original, candidate)))
+                and all(_same_binding_arguments(a, b)
+                        for a, b in zip(original, candidate, strict=True)))
     return type(original) is type(candidate) and original == candidate
 
 
@@ -2063,7 +2091,9 @@ def _prepared_reference_steps(state, candidate):
                        'detail': '引用修复只能返回待执行的这些步骤：编号可以省略或重排，'
                                  '但不能新增、替换或漏掉计划里的步骤'}]
     failed = {error.get('step_id') for error in _reference_failures(state)}
-    for before, after in zip(original, aligned):
+    # `_align_repair_steps` 保证按原步骤一一对齐；长度不等说明对齐逻辑坏了，
+    # 静默截断会让"少了一步"这种真问题看起来像"修复通过"。
+    for before, after in zip(original, aligned, strict=True):
         if (before.get('tool') != after.get('tool')
                 or list(before.get('depends_on') or []) != list(after.get('depends_on') or [])
                 or (before.get('compensate') or None) != (after.get('compensate') or None)):
@@ -2743,7 +2773,15 @@ async def _check_boundary(state: dict) -> str:
         return ''
     try:
         control = await book.store.control_state(context.run_id)
-    except Exception:                                  # noqa: BLE001
+    except Exception as exc:                           # noqa: BLE001
+        # 这是**安全边界**：读不到控制请求却返回"可以继续"，等于在数据库故障时
+        # 忽略用户的取消/暂停。保留放行（否则一次抖动会打断所有运行），
+        # 但必须留下堆栈——否则"我点了取消它还在跑"永远查不出原因。
+        logger.exception('安全边界读取控制状态失败，本次放行 run=%s', context.run_id)
+        state.setdefault('errors', []).append({
+            'stage': 'boundary', 'type': type(exc).__name__,
+            'error_code': getattr(exc, 'error_code', 'E_CONTROL_STATE_UNAVAILABLE'),
+            'message': '边界检查读不到控制请求，本步已放行（取消/暂停可能被忽略）'})
         return ''
     if control.get('cancel_requested_at'):
         raise execution_control.ControlStopped('运行已被取消', 'cancelled')
