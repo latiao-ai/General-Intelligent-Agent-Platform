@@ -252,9 +252,17 @@ class Hub:
                 continue
             record = self.tasks.get(str(claimed.get('task_id') or ''))
             if record is None or record.live:
-                await self.store.update_run(
-                    run_id, status='queued', lease_owner=None,
-                    lease_expires_at=None)
+                # 刚领到的 run 要原样放回队列。带 owner + epoch 做门禁：如果这几行里
+                # 已经被别的 Worker 接手，就不该再动它的租约与状态。
+                requeue = getattr(self.store, 'requeue_run_owned', None)
+                if callable(requeue):
+                    await requeue(run_id,
+                                  lease_owner=str(claimed.get('lease_owner') or ''),
+                                  lease_epoch=int(claimed.get('lease_epoch') or 0))
+                else:
+                    await self.store.update_run(
+                        run_id, status='queued', lease_owner=None,
+                        lease_expires_at=None)
                 continue
             self._arm(record, claimed, self.execute_claimed_run(claimed))
 
@@ -486,7 +494,11 @@ class Hub:
 
         task = await self.store.task(task_id)
         if task is None:
-            await self.store.update_run(run_id, status='failed', error='任务不存在')
+            # 执行者收尾：带上领取时的 owner + epoch。若此刻已被别人接手，
+            # 这一笔会落空（返回 False），而不是把接管者的状态盖掉。
+            await self.store.update_run_owned(
+                run_id, lease_owner=owner, lease_epoch=epoch,
+                status='failed', error='任务不存在')
             return None
 
         record = self.tasks.get(task_id)
@@ -498,8 +510,10 @@ class Hub:
         if record is None or record.run_id != run_id:
             record = await self.get(task_id)
             if record is None:
-                await self.store.update_run(run_id, status='failed',
-                                            error='无任务记录')
+                # 同上：执行者收尾，必须过租约门禁
+                await self.store.update_run_owned(
+                    run_id, lease_owner=owner, lease_epoch=epoch,
+                    status='failed', error='无任务记录')
                 return None
 
         record.run_id = run_id
@@ -543,8 +557,10 @@ class Hub:
             # 原有动作身份，可能重复副作用。
             logger.error('run %s 有 %s 个动作但没有计划，转待核实',
                          run_id, len(actions))
-            await self.store.update_run(run_id, status='needs_reconcile',
-                                        error='有动作但缺失计划，需人工核实')
+            # 执行者收尾：这是我们领到的 run，写结论必须带上自己的租约
+            await self.store.update_run_owned(
+                run_id, lease_owner=owner, lease_epoch=epoch,
+                status='needs_reconcile', error='有动作但缺失计划，需人工核实')
             record.status = 'needs_reconcile'
             await record.persist(status='needs_reconcile', state=record.state)
             return record
@@ -633,7 +649,8 @@ class Hub:
         try:
             await record.persist(status=status, state=state)
             await self.store.append_message(record.session_id, 'assistant', reply)
-            await self._finish_run(record, state, status)
+            # 传 context：这条 run 是本进程领的，收尾要走带租约的门禁
+            await self._finish_run(record, state, status, context=context)
             await record.publish({'type': 'status', **outcome_module.view(status, state),
                                   'detail': reply})
             logger.info('run %s 按快照收尾（步骤已全部结算）status=%s',
@@ -864,8 +881,12 @@ class Hub:
             if stopped == 'cancelled':
                 record.status = 'cancelled'
                 await record.persist(status='cancelled', state=state)
-                await self.store.update_run(record.run_id, status='cancelled',
-                                            cancel_requested_at=now())
+                # 执行者收尾：取消是本进程按控制请求停下的，仍要过租约门禁——
+                # 否则一个已被接管的旧执行者会把接管者刚推进的状态改成 cancelled。
+                await self.store.update_run_owned(
+                    record.run_id, lease_owner=context.lease_owner,
+                    lease_epoch=context.lease_epoch,
+                    status='cancelled', cancel_requested_at=now())
                 await record.publish({'type': 'status', 'status': 'cancelled',
                                       'run_status': 'cancelled',
                                       'detail': '已按请求停止'})
@@ -894,8 +915,12 @@ class Hub:
             unknown = await self._has_uncertain_actions(record.run_id)
             record.status = 'needs_reconcile' if unknown else 'cancelled'
             await record.persist(status=record.status)
-            await self.store.update_run(record.run_id, status=record.status,
-                                  cancel_requested_at=now())
+            # 执行者收尾：上面已排除 `_lease_lost`，但租约仍可能在这几行之间过期，
+            # 所以照样带 owner + epoch——门禁是数据库判的，不是内存里猜的。
+            await self.store.update_run_owned(
+                record.run_id, lease_owner=context.lease_owner,
+                lease_epoch=context.lease_epoch,
+                status=record.status, cancel_requested_at=now())
             # 给会话补一条助手回复：否则下一轮上下文里会出现两条连续的用户消息，
             # 模型会看不出上一轮其实是被打断的。
             await self.store.append_message(record.session_id, 'assistant', '（上一轮被用户中断）')
@@ -1125,6 +1150,10 @@ class Hub:
             # 为真、库里 tasks.status 还是 queued，回放接口按库读就显示"已完成
             # 但还在排队"。内存状态统一由 persist() 在落库之后设置。
         else:
+            # 没有执行上下文（CLI 直调、单测）：这是**唯一**允许无租约写终态的地方。
+            # 生产路径一定带 context（Worker / API 就地执行都会先 claim_run），
+            # 所以这段不是"绕过 fencing 的后门"，而是"本来就没有租约可校验"。
+            # 若将来出现新的无上下文生产调用点，那是设计错误，应当补 claim 而不是加到这里。
             await self.store.update_run(record.run_id, **fields)
         # outbox：业务事件与派生作业在同一处写入，消费者按 dedupe_key 幂等
         await self.store.enqueue_job(
@@ -1228,6 +1257,8 @@ class Hub:
         record = await self.get(run['task_id'])
         if record is None or record.live:
             return
+        # 管理动作（补充要求后放回队列）：调用者不是这条 run 的执行者，
+        # 唤醒的正当性来自"用户补充了要求"。改成 _owned 会让这条永远唤不醒。
         await self.store.update_run(run_id, status='queued')
         await self.store.update_task(run['task_id'], status='queued')
         record.run_id = run_id
@@ -1276,10 +1307,15 @@ class Hub:
         if run is None:
             return {'ok': False, 'status': '', 'pause_requested': False}
         status = str(run.get('status') or '')
+        # 管理动作（运维/用户暂停）：queued 的 run 没有执行者，不存在租约可校验；
+        # 同一事务里直接置 paused，Worker 就领不到它了。
         if status == 'queued':
             await self.store.update_run(run_id, status='paused', pause_requested=1)
             logger.info('run %s 在排队阶段直接暂停', run_id)
             return {'ok': True, 'status': 'paused', 'pause_requested': True}
+        # 管理动作：running 的执行者在别的进程，无法直接 cancel asyncio.Task，
+        # 只能写控制标记，由执行者在下一个安全边界自己读到并停下。
+        # **不能**在这里顺手改 status——那等于替正在跑的进程改账。
         if status == 'running' or status == 'reconciling':
             await self.store.update_run(run_id, pause_requested=1)
             return {'ok': True, 'status': status, 'pause_requested': True}
@@ -1322,6 +1358,8 @@ class Hub:
                 and run.get('lease_expires_at')
                 and float(run['lease_expires_at']) > time.time()):
             return None
+        # 管理动作（resume）：上面已确认没有有效租约（否则直接返回 None），
+        # 所以此刻没有执行者可被 fencing，不存在覆盖别人进度的风险。
         await self.store.update_run(run_id, status='queued', pause_requested=0)
         record.run_id = run_id
         previous_events = await self.store.events(record.task_id)
@@ -1407,6 +1445,8 @@ class Hub:
             return {'run_id': new_run_id, 'status': 'cancelled',
                     'steps': []}
         # 补偿运行本身不产出产物，别把原任务的状态覆盖成空
+        # 管理动作：补偿是**另起一条 run** 跑的，这里给被补偿的原 run 盖时间戳。
+        # 原 run 早已结束、没有活跃执行者，因此是合法的越权写。
         await self.store.update_run(run_id, compensated_at=now())
         state = dict(record.state or {})
         if before.get('artifact') and not state.get('artifact'):
@@ -1485,6 +1525,8 @@ class Hub:
         if record is not None and record.live and record.run_id == run_id:
             record._task.cancel()
             return True
+        # 管理动作（跨进程取消）：执行者在别的进程，这里只写请求标记，
+        # 由持有租约的一方在自己那一侧读到再停。
         await self.store.update_run(run_id, cancel_requested_at=now())
         logger.info('run %s 已写入取消请求（执行者在其他进程）', run_id)
         return True

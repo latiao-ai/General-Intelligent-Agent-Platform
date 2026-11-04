@@ -1429,6 +1429,24 @@ class PostgresStore(GovernanceStore):
             await conn.commit()
             return cur.rowcount > 0
 
+    async def requeue_run_owned(self, run_id: str, *, lease_owner: str,
+                                lease_epoch: int) -> bool:
+        """把**自己刚领到、但没能执行**的 run 放回队列，同时释放租约。
+
+        与 `update_run_owned` 分开的原因：`lease_owner` / `lease_expires_at`
+        不在它的白名单里（那是有意的——执行者不该随手改自己的租约），而"放回
+        队列"恰恰要清掉这两列。门禁照旧：只有当前 owner + epoch 对得上才动，
+        别人已经接手的话返回 False，一个字段都不碰。
+        """
+        async with self._lease() as conn:
+            cur = await self._run(
+                conn, "UPDATE runs SET status='queued', lease_owner=NULL, "
+                'lease_expires_at=NULL, updated_at=%s '
+                'WHERE run_id=%s AND lease_owner=%s AND lease_epoch=%s',
+                (now(), run_id, lease_owner, int(lease_epoch)))
+            await conn.commit()
+            return cur.rowcount > 0
+
     async def claim_run(self, worker_id: str, lease_seconds: float = 60.0,
                   now_ts: float | None = None,
                   run_id: str | None = None) -> dict | None:

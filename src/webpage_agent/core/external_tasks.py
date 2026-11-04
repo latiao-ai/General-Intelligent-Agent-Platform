@@ -105,7 +105,14 @@ async def remember_waiting(state: dict, waiting: list) -> bool:
             next_poll_at=now + float(settings.external_poll_base_seconds))
         wrote = True
     if wrote and hasattr(store, 'update_run'):
-        await store.update_run(context.run_id, waiting_external=1)
+        # 执行者侧写入：这里持有 `context`（正在跑的这次执行），必须过租约门禁，
+        # 否则一个已被接管的旧执行者还能把新执行者的 waiting_external 改回 1。
+        fence = getattr(store, 'update_run_owned', None)
+        if callable(fence):
+            await fence(context.run_id, lease_owner=context.lease_owner,
+                        lease_epoch=context.lease_epoch, waiting_external=1)
+        else:
+            await store.update_run(context.run_id, waiting_external=1)
     return wrote
 
 
@@ -170,20 +177,32 @@ async def _patch_snapshot(store, task: dict, mapped: str, payload) -> None:
 
 
 async def _wake_run(store, run_id: str, *, failed: str = '') -> None:
+    """外部任务有结论时唤醒 run。
+
+    这里的调用者是**轮询器**（Worker 的 `poll_due`），不是这条 run 的执行者：
+    轮询用的是 `external_tasks` 自己的 `poll_epoch` 抢占，与 run 的租约是两套
+    凭证。所以这是**管理动作**，有意保留越权写（`update_run` 而非 `_owned`）：
+    外部任务可能在执行者换人之后才回结果，而唤醒的正当性来自"外部状态变了"，
+    不来自"我还持有这条 run 的租约"。把它改成 `_owned` 会让回结果永远唤不醒。
+    """
     if not hasattr(store, 'external_tasks_of_run'):
         return
     rows = await store.external_tasks_of_run(run_id)
     if any(str(row.get('state') or '') in _OPEN for row in rows):
+        # 管理动作：只标"还在等外部任务"，见上方说明
         await store.update_run(run_id, waiting_external=1)
         return
     run = await store.run(run_id) if hasattr(store, 'run') else None
     status = str((run or {}).get('status') or '')
     if failed:
         if status in ('waiting_input', 'running', 'queued'):
+            # 管理动作：外部任务没有可查询的合同/超期，必须把 run 交给人工核实。
+            # 这里清 lease_owner/lease_expires_at 是有意的：原执行者已经无从收尾。
             await store.update_run(run_id, status='needs_reconcile', waiting_external=0,
                                    error=failed, lease_owner='', lease_expires_at=None)
         return
     if status == 'waiting_input':
+        # 管理动作：把"等外部结果"的 run 放回队列，让执行者继续
         await store.update_run(run_id, status='queued', waiting_external=0,
                                error='', lease_owner='', lease_expires_at=None)
 

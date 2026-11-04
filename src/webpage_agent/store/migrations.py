@@ -92,7 +92,9 @@ def _balanced(text: str, open_index: int) -> tuple[str, int]:
 
 def _split_top_level(body: str) -> list[str]:
     """按顶层逗号切分列定义（`NUMERIC(10,2)` 里的逗号不能切）。"""
-    parts, depth, current = [], 0, []
+    parts: list[str] = []
+    depth = 0
+    current: list[str] = []
     for char in body:
         if char == '(':
             depth += 1
