@@ -35,7 +35,7 @@ from webpage_agent.core import services as services_module
 from webpage_agent.tools import tool_authorization as authorization_module
 from webpage_agent.tools import tool_context as tool_context_module
 from webpage_agent.core.config import settings
-from webpage_agent.store.pg_store import BudgetExceeded
+from webpage_agent.store.pg_store import BudgetExceeded, DecisionBudgetExceeded
 from webpage_agent.observe.events import action, emit, stage_end, stage_start, thought
 from webpage_agent.capabilities.base import ToolError
 from webpage_agent.core.schemas import ExecutionPlan, ObservationDecision, RevisedPlan, ToolSelection
@@ -2181,13 +2181,26 @@ async def decide_next(state):
     except execution_control.IntentChanged as exc:
         emit(action('用户要求已更新', '这次观察结论作废', '📝'))
         return _intent_changed_update(state, exc)
-    except Exception as exc:                            # noqa: BLE001
+    except (execution_control.LeaseLost, execution_control.ControlStopped):
+        # 执行权丢失/被要求停下：**不是**"预算用尽"，必须照旧往上抛。
+        # 吞掉它会把"另一个执行者已接手"谎报成"预算用完，等你补充"，
+        # 同时让本进程以为自己还有资格继续写这条 run。
+        raise
+    except DecisionBudgetExceeded as exc:
+        # 只有它才是真的预算用尽：保存已完成事实，等人显式继续
         hint = getattr(exc, 'safe_message', None) or type(exc).__name__
         emit(action('决策预算用尽', hint, '⚠️'))
         return {'status': 'waiting_input', 'next_route': 'stop',
                 'failure': f'这次运行已经用完自主决策预算（{hint}）。'
                            f'已完成的步骤与结果都保留，可以补充要求后继续。',
                 **_carry_waiting(state)}
+    except Exception as exc:                            # noqa: BLE001
+        # 数据库故障、编程错误等：走统一的规划失败路径，**保留原错误码**。
+        # 以前这里一律渲染成"预算用尽"，于是运维看到的是假信号、用户看到的
+        # 是错误原因——真正该看的是原始异常与它的 error_code。
+        # 此时决策还没预留成功，所以不需要（也不应该）finish_decision。
+        logger.exception('预留决策失败 run=%s key=%s', run_id, key)
+        return planning_failure(state, exc, stage='observe')
 
     decision_id = reserved['decision_id']
     if reserved.get('replay'):
