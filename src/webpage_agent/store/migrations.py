@@ -1,4 +1,25 @@
-"""Ordered, transactional schema upgrades, serialized across all replicas."""
+"""有序、事务化、跨副本串行的结构升级通道。
+
+**铁律（增删列之前先读这一段）**
+
+`SCHEMA`（定义在 `webpage_agent.store.pg_store`）是**全新库的完整快照**，只为
+"从零建库"服务：`apply()` 只在 `v1_baseline` 还没登记时执行它一次，此后**再也
+不会**执行。由此推出三条硬规则：
+
+1. **任何针对存量库的结构变更，都必须作为一条 `UPGRADES` 条目写进来**，并带上
+   自己的版本号。改完 `SCHEMA` 不算数。
+2. **不要**指望往 `SCHEMA` 里加 `ALTER TABLE ... ADD COLUMN` 能升级旧库。它看着
+   像迁移，实际只在全新库建表阶段顺带跑一次；对已记录基线的库永远不会生效，
+   而且不报错、不告警——那一列就是永远不存在，直到某次读写碰到它才炸。
+3. 往 `SCHEMA` 里补列的唯一正当用途是"让新库建表语句保持完整快照"。这种情形
+   （新库有列、旧库没有，且没有对应 `UPGRADES`）由 `verify_schema()` 当场拦下。
+
+历史背景：本项目早期确实靠 `SCHEMA` 里那批 `ADD COLUMN IF NOT EXISTS` 升级过
+旧库（PG 支持 `IF NOT EXISTS`，并进建表脚本当时是有效的）。问题在于一旦有人把它
+当成常规迁移机制，后面新增的列就会静默丢失，而 `require_current()` 只看版本号
+是否登记、查不出列缺失。所以现在规则写死在这里，同时让启动/部署阶段真的去比对
+活库结构（`verify_schema()`）。
+"""
 from datetime import datetime, timezone
 
 BASELINE = 'v1_baseline_20261029'
@@ -29,6 +50,122 @@ CREATE INDEX idx_provider_charges_tenant_day ON provider_charges(tenant_id, day)
 '''), (RUN_TRACE, "ALTER TABLE runs ADD COLUMN trace_id TEXT NOT NULL DEFAULT '';"))
 
 
+class SchemaDrift(RuntimeError):
+    """活库结构与 `SCHEMA` 快照不一致：有表或列没被任何迁移建出来。"""
+
+    def __init__(self, missing: list[str]) -> None:
+        self.missing = list(missing)
+        super().__init__(
+            '数据库结构与迁移脚本不一致，缺 %s。' % '、'.join(self.missing)
+            + '原因通常是有人只改了 SCHEMA 却没写进 UPGRADES——'
+              'SCHEMA 只服务全新库，对已记录基线的库永不执行。'
+              '请把这条变更作为新的 UPGRADES 条目加上自己的版本号后重跑 '
+              'python -m scripts.migrate')
+
+
+# 建表语句体里，以这些词开头的是表级约束，不是列定义
+_CONSTRAINT_WORDS = ('PRIMARY', 'UNIQUE', 'CONSTRAINT', 'FOREIGN',
+                     'CHECK', 'EXCLUDE', 'LIKE')
+
+_CREATE_TABLE = r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w."]+)\s*\('
+_ADD_COLUMN = (r'ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?([\w."]+)\s+'
+               r'ADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?([\w"]+)')
+
+
+def _unquote(name: str) -> str:
+    return name.strip().strip('"').split('.')[-1]
+
+
+def _balanced(text: str, open_index: int) -> tuple[str, int]:
+    """返回 `(` 起那段括号里的内容与收尾位置。类型里的括号（varchar(8)）也在这里被吃掉。"""
+    depth = 0
+    for index in range(open_index, len(text)):
+        char = text[index]
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+            if depth == 0:
+                return text[open_index + 1:index], index + 1
+    raise ValueError('SCHEMA 里的括号不配对')
+
+
+def _split_top_level(body: str) -> list[str]:
+    """按顶层逗号切分列定义（`NUMERIC(10,2)` 里的逗号不能切）。"""
+    parts, depth, current = [], 0, []
+    for char in body:
+        if char == '(':
+            depth += 1
+        elif char == ')':
+            depth -= 1
+        if char == ',' and depth == 0:
+            parts.append(''.join(current))
+            current = []
+            continue
+        current.append(char)
+    if ''.join(current).strip():
+        parts.append(''.join(current))
+    return parts
+
+
+def parse_schema(baseline: str) -> dict[str, set[str]]:
+    """把 `SCHEMA` 文本解析成 `{表: {列}}`，即"全新库应有的完整快照"。
+
+    建表语句和 `ALTER TABLE ... ADD COLUMN` 合并计算：对新库来说，那些 ALTER
+    就是**列的主要来源**（`runs.intent_version` 之类只在 ALTER 里出现），
+    不是重复定义的兜底。
+    """
+    import re
+
+    text = re.sub(r'--[^\n]*', '', baseline)
+    columns: dict[str, set[str]] = {}
+    for match in re.finditer(_CREATE_TABLE, text, re.I):
+        body, _ = _balanced(text, match.end() - 1)
+        table = _unquote(match.group(1))
+        bucket = columns.setdefault(table, set())
+        for part in _split_top_level(body):
+            tokens = part.split()
+            if not tokens:
+                continue
+            if tokens[0].upper() in _CONSTRAINT_WORDS:
+                continue
+            bucket.add(_unquote(tokens[0]))
+    for match in re.finditer(_ADD_COLUMN, text, re.I):
+        columns.setdefault(_unquote(match.group(1)), set()).add(
+            _unquote(match.group(2)))
+    return columns
+
+
+async def verify_schema(conn, baseline: str) -> dict:
+    """把 `SCHEMA` 快照与活库实测结构对齐，缺表/缺列直接抛 `SchemaDrift`。
+
+    这是那条"改 SCHEMA 等于白改"的静默失效的护栏：只要有列写进了 `SCHEMA`
+    却没有任何 `UPGRADES` 把它带给存量库，这里就会指着 `表.列` 报出来。
+    只比较"快照有、库里没有"，库里的额外列（`UPGRADES` 加进来的，如
+    `provider_charges`）不算问题。
+    """
+    expected = parse_schema(baseline)
+    cur = await conn.execute(
+        'SELECT table_name, column_name FROM information_schema.columns '
+        'WHERE table_schema = current_schema()')
+    present: dict[str, set[str]] = {}
+    for row in await cur.fetchall():
+        table, column = ((row['table_name'], row['column_name'])
+                         if isinstance(row, dict) else (row[0], row[1]))
+        present.setdefault(table, set()).add(column)
+    missing = []
+    for table, wanted in sorted(expected.items()):
+        if table not in present:
+            missing.append(f'{table}（整表缺失）')
+            continue
+        missing.extend(f'{table}.{column}'
+                       for column in sorted(wanted - present[table]))
+    if missing:
+        raise SchemaDrift(missing)
+    return {'tables': len(expected),
+            'columns': sum(len(columns) for columns in expected.values())}
+
+
 async def apply(conn, *, baseline: str, legacy_ids=()) -> list[str]:
     """Caller owns the transaction. No DDL is repeated once its version is recorded."""
     await conn.execute('SET LOCAL lock_timeout = \'30s\'')
@@ -51,15 +188,22 @@ async def apply(conn, *, baseline: str, legacy_ids=()) -> list[str]:
             await conn.execute(sql)
             await conn.execute('INSERT INTO schema_migrations VALUES (%s,%s)', (key, stamp))
             changed.append(key)
+    # 升完立刻核对：只改了 SCHEMA 的列在这里就会暴露，而不是等某天读写才炸
+    await verify_schema(conn, baseline)
     return changed
 
 
 async def require_current(conn) -> None:
+    """启动自检：版本号已登记**且**活库结构与 SCHEMA 快照一致才算当前。"""
     cur = await conn.execute("SELECT to_regclass('schema_migrations')")
     row = await cur.fetchone()
     exists = next(iter(row.values())) if isinstance(row, dict) else row[0]
+    current = False
     if exists:
         cur = await conn.execute('SELECT migration_id FROM schema_migrations WHERE migration_id=%s', (LATEST,))
-        if await cur.fetchone():
-            return
-    raise RuntimeError('Database schema is out of date; run python -m scripts.migrate first')
+        current = await cur.fetchone() is not None
+    if not current:
+        raise RuntimeError('Database schema is out of date; run python -m scripts.migrate first')
+    # 版本号只说明"迁移脚本自己认为跑完了"，说明不了列真的在。这里再对一次结构。
+    from webpage_agent.store.pg_store import SCHEMA
+    await verify_schema(conn, SCHEMA)
