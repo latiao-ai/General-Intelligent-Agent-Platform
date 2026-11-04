@@ -1938,6 +1938,33 @@ class PostgresStore(GovernanceStore):
                 (json.dumps(consumed, ensure_ascii=False), now(), run_id))
             return consumed[key]
 
+    async def refund_budget(self, context, *, run_id: str, key: str,
+                            amount: int = 1) -> int:
+        """退回还没发出去的那一笔运行级用量。
+
+        与 `consume_budget` 同一套门禁：`_owned` 校验 owner、epoch 和租约未过期，
+        并用 `FOR UPDATE` 锁住这一行。读出 `consumed_json`、减去 amount、写回，
+        都在这一个事务里。旧执行者（租约已经被人接走）抛 LeaseLost，写不进去。
+
+        不能改成无门禁的 `update_run`。那会让已经失去执行权的人改掉接管者的账。
+        减完不会低于 0。其它用量键原样保留。
+        """
+        async with self._lease() as conn:
+            row = await self._owned(conn, context, run_id=run_id)
+            if row is None:
+                raise BudgetExceeded('运行不存在')
+            try:
+                consumed = json.loads(row.get('consumed_json') or '{}')
+            except ValueError:
+                consumed = {}
+            used = int(consumed.get(key) or 0)
+            remaining = max(0, used - int(amount))
+            consumed[key] = remaining
+            await self._run(
+                conn, 'UPDATE runs SET consumed_json=%s, updated_at=%s WHERE run_id=%s',
+                (json.dumps(consumed, ensure_ascii=False), now(), run_id))
+            return remaining
+
     async def mark_inputs_applied(self, conn, run_id: str, *, intent_version: int,
                                   plan_version: int) -> int:
         """把被这份计划覆盖的输入标成 applied（在计划提交事务里调用）。

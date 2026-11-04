@@ -452,8 +452,82 @@ class UsageLedgerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('25', run['error'])
         self.assertIn('10', run['error'])
         self.assertNotIn('tokens', run['consumed'])
+        # 被 token 闸拦住的那一次没有发出去，次数必须停在实际发出的模型请求上。
+        self.assertEqual(run['consumed']['provider_requests'], 1)
         rows = await self._rows('run1')
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['input_tokens'], usage['input_tokens'])
         self.assertEqual(rows[0]['output_tokens'], usage['output_tokens'])
         self.assertEqual(remote.name_count('read'), 0)
+
+    async def test_token_block_before_the_second_request_does_not_keep_the_count(self):
+        """第一次请求正常成功；第二次发出前 token 已超上限，次数不能留成 2。
+
+        计划本身是合法的，工具也真的跑了。拦住的是下一步的模型请求，
+        不是结构没过再修一次。先扣次数再查 token、拦住了不退，这条会红：
+        `provider_requests` 变成 2，而假模型只被调用了 1 次。
+        """
+        from scripts.run_worker import run_once
+
+        usage = {'input_tokens': 30, 'output_tokens': 12, 'total_tokens': 42}
+        plan = {
+            'steps': [{'tool': 'read', 'args': {}}],
+            'summary': '先读一下',
+            'after_segment': 'observe',
+            'observation_goal': '确认读到的内容能不能用',
+            'result_locus': 'chat',
+        }
+        model = Scripted([
+            [Chunk(plan, usage, 'ExecutionPlan')],
+            [Chunk({'kind': 'continue'},
+                   {'input_tokens': 1, 'output_tokens': 1, 'total_tokens': 2},
+                   'ObservationDecision')],
+        ])
+        remote = Remote()
+        tools = {'read': remote.tool('read', effect='read', output={'answer': '好'})}
+        await seed_run(self.store, message='请读一下再决定')
+        with tempfile.TemporaryDirectory() as folder, install_main(folder), \
+                install_tools(tools), assigned(settings, run_max_tokens=20), \
+                patch.object(services, 'new_llm', _new_llm(model)):
+            await run_once(Hub(self.store), 'worker', run_id='run1')
+
+        self.assertEqual(model.calls, 1)
+        self.assertEqual(remote.name_count('read'), 1)
+        run = await self.store.run('run1')
+        self.assertEqual(run['status'], 'waiting_input')
+        snapshot = await self.store.run_snapshot('run1')
+        failure = snapshot['state']['planning_failure']
+        self.assertEqual(failure['code'], 'E_RUN_BUDGET')
+        self.assertIn('42', run['error'])
+        self.assertIn('20', run['error'])
+        rows = await self._rows('run1')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['purpose'], 'plan')
+        self.assertEqual(rows[0]['status'], 'succeeded')
+        self.assertEqual(rows[0]['input_tokens'], usage['input_tokens'])
+        self.assertEqual(rows[0]['output_tokens'], usage['output_tokens'])
+        # 次数必须等于已经发出并落账的那一次。拦住时不退，这里会是 2。
+        self.assertEqual(run['consumed']['provider_requests'], 1)
+        # 退回只动这一次次数，不能把同一次运行里已经记下的工具调用抹掉。
+        self.assertEqual(run['consumed'].get('tool_calls'), 1)
+
+    async def test_stale_executor_cannot_refund_provider_requests(self):
+        """失去租约的执行者退不回次数，也不能改掉别人已经记下的用量。"""
+        from webpage_agent.governance import execution_control
+
+        await seed_run(self.store, run_id='refund-run', task_id='refund-task',
+                       session_id='refund-sess')
+        claimed = await self.store.claim_run('worker-a', 60, run_id='refund-run')
+        context = execution_control.ExecutionContext.from_claim(claimed)
+        await self.store.consume_budget(
+            context, run_id='refund-run', key='provider_requests', limit=4)
+        await self.store.consume_budget(
+            context, run_id='refund-run', key='tool_calls', limit=4)
+        await self.store.update_run('refund-run', lease_expires_at=0)
+        await self.store.claim_run('worker-b', 60, run_id='refund-run')
+        with self.assertRaises(execution_control.LeaseLost):
+            await self.store.refund_budget(
+                context, run_id='refund-run', key='provider_requests')
+        consumed = (await self.store.run('refund-run'))['consumed']
+        self.assertEqual(consumed['provider_requests'], 1)
+        self.assertEqual(consumed['tool_calls'], 1)
