@@ -131,7 +131,7 @@ class CompleteBudgetTests(unittest.TestCase):
 
 class ModelBoundaryTests(unittest.IsolatedAsyncioTestCase):
     async def test_denied_run_budget_never_sends_and_is_known_not_executed(self):
-        from webpage_agent.store.pg_store import BudgetExceeded
+        from webpage_agent.core.errors import BudgetExceeded
         from webpage_agent.observe.errors import as_outcome
         model = StubModel([[chunk({'value': 'unused'})]])
         token = services.bind_budget(AsyncMock(side_effect=BudgetExceeded()))

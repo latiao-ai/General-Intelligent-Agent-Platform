@@ -31,7 +31,8 @@ from webpage_agent.core import services
 from webpage_agent.core import profile as profile_module
 from webpage_agent.core.services import is_stop_command
 from webpage_agent.store.persistence import open_store
-from webpage_agent.store.pg_store import BudgetExceeded, PostgresStore, now
+from webpage_agent.core.errors import BudgetExceeded
+from webpage_agent.store.pg_store import PostgresStore, now
 
 logger = logging.getLogger(__name__)
 

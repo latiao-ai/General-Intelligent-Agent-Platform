@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 from webpage_agent.agent import nodes
 from webpage_agent.governance import execution_control
-from webpage_agent.store.pg_store import DecisionBudgetExceeded
+from webpage_agent.core.errors import DecisionBudgetExceeded
 
 
 def _store(reserve):

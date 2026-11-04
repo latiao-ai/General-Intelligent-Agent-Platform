@@ -8,7 +8,8 @@ import time
 import uuid
 
 from webpage_agent.observe import telemetry
-from webpage_agent.store.pg_store import DecisionBudgetExceeded, _decode_run, now
+from webpage_agent.core.errors import DecisionBudgetExceeded
+from webpage_agent.store.pg_store import _decode_run, now
 
 class PgRuns:
     """PgRuns 方法组。见模块说明。"""

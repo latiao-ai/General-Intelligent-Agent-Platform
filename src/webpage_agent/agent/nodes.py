@@ -35,7 +35,7 @@ from webpage_agent.core import services as services_module
 from webpage_agent.tools import tool_authorization as authorization_module
 from webpage_agent.tools import tool_context as tool_context_module
 from webpage_agent.core.config import settings
-from webpage_agent.store.pg_store import BudgetExceeded
+from webpage_agent.core.errors import BudgetExceeded
 from webpage_agent.observe.events import action, emit, stage_end, stage_start, thought
 from webpage_agent.core.schemas import ExecutionPlan, RevisedPlan, ToolSelection
 from webpage_agent.core.services import is_small_talk, structured_call, urls_from_input

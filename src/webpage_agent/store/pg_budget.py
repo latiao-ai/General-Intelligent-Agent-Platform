@@ -5,7 +5,8 @@
 """
 import json
 
-from webpage_agent.store.pg_store import BudgetExceeded, now
+from webpage_agent.core.errors import BudgetExceeded
+from webpage_agent.store.pg_store import now
 
 class PgBudget:
     """PgBudget 方法组。见模块说明。"""

@@ -39,24 +39,10 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-class DecisionBudgetExceeded(RuntimeError):
-    """自主决策预算用尽：保存已完成事实，等人显式继续（不是失败）。"""
-
-    def __init__(self, message: str = '决策预算用尽') -> None:
-        super().__init__(message)
-        self.safe_message = message
-
-
-class BudgetExceeded(RuntimeError):
-    """运行级预算（provider 请求数 / 工具调用数 …）用尽。"""
-
-    error_code = 'E_RUN_BUDGET'
-    certainty = 'not_executed'
-    phase = 'validate'
-
-    def __init__(self, message: str = '运行预算用尽') -> None:
-        super().__init__(message)
-        self.safe_message = message
+# 定义在 core.errors。按原名再导出，旧路径拿到的仍是同一个类对象；
+# 在这里重写一遍会让 except / isinstance 对不上。
+from webpage_agent.core.errors import BudgetExceeded as BudgetExceeded
+from webpage_agent.core.errors import DecisionBudgetExceeded as DecisionBudgetExceeded
 
 
 def _decode_run(row: dict) -> dict:

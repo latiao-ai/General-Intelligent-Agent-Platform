@@ -20,11 +20,12 @@ from psycopg.conninfo import make_conninfo
 from webpage_agent.api.api_hub import Hub
 from webpage_agent.core import services
 from webpage_agent.core.config import settings
+from webpage_agent.core.errors import BudgetExceeded
 from webpage_agent.core.schemas import ExecutionPlan, ObservationDecision
 from webpage_agent.governance import core as governance
 from webpage_agent.governance import policies
 from webpage_agent.store import migrations
-from webpage_agent.store.pg_store import SCHEMA, BudgetExceeded, MIGRATIONS
+from webpage_agent.store.pg_store import SCHEMA, MIGRATIONS
 from tests.exec_env import (PG_DSN, Remote, install_main, install_tools,
                             new_store, reset_db, seed_run, valid_test_dsn)
 from tests.test_runtime_closure import assigned

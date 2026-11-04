@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timezone
 
 from webpage_agent.core.config import settings
+from webpage_agent.core.errors import BudgetExceeded
 
 logger = logging.getLogger(__name__)
 # bind() 写入 (store, tenant_id, run_id)；没绑定时是 None。
@@ -267,8 +268,6 @@ class GovernanceStore(ABC):
         不加锁，也不写 runs。结算发生在请求结束之后，手上没有 owner 与 epoch，
         写 runs 就是没有门禁的越权写。总量用 SUM 现算。
         """
-        from webpage_agent.store.pg_store import BudgetExceeded
-
         ceiling = settings.llm_context_window + settings.llm_output_tokens
         async with self._lease() as conn:
             row = await self._one(conn, _TOKEN_SPEND_SQL, ('reserved', run_id, 'llm'))

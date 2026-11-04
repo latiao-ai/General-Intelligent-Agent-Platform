@@ -27,7 +27,7 @@ from webpage_agent.governance import execution_control
 from webpage_agent.observe import observation as observation_module
 from webpage_agent.observe.events import action, emit
 from webpage_agent.store import ledger as ledger_module
-from webpage_agent.store.pg_store import DecisionBudgetExceeded
+from webpage_agent.core.errors import DecisionBudgetExceeded
 from webpage_agent.tools import core as tool_module
 
 # 日志通道保持原名。这些降级路径的堆栈一直记在 webpage_agent.agent.nodes 上，
