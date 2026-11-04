@@ -816,7 +816,12 @@ DATABASE_URL="$PG_TEST_DSN" AUTH_MODE=off TOOL_POLICY_ENFORCED=false \
 
 | 文件 | 覆盖 |
 |---|---|
-| `tests/test_core.py` | 能力包、计划校验、账本、状态词汇、MCP 识别、接口与 SSE、仓储一致性、连接池 |
+| `tests/test_sources.py` | 公开 URL、资料落盘、检索、Markdown/HTML、上下文预算 |
+| `tests/test_planning.py` | 计划校验、编排、寒暄、结构化调用、用户画像 |
+| `tests/test_runs.py` | 账本、租约、生命周期、Worker、状态词汇、补偿 |
+| `tests/test_api.py` | 任务中枢、接口与 SSE、权限归属、创建幂等、回执文案 |
+| `tests/test_store.py` | 会话记忆、仓储一致性、异步驱动、连接池 |
+| `tests/test_mcp.py` | 能力包、MCP 识别与路由、部署闸门、结果落点 |
 | `tests/test_worker_execution.py` | Worker 领取/执行一次、两 Worker 抢同一条、异常不带走循环、空计划、无未 await 协程 |
 | `tests/test_execution_control.py` | 旧代次四件事全被拒、续租失败停派、暂停三种时序、续跑不重发、取消、工具消失 |
 | `tests/test_execution_recovery.py` | 计划先于调用提交、提交失败零调用、prepared 重做、unknown 阻断、succeeded 复用、结算失败不推进 |
