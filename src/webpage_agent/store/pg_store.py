@@ -660,6 +660,24 @@ ALTER TABLE actions ADD COLUMN IF NOT EXISTS external_task_id TEXT NOT NULL DEFA
 -- 已验证的现场上下文（当前项目 / 选中对象）。浏览器自报的 JSON 不能直接当它用。
 ALTER TABLE tasks_meta ADD COLUMN IF NOT EXISTS scene_context_json TEXT NOT NULL DEFAULT '';
 
+-- 费用明细的完整快照。v2 里那张表是给「已经记过基线、还没有这张表」的存量库建的，
+-- 而且建完就不再执行。用途和估算标记必须写在这里，verify_schema 才认得出
+-- 「只改了升级脚本、快照没跟上」。全新库先建这张完整的表，v2 用 IF NOT EXISTS
+-- 让开；已经有旧表的库不重跑 v2，靠 v4_provider_usage_detail 补列和按 run 的索引。
+CREATE TABLE IF NOT EXISTS provider_charges (
+    charge_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, day TEXT NOT NULL,
+    run_id TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+    reserved_micros BIGINT NOT NULL, charged_micros BIGINT NOT NULL,
+    input_tokens BIGINT, output_tokens BIGINT, status TEXT NOT NULL DEFAULT 'reserved',
+    created_at DOUBLE PRECISION NOT NULL, duration_seconds DOUBLE PRECISION,
+    trace_id TEXT NOT NULL DEFAULT '',
+    purpose TEXT NOT NULL DEFAULT '',
+    tokens_estimated BOOLEAN NOT NULL DEFAULT false
+);
+CREATE INDEX IF NOT EXISTS idx_provider_charges_tenant_day ON provider_charges(tenant_id, day);
+-- 按 run 汇总是运营的主路径。只有 (tenant_id, day) 时，这条查询是全表扫。
+CREATE INDEX IF NOT EXISTS idx_provider_charges_run ON provider_charges(run_id);
+
 -- ---------- M6：迁移版本记录 ----------
 CREATE TABLE IF NOT EXISTS schema_migrations (
     migration_id  TEXT PRIMARY KEY,
@@ -1456,6 +1474,9 @@ class PostgresStore(GovernanceStore):
         领不到它）；不给就按入队顺序领一条。子查询上的
         `FOR UPDATE SKIP LOCKED` 是文档 §9.2 明确要求的：两个 Worker 并发
         领取时，第二个直接跳过被锁住的行，而不是等锁再抢同一条。
+
+        这里仍是「每个进程各算各的」：并发上限不跨副本，重租户可以占满一个
+        进程。改领取条件做集群级公平调度是另一量级的改动，这一轮不动。
         """
         stamp = now()
         current = now_ts if now_ts is not None else time.time()
@@ -1916,6 +1937,33 @@ class PostgresStore(GovernanceStore):
                 conn, 'UPDATE runs SET consumed_json=%s, updated_at=%s WHERE run_id=%s',
                 (json.dumps(consumed, ensure_ascii=False), now(), run_id))
             return consumed[key]
+
+    async def refund_budget(self, context, *, run_id: str, key: str,
+                            amount: int = 1) -> int:
+        """退回还没发出去的那一笔运行级用量。
+
+        与 `consume_budget` 同一套门禁：`_owned` 校验 owner、epoch 和租约未过期，
+        并用 `FOR UPDATE` 锁住这一行。读出 `consumed_json`、减去 amount、写回，
+        都在这一个事务里。旧执行者（租约已经被人接走）抛 LeaseLost，写不进去。
+
+        不能改成无门禁的 `update_run`。那会让已经失去执行权的人改掉接管者的账。
+        减完不会低于 0。其它用量键原样保留。
+        """
+        async with self._lease() as conn:
+            row = await self._owned(conn, context, run_id=run_id)
+            if row is None:
+                raise BudgetExceeded('运行不存在')
+            try:
+                consumed = json.loads(row.get('consumed_json') or '{}')
+            except ValueError:
+                consumed = {}
+            used = int(consumed.get(key) or 0)
+            remaining = max(0, used - int(amount))
+            consumed[key] = remaining
+            await self._run(
+                conn, 'UPDATE runs SET consumed_json=%s, updated_at=%s WHERE run_id=%s',
+                (json.dumps(consumed, ensure_ascii=False), now(), run_id))
+            return remaining
 
     async def mark_inputs_applied(self, conn, run_id: str, *, intent_version: int,
                                   plan_version: int) -> int:

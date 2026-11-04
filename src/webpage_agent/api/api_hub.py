@@ -35,7 +35,7 @@ from webpage_agent.core import profile as profile_module
 from webpage_agent.capabilities import registry as capability_registry
 from webpage_agent.core.services import is_stop_command
 from webpage_agent.store.persistence import open_store
-from webpage_agent.store.pg_store import PostgresStore, now
+from webpage_agent.store.pg_store import BudgetExceeded, PostgresStore, now
 
 logger = logging.getLogger(__name__)
 
@@ -790,14 +790,31 @@ class Hub:
         context_token = execution_control.bind(context)
 
         async def bill_provider_request() -> None:
-            """每次真实的模型请求前扣一次预算（重试也算）。
+            """每次真实模型请求前先扣一次次数，紧接着按已记账 token 决定还能不能发。
 
-            预算落在 `runs.consumed_json` 而不是内存里的 state.usage：
-            进程重启后要接着累计，否则"重启就重置预算"等于没有预算。
+            次数落在 `runs.consumed_json`：进程重启后要接着累计。token 不写进这列——
+            结算发生在请求结束之后，手上没有执行租约（owner 与 epoch），写 runs
+            就是一次没有门禁的越权写。token 只留在 provider_charges，这里用 SUM 读。
+
+            流式 usage 在最后一个分片才到，所以这是事后记账、下一次请求前拦截，
+            不是按最坏情况预留。次数闸仍先跑：它自己超限就抛 BudgetExceeded，
+            这次请求不会发出，次数也不会加上。token 闸后跑，同样在请求发出前。
+            被 token 闸拦住时，刚才加上的这一次还没变成真实请求，也没有
+            provider_charges 行，必须退回。退回走 `refund_budget`（同一套
+            owner/epoch 与行锁），不能直接改 consumed_json。
+            重试也走这个钩子，不另开一条路径。
             """
             await self.store.consume_budget(
                 context, run_id=record.run_id, key='provider_requests',
                 limit=settings.run_max_provider_requests)
+            try:
+                await self.store.enforce_run_token_budget(record.run_id)
+            except BudgetExceeded:
+                # 只退 token 闸这一次。次数闸的 BudgetExceeded 在上面已经抛出，
+                # 进不到这里，所以不会把「次数到顶」误退成「还能再发一次」。
+                await self.store.refund_budget(
+                    context, run_id=record.run_id, key='provider_requests')
+                raise
 
         budget_token = services.bind_budget(bill_provider_request)
 

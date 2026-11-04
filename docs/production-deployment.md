@@ -54,7 +54,7 @@ python -m scripts.run_worker
 
 ## 多副本与存储
 
-API 和 Worker 都使用 PostgreSQL 领取运行与租约 fencing。每个进程的 `MAX_CONCURRENT_RUNS`、`DB_POOL_SIZE` 都可配置，但不按负载自动变化；集群容量由副本数和每进程上限控制。数据库总连接预算还需加上每个 API 的一条 LISTEN 连接、Worker 及迁移/运维连接。不要将每进程上限误当成集群总上限。
+API 和 Worker 都使用 PostgreSQL 领取运行与租约 fencing。每个进程的 `MAX_CONCURRENT_RUNS`（默认 16）、`DB_POOL_SIZE`（默认 8）都可配置，但不按负载自动变化；集群容量由副本数和每进程上限控制。进程之间不做公平调度，重租户可以占满其中一个进程。数据库总连接预算还需加上每个 API 的一条 LISTEN 连接、Worker 及迁移/运维连接。不要将每进程上限误当成集群总上限。池默认不是按「一条运行一条连接」换算的：运行只在写账本和写事件时借连接，但池 4 配并发 16 时突发写入会排到 `DB_POOL_TIMEOUT`。别超过服务端 `max_connections` ÷ 副本数。
 
 所有事件，包括 draft 与 answer_delta，先持久化后 NOTIFY；各副本按 seq 读取，通知失联时约 15 秒补读。跨进程结束事件会关闭 SSE；被动副本查询任务时重新读取数据库，不长期展示旧内存状态。客户端仍应在断线后携带 `Last-Event-ID` 或 `after`。逐条增量落库增加数据库写入量，实际容量需按自己的模型吞吐压测。
 
@@ -70,7 +70,9 @@ API 启动后台维护任务，按 `MAINTENANCE_INTERVAL_SECONDS` 执行，数�
 - 任务目录（`ARTIFACT_DIR/<task_id>` 下的 `state.json`、`results/`、产出文件）没有登记表可反查：库重建或任务被删之后，这些目录不会被保留策略扫到，会一直留在磁盘上。维护另外按「`task_id` 是否还在 `tasks` 表里」判断孤儿，删除超过 `RESULT_GC_GRACE_SECONDS`（默认 86400 秒）的孤儿目录；该值设为 0 关闭这段清理。只处理名字是 32 位十六进制的普通目录，符号链接既不跟随也不删除。
 - 限流窗口、过期登录会话和幂等键自动清理。费用台账没有自动删除，长期保留/归档由组织审计策略决定。
 
-`/api/ops/metrics` 保留 operator 权限。`METRICS_FORMAT=prometheus` 返回 Prometheus 文本，否则 JSON；包括队列、未知动作、批准积压、provider 请求/费用/token/未结算数。费用值为 micros，采集器应使用受控 operator 会话，不提供匿名指标入口。当前指标是数据库聚合快照（gauge），并非永久只增计数器。
+`/api/ops/metrics` 保留 operator 权限。`METRICS_FORMAT=prometheus` 返回 Prometheus 文本，否则 JSON；包括队列、未知动作、批准积压、provider 请求/费用/token/未结算数，以及连接池实时统计（`db_pool` 的 min、max、size、available）。`available` 逼近 0 用来判断该不该继续加并发。费用值为 micros，采集器应使用受控 operator 会话，不提供匿名指标入口。当前指标是数据库聚合快照（gauge），并非永久只增计数器。
+
+`GET /api/runs/{run_id}/usage` 按用途返回该运行的请求次数、输入/输出 token 和估算条数，并嵌进 `GET /api/runs/{run_id}`。`GET /api/ops/usage` 按租户与日期区间导出，`format=csv` 为表格。两次查询都是普通 SELECT。token 账只在 `provider_charges`，不在 `runs.consumed_json`。单次运行合计上限是 `RUN_MAX_TOKENS`（默认 1000000），在下一次模型请求前检查；超限为 `E_RUN_BUDGET` / `waiting_input`。
 
 生产日志使用 JSON，接受有效的 W3C traceparent，响应返回 traceparent 和 X-Request-ID。请求日志使用路由模板，不记录正文/查询参数；请求 trace ID 持久保存在 runs 中，Worker 领取后沿用；运行与 provider 各有 span，台账有可关联的 trace/run/charge 标识。当前提供日志关联与请求/provider 时间记录，没有安装 OpenTelemetry Collector 或外部追踪后台。
 

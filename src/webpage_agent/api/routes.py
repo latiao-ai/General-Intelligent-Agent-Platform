@@ -9,10 +9,13 @@
     python -m scripts.serve_api
 """
 import asyncio
+import csv
+import io
 import json
 import os
 import mimetypes
 import logging
+import re
 import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
@@ -679,9 +682,19 @@ async def read_run(run_id: str,
     """run 的状态、计划与步骤（文档 §13）。"""
     run = await _owned_run(run_id, principal)
     plan = await hub.store.plan(run_id) or {}
+    usage = await hub.store.run_usage(run_id)
     return {'run': run, 'plan': plan,
             'steps': await hub.store.steps_of(run_id),
-            'actions': [a for a in (await hub.store.actions_of(run_id))]}
+            'actions': [a for a in (await hub.store.actions_of(run_id))],
+            'usage': usage}
+
+
+@app.get('/api/runs/{run_id}/usage')
+async def read_run_usage(run_id: str,
+                         principal=Depends(policies.current_principal)):
+    """这次运行按用途汇总的 token。归属校验与读取运行是同一条，避免另开一个能猜 ID 的口子。"""
+    await _owned_run(run_id, principal)
+    return await hub.store.run_usage(run_id)
 
 
 @app.post('/api/runs/{run_id}/pause')
@@ -1167,10 +1180,64 @@ async def ops_metrics(principal=Depends(policies.current_principal)):
     stats.update(await hub.store.billing_stats())
     stats['max_concurrent_runs'] = settings.max_concurrent_runs
     stats['db_pool_max_size'] = settings.db_pool_size
+    # 实时池态势并进来：available 逼近 0 的次数才是该不该继续加并发的依据，
+    # 配置里的 db_pool_max_size 看不出池是不是已经空了。
+    pool_stats = getattr(hub.store, 'pool_stats', None)
+    if callable(pool_stats):
+        try:
+            stats['db_pool'] = pool_stats()
+        except Exception:                        # noqa: BLE001
+            stats['db_pool'] = {'error': '取连接池状态失败'}
     if settings.metrics_format == 'prometheus':
         from webpage_agent.observe.telemetry import prometheus
         return Response(prometheus(stats), media_type='text/plain; version=0.0.4')
     return stats
+
+
+_DAY = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def _usage_day(value: str, name: str) -> str:
+    text = (value or '').strip()
+    if text and _DAY.fullmatch(text) is None:
+        raise HTTPException(status_code=422, detail=f'{name} 必须是 YYYY-MM-DD')
+    return text
+
+
+def _usage_csv(report: dict) -> str:
+    """导出用同一套字段名，避免表格和 JSON 各说各的列。"""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(['tenant_id', 'day_from', 'day_to', 'purpose',
+                     'requests', 'input_tokens', 'output_tokens', 'estimated_requests'])
+    for row in report['by_purpose']:
+        writer.writerow([
+            report.get('tenant_id', ''), report.get('day_from', ''),
+            report.get('day_to', ''), row['purpose'], row['requests'],
+            row['input_tokens'], row['output_tokens'], row['estimated_requests']])
+    total = report['total']
+    # 合计行的用途写成 __total__：空字符串是存量行的默认用途，不能拿来当合计。
+    writer.writerow([
+        report.get('tenant_id', ''), report.get('day_from', ''),
+        report.get('day_to', ''), '__total__', total['requests'],
+        total['input_tokens'], total['output_tokens'], total['estimated_requests']])
+    return buffer.getvalue()
+
+
+@app.get('/api/ops/usage')
+async def ops_usage(principal=Depends(policies.current_principal),
+                    tenant: str = '',
+                    day_from: str = Query(default='', alias='from'),
+                    day_to: str = Query(default='', alias='to'),
+                    export_format: str = Query(default='', alias='format')):
+    """运营对账导出。身份沿用 operator 校验，不另做一套。"""
+    _require_operator(principal)
+    report = await hub.store.tenant_usage(
+        tenant_id=tenant.strip(), day_from=_usage_day(day_from, 'from'),
+        day_to=_usage_day(day_to, 'to'))
+    if export_format == 'csv':
+        return Response(_usage_csv(report), media_type='text/csv; charset=utf-8')
+    return report
 
 
 @app.post('/api/ops/gc-results')

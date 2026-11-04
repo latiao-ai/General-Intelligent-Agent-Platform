@@ -38,7 +38,7 @@ async def search(query: str):
         'need_content': True,
     }
     async with httpx.AsyncClient(timeout=30) as client:
-        async with governance.metered(provider='search', model='search'):
+        async with governance.metered(provider='search', model='search', purpose='search'):
             reply = await client.post(f'{settings.deepseek_base_url}/v1/tools/search',
                                       json=payload, headers=_headers())
             reply.raise_for_status()
@@ -65,7 +65,7 @@ async def fetch(urls: list[str]):
 
     async def one(client, url):
         try:
-            async with governance.metered(provider='search', model='fetch'):
+            async with governance.metered(provider='search', model='fetch', purpose='fetch'):
                 reply = await client.post(f'{settings.deepseek_base_url}/v1/tools/fetch',
                                           json={'url': url}, headers=_headers())
                 reply.raise_for_status()

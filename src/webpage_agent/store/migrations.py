@@ -25,7 +25,9 @@ from datetime import datetime, timezone
 BASELINE = 'v1_baseline_20261029'
 GOVERNANCE = 'v2_production_governance'
 RUN_TRACE = 'v3_run_trace'
-LATEST = RUN_TRACE
+# 用途与估算标记单独一个版本：改 SCHEMA 里的 DO 块不会作用到已经记过基线的库。
+USAGE_DETAIL = 'v4_provider_usage_detail'
+LATEST = USAGE_DETAIL
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -38,7 +40,10 @@ CREATE TABLE tenant_usage_days (
     charged_micros BIGINT NOT NULL DEFAULT 0,
     PRIMARY KEY (tenant_id, day)
 );
-CREATE TABLE provider_charges (
+-- 全新库的 SCHEMA 已经建过这张完整的表。这里必须 IF NOT EXISTS：
+-- 否则基线建表成功后，v2 再 CREATE 会直接撞车，升级通道走不完。
+-- 已执行过 v2 的存量库不会重跑这段，缺的列由 v4 补。
+CREATE TABLE IF NOT EXISTS provider_charges (
     charge_id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, day TEXT NOT NULL,
     run_id TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
     reserved_micros BIGINT NOT NULL, charged_micros BIGINT NOT NULL,
@@ -46,8 +51,13 @@ CREATE TABLE provider_charges (
     created_at DOUBLE PRECISION NOT NULL, duration_seconds DOUBLE PRECISION,
     trace_id TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX idx_provider_charges_tenant_day ON provider_charges(tenant_id, day);
-'''), (RUN_TRACE, "ALTER TABLE runs ADD COLUMN trace_id TEXT NOT NULL DEFAULT '';"))
+CREATE INDEX IF NOT EXISTS idx_provider_charges_tenant_day ON provider_charges(tenant_id, day);
+'''), (RUN_TRACE, "ALTER TABLE runs ADD COLUMN trace_id TEXT NOT NULL DEFAULT '';"),
+    (USAGE_DETAIL, '''
+ALTER TABLE provider_charges ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT '';
+ALTER TABLE provider_charges ADD COLUMN IF NOT EXISTS tokens_estimated BOOLEAN NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS idx_provider_charges_run ON provider_charges(run_id);
+'''))
 
 
 class SchemaDrift(RuntimeError):

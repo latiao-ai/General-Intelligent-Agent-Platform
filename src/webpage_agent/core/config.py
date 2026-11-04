@@ -115,8 +115,11 @@ class Settings:
     database_url: str = os.getenv('DATABASE_URL', '').strip()
     # PostgreSQL 连接池大小。一个进程最多同时占用这么多条连接：SSE 写入、
     # 后台作业、接口查询各自借各自的，不再被一把进程内的锁串行化。
+    # 一次运行只在写账本、写事件时借连接，不是全程占着；但池 4 配并发 16 时，
+    # 一次突发写入会排到等待超时。默认 8 是给并发 16 留的写入余量，
+    # 不是按「一条运行一条连接」换算出来的。
     # 注意别超过服务端的 max_connections ÷ 副本数。
-    db_pool_size: int = max(1, int(os.getenv('DB_POOL_SIZE', '4')))
+    db_pool_size: int = max(1, int(os.getenv('DB_POOL_SIZE', '8')))
     # 从池里借连接最多等多久（秒）。等不到就报错，而不是无限期挂住一个请求。
     db_pool_timeout: float = max(1.0, float(os.getenv('DB_POOL_TIMEOUT', '10')))
     # 用户画像文件（Markdown，人可读可改）。含电话等敏感信息，已在 .gitignore 排除。
@@ -170,8 +173,15 @@ class Settings:
     run_max_repairs: int = max(0, int(os.getenv('RUN_MAX_REPAIRS', '2')))
     # 运行级 provider 请求上限：初始规划、观察决策、用户修订、结构化修复、最终回答
     # 全部计入（`structured_call` 的内部重试也算一次真实请求）。
+    # 单进程并发从 8 提到 16 后，上游 429 大约翻倍，而每一次重试都吃这份预算。
+    # 上限不跟着从 24 提到 32，正常重试会先把次数闸打满。
+    # 次数闸保留：搜索与抓取不走模型、没有 token 可记，只靠 token 上限盖不住它们。
     run_max_provider_requests: int = max(4, int(
-        os.getenv('RUN_MAX_PROVIDER_REQUESTS', '24')))
+        os.getenv('RUN_MAX_PROVIDER_REQUESTS', '32')))
+    # 单次运行的 token 上限（输入加输出）。默认一百万。
+    # 真实用量要等流式响应的最后一个分片才知道，所以只能在下一次请求前按已记账的量拦，
+    # 不能像日额度那样按最坏情况预留。超限走已有的 BudgetExceeded，停在 waiting_input。
+    run_max_tokens: int = max(1, int(os.getenv('RUN_MAX_TOKENS', '1000000')))
     # 工具调用次数上限（含查询）。外部写操作另有账本与授权，不靠这个数管。
     run_max_tool_calls: int = max(4, int(
         os.getenv('RUN_MAX_TOOL_CALLS', '40')))
@@ -263,8 +273,9 @@ class Settings:
 
     # ---------- 运维（评审 P2） ----------
     # 单进程同时执行的运行数上限。超过时新任务留在 queued，不再无限起协程。
+    # 只约束本进程。多副本之间不做集群级公平调度，重租户仍可以占满其中一个进程。
     max_concurrent_runs: int = max(1, int(
-        os.getenv('MAX_CONCURRENT_RUNS', '8')))
+        os.getenv('MAX_CONCURRENT_RUNS', '16')))
     # 事件与产物的保留天数。0 = 不自动清理（运维手动处理）。
     retention_events_days: int = max(0, int(
         os.getenv('RETENTION_EVENTS_DAYS', '30')))
