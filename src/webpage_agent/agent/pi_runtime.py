@@ -164,6 +164,25 @@ class PiRuntime:
         self._snapshot = dict(resume_snapshot) if resume_snapshot else \
             pi_snapshot.new_snapshot(user_input=str(state.get('user_input') or ''))
 
+        # 第七阶段：恢复决策。Hub 已按数据库事实产出（resume_admit/resume_deliver/
+        # resume_finish/resume_reconcile/resume_block）。resume_finish / resume_reconcile
+        # 属于「不重新推理」的结局，在进入桥接前直接写回 state 收尾。
+        recovery = state.get('pi_recovery') if isinstance(state, dict) else None
+        if recovery is not None and getattr(recovery, 'kind', '') in (
+                'resume_finish', 'resume_reconcile', 'resume_block'):
+            kind = recovery.kind
+            if kind == 'resume_finish':
+                state['answer'] = recovery.final_answer or ''
+                state['pi_outcome'] = 'answered'
+                state['status'] = 'succeeded'
+            else:
+                state['pi_outcome'] = 'failed'
+                state['status'] = 'needs_reconcile'
+                state.setdefault('errors', []).append({
+                    'stage': 'pi', 'type': 'RecoveryBlocked',
+                    'detail': recovery.reason or '结果未定，需核实后再继续'})
+            return state
+
         # 绑定宿主 sink：让 Pi 事件经统一的公共事件出口（emit_async）有序转交，
         # 与 LangGraph 节点内部事件走同一套 answer_delta / stage_start / stage_end 契约。
         token = bind_sink(on_event) if on_event else None

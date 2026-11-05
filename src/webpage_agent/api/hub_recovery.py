@@ -156,10 +156,14 @@ class HubRecoveryMixin:
         """
         from webpage_agent.agent import runtime_identity
         from webpage_agent.agent import pi_snapshot
+        from webpage_agent.agent import pi_recovery
         raw = await self.store.run_snapshot(run_id)
         snapshot = None
         if raw is not None:
             snapshot = pi_snapshot.parse(raw)
+        actions = await self.store.actions_of(run_id) if snapshot is not None else []
+        decision = pi_recovery.decide(
+            snapshot, actions, str(run.get('status') or ''))
         resume = {
             'runtime_kind': runtime_identity.KIND_PI,
             'intent_version': int(run.get('intent_version') or 0),
@@ -168,6 +172,9 @@ class HubRecoveryMixin:
             'plan_version': int(run.get('plan_version') or 1),
             # 快照里的恢复事实（由 pi_runtime 解释）；首次执行为 None
             'pi_snapshot': snapshot,
+            # 第七阶段：按数据库事实产出的恢复决策（resume_admit / resume_deliver /
+            # resume_finish / resume_reconcile / resume_block）
+            'pi_recovery': decision,
         }
         # 保留用户原始输入：恢复后**不重复追加**原始输入，只把快照里未完成
         # 的处理位置交回。原始输入从快照取（首次执行则交给 run_task 的 user_input）。
