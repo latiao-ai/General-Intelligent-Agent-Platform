@@ -61,6 +61,10 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         # 早点把 task_id 交出去，外部才能在任务被取消后定位已生成的产物。
         await on_start(task_id)
     resumed = resume_plan or {}
+    # 第七阶段收口：Pi 恢复输入用**单一字段** `pi_resume`（快照 + 恢复决策）承载，
+    # 从 resume_plan 里取出放进展平的 state，PiRuntime.run() 只从这里读，
+    # 不在顶层与 resume_plan 里同时维护两份。
+    pi_resume = resumed.get('pi_resume') if isinstance(resumed, dict) else None
     state = {
         'task_id': task_id, 'user_input': text,
         # 原目标：运行中补充要求时，"最初要做什么"不能被新要求顶掉——
@@ -68,6 +72,8 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         'original_goal': text,
         'documents': [], 'mcp_calls': [], 'errors': [], 'usage': [],
         'run_id': run_id or '', 'resume_plan': resumed,
+        # Pi 恢复输入（单一字段；LangGraph 路径为 None）
+        'pi_resume': pi_resume,
         # 三个版本分开：intent_version 是"用户要求版本"，plan_version 是"计划版本"；
         # lease_epoch 不在这里（执行权凭证走 ExecutionContext，不进可落盘的状态）。
         'intent_version': int(resumed.get('intent_version') or 0),

@@ -157,17 +157,18 @@ class PiRuntime:
         own_bridge = self._bridge is None
         answer_parts: list[str] = []
 
-        # 第七阶段：恢复/检查点用的版本化 Pi 快照。首次执行为 None，恢复时从
-        # state['pi_snapshot'] 取（Hub 的 _pi_resume_plan 已装配）。
+        # 第七阶段收口：恢复输入用**单一字段** `pi_resume`（快照 + 恢复决策）承载，
+        # 由 Hub 的 _pi_resume_plan 装配、run_task 展平进 state。这里只从这一处读，
+        # 不在顶层与 resume_plan 里同时维护两份。
         from webpage_agent.agent import pi_snapshot
-        resume_snapshot = state.get('pi_snapshot') if isinstance(state, dict) else None
+        pi_resume = state.get('pi_resume') if isinstance(state, dict) else None
+        resume_snapshot = (pi_resume or {}).get('snapshot') if pi_resume else None
         self._snapshot = dict(resume_snapshot) if resume_snapshot else \
             pi_snapshot.new_snapshot(user_input=str(state.get('user_input') or ''))
 
-        # 第七阶段：恢复决策。Hub 已按数据库事实产出（resume_admit/resume_deliver/
-        # resume_finish/resume_reconcile/resume_block）。resume_finish / resume_reconcile
-        # 属于「不重新推理」的结局，在进入桥接前直接写回 state 收尾。
-        recovery = state.get('pi_recovery') if isinstance(state, dict) else None
+        # 恢复决策。resume_finish / resume_reconcile / resume_block 属于
+        # 「不重新推理」的结局，在进入桥接前直接写回 state 收尾。
+        recovery = (pi_resume or {}).get('recovery') if pi_resume else None
         if recovery is not None and getattr(recovery, 'kind', '') in (
                 'resume_finish', 'resume_reconcile', 'resume_block'):
             kind = recovery.kind
@@ -335,9 +336,9 @@ class PiRuntime:
             from webpage_agent.agent.pi_host_tools import (
                 HostToolCaller, PiCallRegistry)
             # 用当前快照重建逻辑调用身份注册表：恢复时复用原调用 ID，
-            # 新调用（哪怕参数相同）分配新 ID。
-            snapshot = (state.get('pi_snapshot') or {}) if isinstance(state, dict) else {}
-            self._host_caller = HostToolCaller(PiCallRegistry(snapshot))
+            # 新调用（哪怕参数相同）分配新 ID。快照已由 pi_resume 装配进
+            # self._snapshot，这里直接用它，不再从 state 里重复取。
+            self._host_caller = HostToolCaller(PiCallRegistry(self._snapshot))
 
         # 第七阶段：把本次动作的恢复事实（已提交工具结果引用）与 settle_action
         # 同一事务写进快照。build_snapshot 在网关结算前被调用，返回序列化的

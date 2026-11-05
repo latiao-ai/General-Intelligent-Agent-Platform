@@ -89,8 +89,9 @@ class SnapshotReadContractTests(unittest.IsolatedAsyncioTestCase):
         hub = Hub(self.store)
         run = await self.store.run('r1')
         resume = await hub._pi_resume_plan('r1', run)
-        self.assertIsNone(resume['pi_snapshot'])
-        self.assertEqual(resume['pi_recovery'].kind, pi_recovery.RESUME_RECONCILE)
+        self.assertIsNone(resume['pi_resume']['snapshot'])
+        self.assertEqual(resume['pi_resume']['recovery'].kind,
+                         pi_recovery.RESUME_RECONCILE)
         await hub.close()
 
 

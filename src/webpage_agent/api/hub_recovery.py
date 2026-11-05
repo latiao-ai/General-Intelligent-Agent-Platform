@@ -190,24 +190,25 @@ class HubRecoveryMixin:
                 'processed_intent_version': int(
                     run.get('processed_intent_version') or 0),
                 'plan_version': int(run.get('plan_version') or 1),
-                'pi_snapshot': None,
-                'pi_recovery': decision,
+                'pi_resume': {'snapshot': None, 'recovery': decision},
                 'user_input': str(run.get('goal') or ''),
             }
 
         decision = pi_recovery.decide(
             snapshot, actions, str(run.get('status') or ''))
+        # 第七阶段收口：恢复输入用**单一字段** `pi_resume` 承载（快照 + 恢复决策），
+        # 不在顶层与 resume_plan 里同时维护两份。run_task 把它原样放进
+        # state['pi_resume']，PiRuntime.run() 只从这里读。
         resume = {
             'runtime_kind': runtime_identity.KIND_PI,
             'intent_version': int(run.get('intent_version') or 0),
             'processed_intent_version': int(
                 run.get('processed_intent_version') or 0),
             'plan_version': int(run.get('plan_version') or 1),
-            # 快照里的恢复事实（由 pi_runtime 解释）；首次执行为 None
-            'pi_snapshot': snapshot,
-            # 第七阶段：按数据库事实产出的恢复决策（resume_admit / resume_deliver /
-            # resume_finish / resume_reconcile / resume_block）
-            'pi_recovery': decision,
+            'pi_resume': {
+                'snapshot': snapshot,
+                'recovery': decision,
+            },
         }
         # 保留用户原始输入：恢复后**不重复追加**原始输入，只把快照里未完成
         # 的处理位置交回。原始输入从快照取（首次执行则交给 run_task 的 user_input）。
