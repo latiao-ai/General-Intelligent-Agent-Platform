@@ -35,6 +35,8 @@
 """
 from typing import Awaitable, Callable, Optional, Protocol, runtime_checkable
 
+import inspect
+
 # 节点内部细粒度事件回调：接收一个事件 dict。
 #
 # **同步或异步皆可**：运行时用 `inspect.isawaitable` 区分，同步回调按普通函数
@@ -46,6 +48,17 @@ EventCallback = Callable[[dict], Optional[Awaitable[None]]]
 # 节点级进度回调：与宿主原有约定一致 (node, status, elapsed)，保持**同步**调用
 # （CLI 传入的是同步 print lambda，原实现未 await）。
 ProgressCallback = Callable[[str, str, float], None]
+
+
+async def invoke_callback(callback, event: dict) -> None:
+    """统一回调协议：同步回调按普通函数调用，异步回调则 await。
+
+    回调抛出的异常**原样向上传播**，绝不静默吞掉——事件转发失败应打断执行。
+    各运行时实现共用这一份调用约定，避免各自写一套。
+    """
+    result = callback(event)
+    if inspect.isawaitable(result):
+        await result
 
 
 @runtime_checkable

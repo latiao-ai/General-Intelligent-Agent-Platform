@@ -16,7 +16,6 @@
     都**原样向上抛**，由宿主统一收口。唯一的适配是递归预算耗尽——它是
     LangGraph 的专属信号，在这里转成通用异常，宿主才不必 import `langgraph.errors`。
 """
-import inspect
 import logging
 import time
 from pathlib import Path
@@ -27,18 +26,9 @@ from webpage_agent.core.config import settings
 from webpage_agent.core.errors import RecursionBudgetExceeded
 from webpage_agent.core.files import save_json
 from webpage_agent.agent.graph import build_graph
+from webpage_agent.agent.runtime import invoke_callback
 
 logger = logging.getLogger(__name__)
-
-
-async def _invoke_callback(callback, event: dict) -> None:
-    """统一回调协议：同步回调按普通函数调用，异步回调则 await。
-
-    回调抛出的异常**原样向上传播**，绝不静默吞掉——事件转发失败应打断执行。
-    """
-    result = callback(event)
-    if inspect.isawaitable(result):
-        await result
 
 
 class LangGraphRuntime:
@@ -63,7 +53,7 @@ class LangGraphRuntime:
                 if mode == 'custom':
                     # 节点内部发出的动作事件，直接透传给调用方。
                     if on_event:
-                        await _invoke_callback(on_event, chunk)
+                        await invoke_callback(on_event, chunk)
                     continue
                 for name, update in chunk.items():
                     now = time.perf_counter()
