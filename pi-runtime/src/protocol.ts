@@ -96,6 +96,8 @@ export interface StartMessage extends BaseMessage {
    */
   resume?: {
     messages: Array<Record<string, unknown>>;
+    /** 已提交的检查点序号：恢复时 Node 从它继续，不从 0 重新开始。 */
+    checkpoint_seq?: number;
   };
 }
 

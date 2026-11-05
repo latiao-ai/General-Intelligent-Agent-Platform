@@ -347,6 +347,10 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
   if (resume && Array.isArray(resume.messages) && resume.messages.length) {
     // 恢复：用已提交的完整消息重建上下文，**不追加原始用户输入**
     session.importContext(resume.messages);
+    // 第七阶段收口：检查点序号从已提交值继续，不从 0 重新开始。
+    if (typeof resume.checkpoint_seq === 'number' && resume.checkpoint_seq > 0) {
+      checkpointSeq = resume.checkpoint_seq;
+    }
   } else {
     if (history && history.length) {
       session.pushHistory(history);
@@ -383,8 +387,12 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
 
     switch (end.kind) {
       case 'answered':
-        // 最终答复候选确定：先落检查点，宿主确认后再发 finished
-        await sendCheckpoint(session.exportContext(), []);
+        // 最终答复候选确定：先落检查点，宿主确认后才发 finished。
+        // 第七阶段收口：检查点失败/超时/失租 → 停止，不发 finished。
+        if (!(await sendCheckpoint(session.exportContext(), []))) {
+          sendError('最终答复检查点未被宿主确认，停止收尾');
+          return;
+        }
         sendFinished('answered', { answer: end.answer });
         return;
       case 'error':
@@ -415,7 +423,12 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
       seq: i,
       status: 'pending',
     }));
-    await sendCheckpoint(session.exportContext(), pendingCalls);
+    // 第七阶段收口：检查点未被宿主确认（失败/超时/失租）→ 停止工具派发，
+    // 不允许继续运行。
+    if (!(await sendCheckpoint(session.exportContext(), pendingCalls))) {
+      sendError('工具候选检查点未被宿主确认，停止派发');
+      return;
+    }
 
     // 逐个串行回执；若本轮有多个工具调用，取消后不再派发剩余
     for (const call of toolCalls) {
@@ -436,8 +449,12 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
       }
     }
 
-    // 工具结果已吸收进上下文：再落一次检查点，宿主确认后才进入下一轮推理
-    await sendCheckpoint(session.exportContext(), []);
+    // 工具结果已吸收进上下文：再落一次检查点，宿主确认后才进入下一轮推理。
+    // 第七阶段收口：确认失败 → 停止，不进入下一轮模型请求。
+    if (!(await sendCheckpoint(session.exportContext(), []))) {
+      sendError('工具结果检查点未被宿主确认，停止后续推理');
+      return;
+    }
   }
 }
 

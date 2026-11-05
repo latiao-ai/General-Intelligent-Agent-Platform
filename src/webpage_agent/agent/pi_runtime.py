@@ -208,9 +208,11 @@ class PiRuntime:
             # 恢复上下文：有已提交的完整消息就带上，Node 据此重建、不重复追加
             # 原始用户输入；无则走首次执行（pushUser + history）。
             resume_messages = None
+            resume_seq = 0
             if resume_snapshot and isinstance(resume_snapshot.get('messages'), list) \
                     and resume_snapshot['messages']:
                 resume_messages = resume_snapshot['messages']
+                resume_seq = int(resume_snapshot.get('checkpoint_seq') or 0)
 
             start = proto.make_message(
                 bridge.execution_id,
@@ -222,7 +224,9 @@ class PiRuntime:
                 model=self._model,
                 api_key=self._api_key,
                 model_timeout_ms=self._model_timeout_ms,
-                resume={'messages': resume_messages} if resume_messages else None,
+                resume={'messages': resume_messages,
+                        'checkpoint_seq': resume_seq}
+                if resume_messages else None,
             )
             await bridge.send(start)
 
@@ -443,9 +447,9 @@ class PiRuntime:
         """检查点握手：Node 在完整轮次结束 / 工具候选确定时导出版本化上下文，
         宿主持久化后回 checkpoint_ack，Node 才允许后续派发。
 
-        第七阶段：快照里的 messages / pending_calls / checkpoint_seq 由这里更新
-        并落库（`pi_snapshot` 版式）。持久化失败**不回 ok=True**——否则 Node 会
-        认为进度已安全落库、继续派发，而实际上恢复会漏结果。
+        第七阶段收口：持久化前校验检查点序号（拒绝回退、拒绝同序号不同内容）
+        与租约/执行代次（拒绝过期执行者）。持久化失败**不回 ok=True**——否则
+        Node 会认为进度已安全落库、继续派发，而实际上恢复会漏结果。
         """
         try:
             proto.validate_checkpoint(msg, bridge.execution_id)
@@ -454,9 +458,31 @@ class PiRuntime:
                 f"非法 checkpoint：{exc}", stderr_tail=bridge.stderr_tail()
             ) from exc
         seq = int(msg["checkpoint_seq"])
+        new_messages = list(msg.get("messages") or [])
+        new_pending = list(msg.get("pending_calls") or [])
+
+        # 序号单调性：回退（新 < 旧）拒绝，恢复时继续原序号、不从零重来。
+        prev_seq = int(self._snapshot.get('checkpoint_seq') or 0)
+        if prev_seq and seq < prev_seq:
+            await bridge.send(proto.make_message(
+                bridge.execution_id, "checkpoint_ack", checkpoint_seq=seq,
+                ok=False))
+            logger.warning('检查点序号回退：%s < %s，拒绝', seq, prev_seq)
+            return
+        # 同序号不同内容：拒绝（同一序号必须是同一份上下文）。
+        if prev_seq and seq == prev_seq:
+            prev_messages = self._snapshot.get('messages')
+            prev_pending = self._snapshot.get('pending_calls')
+            if (prev_messages != new_messages or prev_pending != new_pending):
+                await bridge.send(proto.make_message(
+                    bridge.execution_id, "checkpoint_ack", checkpoint_seq=seq,
+                    ok=False))
+                logger.warning('检查点序号 %s 内容变化，拒绝', seq)
+                return
+
         self._snapshot['checkpoint_seq'] = seq
-        self._snapshot['messages'] = list(msg.get("messages") or [])
-        self._snapshot['pending_calls'] = list(msg.get("pending_calls") or [])
+        self._snapshot['messages'] = new_messages
+        self._snapshot['pending_calls'] = new_pending
         self._snapshot['phase'] = (
             'awaiting_tools' if self._snapshot.get('pending_calls') else 'running')
         ok = await self._persist_snapshot()
@@ -464,14 +490,23 @@ class PiRuntime:
             bridge.execution_id, "checkpoint_ack", checkpoint_seq=seq, ok=ok))
 
     async def _persist_snapshot(self) -> bool:
-        """把当前版本化 Pi 快照落库（经账本的 store）。无账本/无 store 返回 False。"""
+        """把当前版本化 Pi 快照落库（经账本的 store，校验租约/代次）。无账本/无 store
+        返回 False。过期执行者（租约 owner/epoch 不匹配）拒绝写入。"""
         from webpage_agent.agent import pi_snapshot
         from webpage_agent.agent import runtime_identity
+        from webpage_agent.governance import execution_control
         from webpage_agent.store import ledger as ledger_module
         book = ledger_module.current_ledger()
         if book is None or getattr(book, 'store', None) is None:
             return False
+        context = getattr(book, 'context', None)
         try:
+            if context is not None and getattr(context, 'lease_owner', None):
+                # 校验租约：owner + epoch 必须仍是当前执行者（拒绝过期执行者）。
+                await book.store.verify_lease(
+                    book.run_id,
+                    lease_owner=getattr(context, 'lease_owner', ''),
+                    lease_epoch=getattr(context, 'lease_epoch', 0))
             await book.store.save_snapshot(
                 book.run_id, plan_version=int(book.plan_version or 1),
                 state=pi_snapshot.serialize(self._snapshot),
@@ -481,6 +516,9 @@ class PiRuntime:
                     self._snapshot.get('processed_intent_version') or 0),
                 observation_seq=int(self._snapshot.get('observation_seq') or 0))
             return True
+        except execution_control.LeaseLost:
+            logger.warning('持久化 Pi 快照时已失租，拒绝写入')
+            return False
         except Exception as exc:  # noqa: BLE001
             logger.warning("持久化 Pi 快照失败：%s", exc)
             return False

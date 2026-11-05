@@ -217,6 +217,29 @@ class PgRuns:
                 (run_id,))
         return dict(row) if row else {}
 
+    async def verify_lease(self, run_id: str, *, lease_owner: str,
+                           lease_epoch: int) -> None:
+        '''校验当前执行者仍持有租约（owner + epoch 一致且未过期）。
+
+        第七阶段收口：检查点/快照等**非动作**写入也要过租约门禁，否则过期执行者
+        仍能覆盖新执行者的快照。失租/代次不符抛 `LeaseLost`。
+        '''
+        from webpage_agent.governance import execution_control
+        async with self._lease() as conn:
+            row = await self._one(
+                conn, 'SELECT lease_owner, lease_epoch, lease_expires_at '
+                'FROM runs WHERE run_id=%s', (run_id,))
+        if row is None:
+            raise execution_control.LeaseLost(run_id, '运行不存在')
+        if str(row.get('lease_owner') or '') != str(lease_owner) \
+                or int(row.get('lease_epoch') or 0) != int(lease_epoch):
+            raise execution_control.LeaseLost(
+                run_id, f'持有者/代次已变更（库中 {row.get("lease_owner") or "空"}'
+                        f'#{row.get("lease_epoch") or 0}）')
+        expires = float(row.get('lease_expires_at') or 0)
+        if expires and expires < time.time():
+            raise execution_control.LeaseLost(run_id, '租约已过期')
+
     async def save_snapshot(self, run_id: str, *, plan_version: int, state: dict,
                             next_step_id: str = '', artifact_namespace: str = '',
                             conn=None, intent_version: int | None = None,

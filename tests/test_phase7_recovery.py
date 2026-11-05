@@ -128,6 +128,24 @@ class LeaseFencingTests(unittest.IsolatedAsyncioTestCase):
         run = await self.store.run('r1')
         self.assertNotEqual(run['status'], 'succeeded')
 
+    async def test_verify_lease_rejects_stale_executor(self):
+        """过期执行者（owner/epoch 不匹配）校验租约抛 LeaseLost。"""
+        from webpage_agent.governance import execution_control
+        await seed_run(self.store, run_id='r1')
+        claimed = await self.store.claim_run('worker-a', 60, run_id='r1')
+        # 错误 owner → 抛 LeaseLost
+        with self.assertRaises(execution_control.LeaseLost):
+            await self.store.verify_lease(
+                'r1', lease_owner='ghost', lease_epoch=int(claimed['lease_epoch']))
+        # 错误 epoch → 抛 LeaseLost
+        with self.assertRaises(execution_control.LeaseLost):
+            await self.store.verify_lease(
+                'r1', lease_owner='worker-a',
+                lease_epoch=int(claimed['lease_epoch']) + 1)
+        # 正确 owner+epoch → 通过
+        await self.store.verify_lease(
+            'r1', lease_owner='worker-a', lease_epoch=int(claimed['lease_epoch']))
+
     async def test_final_message_dedupe(self):
         await self.store.ensure_session('s1')
         await self.store.append_message('s1', 'assistant', '答复', dedupe_key='final:r1')
