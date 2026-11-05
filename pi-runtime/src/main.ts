@@ -531,6 +531,7 @@ async function handleStart(msg: Extract<InboundMessage, { type: 'start' }>): Pro
     },
     apiKey: msg.api_key,
     modelTimeoutMs: msg.model_timeout_ms,
+    mockScript: msg.mock,
   });
 
   try {

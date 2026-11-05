@@ -110,5 +110,29 @@ def get_runtime(kind: str = '') -> Runtime:
         return LangGraphRuntime()
     if normalized == runtime_identity.KIND_PI:
         from webpage_agent.agent.pi_runtime import PiRuntime
-        return PiRuntime()
+        # 第七阶段收口：受控模型脚本（测试专用）经环境变量注入，让正式
+        # Hub/Worker 入口在无外部凭据下用确定性模型产出做端到端恢复验证。
+        import json as _json
+        import os as _os
+        mock_script = None
+        raw_mock = _os.environ.get('PI_MOCK_SCRIPT')
+        if raw_mock:
+            try:
+                parsed = _json.loads(raw_mock)
+                if isinstance(parsed, list):
+                    mock_script = parsed
+            except ValueError:
+                mock_script = None
+        # 受控工具执行器（测试专用）：PI_MOCK_TOOL=1 时，web_search 走确定性
+        # mock 结果（仍经完整受治理结算链路），不依赖真实网络。
+        tool_runner = None
+        if _os.environ.get('PI_MOCK_TOOL') == '1':
+            async def tool_runner(name: str, args: dict):
+                return True, {
+                    'documents': [{
+                        'source_id': f'mock-{name}', 'title': 'mock',
+                        'url': 'https://mock.example', 'chars': 3,
+                    }],
+                }
+        return PiRuntime(mock_script=mock_script, tool_runner=tool_runner)
     raise runtime_identity.UnknownRuntimeKind('<new-run>', kind)

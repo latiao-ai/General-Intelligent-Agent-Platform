@@ -236,8 +236,13 @@ class HostToolCaller:
     身份——与参数哈希解耦，避免相同参数的重复查询被误判成 replay。
     """
 
-    def __init__(self, registry: PiCallRegistry | None = None) -> None:
+    def __init__(self, registry: PiCallRegistry | None = None,
+                 executor=None) -> None:
         self._registry = registry or PiCallRegistry()
+        # 可注入的工具执行器（测试用）：覆盖真实 web_search 的 tool.run，但仍走
+        # 完整的受治理结算链路（授权 → 准入 → 撤权复查 → 结算），产生 action/
+        # attempt，用于无网络/无外部依赖下验证恢复不变量。
+        self._executor = executor
 
     @property
     def registry(self) -> PiCallRegistry:
@@ -281,7 +286,8 @@ class HostToolCaller:
         result = await execution_gateway.governed_call(
             tool=tool, args=args, step_id=step_id, state=state, ctx=ctx,
             build_snapshot=build_snapshot,
-            snapshot_schema=runtime_identity.PI_STATE_SCHEMA)
+            snapshot_schema=runtime_identity.PI_STATE_SCHEMA,
+            executor=self._executor)
 
         if result.kind == 'replay':
             # 此前已成功：复用已有回执（不重新搜索）。重放从 receipt 恢复完整
@@ -297,6 +303,12 @@ class HostToolCaller:
                 action_id=result.action_id, attempt_id=result.attempt_id,
                 step_id=step_id, updates=_mergeable_updates(replay))
         if result.kind == 'succeeded':
+            # 第七阶段收口：故障注入钩子（测试专用）。工具已结算（action/attempt/
+            # 快照已落库）后、Node 尚未吸收结果前，模拟进程崩溃——验证「工具已
+            # 结算、Node 未吸收」的恢复不重复执行工具。
+            import os as _os
+            if _os.environ.get('PI_CRASH_AFTER_SETTLE') == '1':
+                _os._exit(0)
             return ToolReceipt(
                 ok=True, content=_search_receipt(result.updates),
                 action_id=result.action_id, attempt_id=result.attempt_id,

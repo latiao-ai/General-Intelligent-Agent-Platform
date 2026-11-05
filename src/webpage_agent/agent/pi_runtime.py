@@ -114,6 +114,8 @@ class PiRuntime:
         api_key: str | None = None,
         system_prompt: str | None = None,
         model_timeout_ms: int | None = None,
+        mock_script: list[dict[str, Any]] | None = None,
+        tool_runner: ToolExecutor | None = None,
     ) -> None:
         self._bridge = bridge
         # tool_executor 是测试注入的假工具替身；host_caller 是真实受治理调用对象
@@ -132,6 +134,11 @@ class PiRuntime:
         self._api_key = api_key
         self._system_prompt = system_prompt
         self._model_timeout_ms = model_timeout_ms
+        # 受控模型脚本（测试）：非空时经真实 Node 走确定性模型产出，不依赖外部凭据。
+        self._mock_script = mock_script
+        # 受控工具执行器（测试）：覆盖真实 web_search 的 tool.run，但仍走完整
+        # 受治理结算链路（产生 action/attempt），用于无网络下验证恢复不变量。
+        self._tool_runner = tool_runner
         # 模型请求握手：request_id → reservation，准入时存、结算时取。
         self._model_reservations: dict[str, Any] = {}
         # 第七阶段：版本化 Pi 快照（检查点/恢复用），run() 里初始化。
@@ -168,12 +175,13 @@ class PiRuntime:
 
         # 恢复决策。resume_finish / resume_reconcile / resume_block 属于
         # 「不重新推理」的结局，在进入桥接前直接写回 state 收尾。
+        # recovery 是 dict（pi_resume 里 to_dict 后），用 .get 读。
         recovery = (pi_resume or {}).get('recovery') if pi_resume else None
-        if recovery is not None and getattr(recovery, 'kind', '') in (
+        if isinstance(recovery, dict) and recovery.get('kind') in (
                 'resume_finish', 'resume_reconcile', 'resume_block'):
-            kind = recovery.kind
+            kind = recovery['kind']
             if kind == 'resume_finish':
-                state['answer'] = recovery.final_answer or ''
+                state['answer'] = recovery.get('final_answer') or ''
                 state['pi_outcome'] = 'answered'
                 state['status'] = 'succeeded'
             else:
@@ -181,7 +189,7 @@ class PiRuntime:
                 state['status'] = 'needs_reconcile'
                 state.setdefault('errors', []).append({
                     'stage': 'pi', 'type': 'RecoveryBlocked',
-                    'detail': recovery.reason or '结果未定，需核实后再继续'})
+                    'detail': recovery.get('reason') or '结果未定，需核实后再继续'})
             return state
 
         # 绑定宿主 sink：让 Pi 事件经统一的公共事件出口（emit_async）有序转交，
@@ -218,7 +226,7 @@ class PiRuntime:
                 # 第七阶段收口：按恢复决策给 Node 模式（admit/deliver）与待重派发
                 # 的原调用（含原 call_id）。resume_finish/reconcile/block 已在
                 # 上面提前返回，不会走到这里。
-                kind = getattr(recovery, 'kind', '')
+                kind = recovery.get('kind', '') if isinstance(recovery, dict) else ''
                 pending = list(resume_snapshot.get('pending_calls') or [])
                 if kind in ('resume_admit', 'resume_deliver') and pending:
                     resume_mode = 'admit' if kind == 'resume_admit' else 'deliver'
@@ -248,6 +256,7 @@ class PiRuntime:
                 api_key=self._api_key,
                 model_timeout_ms=self._model_timeout_ms,
                 resume=resume_field,
+                mock=self._mock_script,
             )
             await bridge.send(start)
 
@@ -363,7 +372,17 @@ class PiRuntime:
             # 用当前快照重建逻辑调用身份注册表：恢复时复用原调用 ID，
             # 新调用（哪怕参数相同）分配新 ID。快照已由 pi_resume 装配进
             # self._snapshot，这里直接用它，不再从 state 里重复取。
-            self._host_caller = HostToolCaller(PiCallRegistry(self._snapshot))
+            # 受控工具执行器（测试）：仍走完整受治理结算链路，只是覆盖 tool.run。
+            runner = self._tool_runner
+            executor = None
+            if runner is not None:
+                async def executor(tool, args, state):
+                    ok, result = await runner(tool.name, args)
+                    if not ok:
+                        raise RuntimeError(str(result))
+                    return result if isinstance(result, dict) else {}
+            self._host_caller = HostToolCaller(
+                PiCallRegistry(self._snapshot), executor=executor)
 
         # 第七阶段：把本次动作的恢复事实（已提交工具结果引用）与 settle_action
         # 同一事务写进快照。build_snapshot 在网关结算前被调用，返回序列化的
@@ -373,6 +392,12 @@ class PiRuntime:
 
         def build_snapshot(tool_updates: dict, tool_result=None):
             self._snapshot['logical_call_seq'] = self._host_caller.registry.seq
+            # 第七阶段收口：把 registry 已分配的逻辑调用身份**回填**进快照的
+            # pending_calls。Node 发的检查点里 logical_call_id 是空占位（Node
+            # 不知道宿主分配的逻辑 ID），恢复时必须从这里读回原 ID，否则同一次
+            # 调用会被当成新调用再分配新 ID、重复执行工具。
+            self._snapshot['pending_calls'] = (
+                self._host_caller.registry.pending_calls())
             committed = {
                 'step_id': str((tool_result or {}).get('step_id') or ''),
                 'action_id': str((tool_result or {}).get('action_id') or ''),
@@ -516,14 +541,23 @@ class PiRuntime:
             bridge.execution_id, "checkpoint_ack", checkpoint_seq=seq, ok=ok))
 
     async def _persist_snapshot(self) -> bool:
-        """把当前版本化 Pi 快照落库（经账本的 store，校验租约/代次）。无账本/无 store
-        返回 False。过期执行者（租约 owner/epoch 不匹配）拒绝写入。"""
+        """把当前版本化 Pi 快照落库（经账本的 store，校验租约/代次）。
+
+        - **无账本**（独立 smoke / CLI 直调）：没有持久化目标，检查点确认视为
+          空操作、放行（返回 True）——这不等于「提交失败」，而是根本没有治理
+          账本可写，与 `governed_call` 的兼容路径一致。
+        - **有账本但 store 缺失 / 持久化失败 / 失租**：返回 False，停止。
+        """
         from webpage_agent.agent import pi_snapshot
         from webpage_agent.agent import runtime_identity
         from webpage_agent.governance import execution_control
         from webpage_agent.store import ledger as ledger_module
         book = ledger_module.current_ledger()
-        if book is None or getattr(book, 'store', None) is None:
+        if book is None:
+            # 独立 smoke/CLI：无治理账本，检查点无持久化目标，放行。
+            return True
+        if getattr(book, 'store', None) is None:
+            logger.error('有账本但 store 缺失，无法持久化 Pi 快照')
             return False
         context = getattr(book, 'context', None)
         try:

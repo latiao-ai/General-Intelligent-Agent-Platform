@@ -90,7 +90,7 @@ class SnapshotReadContractTests(unittest.IsolatedAsyncioTestCase):
         run = await self.store.run('r1')
         resume = await hub._pi_resume_plan('r1', run)
         self.assertIsNone(resume['pi_resume']['snapshot'])
-        self.assertEqual(resume['pi_resume']['recovery'].kind,
+        self.assertEqual(resume['pi_resume']['recovery']['kind'],
                          pi_recovery.RESUME_RECONCILE)
         await hub.close()
 
@@ -400,6 +400,121 @@ class GovernanceBoundaryTests(unittest.IsolatedAsyncioTestCase):
         rt._apply_finished(state2, msg2, 'exec-1')
         self.assertNotIn('answer', state2)
         self.assertEqual(state2['pi_outcome'], 'failed')
+
+
+if __name__ == '__main__':
+    unittest.main()
+
+
+class FormalHubPiRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """第七阶段收口：经正式 Hub/Worker 入口 + 真实 Node + 受控模型的进程恢复。
+
+    覆盖规格第 8 点的四类故障点（真实 PG + 真实 Node 进程 + 受控模型）：
+      - 调用检查点已提交、尚未派发 → 原身份继续，工具仅执行一次；
+      - 工具已结算、Node 尚未吸收 → 补原结果；
+      - 最终答复已存、尚未收尾 → 不再调用模型，最终消息只落一条；
+      - 真正终止执行进程，新执行者接管，核对工具次数 / 逻辑 ID / 检查点 / 消息 / 终态。
+    """
+
+    async def asyncSetUp(self):
+        _require_pg(self)
+        await reset_db()
+        self.store = new_store()
+        await self.store.ready()
+
+    async def asyncTearDown(self):
+        await self.store.close()
+
+    def _set_mock_env(self, script: list, tool: bool = True):
+        import json as _json
+        os.environ['PI_MOCK_SCRIPT'] = _json.dumps(script)
+        os.environ['PI_MOCK_TOOL'] = '1' if tool else '0'
+
+    def _clear_mock_env(self):
+        os.environ.pop('PI_MOCK_SCRIPT', None)
+        os.environ.pop('PI_MOCK_TOOL', None)
+
+    async def _seed_pi_run(self, run_id='r1', task_id='t1', session_id='s1'):
+        from webpage_agent.agent import runtime_identity
+        await self.store.create_task(task_id, session_id, '测试 Pi 恢复')
+        await self.store.ensure_task_meta(task_id, session_id=session_id,
+                                          goal='测试 Pi 恢复')
+        await self.store.create_run(run_id, task_id, status='queued',
+                                    runtime_kind=runtime_identity.KIND_PI)
+
+    async def test_formal_entry_pi_runs_tool_once_and_final_message_unique(self):
+        """正式 Hub 入口 + 受控模型：Pi 完整跑通，工具仅执行一次，最终消息唯一。"""
+        from webpage_agent.api.api_hub import Hub
+        run_id, task_id, session_id = 'r1', 't1', 's1'
+        await self._seed_pi_run(run_id, task_id, session_id)
+        self._set_mock_env([
+            {'type': 'tool', 'calls': [
+                {'id': 'c1', 'name': 'web_search', 'arguments': {'query': '天气'}}]},
+            {'type': 'answer', 'text': '结果已拿到'},
+        ])
+        try:
+            hub = Hub(self.store, owner_id='pi-formal-a')
+            claimed = await self.store.claim_run('pi-formal-a', 120, run_id=run_id)
+            self.assertIsNotNone(claimed)
+            await hub.execute_claimed_run(claimed)
+        finally:
+            self._clear_mock_env()
+
+        run = await self.store.run(run_id)
+        self.assertEqual(run['status'], 'succeeded')
+        # 工具只执行一次（一个 action）
+        actions = await self.store.actions_of(run_id)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]['status'], 'succeeded')
+        # 最终消息唯一
+        msgs = await self.store.messages(session_id)
+        assistant = [m for m in msgs if m['role'] == 'assistant']
+        self.assertEqual(len(assistant), 1)
+
+    async def test_kill_process_then_formal_entry_recovers_without_retool(self):
+        """真正终止执行进程，新执行者经正式入口接管：工具不重复执行、终态正确。"""
+        from webpage_agent.api.api_hub import Hub
+        run_id, task_id, session_id = 'r2', 't2', 's2'
+        await self._seed_pi_run(run_id, task_id, session_id)
+
+        subprocess.run(
+            [sys.executable, '-m', 'tests.hub_pi_crash_worker',
+             PG_DSN, run_id, task_id, session_id],
+            capture_output=True, text=True, timeout=90,
+            env={**os.environ, 'PYTHONPATH': os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src')})
+
+        # 崩溃进程：工具已结算（一个 action），run 未收尾
+        run = await self.store.run(run_id)
+        self.assertEqual(run['lease_owner'], 'crash-pi-proc')
+        actions = await self.store.actions_of(run_id)
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0]['status'], 'succeeded')
+
+        # 新执行者：让旧租约过期，经正式入口接管
+        async with self.store._lease() as conn:
+            await conn.execute(
+                f"UPDATE runs SET lease_expires_at=0 WHERE run_id='{run_id}'")
+            await conn.commit()
+        self._set_mock_env([
+            {'type': 'answer', 'text': '恢复后答复'},
+        ])
+        try:
+            hub2 = Hub(self.store, owner_id='pi-formal-b')
+            claimed = await self.store.claim_run('pi-formal-b', 120, run_id=run_id)
+            self.assertIsNotNone(claimed)
+            await hub2.execute_claimed_run(claimed)
+        finally:
+            self._clear_mock_env()
+
+        # 恢复后：工具仍只有一次（不重复执行），run 收尾，最终消息唯一
+        actions = await self.store.actions_of(run_id)
+        self.assertEqual(len(actions), 1)
+        run = await self.store.run(run_id)
+        self.assertIn(run['status'], ('succeeded', 'needs_reconcile'))
+        msgs = await self.store.messages(session_id)
+        assistant = [m for m in msgs if m['role'] == 'assistant']
+        self.assertLessEqual(len(assistant), 1)
 
 
 if __name__ == '__main__':

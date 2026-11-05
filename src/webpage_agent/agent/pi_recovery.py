@@ -53,6 +53,16 @@ class RecoveryDecision:
         if self.pending_calls is None:
             self.pending_calls = []
 
+    def to_dict(self) -> dict:
+        """转成可 JSON 序列化的 dict（恢复事实随 pi_resume 进入 state 落盘用）。"""
+        return {
+            'kind': self.kind,
+            'tool_results': list(self.tool_results),
+            'final_answer': self.final_answer,
+            'pending_calls': list(self.pending_calls),
+            'reason': self.reason,
+        }
+
 
 def _action_status(action: dict) -> str:
     return str(action.get('status') or '')

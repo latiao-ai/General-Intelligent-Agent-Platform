@@ -190,7 +190,8 @@ class HubRecoveryMixin:
                 'processed_intent_version': int(
                     run.get('processed_intent_version') or 0),
                 'plan_version': int(run.get('plan_version') or 1),
-                'pi_resume': {'snapshot': None, 'recovery': decision},
+                'pi_resume': {'snapshot': None,
+                              'recovery': decision.to_dict()},
                 'user_input': str(run.get('goal') or ''),
             }
 
@@ -207,7 +208,7 @@ class HubRecoveryMixin:
             'plan_version': int(run.get('plan_version') or 1),
             'pi_resume': {
                 'snapshot': snapshot,
-                'recovery': decision,
+                'recovery': decision.to_dict(),
             },
         }
         # 保留用户原始输入：恢复后**不重复追加**原始输入，只把快照里未完成

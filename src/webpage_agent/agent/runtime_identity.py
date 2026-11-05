@@ -24,8 +24,10 @@ PI_RUNTIME_VERSION = 1
 
 # 状态格式版本（runs.runtime_state_schema）：快照 state_json 的读写 schema 代次。
 # 与「实现版本」分开：实现可以升级，但快照 schema 不兼容时必须递增并阻断旧读。
+# Pi 与 LangGraph 的 schema 代次**必须不同**：恢复入口靠它区分「这是 LangGraph 的
+# step_outputs 快照还是 Pi 的版本化快照」，撞值会读错格式。
 LANGGRAPH_STATE_SCHEMA = 1
-PI_STATE_SCHEMA = 1
+PI_STATE_SCHEMA = 2
 
 
 def default_kind() -> str:

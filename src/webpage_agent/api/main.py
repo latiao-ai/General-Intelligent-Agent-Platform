@@ -112,6 +112,11 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         async with asyncio.timeout(settings.task_timeout):
             await get_runtime(runtime_kind).run(
                 state, on_event=on_event, progress=progress)
+            # 第七阶段收口：pi_resume 是**运行时专用**的恢复输入（含不可 JSON 序列化
+            # 的 RecoveryDecision 对象）。runtime 已原地消费完毕，这里 pop 掉，避免
+            # 落盘 state.json 时序列化失败——恢复事实已由 runtime 写进版本化 Pi 快照，
+            # 不在最终 state 里重复一份。
+            state.pop('pi_resume', None)
     except (execution_control.LeaseLost, execution_control.ControlStopped):
         # 控制流异常必须**原样穿过**这一层：把它们包成 RuntimeError 会让
         # "失租"和"暂停"退化成普通失败，中枢再也没法区分该由谁收尾（§4.3、§7.2）。

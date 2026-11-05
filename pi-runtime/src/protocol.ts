@@ -90,6 +90,17 @@ export interface StartMessage extends BaseMessage {
   /** 模型运行超时（毫秒） */
   model_timeout_ms?: number;
   /**
+   * 受控模型脚本（测试）：非空时 Node 不走真实模型，按脚本逐轮产出确定性的
+   * 工具调用/答复，用于无外部凭据下经真实 Node 端到端验证恢复链路。
+   */
+  mock?: Array<{
+    type: 'answer';
+    text: string;
+  } | {
+    type: 'tool';
+    calls: Array<{ id: string; name: string; arguments: Record<string, unknown> }>;
+  }>;
+  /**
    * 恢复上下文（第七阶段）：携带已提交的完整模型消息（含 assistant/toolCall/
    * toolResult 配对）。有 resume 时 Node 用它**重建** session 上下文，不再
    * 追加原始用户输入——避免恢复后把同一句用户输入再发一遍。

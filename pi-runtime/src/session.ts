@@ -27,7 +27,17 @@ export interface SessionConfig {
   };
   apiKey?: string;
   modelTimeoutMs?: number;
+  /**
+   * 受控模型脚本（测试用）：非空时 run() 不走真实 stream，而是按队列逐轮
+   * 返回确定性的工具调用/答复。每项描述一次 run() 的产出。
+   */
+  mockScript?: Array<MockTurn>;
 }
+
+/** 受控模型的一轮产出（对应一次 run() 的返回）。 */
+export type MockTurn =
+  | { type: 'answer'; text: string }
+  | { type: 'tool'; calls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> };
 
 /**
  * 一次推理的终结状态（按安装版本 SDK 的 `stopReason` 区分，不做伪造兜底）。
@@ -113,11 +123,13 @@ export class PiSession {
   private model: Model<'openai-completions'>;
   private apiKey?: string;
   private modelTimeoutMs: number;
+  private mockScript?: Array<MockTurn>;
 
   constructor(cfg: SessionConfig) {
     this.model = buildModel(cfg.model);
     this.apiKey = cfg.apiKey;
     this.modelTimeoutMs = cfg.modelTimeoutMs ?? 180_000;
+    this.mockScript = cfg.mockScript;
     this.context = {
       systemPrompt: cfg.systemPrompt,
       messages: [],
@@ -263,6 +275,13 @@ export class PiSession {
       };
     }
 
+    // 受控模型（测试）：非空脚本时走确定性产出，不碰真实 stream，但仍完整走
+    // 准入（onModelRequest）→ 产出 → 结算（onModelUsage）握手，使真实 Node 的
+    // 协议/检查点/恢复链路在无外部凭据下可被端到端验证。
+    if (this.mockScript && this.mockScript.length) {
+      return this.runMock(requestId, handlers, answer);
+    }
+
     const s = stream(this.model, this.context, {
       signal,
       apiKey: this.apiKey,
@@ -384,6 +403,98 @@ export class PiSession {
       return { kind: 'toolUse', message: finalMessage };
     }
     return { kind: 'answered', answer: answer || extractText(finalMessage), message: finalMessage };
+  }
+
+  /**
+   * 受控模型：按脚本队列逐轮产出确定性的工具调用/答复，完整走准入与结算握手。
+   * 与真实 stream 分支共用同样的 onModelUsage 结算（失败则明确停止）。
+   */
+  private async runMock(
+    requestId: string,
+    handlers: {
+      onTextDelta: (delta: string) => void;
+      onToolCall: (toolCall: import('@mariozechner/pi-ai').ToolCall) => void;
+      onModelUsage: (
+        requestId: string,
+        usage: {
+          input_tokens: number;
+          output_tokens: number;
+          cache_read_tokens: number;
+          cache_write_tokens: number;
+          total_tokens: number;
+        },
+        outcome: 'succeeded' | 'failed' | 'cancelled',
+      ) => Promise<boolean>;
+    },
+    answer: string,
+  ): Promise<TurnEnd> {
+    const turn = this.mockScript!.shift()!;
+    let finalMessage: AssistantMessage;
+
+    if (turn.type === 'tool') {
+      // 工具轮：产出 assistant 消息（含 toolCall blocks），触发 onToolCall
+      const blocks = turn.calls.map((c) => ({
+        type: 'toolCall' as const,
+        id: c.id,
+        name: c.name,
+        arguments: c.arguments,
+      }));
+      finalMessage = {
+        role: 'assistant',
+        content: blocks as never,
+        api: this.model.api,
+        provider: this.model.provider,
+        model: this.model.id,
+        usage: {
+          input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+        },
+        stopReason: 'toolUse',
+        timestamp: Date.now(),
+      };
+      for (const c of turn.calls) {
+        handlers.onToolCall({
+          type: 'toolCall',
+          id: c.id,
+          name: c.name,
+          arguments: c.arguments,
+        });
+      }
+      this.context.messages.push(finalMessage);
+      const settled = await handlers.onModelUsage(requestId, {
+        input_tokens: 1, output_tokens: 1, cache_read_tokens: 0,
+        cache_write_tokens: 0, total_tokens: 2,
+      }, 'succeeded');
+      if (!settled) {
+        return { kind: 'error', error: '模型用量结算失败，停止后续推理', message: finalMessage };
+      }
+      return { kind: 'toolUse', message: finalMessage };
+    }
+
+    // 答复轮：产出文本答复
+    handlers.onTextDelta(turn.text);
+    finalMessage = {
+      role: 'assistant',
+      content: [{ type: 'text', text: turn.text }],
+      api: this.model.api,
+      provider: this.model.provider,
+      model: this.model.id,
+      usage: {
+        input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+      },
+      stopReason: 'stop',
+      timestamp: Date.now(),
+    };
+    this.context.messages.push(finalMessage);
+    const settled = await handlers.onModelUsage(requestId, {
+      input_tokens: 1, output_tokens: 1, cache_read_tokens: 0,
+      cache_write_tokens: 0, total_tokens: 2,
+    }, 'succeeded');
+    if (!settled) {
+      return { kind: 'error', error: '模型用量结算失败，停止后续推理', message: finalMessage };
+    }
+    return { kind: 'answered', answer: answer || turn.text, message: finalMessage };
   }
 
   /** 销毁：第三阶段是内存 session，无外部资源需释放。 */
