@@ -333,18 +333,6 @@ async def governed_call(
 
     action_id, attempt_id = '', ''
 
-    # 调用预算：工具调用次数进运行预算
-    try:
-        await book.store.consume_budget(
-            book.context, run_id=book.run_id, key='tool_calls',
-            limit=settings.run_max_tool_calls)
-    except Exception as exc:                       # noqa: BLE001
-        hint = getattr(exc, 'safe_message', None) or type(exc).__name__
-        emit(action('调用预算用尽', hint, '⚠️'))
-        return GovernedResult(
-            kind='failed', error=hint, error_code='E_RUN_BUDGET',
-            certainty='not_executed', effect=effect)
-
     # 授权（先授权再准入；拒绝/等待批准都还没有 in_flight）
     # 没有可信主体（ctx 为 None）时 authorize_call 依据缺失 → 拒绝，不伪造主体。
     try:
@@ -436,6 +424,26 @@ async def governed_call(
         return GovernedResult(
             kind='blocked', error='准入未分配 action/attempt 身份',
             error_code='E_NO_ACTION_ID', certainty='unknown', effect=effect)
+
+    # 调用预算：只有**已准入**的动作才消耗一次工具调用预算。
+    # 放在准入之后，而不是之前——否则「run 不存在」会被 consume_budget 的
+    # `_owned` 抛成 BudgetExceeded，把 no_run 误判成 failed。准入本身就是
+    # run / 租约存在性的权威裁决（admit 返回 no_run 或抛 LeaseLost），
+    # 预算只对真正取得准入资格的动作有意义。
+    try:
+        await book.store.consume_budget(
+            book.context, run_id=book.run_id, key='tool_calls',
+            limit=settings.run_max_tool_calls)
+    except Exception as exc:                       # noqa: BLE001
+        hint = getattr(exc, 'safe_message', None) or type(exc).__name__
+        emit(action('调用预算用尽', hint, '⚠️'))
+        # 预算不足：这次动作没有发出，把它结算为失败，不留 in_flight。
+        await book.fail_from_exception(
+            step_id=step_id, action_id=action_id, attempt_id=attempt_id,
+            exc=exc, effect=effect)
+        return GovernedResult(
+            kind='failed', error=hint, error_code='E_RUN_BUDGET',
+            certainty='not_executed', effect=effect, settled=True)
 
     # 撤权复查
     if ctx is not None and decision is not None:
