@@ -13,7 +13,7 @@ from webpage_agent.governance import execution_control
 from webpage_agent.store import ledger as ledger_module
 from webpage_agent.core import outcome as outcome_module
 from webpage_agent.capabilities.publishing import deploy_once
-from webpage_agent.agent.graph import build_graph
+from webpage_agent.agent.langgraph_runtime import LangGraphRuntime
 from webpage_agent.core.files import save_json
 from langgraph.errors import GraphRecursionError
 
@@ -90,42 +90,14 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         'prior_documents': (prior or {}).get('documents') or [],
     }
     started = time.perf_counter()
-    marked = started
     ledger_token = ledger_module.bind(ledger)
     try:
+        # 运行时边界：宿主负责准备状态与收尾，LangGraphRuntime 负责驱动图、
+        # 合并增量、记录耗时并透传节点内部事件。控制流异常与取消原样穿过，
+        # 由下面这段宿主收尾统一处理（§4.3、§7.2）。
         async with asyncio.timeout(settings.task_timeout):
-            async for mode, chunk in build_graph().astream(
-                state, config={'recursion_limit': settings.graph_recursion_limit},
-                stream_mode=['updates', 'custom'],
-            ):
-                if mode == 'custom':
-                    # 节点内部发出的动作事件，直接透传给调用方。
-                    if on_event:
-                        await on_event(chunk)
-                    continue
-                for name, update in chunk.items():
-                    now = time.perf_counter()
-                    if isinstance(update, dict):
-                        state.update(update)
-                    # 计划的落库**不再依赖这里**：图里有一个显式的
-                    # `persist_plan` 节点，在第一处工具调用之前用 CAS 提交。
-                    # 以前用 `plan_committed` 布尔值兜在这里，只适合"一次规划"——
-                    # 一旦允许修订，第二份计划就可能没经过持久提交就开始执行。
-                    # stream_mode='updates' 在该节点跑完后才产出事件，
-                    # 所以相邻事件的时间差≈该节点耗时（含少量调度开销）。
-                    # run_step 会自我循环多次，用 step_label 记具体是哪一步，
-                    # 否则耗时表里会出现一排分不清的 "run_step"。
-                    label = (update.get('step_label')
-                             if isinstance(update, dict) else None) or name
-                    state['timings'].append({
-                        'stage': label,
-                        'seconds': round(now - marked, 2),
-                        'status': state.get('status'),
-                    })
-                    marked = now
-                    if progress:
-                        progress(label, state.get('status'), round(now - started, 2))
-                    save_json(folder / 'state.json', state)
+            await LangGraphRuntime().run(
+                state, on_event=on_event, progress=progress)
     except (execution_control.LeaseLost, execution_control.ControlStopped):
         # 控制流异常必须**原样穿过**这一层：把它们包成 RuntimeError 会让
         # "失租"和"暂停"退化成普通失败，中枢再也没法区分该由谁收尾（§4.3、§7.2）。
