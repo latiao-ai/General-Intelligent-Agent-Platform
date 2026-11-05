@@ -112,11 +112,10 @@ def _search_receipt(updates: dict) -> dict:
 
 
 def _stable_step_id(tool_key: str, args: dict) -> str:
-    """由 Python 分配的稳定执行身份（第 4 点）。
+    """**已废弃**（第七阶段）：按参数指纹派生执行身份会导致「相同参数=相同身份」。
 
-    桥接 `call_id` 只用于一次通信往返关联，**不进账本幂等键**。这里的 step_id
-    由 `tool_key + args 指纹` 确定性生成，使「同一轮重复发起的相同调用」命中
-    账本的同一幂等键，复用已有动作，而不是分配新身份再调用一次。
+    保留仅为向后兼容旧测试引用；新代码一律用 `PiCallRegistry` 分配**持久化的
+    逻辑调用 ID**（run 内序号），与参数哈希解耦。
     """
     return f'pi:{tool_key}:{ledger_module.args_hash(args)[:16]}'
 
@@ -127,20 +126,112 @@ def _mergeable_updates(updates: dict) -> dict:
             if key in _MERGEABLE_KEYS}
 
 
+class PiCallRegistry:
+    """Pi 逻辑调用身份注册表：把「Node 发起的调用」映射到宿主分配并持久化的
+    逻辑调用 ID（run 内单调序号），与参数哈希解耦。
+
+    为什么不能再用 `_stable_step_id(tool_key, args)`：
+
+    - 相同工具 + 相同参数会被派生为**同一个**身份，后续**有意的重复查询**会被
+      误判成 replay；
+    - 身份必须由宿主**分配并持久化**：第一次见到某个 Node 调用时分配一个新
+      序号；恢复时按快照里已提交的 `pending_calls` 重建映射，让**同一次调用**
+      复用原序号，而**新的调用**（哪怕参数相同）拿到新序号。
+
+    绑定关系：`node_call_key`（Node 侧稳定标识，来自桥接 call_id + 工具名）→
+    `logical_call_id`；同时记录 `(tool_key, args_hash)`。同一 `logical_call_id`
+    若参数哈希变化 → 拒绝（不能静默换参数）。
+    """
+
+    def __init__(self, snapshot: dict | None = None) -> None:
+        # node_call_key -> {'logical_call_id', 'tool_key', 'args_hash'}
+        self._bindings: dict[str, dict] = {}
+        self._seq = 0
+        self._restore(snapshot)
+
+    def _restore(self, snapshot: dict | None) -> None:
+        """从快照的 pending_calls 重建已分配的调用身份与序号。"""
+        if not snapshot:
+            return
+        calls = snapshot.get('pending_calls') or []
+        if not isinstance(calls, list):
+            return
+        for item in calls:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get('node_call_key') or '')
+            logical = str(item.get('logical_call_id') or '')
+            if not key or not logical:
+                continue
+            self._bindings[key] = {
+                'logical_call_id': logical,
+                'tool_key': str(item.get('tool_key') or ''),
+                'args_hash': str(item.get('args_hash') or ''),
+            }
+        self._seq = int(snapshot.get('logical_call_seq') or 0)
+
+    @property
+    def seq(self) -> int:
+        return self._seq
+
+    def logical_id(self, node_call_key: str, *, tool_key: str,
+                   args: dict) -> str:
+        """取或分配逻辑调用 ID。恢复复用原 ID，新调用分配新 ID，参数变化拒绝。"""
+        args_digest = ledger_module.args_hash(args)
+        existing = self._bindings.get(node_call_key)
+        if existing is not None:
+            # 同一 node_call_key：复用原身份，但参数必须一致
+            if existing.get('args_hash') and existing['args_hash'] != args_digest:
+                raise RuntimeError(
+                    f'逻辑调用 {existing["logical_call_id"]} 的参数已变化，拒绝复用')
+            return existing['logical_call_id']
+        # 新调用：分配新序号（哪怕参数与历史上某次相同）
+        self._seq += 1
+        logical = f'pi:call:{self._seq}'
+        self._bindings[node_call_key] = {
+            'logical_call_id': logical,
+            'tool_key': tool_key,
+            'args_hash': args_digest,
+        }
+        return logical
+
+    def pending_calls(self) -> list[dict]:
+        """导出待处理调用清单（写进快照，恢复时重建映射）。"""
+        return [
+            {'node_call_key': key, **value}
+            for key, value in self._bindings.items()
+        ]
+
+    def node_call_key(self, call_id: str, tool_name: str) -> str:
+        """Node 侧稳定标识：桥接 call_id + 工具名（同一轮内唯一）。"""
+        return f'{tool_name}:{call_id}'
+
+
 class HostToolCaller:
     """Pi 宿主工具调用对象：受治理地执行模型发起的工具调用。
 
     一次 `run()` 独占一个 caller；它不持有凭据或身份，可信主体每次从当前
     执行上下文（账本 + 执行权）推导。
+
+    第七阶段起，`caller` 持有一个 `PiCallRegistry`（逻辑调用身份），由宿主在
+    恢复时用快照初始化，据此把「同一次调用」复用原身份、把「新调用」分配新
+    身份——与参数哈希解耦，避免相同参数的重复查询被误判成 replay。
     """
+
+    def __init__(self, registry: PiCallRegistry | None = None) -> None:
+        self._registry = registry or PiCallRegistry()
+
+    @property
+    def registry(self) -> PiCallRegistry:
+        return self._registry
 
     async def call(self, *, call_id: str, tool_name: str,
                    args: dict, state: dict) -> ToolReceipt:
         """执行一次工具调用并返回模型回执。
 
-        `call_id` 是桥接往返关联 ID（不进账本幂等键）；稳定执行身份由
-        `_stable_step_id` 生成，`execution_gateway.governed_call` 内的
-        `ActionLedger.admit` 据此分配 action_id / attempt_id。
+        `call_id` 是桥接往返关联 ID（不进账本幂等键）；逻辑调用身份由
+        `PiCallRegistry` 分配（run 内序号），`execution_gateway.governed_call`
+        内的 `ActionLedger.admit` 据此分配 action_id / attempt_id。
         """
         # 执行点再次解析并检查工具：只开放 web_search
         tool = _resolve_web_search()
@@ -151,7 +242,13 @@ class HostToolCaller:
                 ok=False, error=f'工具未开放：{tool_name}（仅 {tool.name}）')
 
         tool_key = tool.tool_key or tool.name
-        step_id = _stable_step_id(tool_key, args)
+        # 逻辑调用身份：宿主分配并持久化的 run 内序号，与参数哈希解耦
+        node_key = self._registry.node_call_key(call_id, tool_name)
+        try:
+            step_id = self._registry.logical_id(
+                node_key, tool_key=tool_key, args=args)
+        except RuntimeError as exc:
+            return ToolReceipt(ok=False, error=str(exc), step_id='')
 
         # 可信主体由 Python 持有（库里的 run 行），不是模型输出
         ctx = await execution_gateway.tool_context(step_id=step_id, action_id='')

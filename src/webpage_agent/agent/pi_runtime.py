@@ -294,8 +294,12 @@ class PiRuntime:
 
         # 真实受治理调用：走 HostToolCaller（授权 → 准入 → 撤权复查 → 真实调用 → 结算）
         if self._host_caller is None:
-            from webpage_agent.agent.pi_host_tools import HostToolCaller
-            self._host_caller = HostToolCaller()
+            from webpage_agent.agent.pi_host_tools import (
+                HostToolCaller, PiCallRegistry)
+            # 用当前快照重建逻辑调用身份注册表：恢复时复用原调用 ID，
+            # 新调用（哪怕参数相同）分配新 ID。
+            snapshot = (state.get('pi_snapshot') or {}) if isinstance(state, dict) else {}
+            self._host_caller = HostToolCaller(PiCallRegistry(snapshot))
         receipt = await self._host_caller.call(
             call_id=call_id, tool_name=tool_name, args=args, state=state)
         if receipt.ok:

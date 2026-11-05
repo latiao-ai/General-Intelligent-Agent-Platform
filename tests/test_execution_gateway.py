@@ -215,12 +215,69 @@ class PiHostToolCallerTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_stable_step_id_ignores_call_id(self):
         from webpage_agent.agent import pi_host_tools
-        # 稳定执行身份由 tool_key + args 决定，与桥接 call_id 无关
+        # 稳定执行身份由 tool_key + args 决定，与桥接 call_id 无关（旧语义，
+        # 保留回归：同参数同身份）。第七阶段起正式路径改用 PiCallRegistry，
+        # 这里只锁旧函数的确定性行为。
         a = pi_host_tools._stable_step_id('local:web:search', {'query': 'x'})
         b = pi_host_tools._stable_step_id('local:web:search', {'query': 'x'})
         c = pi_host_tools._stable_step_id('local:web:search', {'query': 'y'})
         self.assertEqual(a, b)
         self.assertNotEqual(a, c)
+
+
+class PiCallRegistryTests(unittest.TestCase):
+    """第七阶段：逻辑调用身份与参数哈希分离。"""
+
+    def test_same_args_new_calls_get_distinct_ids(self):
+        from webpage_agent.agent.pi_host_tools import PiCallRegistry
+        reg = PiCallRegistry()
+        # 两个不同的 Node 调用（不同 call_id），参数完全相同 → 不同逻辑 ID
+        id1 = reg.logical_id('web_search:c1', tool_key='local:web:search',
+                             args={'query': 'x'})
+        id2 = reg.logical_id('web_search:c2', tool_key='local:web:search',
+                             args={'query': 'x'})
+        self.assertNotEqual(id1, id2)
+
+    def test_same_node_call_reuses_id(self):
+        from webpage_agent.agent.pi_host_tools import PiCallRegistry
+        reg = PiCallRegistry()
+        first = reg.logical_id('web_search:c1', tool_key='local:web:search',
+                               args={'query': 'x'})
+        again = reg.logical_id('web_search:c1', tool_key='local:web:search',
+                               args={'query': 'x'})
+        self.assertEqual(first, again)
+
+    def test_same_id_different_args_rejected(self):
+        from webpage_agent.agent.pi_host_tools import PiCallRegistry
+        reg = PiCallRegistry()
+        reg.logical_id('web_search:c1', tool_key='local:web:search',
+                       args={'query': 'x'})
+        with self.assertRaises(RuntimeError):
+            reg.logical_id('web_search:c1', tool_key='local:web:search',
+                           args={'query': 'y'})
+
+    def test_restore_reuses_original_ids(self):
+        from webpage_agent.agent.pi_host_tools import PiCallRegistry
+        from webpage_agent.store import ledger as ledger_module
+        args = {'query': 'x'}
+        snapshot = {
+            'logical_call_seq': 2,
+            'pending_calls': [
+                {'node_call_key': 'web_search:c1',
+                 'logical_call_id': 'pi:call:1',
+                 'tool_key': 'local:web:search',
+                 'args_hash': ledger_module.args_hash(args)},
+            ],
+        }
+        reg = PiCallRegistry(snapshot)
+        # 恢复后同一次调用（参数一致）复用原 ID
+        restored = reg.logical_id('web_search:c1', tool_key='local:web:search',
+                                  args=args)
+        self.assertEqual(restored, 'pi:call:1')
+        # 新调用拿到新序号（从 2 继续）
+        new_id = reg.logical_id('web_search:c2', tool_key='local:web:search',
+                                args=args)
+        self.assertEqual(new_id, 'pi:call:3')
 
 
 class SchemaValidationTests(unittest.TestCase):
