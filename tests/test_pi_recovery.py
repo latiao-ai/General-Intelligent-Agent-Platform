@@ -41,21 +41,26 @@ class PiRecoveryDecisionTests(unittest.TestCase):
         self.assertEqual(d.kind, pi_recovery.RESUME_RECONCILE)
 
     def test_committed_result_not_absorbed_delivers(self):
+        # step_id='s1'（逻辑调用 ID）经 pending_calls 映射到桥接 call_id='c1'，
+        # 但 messages 里没有 toolResult(c1) → 未吸收，补 toolResult。
         snap = _snap(
             committed_tool_results=[
                 {'action_id': 'a1', 'step_id': 's1', 'data_ref': 'results/x'}],
+            pending_calls=[{'call_id': 'c1', 'logical_call_id': 's1'}],
             messages=[{'role': 'assistant', 'content': 'x'}])
         d = pi_recovery.decide(snap, [], 'running')
         self.assertEqual(d.kind, pi_recovery.RESUME_DELIVER)
         self.assertEqual(d.tool_results[0]['action_id'], 'a1')
 
     def test_committed_result_already_absorbed(self):
+        # toolResult 用实际字段 toolCallId == 桥接 call_id 配对，判定已吸收。
         snap = _snap(
             committed_tool_results=[
                 {'action_id': 'a1', 'step_id': 's1', 'data_ref': 'results/x'}],
+            pending_calls=[{'call_id': 'c1', 'logical_call_id': 's1'}],
             messages=[
                 {'role': 'assistant', 'content': 'x'},
-                {'role': 'toolResult', 'action_id': 'a1'}])
+                {'role': 'toolResult', 'toolCallId': 'c1'}])
         d = pi_recovery.decide(snap, [], 'running')
         # 已吸收 → 不是 RESUME_DELIVER；无其他未完成 → resume_admit 继续
         self.assertEqual(d.kind, pi_recovery.RESUME_ADMIT)

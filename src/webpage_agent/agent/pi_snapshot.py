@@ -46,6 +46,105 @@ _SNAPSHOT_KEYS = (
 # 快照 `messages` 允许的角色（assistant / toolCall / toolResult 必须成对保留）。
 _MESSAGE_ROLES = ('user', 'assistant', 'toolCall', 'toolResult', 'system')
 
+# 待处理调用的**唯一版本化结构**（第七阶段收口）：Node 检查点、Python 注册表、
+# 动作回执、恢复决策共用这一份映射。字段含义：
+#   call_id          桥接调用 ID（Node 侧 ToolCall.id）
+#   logical_call_id  宿主分配并持久化的逻辑调用 ID（run 内序号 pi:call:N）
+#   tool_name        工具名
+#   tool_key         稳定工具键（local:web:search）
+#   arguments        完整参数
+#   args_hash        完整参数哈希（sha256，与账本幂等键一致）
+#   seq              调用顺序（同一轮内从 0 递增）
+#   status           pending / admitted / succeeded / delivered
+_PENDING_CALL_KEYS = (
+    'call_id', 'logical_call_id', 'tool_name', 'tool_key',
+    'arguments', 'args_hash', 'seq', 'status',
+)
+
+
+def normalize_pending_call(item: dict) -> dict:
+    """把一份待处理调用规整成唯一结构（缺失字段给默认值，多余字段丢弃）。"""
+    if not isinstance(item, dict):
+        return {}
+    return {
+        'call_id': str(item.get('call_id') or ''),
+        'logical_call_id': str(item.get('logical_call_id') or ''),
+        'tool_name': str(item.get('tool_name') or ''),
+        'tool_key': str(item.get('tool_key') or ''),
+        'arguments': dict(item.get('arguments') or {}),
+        'args_hash': str(item.get('args_hash') or ''),
+        'seq': int(item.get('seq') or 0),
+        'status': str(item.get('status') or 'pending'),
+    }
+
+
+def normalize_pending_calls(calls: list) -> list[dict]:
+    """规整一组待处理调用（只保留 normalize_pending_call 的字段）。"""
+    if not isinstance(calls, list):
+        return []
+    out = []
+    for item in calls:
+        normalized = normalize_pending_call(item)
+        if normalized:
+            out.append(normalized)
+    return out
+
+
+def assistant_tool_calls(messages: list) -> list[dict]:
+    """从完整消息里提取 assistant 消息里的工具调用（ToolCall 嵌在 content 里）。
+
+    识别**实际字段**：Pi SDK 的 `AssistantMessage.content` 是数组，其中
+    `type == 'toolCall'` 的元素是工具调用，其 `id` 才是桥接调用 ID
+    （对应 `ToolResultMessage.toolCallId`）。不能只看消息角色。
+    """
+    result: list[dict] = []
+    if not isinstance(messages, list):
+        return result
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get('role') or '') != 'assistant':
+            continue
+        content = msg.get('content')
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get('type') == 'toolCall':
+                result.append({
+                    'id': str(block.get('id') or ''),
+                    'name': str(block.get('name') or ''),
+                    'arguments': dict(block.get('arguments') or {}),
+                })
+    return result
+
+
+def tool_result_ids(messages: list) -> set[str]:
+    """从完整消息里提取 toolResult 消息的 toolCallId 集合（配对键）。"""
+    ids: set[str] = set()
+    if not isinstance(messages, list):
+        return ids
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if str(msg.get('role') or '') != 'toolResult':
+            continue
+        call_id = str(msg.get('toolCallId') or '')
+        if call_id:
+            ids.add(call_id)
+    return ids
+
+
+def unabsorbed_tool_calls(messages: list) -> list[dict]:
+    """返回 assistant 里尚未被 toolResult 吸收（toolCallId 未配对）的工具调用。
+
+    配对键是 `ToolCall.id == ToolResultMessage.toolCallId`，不是消息角色。
+    """
+    results = tool_result_ids(messages)
+    return [call for call in assistant_tool_calls(messages)
+            if call['id'] and call['id'] not in results]
+
 
 class SnapshotError(RuntimeError):
     """Pi 快照缺失 / 损坏 / 版本不兼容：不能继续，必须明确停止。"""
@@ -153,10 +252,12 @@ def parse_row(row: dict | None) -> dict:
 
 
 def messages_ok(messages: list) -> bool:
-    """校验消息序列的配对：assistant 产出的 toolCall 必须被 toolResult 覆盖。
+    """校验消息序列的结构合法性：角色合法 + assistant 工具调用与 toolResult 配对。
 
-    恢复时消息不配对就说明「工具结果已提交但 Node 未吸收」，属于恢复决策表
-    要处理的场景；这里只做结构合法性判断，不做恢复决策。
+    第七阶段收口：**不能只检查消息角色**。assistant 消息里的 `toolCall`（嵌在
+    content 数组、`type=='toolCall'`）必须被 `toolResult`（`toolCallId == id`）
+    覆盖；否则说明「工具结果已提交但 Node 未吸收」，属于恢复决策表要处理的
+    场景。这里只做结构合法性判断，不做恢复决策。
     """
     if not isinstance(messages, list):
         return False
@@ -165,5 +266,10 @@ def messages_ok(messages: list) -> bool:
             return False
         role = str(item.get('role') or '')
         if role not in _MESSAGE_ROLES:
+            return False
+    # 配对检查：每个 assistant toolCall 都要有对应 toolResult
+    absorbed = tool_result_ids(messages)
+    for call in assistant_tool_calls(messages):
+        if call['id'] and call['id'] not in absorbed:
             return False
     return True

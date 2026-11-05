@@ -402,10 +402,18 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
 
     // 工具调用候选已确定：先落检查点（含待处理调用），宿主确认后再派发。
     // 这样「结果已产出但进程崩溃」时，恢复能重新交付同一结果而不重复执行。
-    const pendingCalls = toolCalls.map((c) => ({
+    // 第七阶段收口：待处理调用用唯一版本化结构（call_id / logical_call_id 占位 /
+    // tool_name / arguments / seq / status），与 Python 注册表、动作回执、恢复
+    // 决策共用同一映射。
+    const pendingCalls = toolCalls.map((c, i) => ({
       call_id: c.id,
+      logical_call_id: '',
       tool_name: c.name,
+      tool_key: '',
       arguments: c.arguments ?? {},
+      args_hash: '',
+      seq: i,
+      status: 'pending',
     }));
     await sendCheckpoint(session.exportContext(), pendingCalls);
 

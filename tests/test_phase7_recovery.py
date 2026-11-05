@@ -153,14 +153,14 @@ class SameArgReplayTests(unittest.IsolatedAsyncioTestCase):
         from webpage_agent.agent.pi_host_tools import PiCallRegistry
         # 两个不同 Node 调用，参数完全相同 → 两个不同逻辑 ID（不是 replay）
         reg = PiCallRegistry()
-        a = reg.logical_id('web_search:c1', tool_key='local:web:search',
-                           args={'query': 'x'})
-        b = reg.logical_id('web_search:c2', tool_key='local:web:search',
-                           args={'query': 'x'})
+        a = reg.logical_id('c1', tool_name='web_search',
+                           tool_key='local:web:search', args={'query': 'x'})
+        b = reg.logical_id('c2', tool_name='web_search',
+                           tool_key='local:web:search', args={'query': 'x'})
         self.assertNotEqual(a, b)
         # 同一个 Node 调用恢复 → 复用原 ID（replay 身份）
-        again = reg.logical_id('web_search:c1', tool_key='local:web:search',
-                               args={'query': 'x'})
+        again = reg.logical_id('c1', tool_name='web_search',
+                               tool_key='local:web:search', args={'query': 'x'})
         self.assertEqual(a, again)
 
 

@@ -90,15 +90,16 @@ def decide(snapshot: dict | None, actions: list[dict], run_status: str) -> Recov
 
     # 3. 工具结果已提交、Node 未吸收 → 补 toolResult 再继续
     #    判断依据：committed_tool_results 里有结果，但快照 messages 里没有
-    #    对应的 toolResult 配对（Node 没吸收）。
+    #    对应的 toolResult（按 toolCallId 配对，Node 没吸收）。
     committed = list(snapshot.get('committed_tool_results') or [])
     if committed:
-        # 找已成功结算但尚未出现在 messages 里作为 toolResult 的结果
+        call_id_by_logical = _call_id_by_logical(snapshot)
         to_deliver: list[dict] = []
         for ref in committed:
             if not isinstance(ref, dict):
                 continue
-            if not _absorbed(ref, snapshot.get('messages') or []):
+            if not _absorbed(ref, snapshot.get('messages') or [],
+                             call_id_by_logical):
                 to_deliver.append(ref)
         if to_deliver:
             return RecoveryDecision(kind=RESUME_DELIVER, tool_results=to_deliver,
@@ -115,23 +116,33 @@ def decide(snapshot: dict | None, actions: list[dict], run_status: str) -> Recov
                             reason='无未完成的恢复事实，继续执行')
 
 
-def _absorbed(ref: dict, messages: list) -> bool:
-    """判断一个已提交工具结果是否已被 Node 吸收（messages 里有对应 toolResult）。"""
-    action_id = str(ref.get('action_id') or '')
+def _absorbed(ref: dict, messages: list, call_id_by_logical: dict) -> bool:
+    """判断一个已提交工具结果是否已被 Node 吸收（messages 里有对应 toolResult）。
+
+    第七阶段收口：配对键是**实际字段** `ToolResultMessage.toolCallId ==
+    ToolCall.id`，不是消息角色、不是 action_id/step_id 猜。逻辑调用 ID
+    （ref['step_id']）先经 pending_calls 映射到桥接 call_id，再比对 messages
+    里的 `toolResult.toolCallId`。
+    """
+    from webpage_agent.agent import pi_snapshot
     step_id = str(ref.get('step_id') or '')
-    for msg in messages:
-        if not isinstance(msg, dict):
+    # 逻辑 ID → 桥接 call_id（无映射时退回 step_id 本身，兼容旧数据）
+    call_id = call_id_by_logical.get(step_id, step_id)
+    absorbed_ids = pi_snapshot.tool_result_ids(messages)
+    return bool(call_id) and call_id in absorbed_ids
+
+
+def _call_id_by_logical(snapshot: dict) -> dict:
+    """从快照 pending_calls 建立 logical_call_id → call_id 映射（唯一结构）。"""
+    mapping: dict = {}
+    for item in (snapshot.get('pending_calls') or []):
+        if not isinstance(item, dict):
             continue
-        if str(msg.get('role') or '') != 'toolResult':
-            continue
-        # toolResult 用 call_id / step_id / action_id 关联；任一命中即视为已吸收
-        if action_id and action_id in (str(msg.get('action_id') or ''),
-                                       str(msg.get('step_id') or '')):
-            return True
-        if step_id and step_id in (str(msg.get('call_id') or ''),
-                                   str(msg.get('step_id') or '')):
-            return True
-    return False
+        logical = str(item.get('logical_call_id') or '')
+        call_id = str(item.get('call_id') or '')
+        if logical and call_id:
+            mapping[logical] = call_id
+    return mapping
 
 
 def conservative_block(action: dict) -> bool:

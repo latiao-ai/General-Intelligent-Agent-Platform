@@ -97,6 +97,49 @@ class PiSnapshotTests(unittest.TestCase):
         ]))
         self.assertFalse(pi_snapshot.messages_ok('nope'))
 
+    def test_assistant_tool_calls_extract_real_toolcall_blocks(self):
+        """识别实际字段：assistant 的 content 里 type=='toolCall' 的块，取 id。"""
+        messages = [
+            {'role': 'assistant', 'content': [
+                {'type': 'text', 'text': 'hi'},
+                {'type': 'toolCall', 'id': 'call-1', 'name': 'web_search',
+                 'arguments': {'query': 'x'}},
+            ]},
+            {'role': 'toolResult', 'toolCallId': 'call-1', 'toolName': 'web_search'},
+        ]
+        calls = pi_snapshot.assistant_tool_calls(messages)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]['id'], 'call-1')
+        self.assertEqual(calls[0]['name'], 'web_search')
+
+    def test_messages_ok_requires_toolcallid_pairing(self):
+        """配对键是 toolCallId，不是消息角色：缺 toolResult 的 assistant toolCall 判不合法。"""
+        # assistant 有 toolCall，但没有对应 toolResult → 不配对
+        unpaired = [
+            {'role': 'assistant', 'content': [
+                {'type': 'toolCall', 'id': 'call-1', 'name': 'web_search'}]},
+        ]
+        self.assertFalse(pi_snapshot.messages_ok(unpaired))
+        # 补上 toolResult(toolCallId=call-1) → 配对合法
+        paired = [
+            {'role': 'assistant', 'content': [
+                {'type': 'toolCall', 'id': 'call-1', 'name': 'web_search'}]},
+            {'role': 'toolResult', 'toolCallId': 'call-1'},
+        ]
+        self.assertTrue(pi_snapshot.messages_ok(paired))
+
+    def test_unabsorbed_tool_calls(self):
+        """未吸收的工具调用 = assistant toolCall 没有对应 toolResult。"""
+        messages = [
+            {'role': 'assistant', 'content': [
+                {'type': 'toolCall', 'id': 'call-1', 'name': 'web_search'},
+                {'type': 'toolCall', 'id': 'call-2', 'name': 'web_search'}]},
+            {'role': 'toolResult', 'toolCallId': 'call-1'},
+        ]
+        unabsorbed = pi_snapshot.unabsorbed_tool_calls(messages)
+        self.assertEqual(len(unabsorbed), 1)
+        self.assertEqual(unabsorbed[0]['id'], 'call-2')
+
 
 class CheckpointProtocolTests(unittest.TestCase):
     """第七阶段：checkpoint 消息校验（Node → Python 的版本化上下文导出）。"""

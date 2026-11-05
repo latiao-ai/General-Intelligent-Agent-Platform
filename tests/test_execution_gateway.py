@@ -261,29 +261,29 @@ class PiCallRegistryTests(unittest.TestCase):
         from webpage_agent.agent.pi_host_tools import PiCallRegistry
         reg = PiCallRegistry()
         # 两个不同的 Node 调用（不同 call_id），参数完全相同 → 不同逻辑 ID
-        id1 = reg.logical_id('web_search:c1', tool_key='local:web:search',
-                             args={'query': 'x'})
-        id2 = reg.logical_id('web_search:c2', tool_key='local:web:search',
-                             args={'query': 'x'})
+        id1 = reg.logical_id('c1', tool_name='web_search',
+                             tool_key='local:web:search', args={'query': 'x'})
+        id2 = reg.logical_id('c2', tool_name='web_search',
+                             tool_key='local:web:search', args={'query': 'x'})
         self.assertNotEqual(id1, id2)
 
     def test_same_node_call_reuses_id(self):
         from webpage_agent.agent.pi_host_tools import PiCallRegistry
         reg = PiCallRegistry()
-        first = reg.logical_id('web_search:c1', tool_key='local:web:search',
-                               args={'query': 'x'})
-        again = reg.logical_id('web_search:c1', tool_key='local:web:search',
-                               args={'query': 'x'})
+        first = reg.logical_id('c1', tool_name='web_search',
+                               tool_key='local:web:search', args={'query': 'x'})
+        again = reg.logical_id('c1', tool_name='web_search',
+                               tool_key='local:web:search', args={'query': 'x'})
         self.assertEqual(first, again)
 
     def test_same_id_different_args_rejected(self):
         from webpage_agent.agent.pi_host_tools import PiCallRegistry
         reg = PiCallRegistry()
-        reg.logical_id('web_search:c1', tool_key='local:web:search',
+        reg.logical_id('c1', tool_name='web_search', tool_key='local:web:search',
                        args={'query': 'x'})
         with self.assertRaises(RuntimeError):
-            reg.logical_id('web_search:c1', tool_key='local:web:search',
-                           args={'query': 'y'})
+            reg.logical_id('c1', tool_name='web_search',
+                           tool_key='local:web:search', args={'query': 'y'})
 
     def test_restore_reuses_original_ids(self):
         from webpage_agent.agent.pi_host_tools import PiCallRegistry
@@ -292,21 +292,36 @@ class PiCallRegistryTests(unittest.TestCase):
         snapshot = {
             'logical_call_seq': 2,
             'pending_calls': [
-                {'node_call_key': 'web_search:c1',
-                 'logical_call_id': 'pi:call:1',
-                 'tool_key': 'local:web:search',
-                 'args_hash': ledger_module.args_hash(args)},
+                {'call_id': 'c1', 'logical_call_id': 'pi:call:1',
+                 'tool_name': 'web_search', 'tool_key': 'local:web:search',
+                 'args_hash': ledger_module.args_hash(args), 'seq': 1,
+                 'status': 'pending'},
             ],
         }
         reg = PiCallRegistry(snapshot)
         # 恢复后同一次调用（参数一致）复用原 ID
-        restored = reg.logical_id('web_search:c1', tool_key='local:web:search',
-                                  args=args)
+        restored = reg.logical_id('c1', tool_name='web_search',
+                                  tool_key='local:web:search', args=args)
         self.assertEqual(restored, 'pi:call:1')
         # 新调用拿到新序号（从 2 继续）
-        new_id = reg.logical_id('web_search:c2', tool_key='local:web:search',
-                                args=args)
+        new_id = reg.logical_id('c2', tool_name='web_search',
+                                tool_key='local:web:search', args=args)
         self.assertEqual(new_id, 'pi:call:3')
+
+    def test_pending_calls_export_canonical_structure(self):
+        from webpage_agent.agent.pi_host_tools import PiCallRegistry
+        reg = PiCallRegistry()
+        reg.logical_id('c1', tool_name='web_search', tool_key='local:web:search',
+                       args={'query': 'x'})
+        calls = reg.pending_calls()
+        self.assertEqual(len(calls), 1)
+        self.assertIn('call_id', calls[0])
+        self.assertIn('logical_call_id', calls[0])
+        self.assertIn('tool_key', calls[0])
+        self.assertIn('args_hash', calls[0])
+        self.assertIn('seq', calls[0])
+        self.assertIn('status', calls[0])
+        self.assertEqual(calls[0]['call_id'], 'c1')
 
 
 class SchemaValidationTests(unittest.TestCase):

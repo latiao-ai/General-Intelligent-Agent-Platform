@@ -138,19 +138,24 @@ class PiCallRegistry:
       序号；恢复时按快照里已提交的 `pending_calls` 重建映射，让**同一次调用**
       复用原序号，而**新的调用**（哪怕参数相同）拿到新序号。
 
-    绑定关系：`node_call_key`（Node 侧稳定标识，来自桥接 call_id + 工具名）→
-    `logical_call_id`；同时记录 `(tool_key, args_hash)`。同一 `logical_call_id`
-    若参数哈希变化 → 拒绝（不能静默换参数）。
+    绑定关系：桥接 `call_id`（Node 侧 `ToolCall.id`）→ 逻辑调用 ID；同时记录
+    `(tool_key, args_hash, seq, status)`。同一 `logical_call_id` 若参数哈希变化
+    → 拒绝（不能静默换参数）。
+
+    第七阶段收口：`pending_calls()` 导出**唯一版本化结构**（见
+    `pi_snapshot.normalize_pending_call`），与 Node 检查点、动作回执、恢复决策
+    共用同一映射，不再各自维护一套字段名。
     """
 
     def __init__(self, snapshot: dict | None = None) -> None:
-        # node_call_key -> {'logical_call_id', 'tool_key', 'args_hash'}
+        # call_id -> {'logical_call_id', 'tool_name', 'tool_key', 'args_hash',
+        #             'seq', 'status'}
         self._bindings: dict[str, dict] = {}
         self._seq = 0
         self._restore(snapshot)
 
     def _restore(self, snapshot: dict | None) -> None:
-        """从快照的 pending_calls 重建已分配的调用身份与序号。"""
+        """从快照的 pending_calls（唯一结构）重建已分配的调用身份与序号。"""
         if not snapshot:
             return
         calls = snapshot.get('pending_calls') or []
@@ -159,14 +164,17 @@ class PiCallRegistry:
         for item in calls:
             if not isinstance(item, dict):
                 continue
-            key = str(item.get('node_call_key') or '')
+            call_id = str(item.get('call_id') or '')
             logical = str(item.get('logical_call_id') or '')
-            if not key or not logical:
+            if not call_id or not logical:
                 continue
-            self._bindings[key] = {
+            self._bindings[call_id] = {
                 'logical_call_id': logical,
+                'tool_name': str(item.get('tool_name') or ''),
                 'tool_key': str(item.get('tool_key') or ''),
                 'args_hash': str(item.get('args_hash') or ''),
+                'seq': int(item.get('seq') or 0),
+                'status': str(item.get('status') or 'pending'),
             }
         self._seq = int(snapshot.get('logical_call_seq') or 0)
 
@@ -174,13 +182,13 @@ class PiCallRegistry:
     def seq(self) -> int:
         return self._seq
 
-    def logical_id(self, node_call_key: str, *, tool_key: str,
+    def logical_id(self, call_id: str, *, tool_name: str, tool_key: str,
                    args: dict) -> str:
         """取或分配逻辑调用 ID。恢复复用原 ID，新调用分配新 ID，参数变化拒绝。"""
         args_digest = ledger_module.args_hash(args)
-        existing = self._bindings.get(node_call_key)
+        existing = self._bindings.get(call_id)
         if existing is not None:
-            # 同一 node_call_key：复用原身份，但参数必须一致
+            # 同一 call_id：复用原身份，但参数必须一致
             if existing.get('args_hash') and existing['args_hash'] != args_digest:
                 raise RuntimeError(
                     f'逻辑调用 {existing["logical_call_id"]} 的参数已变化，拒绝复用')
@@ -188,22 +196,32 @@ class PiCallRegistry:
         # 新调用：分配新序号（哪怕参数与历史上某次相同）
         self._seq += 1
         logical = f'pi:call:{self._seq}'
-        self._bindings[node_call_key] = {
+        self._bindings[call_id] = {
             'logical_call_id': logical,
+            'tool_name': tool_name,
             'tool_key': tool_key,
             'args_hash': args_digest,
+            'seq': self._seq,
+            'status': 'pending',
         }
         return logical
 
+    def mark(self, call_id: str, status: str) -> None:
+        """更新某个调用的处理状态（pending → admitted/succeeded/delivered）。"""
+        binding = self._bindings.get(call_id)
+        if binding is not None:
+            binding['status'] = status
+
     def pending_calls(self) -> list[dict]:
-        """导出待处理调用清单（写进快照，恢复时重建映射）。"""
-        return [
-            {'node_call_key': key, **value}
-            for key, value in self._bindings.items()
-        ]
+        """导出待处理调用清单（唯一版本化结构，写进快照）。"""
+        from webpage_agent.agent import pi_snapshot
+        return pi_snapshot.normalize_pending_calls([
+            {'call_id': call_id, **binding}
+            for call_id, binding in self._bindings.items()
+        ])
 
     def node_call_key(self, call_id: str, tool_name: str) -> str:
-        """Node 侧稳定标识：桥接 call_id + 工具名（同一轮内唯一）。"""
+        """兼容旧调用点：桥接 call_id + 工具名。第七阶段起内部按 call_id 绑定。"""
         return f'{tool_name}:{call_id}'
 
 
@@ -246,11 +264,11 @@ class HostToolCaller:
                 ok=False, error=f'工具未开放：{tool_name}（仅 {tool.name}）')
 
         tool_key = tool.tool_key or tool.name
-        # 逻辑调用身份：宿主分配并持久化的 run 内序号，与参数哈希解耦
-        node_key = self._registry.node_call_key(call_id, tool_name)
+        # 逻辑调用身份：宿主分配并持久化的 run 内序号，与参数哈希解耦。
+        # 第七阶段收口：按桥接 call_id 直接绑定（ToolCall.id），不再拼 node_call_key。
         try:
             step_id = self._registry.logical_id(
-                node_key, tool_key=tool_key, args=args)
+                call_id, tool_name=tool_name, tool_key=tool_key, args=args)
         except RuntimeError as exc:
             return ToolReceipt(ok=False, error=str(exc), step_id='')
 
