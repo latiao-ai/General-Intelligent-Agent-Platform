@@ -28,14 +28,19 @@ export interface SessionConfig {
   modelTimeoutMs?: number;
 }
 
-export interface SessionRunResult {
-  /** 最终答复文本（取 assistant 消息里的 text 块拼接） */
-  answer: string;
-  /** 是否因为工具调用而停止（还需要回执后继续） */
-  toolUse: boolean;
-  /** 最终 assistant 消息（含 usage） */
-  message: AssistantMessage;
-}
+/**
+ * 一次推理的终结状态（按安装版本 SDK 的 `stopReason` 区分，不做伪造兜底）。
+ *
+ * - `answered`：模型正常产出最终答复（stopReason = "stop" / "length"）；
+ * - `toolUse`：模型因要调用工具而停下，等待宿主回执后继续（stopReason = "toolUse"）；
+ * - `error`：模型运行失败（stopReason = "error"，含 errorMessage）；
+ * - `aborted`：模型被中止（stopReason = "aborted"，通常是取消）。
+ */
+export type TurnEnd =
+  | { kind: 'answered'; answer: string; message: AssistantMessage }
+  | { kind: 'toolUse'; message: AssistantMessage }
+  | { kind: 'error'; error: string; message: AssistantMessage }
+  | { kind: 'aborted'; message: AssistantMessage };
 
 /** 由宿主传入的模型配置构造一个 OpenAI 兼容的自定义 Model。 */
 export function buildModel(cfg: SessionConfig['model']): Model<'openai-completions'> {
@@ -136,12 +141,13 @@ export class PiSession {
   }
 
   /**
-   * 跑一次推理。返回本轮结果。
+   * 跑一次推理。返回本轮终结状态（TurnEnd）。
+   *
+   * 关键：按 `stopReason` 精确区分停止原因，**不伪造正常停止消息兜底**。模型
+   * 失败（stopReason="error"）绝不映射成 answered；只有 stop/length 才是正常回答。
    *
    * 注意：Node 侧必须**持续读输入**，不能在推理期间阻塞事件循环去 await 单个
    * 工具回执——那个等待由 main.ts 的消息循环负责，通过 call_id → Promise 完成。
-   * 这里只负责发起一次 stream 并消费其事件，工具调用通过 onToolCall 回调交出去，
-   * 由上层决定何时（回执到达后）再次调用 run 继续。
    */
   async run(
     signal: AbortSignal,
@@ -149,10 +155,11 @@ export class PiSession {
       onTextDelta: (delta: string) => void;
       onToolCall: (toolCall: import('@mariozechner/pi-ai').ToolCall) => void;
     },
-  ): Promise<SessionRunResult> {
+  ): Promise<TurnEnd> {
     let answer = '';
-    let toolUse = false;
+    let sawToolCall = false;
     let finalMessage: AssistantMessage | null = null;
+    let streamError: string | null = null;
 
     const s = stream(this.model, this.context, {
       signal,
@@ -167,21 +174,24 @@ export class PiSession {
           handlers.onTextDelta(event.delta);
           break;
         case 'toolcall_end':
-          toolUse = true;
+          sawToolCall = true;
           handlers.onToolCall(event.toolCall);
           break;
         case 'done':
           finalMessage = event.message;
           break;
         case 'error':
+          // 模型失败/中止：记录错误消息，**不**当正常结果
           finalMessage = event.error;
+          streamError = event.error.errorMessage ?? `模型运行失败（${event.reason}）`;
           break;
         default:
           break;
       }
     }
 
-    // stream 可能在没有 done/error 事件（如直接返回）时结束，用 result() 兜底
+    // stream 可能在未显式发出 done/error 时结束：用 result() 补最终消息。
+    // 若仍拿不到最终消息，视为失败，不伪造 stop 消息兜底。
     if (!finalMessage) {
       try {
         finalMessage = await s.result();
@@ -190,34 +200,48 @@ export class PiSession {
       }
     }
 
-    const msg: AssistantMessage =
-      finalMessage ??
-      ({
-        role: 'assistant',
-        content: [{ type: 'text', text: answer }],
-        api: this.model.api,
-        provider: this.model.provider,
-        model: this.model.id,
-        usage: {
-          input: 0,
-          output: 0,
-          cacheRead: 0,
-          cacheWrite: 0,
-          totalTokens: 0,
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    if (!finalMessage) {
+      // 无有效最终消息：明确失败，不做伪造
+      return {
+        kind: 'error',
+        error: '模型未返回有效最终消息',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: answer }],
+          api: this.model.api,
+          provider: this.model.provider,
+          model: this.model.id,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: 'error',
+          errorMessage: '模型未返回有效最终消息',
+          timestamp: Date.now(),
         },
-        stopReason: 'stop',
-        timestamp: Date.now(),
-      } as AssistantMessage);
+      };
+    }
 
     // 记录这条 assistant 消息，供后续继续（工具回执后再跑）
-    this.context.messages.push(msg);
+    this.context.messages.push(finalMessage);
 
-    return {
-      answer: answer || extractText(msg),
-      toolUse,
-      message: msg,
-    };
+    // 按 stopReason 判定：error/aborted 优先于 toolUse/stop
+    const reason = finalMessage.stopReason;
+    if (streamError || reason === 'error') {
+      return { kind: 'error', error: streamError ?? '模型运行失败', message: finalMessage };
+    }
+    if (reason === 'aborted') {
+      return { kind: 'aborted', message: finalMessage };
+    }
+    if (reason === 'toolUse' || sawToolCall) {
+      return { kind: 'toolUse', message: finalMessage };
+    }
+    // stop / length（或缺失）都视为正常回答
+    return { kind: 'answered', answer: answer || extractText(finalMessage), message: finalMessage };
   }
 
   /** 销毁：第三阶段是内存 session，无外部资源需释放。 */

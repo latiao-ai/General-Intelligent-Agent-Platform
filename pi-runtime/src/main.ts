@@ -10,6 +10,12 @@
  *     tool_result 消息到达时 resolve；
  *   - cancel 通过 AbortController 中止当前推理，并结束所有待响应的工具 Promise；
  *   - 检测到 stdin EOF（Python 异常退出）后清理并退出。
+ *
+ * 终止语义（第四阶段）：
+ *   - `finished` 每条执行只发一次；`error` 是终结性诊断，发出后不再继续发结果；
+ *   - 按 session.run 返回的 TurnEnd（answered/toolUse/error/aborted）精确判定，
+ *     模型错误绝不映射成 answered；
+ *   - 取消后停止派发剩余工具调用，拒绝所有 pending Promise。
  */
 import * as readline from 'node:readline';
 
@@ -25,7 +31,7 @@ import {
   type ToolCallMessage,
 } from './protocol.js';
 import { PiSession } from './session.js';
-import { TEST_TOOLS, toToolCallMessage } from './tools.js';
+import { buildToolsFromHost, DEFAULT_TOOL_DECLS, toToolCallMessage } from './tools.js';
 
 // ---- 输出（stdout 只写协议） ----
 
@@ -43,6 +49,9 @@ const executionId = process.env.PI_EXECUTION_ID ?? 'unknown';
 let session: PiSession | null = null;
 let controller: AbortController | null = null;
 
+/** 本轮是否已经发送过终结性消息（finished / error），防止重复发送。 */
+let terminalSent = false;
+
 // 待响应的工具调用：call_id → { resolve, timer }
 interface PendingTool {
   resolve: (msg: { ok: boolean; result?: unknown; error?: string }) => void;
@@ -53,12 +62,49 @@ const pendingTools = new Map<string, PendingTool>();
 /** 工具回执超时（毫秒），由 start 消息可覆盖，默认 120s。 */
 let toolTimeoutMs = 120_000;
 
+/** 取消标记：置位后不再派发新的工具调用。 */
+let cancelled = false;
+
 function rejectAllPending(reason: string): void {
   for (const [, pending] of pendingTools) {
     clearTimeout(pending.timer);
     pending.resolve({ ok: false, error: reason });
   }
   pendingTools.clear();
+}
+
+// ---- 终结性消息（只发一次） ----
+
+function sendFinished(outcome: 'answered' | 'cancelled' | 'failed', fields: Partial<FinishedMessage> = {}): void {
+  if (terminalSent) {
+    return;
+  }
+  terminalSent = true;
+  const fin: FinishedMessage = {
+    protocol_version: PROTOCOL_VERSION,
+    execution_id: executionId,
+    type: 'finished',
+    outcome,
+    ...fields,
+  };
+  send(fin);
+}
+
+function sendError(error: string): void {
+  // error 是终结性诊断；若已发过 finished 则不再补发 error，避免 Python 收到
+  // error 退出后 Node 又继续发结果的竞争。
+  if (terminalSent) {
+    log('已终结，忽略诊断错误：', error);
+    return;
+  }
+  terminalSent = true;
+  const err: ErrorMessage = {
+    protocol_version: PROTOCOL_VERSION,
+    execution_id: executionId,
+    type: 'error',
+    error,
+  };
+  send(err);
 }
 
 // ---- 消息处理 ----
@@ -68,9 +114,7 @@ function validate(msg: InboundMessage): void {
     throw new Error(`协议版本不匹配：期望 ${PROTOCOL_VERSION}，收到 ${msg.protocol_version}`);
   }
   if (msg.execution_id !== executionId) {
-    throw new Error(
-      `execution_id 不匹配：期望 ${executionId}，收到 ${msg.execution_id}`,
-    );
+    throw new Error(`execution_id 不匹配：期望 ${executionId}，收到 ${msg.execution_id}`);
   }
 }
 
@@ -78,13 +122,7 @@ function handleToolResult(msg: Extract<InboundMessage, { type: 'tool_result' }>)
   const pending = pendingTools.get(msg.call_id);
   if (!pending) {
     // 未知结果 ID：明确拒绝，不静默忽略
-    const err: ErrorMessage = {
-      protocol_version: PROTOCOL_VERSION,
-      execution_id: executionId,
-      type: 'error',
-      error: `未知的 tool_result call_id: ${msg.call_id}`,
-    };
-    send(err);
+    sendError(`未知的 tool_result call_id: ${msg.call_id}`);
     return;
   }
   pendingTools.delete(msg.call_id);
@@ -95,16 +133,33 @@ function handleToolResult(msg: Extract<InboundMessage, { type: 'tool_result' }>)
 function handleCancel(): void {
   // 停止接纳新工具调用：中止推理，拒绝所有待响应工具 Promise
   log('收到 cancel，中止推理');
+  cancelled = true;
   controller?.abort();
   rejectAllPending('已取消');
+  sendFinished('cancelled');
 }
 
 function handleShutdown(): void {
   log('收到 shutdown，退出');
   controller?.abort();
   rejectAllPending('进程关闭');
-  finish('cancelled');
   process.exit(0);
+}
+
+/** 发送一次工具调用请求，等待 Python 回执（call_id → Promise）。 */
+function dispatchToolCall(call: ToolCall): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  const msg: ToolCallMessage = toToolCallMessage(executionId, call);
+  send(msg);
+  return new Promise<{ ok: boolean; result?: unknown; error?: string }>((resolve) => {
+    const timer = setTimeout(() => {
+      const pending = pendingTools.get(call.id);
+      if (pending) {
+        pendingTools.delete(call.id);
+        resolve({ ok: false, error: `工具回执超时：${call.name}` });
+      }
+    }, toolTimeoutMs);
+    pendingTools.set(call.id, { resolve, timer });
+  });
 }
 
 /** 运行一轮推理，串行处理工具调用。 */
@@ -119,11 +174,13 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
 
   controller = new AbortController();
 
-  // 串行循环：一次推理 → 若产生工具调用，等回执 → 继续推理
   for (;;) {
-    // 本轮推理产生的工具调用（串行：一次只处理一个）
+    if (cancelled) {
+      return; // 已取消，不再推进
+    }
+
     const toolCalls: ToolCall[] = [];
-    const result = await session.run(controller.signal, {
+    const end = await session.run(controller.signal, {
       onTextDelta: (delta) => {
         const ev: EventMessage = {
           protocol_version: PROTOCOL_VERSION,
@@ -139,40 +196,35 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
       },
     });
 
-    // 无工具调用 → 本轮结束，产出答复
-    if (!result.toolUse || toolCalls.length === 0) {
-      const fin: FinishedMessage = {
-        protocol_version: PROTOCOL_VERSION,
-        execution_id: executionId,
-        type: 'finished',
-        outcome: 'answered',
-        answer: result.answer,
-      };
-      send(fin);
-      return;
+    switch (end.kind) {
+      case 'answered':
+        sendFinished('answered', { answer: end.answer });
+        return;
+      case 'error':
+        sendError(end.error);
+        return;
+      case 'aborted':
+        // 模型被中止（通常是取消）：若已由 cancel 路径发过 finished 则忽略
+        if (!terminalSent) {
+          sendFinished('cancelled');
+        }
+        return;
+      case 'toolUse':
+        break; // 继续串行回执工具
     }
 
-    // 逐个串行回执：发 tool_call，等回执，push 进 session，再继续推理
+    // 逐个串行回执；若本轮有多个工具调用，取消后不再派发剩余
     for (const call of toolCalls) {
-      const msg: ToolCallMessage = toToolCallMessage(executionId, call);
-      send(msg);
-
-      const reply = await new Promise<{ ok: boolean; result?: unknown; error?: string }>(
-        (resolve) => {
-          const timer = setTimeout(() => {
-            const pending = pendingTools.get(call.id);
-            if (pending) {
-              pendingTools.delete(call.id);
-              resolve({ ok: false, error: `工具回执超时：${call.name}` });
-            }
-          }, toolTimeoutMs);
-          pendingTools.set(call.id, { resolve, timer });
-        },
-      );
-
+      if (cancelled) {
+        return;
+      }
+      const reply = await dispatchToolCall(call);
+      if (cancelled) {
+        // 等待回执期间被取消：不再 push 剩余结果
+        return;
+      }
       session.pushToolResult(call.id, call.name, reply.result, reply.ok ? false : true);
       if (!reply.ok) {
-        // 工具失败也作为回执返回给 Pi，让它据此继续或结束；这里继续推理
         log(`工具 ${call.name} 回执为失败：`, reply.error ?? '未知错误');
       }
     }
@@ -181,23 +233,30 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
 
 async function handleStart(msg: Extract<InboundMessage, { type: 'start' }>): Promise<void> {
   if (session) {
-    // 一次运行独占一个 session；重复 start 拒绝
-    const err: ErrorMessage = {
-      protocol_version: PROTOCOL_VERSION,
-      execution_id: executionId,
-      type: 'error',
-      error: 'session 已存在，拒绝重复 start',
-    };
-    send(err);
+    sendError('session 已存在，拒绝重复 start');
+    return;
+  }
+  if (terminalSent) {
+    sendError('本轮已终结，拒绝 start');
     return;
   }
   if (msg.model_timeout_ms) {
     toolTimeoutMs = Math.max(1000, msg.model_timeout_ms);
   }
 
+  // 宿主工具目录真正生效：start 传入的工具声明转成 Pi 工具；失败则明确报错
+  let tools;
+  try {
+    const decls = msg.tools && msg.tools.length ? msg.tools : DEFAULT_TOOL_DECLS;
+    tools = buildToolsFromHost(decls);
+  } catch (e) {
+    sendError(e instanceof Error ? e.message : String(e));
+    return;
+  }
+
   session = new PiSession({
     systemPrompt: msg.system_prompt,
-    tools: TEST_TOOLS,
+    tools,
     model: {
       id: msg.model.id,
       baseUrl: msg.model.base_url,
@@ -211,38 +270,16 @@ async function handleStart(msg: Extract<InboundMessage, { type: 'start' }>): Pro
   try {
     await runTurn(msg.user_input, msg.system_prompt, msg.history);
   } catch (e) {
-    if (controller?.signal.aborted) {
-      // 取消/关闭：已由 cancel/shutdown 路径收尾，不重复发 finished
-      const fin: FinishedMessage = {
-        protocol_version: PROTOCOL_VERSION,
-        execution_id: executionId,
-        type: 'finished',
-        outcome: 'cancelled',
-      };
-      send(fin);
+    if (controller?.signal.aborted || cancelled) {
+      // 取消/关闭：只发一次 cancelled
+      if (!terminalSent) {
+        sendFinished('cancelled');
+      }
     } else {
-      const err: ErrorMessage = {
-        protocol_version: PROTOCOL_VERSION,
-        execution_id: executionId,
-        type: 'error',
-        error: e instanceof Error ? e.message : String(e),
-      };
-      send(err);
-      const fin: FinishedMessage = {
-        protocol_version: PROTOCOL_VERSION,
-        execution_id: executionId,
-        type: 'finished',
-        outcome: 'failed',
-        error: e instanceof Error ? e.message : String(e),
-      };
-      send(fin);
+      const err = e instanceof Error ? e.message : String(e);
+      sendError(err);
     }
   }
-}
-
-function finish(_outcome: 'answered' | 'cancelled' | 'failed'): void {
-  session?.dispose();
-  session = null;
 }
 
 // ---- 主循环：持续读 stdin ----
@@ -260,26 +297,14 @@ rl.on('line', (line) => {
   try {
     msg = JSON.parse(line) as InboundMessage;
   } catch {
-    const err: ErrorMessage = {
-      protocol_version: PROTOCOL_VERSION,
-      execution_id: executionId,
-      type: 'error',
-      error: '无法解析输入 JSON 行',
-    };
-    send(err);
+    sendError('无法解析输入 JSON 行');
     return;
   }
 
   try {
     validate(msg);
   } catch (e) {
-    const err: ErrorMessage = {
-      protocol_version: PROTOCOL_VERSION,
-      execution_id: executionId,
-      type: 'error',
-      error: e instanceof Error ? e.message : String(e),
-    };
-    send(err);
+    sendError(e instanceof Error ? e.message : String(e));
     return;
   }
 
@@ -288,6 +313,9 @@ rl.on('line', (line) => {
       // 异步处理 start，不阻塞 readline 继续读后续 tool_result / cancel
       void handleStart(msg).catch((e) => {
         log('handleStart 异常：', e);
+        if (!terminalSent) {
+          sendError(e instanceof Error ? e.message : String(e));
+        }
       });
       break;
     case 'tool_result':
@@ -300,12 +328,7 @@ rl.on('line', (line) => {
       handleShutdown();
       break;
     default:
-      send({
-        protocol_version: PROTOCOL_VERSION,
-        execution_id: executionId,
-        type: 'error',
-        error: `未知消息类型：${(msg as { type: string }).type}`,
-      } as ErrorMessage);
+      sendError(`未知消息类型：${(msg as { type: string }).type}`);
       break;
   }
 });

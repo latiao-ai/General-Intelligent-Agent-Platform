@@ -1,13 +1,19 @@
 // 假 Pi 桥接进程：纯协议回显，不含 Pi SDK，用于 Python 侧假进程测试。
 //
 // 通过环境变量控制行为：
-//   FAKE_MODE = echo    收到 start 后直接回 finished(answered, answer="你好")
-//             = tool    收到 start 后回 tool_call，等 tool_result 再回 finished
-//             = crash   收到 start 后直接 exit(1)
-//             = noisy   启动时往 stderr 写大量输出
-//             = hang    收到 start 后不响应（测启动/模型超时）
-//             = badjson 启动后输出一行非法 JSON
-//   FAKE_READY = no      不输出 ready（测启动超时）
+//   FAKE_MODE = echo      收到 start 后直接回 finished(answered, answer="你好")
+//             = tool      收到 start 后回 tool_call，等 tool_result 再回 finished
+//             = multi_tool 收到 start 后回两个 tool_call（测取消后不派发剩余）
+//             = error_stop 收到 start 后回 finished(outcome=failed)（测错误停止原因）
+//             = tool_err  收到 start 后回 tool_call，等 tool_result 回 finished
+//                         （测工具错误正文保留）
+//             = badenvelope 收到 start 后回一条 protocol_version 错误的消息（测
+//                         收发路径的信封校验确实生效）
+//             = crash     收到 start 后直接 exit(1)
+//             = noisy     启动时往 stderr 写大量输出
+//             = hang      收到 start 后不响应（测启动/模型超时）
+//             = badjson   启动后输出一行非法 JSON
+//   FAKE_READY = no        不输出 ready（测启动超时）
 const readline = require('readline');
 
 const execId = process.env.PI_EXECUTION_ID || 'unknown';
@@ -54,6 +60,17 @@ rl.on('line', (line) => {
       send(envelope('finished', { outcome: 'answered', answer: '你好😀' }));
     } else if (mode === 'tool') {
       send(envelope('tool_call', { call_id: 'call-1', tool_name: 'add', arguments: { a: 17, b: 25 } }));
+    } else if (mode === 'multi_tool') {
+      // 同一模型轮次多个工具调用：取消后应不再派发剩余
+      send(envelope('tool_call', { call_id: 'call-1', tool_name: 'add', arguments: { a: 1, b: 2 } }));
+      send(envelope('tool_call', { call_id: 'call-2', tool_name: 'add', arguments: { a: 3, b: 4 } }));
+    } else if (mode === 'error_stop') {
+      send(envelope('finished', { outcome: 'failed', error: '模型返回失败' }));
+    } else if (mode === 'badenvelope') {
+      // 协议版本错误的信封：验证 Python 收发路径的信封校验确实生效
+      send({ protocol_version: 999, execution_id: execId, type: 'event', kind: 'text_delta', delta: 'x' });
+    } else if (mode === 'tool_err') {
+      send(envelope('tool_call', { call_id: 'call-1', tool_name: 'add', arguments: { a: 'bad', b: 25 } }));
     } else if (mode === 'tool_fail') {
       send(envelope('tool_call', { call_id: 'call-1', tool_name: 'nope', arguments: {} }));
     } else if (mode === 'crash') {
@@ -64,6 +81,11 @@ rl.on('line', (line) => {
   } else if (msg.type === 'tool_result') {
     if (mode === 'tool') {
       send(envelope('finished', { outcome: 'answered', answer: '结果是 42' }));
+    } else if (mode === 'multi_tool') {
+      send(envelope('finished', { outcome: 'answered', answer: 'multi done' }));
+    } else if (mode === 'tool_err') {
+      // 工具失败：回传时保留错误正文
+      send(envelope('finished', { outcome: 'answered', answer: '工具参数非法，已上报错误' }));
     } else if (mode === 'tool_fail') {
       send(envelope('finished', { outcome: 'answered', answer: '工具失败但继续' }));
     }

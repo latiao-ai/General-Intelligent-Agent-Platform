@@ -65,7 +65,7 @@ export interface StartMessage extends BaseMessage {
   user_input: string;
   system_prompt?: string;
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;
-  tools: Array<{ name: string; description: string }>;
+  tools: Array<{ name: string; description: string; parameters: Record<string, string> }>;
   model: {
     id: string;
     base_url: string;
