@@ -36,6 +36,17 @@
       结算失败异常向上传播、停止后续模型执行；
     - 模型 usage 结算失败不阻断 ack（模型已跑完，usage 是事后记账），但「全零
       或缺失 usage」在 `core.services.end_model_request` 里走保守估算、不填零。
+
+第六阶段（共享网关）修正：
+
+    - `HostToolCaller.call()` 传入**真实 state**（含 task_id / artifact_dir /
+      documents），移除正式路径里的 `state={}`；可信主体、要求版本、执行上下文
+      与账本由宿主持有，不取自 Node 或模型输出；
+    - 工具结果**成功结算后**把认可增量（documents / usage / errors 白名单）合并
+      回宿主 state，不把 status="searched" 当业务终态，也不让任意结果覆盖身份、
+      租约等宿主字段；
+    - 桥接 `call_id` 只用于往返关联，稳定执行身份由 `_stable_step_id`
+      （tool_key + args 指纹）分配，映射到账本幂等键，重复调用复用同一动作。
 """
 from __future__ import annotations
 
@@ -185,7 +196,7 @@ class PiRuntime:
                 if mtype == "event":
                     await self._handle_event(msg, answer_parts)
                 elif mtype == "tool_call":
-                    await self._handle_tool_call(bridge, msg)
+                    await self._handle_tool_call(bridge, msg, state)
                 elif mtype == "model_request":
                     await self._handle_model_request(bridge, msg)
                 elif mtype == "model_usage":
@@ -238,8 +249,13 @@ class PiRuntime:
             stage = str(msg.get("label", ""))
             await emit_async(stage_start(stage))
 
-    async def _handle_tool_call(self, bridge: PiBridge, msg: dict) -> None:
-        """校验并执行工具，回执（保留错误正文）。"""
+    async def _handle_tool_call(self, bridge: PiBridge, msg: dict, state: dict) -> None:
+        """校验并执行工具，回执（保留错误正文）。
+
+        真实受治理调用成功后，把工具返回的**认可增量**（documents / usage /
+        errors）合并回 `state`，保留来源与结果引用；不把 status="searched"
+        当作业务终态，也不允许任意结果覆盖身份、租约等宿主字段。
+        """
         try:
             proto.validate_tool_call(msg, bridge.execution_id)
         except ProtocolError as exc:
@@ -281,8 +297,12 @@ class PiRuntime:
             from webpage_agent.agent.pi_host_tools import HostToolCaller
             self._host_caller = HostToolCaller()
         receipt = await self._host_caller.call(
-            call_id=call_id, tool_name=tool_name, args=args, state={})
+            call_id=call_id, tool_name=tool_name, args=args, state=state)
         if receipt.ok:
+            # 成功结算后合并认可增量回宿主 state（documents/usage/errors）
+            if receipt.updates:
+                for key, value in receipt.updates.items():
+                    state[key] = value
             reply = proto.make_message(
                 bridge.execution_id,
                 "tool_result",

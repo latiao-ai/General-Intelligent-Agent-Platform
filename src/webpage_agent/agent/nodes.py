@@ -41,6 +41,7 @@ from webpage_agent.core.schemas import ExecutionPlan, RevisedPlan, ToolSelection
 from webpage_agent.core.services import is_small_talk, structured_call, urls_from_input
 from webpage_agent.capabilities import registry as capability_registry
 from webpage_agent.tools import core as tool_module
+from webpage_agent.tools import execution_gateway
 from webpage_agent.governance import request_review
 
 from webpage_agent.agent.plan_validate import (
@@ -1514,185 +1515,84 @@ async def run_step(state):
                 'failure': f'{tool.label}失败：{hint}'}
 
     book = ledger_module.current_ledger()
-    action_id, attempt_id, reused = None, None, False
-    decision = None
-    tool_context = None
-    if book is not None:
-        # 工具调用次数也进运行预算：查询同样烧钱、同样会无进展地重复。
-        try:
-            await book.store.consume_budget(
-                book.context, run_id=book.run_id, key='tool_calls',
-                limit=settings.run_max_tool_calls)
-        except Exception as exc:                       # noqa: BLE001
-            hint = getattr(exc, 'safe_message', None) or type(exc).__name__
-            emit(action('调用预算用尽', hint, '⚠️'))
-            return {'step_index': index, 'step_label': tool.label,
-                    'status': 'waiting_input', 'next_route': 'stop',
-                    'failure': f'{hint}。已完成的步骤与产物都保留，'
-                               f'可以补充要求后继续。',
-                    **_carry_waiting(state)}
-        # 先授权，再准入。拒绝和等待批准都还没有 in_flight。
-        tool_context = await _tool_context(step_id=step_id, action_id='')
-        try:
-            decision = await authorization_module.authorize_call(
-                book.store, tool_context,
-                tool_key=tool.tool_key or name, effect=tool.effect, args=args)
-        except authorization_module.ApprovalRequired as exc:
-            approval_id = await _open_approval(
-                book, tool_context, tool_key=tool.tool_key or name, args=args)
-            emit(action('等待批准', exc.safe_message, '⏸️'))
-            outputs[step_id] = {'__status__': 'waiting_approval',
-                                'approval_id': approval_id}
-            return {'step_index': index, 'step_label': tool.label,
-                    'step_outputs': outputs, 'status': 'waiting_approval',
-                    'next_route': 'stop',
-                    'failure': exc.safe_message,
-                    'approval_id': approval_id}
-        except authorization_module.AuthorizationDenied as exc:
-            emit(action('没有调用资格', exc.safe_message, '⛔'))
-            errors = list(state.get('errors') or []) + [
-                {'stage': name, 'type': 'AuthorizationDenied',
-                 'error_code': getattr(exc, 'error_code', 'E_POLICY_DENIED'),
-                 'certainty': 'not_executed', 'effect': tool.effect}]
-            return {'step_index': len(steps), 'step_label': tool.label,
-                    'errors': errors, 'step_outputs': outputs,
-                    'status': 'failed',
-                    'failure': f'{tool.label}没有调用资格：{exc.safe_message}'}
-        from webpage_agent.governance import approvals as approvals_module
-        authorization = None
-        if settings.tool_policy_enforced and decision is not None and tool_context is not None:
-            from webpage_agent.tools import tool_policy as policy_module
-            credential = decision.credential
-            authorization = {
-                'tenant_id': tool_context.tenant_id,
-                'user_id': tool_context.user_id,
-                'tool_key': tool.tool_key or name,
-                'args_hash': policy_module.canonical_hash(args or {}),
-                'credential_binding': credential.binding_id if credential else '',
-                'credential_subject': credential.subject_id if credential else '',
-                'credential_revision': credential.revision if credential else 0,
-                'policy_revision': decision.policy.revision if decision.policy else 0,
-                'approval_id': decision.approval_id,
-                'approval_item_key': decision.approval_item_key or 'call',
-            }
-        try:
-            admitted = await book.admit(step_id=step_id,
-                                        tool_key=tool.tool_key or name,
-                                        effect=tool.effect, args=args,
-                                        expected_intent_version=_plan_intent(state),
-                                        authorization=authorization)
-        except execution_control.IntentChanged as exc:
-            emit(action('要求已更新', f'{tool.label} 尚未派发', '📝'))
-            return _intent_changed_update(state, exc)
-        except execution_control.ControlStopped as exc:
-            emit(action('停止派发', exc.reason, '⏸️'))
-            return {'step_index': index, 'step_label': tool.label,
-                    'status': exc.status, 'failure': exc.reason}
-        except execution_control.LeaseLost as exc:
-            emit(action('执行权已丢失', str(exc), '⛔'))
-            raise
-        except (approvals_module.ApprovalConflict,
-                approvals_module.ApprovalMissing) as exc:
-            emit(action('批准不可用', str(exc), '⛔'))
-            return {'step_index': len(steps), 'step_label': tool.label,
-                    'step_outputs': outputs, 'status': 'failed',
-                    'failure': f'{tool.label}的批准不可用：{exc}'}
-        if admitted.get('blocked'):
-            emit(action('该步骤结果未定',
-                        f'{tool.label}（{admitted["blocked"]}），需核实后再继续', '❓'))
-            outputs[step_id] = {'__status__': 'unknown'}
-            return {'step_index': len(steps), 'step_label': tool.label,
-                    'step_outputs': outputs, 'status': 'needs_reconcile',
-                    'needs_reconciliation': True,
-                    'failure': f'{tool.label}的结果未确定（{admitted["blocked"]}），'
-                               f'为避免重复副作用已停止，请核实后重试'}
-        if admitted.get('replay') is not None:
-            emit(action('复用已有结果', f'{tool.label}（该动作此前已成功）', '♻️'))
-            updates = dict(admitted['replay']) if isinstance(admitted['replay'], dict) else {}
-            reused = True
-        action_id = admitted.get('action_id')
-        attempt_id = admitted.get('attempt_id')
-        if not reused and tool_context is not None and decision is not None:
-            try:
-                await authorization_module.check_revocations(
-                    book.store, decision,
-                    tool_key=tool.tool_key or name,
-                    tenant_id=tool_context.tenant_id, user_id=tool_context.user_id,
-                    role=tool_context.role, platform_id=tool_context.platform_id)
-            except authorization_module.AuthorizationDenied as exc:
-                if action_id:
-                    await book.fail_from_exception(
-                        step_id=step_id, action_id=action_id,
-                        attempt_id=attempt_id, exc=exc, effect=tool.effect)
-                    if decision is not None and decision.approval_id:
-                        try:
-                            await book.store.release_approval_reservation(
-                                approval_id=decision.approval_id, action_id=action_id,
-                                manifest_item_key=decision.approval_item_key or 'call')
-                        except Exception:          # noqa: BLE001
-                            logger.warning('释放批准预留失败 action=%s', action_id,
-                                           exc_info=True)
-                emit(action('权限已撤销', exc.safe_message, '⛔'))
-                return {'step_index': len(steps), 'step_label': tool.label,
-                        'step_outputs': outputs, 'status': 'failed',
-                        'failure': f'{tool.label}没有调用资格：{exc.safe_message}'}
-        if not reused and tool_context is not None and action_id and authorization is None:
-            await authorization_module.record_authorization(
-                book.store, tool_context,
-                tool_key=tool.tool_key or name, action_id=action_id, args=args,
-                decision=decision)
+    tool_context = await _tool_context(step_id=step_id, action_id='')
+    next_step_id = (steps[index + 1].get('step_id') or '') if index + 1 < len(steps) else ''
+
+    # 共享网关：授权 → 预算 → 准入 → 撤权复查 → 真实调用 → 结果归一 → 结算。
+    # run_step 只保留编排：选步/依赖/引用解析（上方）、图路由、补偿编排、游标推进。
+    # 结算只在网关一处发生（run_step 不再自己调 book.settle / fail_from_exception）。
+    def build_snapshot(tool_updates: dict):
+        merged = dict(state)
+        merged.update(tool_updates)
+        merged['step_outputs'] = outputs
+        merged['step_index'] = index + 1
+        merged['step_label'] = tool.label
+        return _snapshot_state(merged)
 
     try:
-        if not reused:
-            updates = await tool.run(args, state)
-    except execution_control.LeaseLost:
+        result = await execution_gateway.governed_call(
+            tool=tool, args=args, step_id=step_id, state=state, ctx=tool_context,
+            next_step_id=next_step_id, build_snapshot=build_snapshot,
+            require_ledger=(book is not None))
+    except execution_control.IntentChanged as exc:
+        emit(action('要求已更新', f'{tool.label} 尚未派发', '📝'))
+        return _intent_changed_update(state, exc)
+    except execution_control.ControlStopped as exc:
+        emit(action('停止派发', exc.reason, '⏸️'))
+        return {'step_index': index, 'step_label': tool.label,
+                'status': exc.status, 'failure': exc.reason}
+    except execution_control.LeaseLost as exc:
+        emit(action('执行权已丢失', str(exc), '⛔'))
         raise
-    except Exception as exc:                      # noqa: BLE001
+
+    action_id = result.action_id
+    attempt_id = result.attempt_id
+
+    # ---- 未调用 / 需人工介入的分支 ----
+    if result.kind == 'needs_approval':
+        outputs[step_id] = {'__status__': 'waiting_approval',
+                            'approval_id': result.approval_id}
+        return {'step_index': index, 'step_label': tool.label,
+                'step_outputs': outputs, 'status': 'waiting_approval',
+                'next_route': 'stop', 'failure': result.error,
+                'approval_id': result.approval_id}
+    if result.kind == 'denied':
+        errors = list(state.get('errors') or []) + [
+            {'stage': name, 'type': 'AuthorizationDenied',
+             'error_code': result.error_code or 'E_POLICY_DENIED',
+             'certainty': 'not_executed', 'effect': tool.effect}]
+        return {'step_index': len(steps), 'step_label': tool.label,
+                'errors': errors, 'step_outputs': outputs, 'status': 'failed',
+                'failure': f'{tool.label}没有调用资格：{result.error}'}
+    if result.kind == 'no_run':
+        return {'step_index': len(steps), 'step_label': tool.label,
+                'step_outputs': outputs, 'status': 'failed',
+                'failure': f'{tool.label}没有可执行的运行：{result.error}'}
+    if result.kind == 'blocked':
+        outputs[step_id] = {'__status__': 'unknown'}
+        return {'step_index': len(steps), 'step_label': tool.label,
+                'step_outputs': outputs, 'status': 'needs_reconcile',
+                'needs_reconciliation': True,
+                'failure': f'{tool.label}的结果未确定（{result.error}），'
+                           f'为避免重复副作用已停止，请核实后重试'}
+
+    # ---- 已调用（replay / failed / succeeded）----
+    if result.kind == 'replay':
+        emit(action('复用已有结果', f'{tool.label}（该动作此前已成功）', '♻️'))
+        updates = dict(result.replay) if isinstance(result.replay, dict) else {}
+    elif result.kind == 'failed':
         emit(stage_end(name, time.perf_counter() - started, '失败', tool.label))
+        # read 工具的可恢复失败（上下文预算/模型不可用/预算耗尽）不撤销前面已成功的业务修改
         if tool.effect == 'read' and isinstance(
-                exc, (context.ContextBudgetExceeded, services_module.ModelRequestError,
-                      BudgetExceeded)):
-            if book is not None and action_id:
-                await book.fail_from_exception(step_id=step_id, action_id=action_id,
-                                               attempt_id=attempt_id, exc=exc,
-                                               effect=tool.effect)
-            # 本地回答未完成不应撤销前面已经成功的业务修改。
-            return {**planning_failure(state, exc, stage=name),
+                result.exc, (context.ContextBudgetExceeded, services_module.ModelRequestError,
+                             BudgetExceeded)):
+            return {**planning_failure(state, result.exc, stage=name),
                     'step_label': tool.label, 'step_index': index}
-        outcome = errors_module.as_outcome(exc)
-        hint = outcome.safe_message or type(exc).__name__
-        emit(action(f'{tool.label}失败', hint, '⚠️'))
-        # 只有"结果未定 + 有副作用"才拦人：只读调用重发一次没有可重复的后果
-        blocking = errors_module.is_blocking(outcome.certainty, tool.effect)
-        if book is not None and action_id:
-            await book.fail_from_exception(
-                step_id=step_id, action_id=action_id, attempt_id=attempt_id,
-                exc=exc, effect=tool.effect)
-            if (decision is not None and decision.approval_id
-                    and outcome.certainty == 'not_executed'):
-                try:
-                    await book.store.release_approval_reservation(
-                        approval_id=decision.approval_id, action_id=action_id,
-                        manifest_item_key=decision.approval_item_key or 'call')
-                except Exception:                  # noqa: BLE001
-                    logger.warning('释放批准预留失败 action=%s', action_id, exc_info=True)
-            if blocking:
-                emit(action('结果不确定', '远端可能已执行，需要核实', '❓'))
+        blocking = errors_module.is_blocking(result.certainty, tool.effect)
         errors = list(state.get('errors', [])) + [
-            {'stage': name, 'type': type(exc).__name__,
-             'error_code': outcome.error_code, 'certainty': outcome.certainty,
+            {'stage': name, 'type': 'ToolError',
+             'error_code': result.error_code, 'certainty': result.certainty,
              'effect': tool.effect}]
-        failed_result = _record_result(
-            state, step_id=step_id, tool_key=tool.tool_key or name,
-            tool_name=name,
-            action_id=action_id or '', attempt_id=attempt_id or '',
-            payload=None, marker='failed',
-            execution_status='unknown' if outcome.certainty == 'unknown' else 'failed',
-            error={'code': outcome.error_code, 'phase': outcome.phase,
-                   'execution_certainty': outcome.certainty,
-                   'message': hint})
-        # 已经发生的写操作要收回来（文档 §8.4）：只回滚声明了 compensate 且确实
-        # 成功的步骤，逆序执行。**结果未定的步骤不自动补偿**——那是猜着再发一次。
         outputs[step_id] = {'__status__': ('unknown' if blocking else 'failed')}
         compensations = []
         if not blocking:
@@ -1710,39 +1610,24 @@ async def run_step(state):
         return {'step_index': len(steps), 'step_label': tool.label,
                 'errors': errors, 'step_outputs': outputs,
                 'compensations': compensations,
-                'tool_results': list(state.get('tool_results') or []) + [failed_result],
+                'tool_results': list(state.get('tool_results') or []) + [result.tool_result],
                 'needs_reconciliation': blocking,
                 'status': status,
-                'failure': f'{tool.label}失败：{hint}{note}'}
+                'failure': f'{tool.label}失败：{result.error}{note}'}
+    else:
+        updates = dict(result.updates)
 
-    updates = dict(updates)
-    async_accepted = bool(updates.pop('async_accepted', False))
-    remote_task_id = str(updates.pop('remote_task_id', '') or '')
-    contract_id = str(updates.pop('contract_id', '') or '')
-    contract_version = updates.pop('contract_version', 1)
-    updates.pop('execution_status', None)
-    updates.pop('phase', None)
-    # 工具返回的 `status` 是**阶段小结**（searched / fetched / rendered / deployed），
-    # 不是 run 终态：run 终态由 outcome 统一判定。
+    # ---- succeeded / replay 的共用收尾 ----
     marker = str(updates.pop('status', '') or '')
     record = {k: v for k, v in updates.items()
               if isinstance(v, (str, int, float, bool, dict, list))}
     record['__status__'] = 'succeeded'
     if marker:
         record['status'] = marker
-    # 归一成 ToolResult：摘要给模型看，完整结果落 `results/` 用引用读取。
-    # 这一步是"观察"的数据基础——结果只剩几个标量的话，后面根本没法判断。
-    tool_result = _record_result(state, step_id=step_id,
-                                tool_key=tool.tool_key or name,
-                                tool_name=name,
-                                action_id=action_id or '', attempt_id=attempt_id or '',
-                                payload=_result_payload(updates), marker=marker,
-                                execution_status='accepted' if async_accepted else 'succeeded')
-    if async_accepted:
-        tool_result['phase'] = 'accepted'
-        tool_result['remote_task_id'] = remote_task_id
-        tool_result['contract_id'] = contract_id
-        tool_result['contract_version'] = contract_version
+    tool_result = result.tool_result or _record_result(
+        state, step_id=step_id, tool_key=tool.tool_key or name, tool_name=name,
+        action_id=action_id, attempt_id=attempt_id, payload=_result_payload(updates),
+        marker=marker, execution_status='succeeded')
     record['tool_result'] = tool_result
     outputs[step_id] = record
     results_log = list(state.get('tool_results') or []) + [tool_result]
@@ -1757,29 +1642,9 @@ async def run_step(state):
         updates['status'] = final_status(merged)
         updates['outcome'] = outcome_module.build(merged)
 
-    # 结算：动作 + attempt + 步骤 + 快照一次提交。失败就抛出去，不推进游标——
-    # "工具已返回但提交失败"时绝不能当作完成继续下一步。
-    if book is not None and action_id and not reused:
-        next_step_id = ''
-        if index + 1 < len(steps):
-            next_step_id = steps[index + 1].get('step_id') or ''
-        merged = dict(state)
-        merged.update(updates)
-        settled = await book.settle(
-            step_id=step_id, action_id=action_id,
-            attempt_id=attempt_id, status='succeeded',
-            receipt={k: v for k, v in updates.items()
-                     if isinstance(v, (str, int, float, bool))},
-            step_status='succeeded', state=_snapshot_state(merged),
-            next_step_id=next_step_id)
-        updates['observation_seq'] = int((settled or {}).get('observation_seq') or 0)
-        if decision is not None and decision.approval_id and action_id:
-            try:
-                await book.store.consume_approval_reservation(
-                    approval_id=decision.approval_id, action_id=action_id,
-                    manifest_item_key=decision.approval_item_key or 'call')
-            except Exception:                      # noqa: BLE001
-                logger.warning('消费批准预留失败 action=%s', action_id, exc_info=True)
+    # 结算已在网关完成；这里只取回 observation_seq 供派生终态对齐。
+    if result.kind == 'succeeded':
+        updates['observation_seq'] = int((result.receipt or {}).get('observation_seq') or 0)
 
     emit(stage_end(name, time.perf_counter() - started, marker, tool.label))
     return updates
