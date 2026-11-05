@@ -425,12 +425,17 @@ class PiRuntime:
         reservation = self._model_reservations.pop(request_id, None)
         usage = msg.get("usage")
         outcome = msg.get("outcome")
+        settled = True
         try:
             await self._end_model(reservation, usage=usage, succeeded=(outcome == "succeeded"))
-        except Exception as exc:  # noqa: BLE001 结算失败记录，不阻断 ack（Node 需继续）
+        except Exception as exc:  # noqa: BLE001
+            # 第七阶段：结算失败**不得**静默确认。回 ok=False，Node 停止后续推理；
+            # 未决费用沿用现有存储记录（provider_charges 的 reserved/未完成行）
+            # 供对账，不填零冒充已结算。
             logger.warning("模型用量结算失败：%s", exc)
+            settled = False
         ack = proto.make_message(
-            bridge.execution_id, "model_usage_ack", request_id=request_id)
+            bridge.execution_id, "model_usage_ack", request_id=request_id, ok=settled)
         await bridge.send(ack)
 
     async def _handle_checkpoint(self, bridge: PiBridge, msg: dict) -> None:

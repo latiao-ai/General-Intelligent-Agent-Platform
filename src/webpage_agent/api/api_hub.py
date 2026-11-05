@@ -682,8 +682,13 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
     async def _finish_run(self, record: TaskRecord, state: dict, status: str, *,
                           context=None,
                           expected_intent_version: int | None = None,
-                          require_pending_clear: bool = True) -> None:
+                          require_pending_clear: bool = True,
+                          final_message: str | None = None,
+                          final_message_key: str = '') -> bool:
         """把 run 收尾，并把计划与步骤落库，供续跑与界面查询。
+
+        返回 True 表示终态已提交；返回 False 表示**失租**（finish_run_owned 落空），
+        调用方据此**禁止追加最终消息**（第七阶段）。
 
         `status` 必须是**通用**状态：run 层不认识 `local_ready` 这类展示词。
         以前这里用 `RUN_STATUS_OF.get(status, status)` 折算，兜底会让新业务词
@@ -751,7 +756,7 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
         if context is not None and context.lease_owner:
             # 有执行权就走带门禁的收尾：版本 + 待处理补充一起校验，一次事务。
             try:
-                await self.store.finish_run_owned(
+                committed = await self.store.finish_run_owned(
                     context, run_id=record.run_id, status=run_status,
                     error=fields.get('error'), state=state,
                     observation_seq=int(state.get('observation_seq') or 0),
@@ -759,10 +764,21 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
                     expected_intent_version=expected_intent_version,
                     plan_version=fields['plan_version'],
                     compensated_at=fields.get('compensated_at'),
-                    require_no_pending_inputs=require_pending_clear)
+                    require_no_pending_inputs=require_pending_clear,
+                    final_message=final_message,
+                    final_message_key=final_message_key,
+                    session_id=record.session_id)
             except execution_control.LeaseLost:
                 logger.warning('run %s 收尾时已失租，不写终态', record.run_id)
-                return
+                return False
+            if not committed:
+                # 第七阶段：finish_run_owned 返回 False = 已失租（内部吞了
+                # LeaseLost）。失租后**禁止继续追加最终消息**——这一笔落空，
+                # 最终答复/消息由新执行者按恢复决策补收尾，这里直接返回。
+                logger.warning('run %s 收尾时已失租（finish_run_owned=False），'
+                               '禁止追加最终消息', record.run_id)
+                record._lease_lost = True
+                return False
             # 这里**只动 runs 行**，不动 record.status：`tasks` 行要等调用方的
             # persist() 才写。提前把内存置成终态会开一个窗口——record.done 已经
             # 为真、库里 tasks.status 还是 queued，回放接口按库读就显示"已完成
@@ -773,11 +789,17 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
             # 所以这段不是"绕过 fencing 的后门"，而是"本来就没有租约可校验"。
             # 若将来出现新的无上下文生产调用点，那是设计错误，应当补 claim 而不是加到这里。
             await self.store.update_run(record.run_id, **fields)
+            # 无上下文路径的最终答复也按稳定去重键幂等落库（第七阶段）。
+            if final_message is not None:
+                await self.store.append_message(
+                    record.session_id, 'assistant', final_message,
+                    dedupe_key=final_message_key)
         # outbox：业务事件与派生作业在同一处写入，消费者按 dedupe_key 幂等
         await self.store.enqueue_job(
             uuid.uuid4().hex[:12], 'session_summary',
             f"{record.session_id}:{record.run_id}",
             {'session_id': record.session_id})
+        return True
 
     async def get(self, task_id: str) -> TaskRecord | None:
         """Refresh passive records from PostgreSQL; another worker may have changed them."""

@@ -20,8 +20,11 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL,
     role       TEXT NOT NULL,
     content    TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL DEFAULT ''
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_dedupe
+    ON messages(session_id, dedupe_key) WHERE dedupe_key <> '';
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 CREATE TABLE IF NOT EXISTS tasks (
     task_id     TEXT PRIMARY KEY,
@@ -631,6 +634,12 @@ ALTER TABLE tasks_meta ADD COLUMN IF NOT EXISTS scene_context_json TEXT NOT NULL
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_kind TEXT NOT NULL DEFAULT 'langgraph';
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_state_schema INTEGER NOT NULL DEFAULT 1;
+
+-- 最终答复的去重键：恢复补收尾时按 (session_id, dedupe_key) 幂等，
+-- 避免「进程在终态与最终消息之间崩溃」后恢复重复追加最终答复。
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS dedupe_key TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_dedupe
+    ON messages(session_id, dedupe_key) WHERE dedupe_key <> '';
 
 -- 费用明细的完整快照。v2 里那张表是给「已经记过基线、还没有这张表」的存量库建的，
 -- 而且建完就不再执行。用途和估算标记必须写在这里，verify_schema 才认得出

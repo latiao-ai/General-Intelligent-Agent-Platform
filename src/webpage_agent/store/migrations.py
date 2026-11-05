@@ -29,7 +29,9 @@ RUN_TRACE = 'v3_run_trace'
 USAGE_DETAIL = 'v4_provider_usage_detail'
 # 引擎归属：runs 增加 runtime_kind / runtime_version / runtime_state_schema。
 RUNTIME_OWNERSHIP = 'v5_runtime_ownership'
-LATEST = RUNTIME_OWNERSHIP
+# 最终答复去重：messages 增 dedupe_key（部分唯一索引），恢复补收尾幂等。
+FINAL_ANSWER_DEDUPE = 'v6_final_answer_dedupe'
+LATEST = FINAL_ANSWER_DEDUPE
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -63,6 +65,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_charges_run ON provider_charges(run_id);
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_kind TEXT NOT NULL DEFAULT 'langgraph';
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_state_schema INTEGER NOT NULL DEFAULT 1;
+'''), (FINAL_ANSWER_DEDUPE, '''
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS dedupe_key TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_dedupe
+    ON messages(session_id, dedupe_key) WHERE dedupe_key <> '';
 '''))
 
 

@@ -150,6 +150,8 @@ export interface ModelUsageMessage extends BaseMessage {
 export interface ModelUsageAckMessage extends BaseMessage {
   type: 'model_usage_ack';
   request_id: string;
+  /** 结算是否成功（第七阶段：失败时 Node 停止后续推理）。 */
+  ok?: boolean;
 }
 
 /** 工具回执：同一 call_id 的成功结果或工具错误 */

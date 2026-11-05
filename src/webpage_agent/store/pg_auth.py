@@ -226,11 +226,13 @@ class PgAuth:
 
     async def append_message(self, session_id: str, role: str, content: str, *,
                        tenant_id: str = 'default',
-                       owner_user_id: str = 'default') -> None:
+                       owner_user_id: str = 'default',
+                       dedupe_key: str = '') -> None:
         stamp = now()
         async with self._lease() as conn:
-            await self._run(conn, 'INSERT INTO messages (session_id, role, content, created_at) '
-                'VALUES (%s, %s, %s, %s)', (session_id, role, content, stamp))
+            await self._run(conn, 'INSERT INTO messages (session_id, role, content, created_at, dedupe_key) '
+                'VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',
+                (session_id, role, content, stamp, dedupe_key or ''))
             await self._run(conn, 'INSERT INTO sessions '
                 '(session_id, tenant_id, owner_user_id, created_at, updated_at) '
                 'VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING',

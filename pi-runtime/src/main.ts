@@ -86,9 +86,9 @@ interface PendingModelRequest {
 }
 const pendingModelRequests = new Map<string, PendingModelRequest>();
 
-// 待结算确认的模型请求：request_id → { resolve, timer }
+// 待结算确认的模型请求：request_id → { resolve(ok), timer }
 interface PendingModelUsage {
-  resolve: () => void;
+  resolve: (ok: boolean) => void;
   timer: NodeJS.Timeout;
 }
 const pendingModelUsage = new Map<string, PendingModelUsage>();
@@ -108,18 +108,25 @@ function requestModelAdmission(requestId: string): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => {
       pendingModelRequests.delete(requestId);
-      resolve(true); // 超时默认放行：无治理宿主（smoke/测试）不拦
+      // 第七阶段：准入超时**默认拒绝**（停止请求），不再放行。
+      // 无治理 smoke/测试由宿主显式回 model_admit(allow=true) 放行。
+      resolve(false);
     }, modelRequestTimeoutMs);
     pendingModelRequests.set(requestId, { resolve, timer });
   });
 }
 
-/** 发 model_usage 并等待宿主 model_usage_ack（结算确认）。 */
+/** 发 model_usage 并等待宿主 model_usage_ack（结算确认）。
+ *
+ * 返回布尔：true 表示宿主已确认结算；false 表示结算失败/超时。
+ * 第七阶段：结算失败**不得继续下一轮**——未决费用沿用现有存储记录并对账，
+ * 不静默吞掉。
+ */
 function reportModelUsage(
   requestId: string,
   usage: { input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number; total_tokens: number },
   outcome: 'succeeded' | 'failed' | 'cancelled',
-): Promise<void> {
+): Promise<boolean> {
   const msg: ModelUsageMessage = {
     protocol_version: PROTOCOL_VERSION,
     execution_id: executionId,
@@ -129,10 +136,10 @@ function reportModelUsage(
     usage,
   };
   send(msg);
-  return new Promise<void>((resolve) => {
+  return new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => {
       pendingModelUsage.delete(requestId);
-      resolve(); // 超时视为已结算：不阻塞主流程
+      resolve(false); // 超时：未确认结算，视为失败（不静默吞）
     }, modelRequestTimeoutMs);
     pendingModelUsage.set(requestId, { resolve, timer });
   });
@@ -155,7 +162,8 @@ function handleModelUsageAck(msg: Extract<InboundMessage, { type: 'model_usage_a
   }
   pendingModelUsage.delete(msg.request_id);
   clearTimeout(pending.timer);
-  pending.resolve();
+  // 第七阶段：ack 带 ok 表示结算是否成功；缺省视为成功（向后兼容旧宿主）。
+  pending.resolve(msg.ok !== false);
 }
 
 function rejectAllModelRequests(reason: string): void {
@@ -166,7 +174,7 @@ function rejectAllModelRequests(reason: string): void {
   pendingModelRequests.clear();
   for (const [, pending] of pendingModelUsage) {
     clearTimeout(pending.timer);
-    pending.resolve();
+    pending.resolve(false); // 取消/退出时结算未确认
   }
   pendingModelUsage.clear();
 }

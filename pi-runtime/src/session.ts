@@ -226,7 +226,7 @@ export class PiSession {
           total_tokens: number;
         },
         outcome: 'succeeded' | 'failed' | 'cancelled',
-      ) => Promise<void>;
+      ) => Promise<boolean>;
     },
   ): Promise<TurnEnd> {
     let answer = '';
@@ -308,13 +308,39 @@ export class PiSession {
         ? 'failed'
         : (finalMessage?.stopReason === 'aborted' ? 'cancelled' : 'succeeded');
     const u = finalMessage?.usage;
-    await handlers.onModelUsage(requestId, {
+    const settled = await handlers.onModelUsage(requestId, {
       input_tokens: u?.input ?? 0,
       output_tokens: u?.output ?? 0,
       cache_read_tokens: u?.cacheRead ?? 0,
       cache_write_tokens: u?.cacheWrite ?? 0,
       total_tokens: u?.totalTokens ?? 0,
     }, outcome);
+    if (!settled) {
+      // 第七阶段：结算失败/超时**不得继续下一轮**。未决费用沿用现有存储记录，
+      // 由宿主对账；这里明确失败，不静默进入下一轮推理。
+      return {
+        kind: 'error',
+        error: '模型用量结算失败，停止后续推理',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: answer }],
+          api: this.model.api,
+          provider: this.model.provider,
+          model: this.model.id,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: 'error',
+          errorMessage: '模型用量结算失败，停止后续推理',
+          timestamp: Date.now(),
+        },
+      };
+    }
 
     if (!finalMessage) {
       // 无有效最终消息：明确失败，不做伪造

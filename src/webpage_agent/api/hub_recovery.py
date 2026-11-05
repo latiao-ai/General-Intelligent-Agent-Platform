@@ -88,10 +88,17 @@ class HubRecoveryMixin:
         record.status = status
         reply = reply_text(state)
         try:
+            # 传 context：这条 run 是本进程领的，收尾要走带租约的门禁。
+            # **先过门禁**：失租时不得追加最终消息；最终答复与终态同事务提交，
+            # 用稳定去重键保证恢复补收尾不重复（第七阶段）。
+            final_key = f'final:{record.run_id}'
+            committed = await self._finish_run(
+                record, state, status, context=context,
+                final_message=reply, final_message_key=final_key)
+            if not committed:
+                logger.warning('run %s 按快照收尾失租，跳过最终消息', record.run_id)
+                return record
             await record.persist(status=status, state=state)
-            await self.store.append_message(record.session_id, 'assistant', reply)
-            # 传 context：这条 run 是本进程领的，收尾要走带租约的门禁
-            await self._finish_run(record, state, status, context=context)
             await record.publish({'type': 'status', **outcome_module.view(status, state),
                                   'detail': reply})
             logger.info('run %s 按快照收尾（步骤已全部结算）status=%s',
@@ -201,12 +208,21 @@ class HubRecoveryMixin:
             })
         # 只有"声称做完了"的状态才必须保证没有未处理的补充；停下等人
         # （waiting_input / failed / paused）允许留着，那正是它们在等的东西。
-        await self._finish_run(
+        # 最终答复与终态同事务提交，用稳定去重键（final:<run_id>）保证恢复
+        # 补收尾不重复追加（第七阶段）。
+        final_key = f'final:{record.run_id}'
+        committed = await self._finish_run(
             record, state, status, context=context,
             expected_intent_version=state.get('intent_version'),
             require_pending_clear=status in ('succeeded', 'partially_succeeded',
-                                             'needs_reconcile'))
-        await self.store.append_message(record.session_id, 'assistant', reply)
+                                             'needs_reconcile'),
+            final_message=reply, final_message_key=final_key)
+        if not committed:
+            # 第七阶段：失租（finish_run_owned 落空）后**禁止追加最终消息**。
+            # 终态与最终答复由新执行者按恢复决策补收尾，这里不再写 assistant
+            # 消息或发状态事件，避免恢复后重复答复。
+            logger.warning('run %s 收尾失租，跳过最终消息与状态事件', record.run_id)
+            return
         # 先落记录（内存 + tasks 行），再发事件：两者都写、职责不同。
         await record.persist(status=status, state=state)
         # 状态事件里 `status` 仍是展示标签（前端认这套），另带 run_status

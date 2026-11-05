@@ -348,12 +348,19 @@ class PgActions:
                                compensated_at: str | None = None,
                                observation_seq: int | None = None,
                                next_route: str = '',
-                               require_no_pending_inputs: bool = False) -> bool:
+                               require_no_pending_inputs: bool = False,
+                               final_message: str | None = None,
+                               final_message_key: str = '',
+                               session_id: str = '') -> bool:
         """带租约与**要求版本**条件地写 run 终态。返回 False = 已失去执行权(不写)。
 
         收尾也必须过版本门禁（文档 §5 第十一步）：旧版本跑出来的"完成"不能
         盖在新要求上面。若用户在收尾前补了一句要求，这里抛 `IntentChanged`——
         调用方应当回到消费循环，而不是把这个 run 标成结束。
+
+        第七阶段：可选的 `final_message` / `final_message_key` / `session_id` 让
+        最终答复在**同一事务**里提交，并用稳定去重键（`(session_id, dedupe_key)`
+        唯一索引）保证恢复补收尾不会重复追加最终消息。
         """
         from webpage_agent.governance import execution_control
 
@@ -399,6 +406,13 @@ class PgActions:
                     processed_intent_version=int(
                         row.get('processed_intent_version') or 0),
                     observation_seq=observation_seq, next_route=next_route)
+            # 最终答复与终态同事务提交，按稳定去重键幂等（第七阶段）。
+            if final_message is not None and session_id:
+                await self._run(
+                    conn, 'INSERT INTO messages '
+                    '(session_id, role, content, created_at, dedupe_key) '
+                    "VALUES (%s, 'assistant', %s, %s, %s) ON CONFLICT DO NOTHING",
+                    (session_id, final_message, now(), final_message_key or ''))
             return True
 
     async def pause_at_boundary(self, context, *, run_id: str, plan_version: int,
