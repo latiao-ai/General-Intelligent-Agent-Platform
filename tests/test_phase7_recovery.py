@@ -338,3 +338,69 @@ class CrossProcessCrashRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class GovernanceBoundaryTests(unittest.IsolatedAsyncioTestCase):
+    """第七阶段收口：治理分支（终态保护 / 取消失败不归一为成功）。"""
+
+    async def asyncSetUp(self):
+        _require_pg(self)
+        await reset_db()
+        self.store = new_store()
+        await self.store.ready()
+
+    async def asyncTearDown(self):
+        await self.store.close()
+
+    async def test_terminal_state_not_overwritten_by_late_finish(self):
+        """已持久化终态不得被迟到收尾覆盖（require_status 保护）。"""
+        from webpage_agent.governance import execution_control
+        await seed_run(self.store, run_id='r1')
+        claimed = await self.store.claim_run('worker-a', 60, run_id='r1')
+        ctx = execution_control.ExecutionContext(
+            run_id='r1', lease_owner='worker-a',
+            lease_epoch=int(claimed['lease_epoch']))
+        # 第一次收尾成功
+        ok = await self.store.finish_run_owned(
+            ctx, run_id='r1', status='succeeded', plan_version=1)
+        self.assertTrue(ok)
+        # 第二次（迟到）收尾：run 已 succeeded，require_status 抛 LeaseLost → False
+        ok2 = await self.store.finish_run_owned(
+            ctx, run_id='r1', status='failed', plan_version=1)
+        self.assertFalse(ok2)
+        run = await self.store.run('r1')
+        self.assertEqual(run['status'], 'succeeded')
+
+    def test_final_status_not_succeeded_on_stale_answer(self):
+        """取消/失败不得因残留旧 answer 被归一为成功。
+
+        真正的保护在 pi_runtime._apply_finished 清除旧 answer（见下个测试）；
+        这里验证 final_status 对「有 answer 但无失败标志」仍判 succeeded 的
+        现状，说明清除 answer 是必要的防线。
+        """
+        from webpage_agent.core import outcome
+        self.assertEqual(outcome.final_status({'answer': '旧答复'}), 'succeeded')
+
+    def test_apply_finished_clears_stale_answer_on_cancel(self):
+        """_apply_finished 取消/失败时清除旧 answer，避免 final_status 误判成功。"""
+        from webpage_agent.agent.pi_runtime import PiRuntime
+        from webpage_agent.agent.pi_protocol import PROTOCOL_VERSION
+        rt = PiRuntime.__new__(PiRuntime)
+        # 预置旧 answer
+        state = {'answer': '旧答复'}
+        msg = {'type': 'finished', 'outcome': 'cancelled',
+               'protocol_version': PROTOCOL_VERSION, 'execution_id': 'exec-1'}
+        rt._apply_finished(state, msg, 'exec-1')
+        self.assertNotIn('answer', state)
+        self.assertEqual(state['pi_outcome'], 'cancelled')
+
+        state2 = {'answer': '旧答复'}
+        msg2 = {'type': 'finished', 'outcome': 'failed', 'error': 'boom',
+                'protocol_version': PROTOCOL_VERSION, 'execution_id': 'exec-1'}
+        rt._apply_finished(state2, msg2, 'exec-1')
+        self.assertNotIn('answer', state2)
+        self.assertEqual(state2['pi_outcome'], 'failed')
+
+
+if __name__ == '__main__':
+    unittest.main()

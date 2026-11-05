@@ -112,12 +112,15 @@ async def check_boundary(state: dict) -> str:
     try:
         control = await book.store.control_state(context.run_id)
     except Exception as exc:                           # noqa: BLE001
-        logger.exception('安全边界读取控制状态失败，本次放行 run=%s', context.run_id)
+        # 第七阶段收口：控制状态读取失败**必须停止**，不能放行——否则取消/暂停
+        # 请求会被静默忽略，执行者继续做副作用。与取消/暂停一致地抛 ControlStopped。
+        logger.exception('安全边界读取控制状态失败，停止本步 run=%s', context.run_id)
         state.setdefault('errors', []).append({
             'stage': 'boundary', 'type': type(exc).__name__,
             'error_code': getattr(exc, 'error_code', 'E_CONTROL_STATE_UNAVAILABLE'),
-            'message': '边界检查读不到控制请求，本步已放行（取消/暂停可能被忽略）'})
-        return ''
+            'message': '边界检查读不到控制请求，本步停止（避免忽略取消/暂停）'})
+        raise execution_control.ControlStopped(
+            '边界控制状态不可用，停止本步以免忽略取消/暂停', 'unknown')
     if control.get('cancel_requested_at'):
         raise execution_control.ControlStopped('运行已被取消', 'cancelled')
     if control.get('pause_requested'):

@@ -614,12 +614,17 @@ class PiRuntime:
             state["pi_outcome"] = "answered"
         elif outcome == "cancelled":
             state["pi_outcome"] = "cancelled"
+            # 第七阶段收口：取消**不得**因残留旧 answer 被归一为成功。清除旧答复，
+            # 让 final_status 按「未产出有效结果」判定。
+            state.pop("answer", None)
         elif outcome == "failed":
             state["pi_outcome"] = "failed"
             err = str(msg.get("error", "Pi 执行失败"))
             state.setdefault("errors", []).append(
                 {"stage": "pi", "type": "PiError", "detail": err}
             )
+            # 第七阶段收口：失败同样清除旧 answer，避免 final_status 误判成功。
+            state.pop("answer", None)
         else:
             # validate_finished 已保证 outcome 只可能是上述三者，此分支防御性兜底
             state["pi_outcome"] = "failed"

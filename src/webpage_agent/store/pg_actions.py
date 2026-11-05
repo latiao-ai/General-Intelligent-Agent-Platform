@@ -369,7 +369,11 @@ class PgActions:
 
         async with self._lease() as conn:
             try:
-                row = await self._owned(conn, context, run_id=run_id)
+                # 第七阶段收口：终态只允许从 running/paused 进入。已持久化终态
+                # （succeeded/failed/cancelled/needs_reconcile 等）不得被迟到
+                # 消息覆盖——require_status 让重复收尾抛 LeaseLost。
+                row = await self._owned(conn, context, run_id=run_id,
+                                        require_status=('running', 'paused'))
             except execution_control.LeaseLost:
                 return False
             if row is None:
