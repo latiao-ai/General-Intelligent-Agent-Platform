@@ -98,6 +98,17 @@ export interface StartMessage extends BaseMessage {
     messages: Array<Record<string, unknown>>;
     /** 已提交的检查点序号：恢复时 Node 从它继续，不从 0 重新开始。 */
     checkpoint_seq?: number;
+    /** 恢复模式（第七阶段收口）：
+     *  - 'admit'：继续原 pending call（重派发，宿主按账本 replay 或执行）；
+     *  - 'deliver'：交付已提交结果（重派发原 call_id，宿主 replay 不重执行）。
+     *  缺省为 undefined（首次执行，正常 pushUser + 请求模型）。 */
+    mode?: 'admit' | 'deliver';
+    /** 待重派发的原工具调用（含原 call_id / tool_name / arguments）。 */
+    pending_calls?: Array<{
+      call_id: string;
+      tool_name: string;
+      arguments: Record<string, unknown>;
+    }>;
   };
 }
 

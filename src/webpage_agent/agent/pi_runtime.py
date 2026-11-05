@@ -209,10 +209,33 @@ class PiRuntime:
             # 原始用户输入；无则走首次执行（pushUser + history）。
             resume_messages = None
             resume_seq = 0
+            resume_mode = None
+            resume_pending = None
             if resume_snapshot and isinstance(resume_snapshot.get('messages'), list) \
                     and resume_snapshot['messages']:
                 resume_messages = resume_snapshot['messages']
                 resume_seq = int(resume_snapshot.get('checkpoint_seq') or 0)
+                # 第七阶段收口：按恢复决策给 Node 模式（admit/deliver）与待重派发
+                # 的原调用（含原 call_id）。resume_finish/reconcile/block 已在
+                # 上面提前返回，不会走到这里。
+                kind = getattr(recovery, 'kind', '')
+                pending = list(resume_snapshot.get('pending_calls') or [])
+                if kind in ('resume_admit', 'resume_deliver') and pending:
+                    resume_mode = 'admit' if kind == 'resume_admit' else 'deliver'
+                    resume_pending = [
+                        {'call_id': str(p.get('call_id') or ''),
+                         'tool_name': str(p.get('tool_name') or ''),
+                         'arguments': dict(p.get('arguments') or {})}
+                        for p in pending if isinstance(p, dict)
+                    ]
+
+            resume_field = None
+            if resume_messages:
+                resume_field = {'messages': resume_messages,
+                                'checkpoint_seq': resume_seq}
+                if resume_mode:
+                    resume_field['mode'] = resume_mode
+                    resume_field['pending_calls'] = resume_pending or []
 
             start = proto.make_message(
                 bridge.execution_id,
@@ -224,9 +247,7 @@ class PiRuntime:
                 model=self._model,
                 api_key=self._api_key,
                 model_timeout_ms=self._model_timeout_ms,
-                resume={'messages': resume_messages,
-                        'checkpoint_seq': resume_seq}
-                if resume_messages else None,
+                resume=resume_field,
             )
             await bridge.send(start)
 

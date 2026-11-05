@@ -360,6 +360,39 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
 
   controller = new AbortController();
 
+  // 第七阶段收口：恢复模式下，先重派发原待处理调用（resume_admit / resume_deliver），
+  // 再进入模型循环。导入消息后**不能**一律立即请求模型——先把上一轮没处理完的
+  // 工具调用补上（宿主按账本 replay 或执行），也不重复追加原始用户输入。
+  if (resume && (resume.mode === 'admit' || resume.mode === 'deliver')
+      && Array.isArray(resume.pending_calls) && resume.pending_calls.length) {
+    for (const pending of resume.pending_calls) {
+      if (cancelled) {
+        return;
+      }
+      // 构造 ToolCall 形状，复用原 call_id / name / arguments
+      const call: ToolCall = {
+        type: 'toolCall',
+        id: pending.call_id,
+        name: pending.tool_name,
+        arguments: (pending.arguments ?? {}) as Record<string, unknown>,
+      };
+      const reply = await dispatchToolCall(call);
+      if (cancelled) {
+        return;
+      }
+      if (reply.ok) {
+        session.pushToolResult(call.id, call.name, reply.result, false);
+      } else {
+        session.pushToolResult(call.id, call.name, reply.error ?? '工具执行失败', true);
+      }
+    }
+    // 补完结果后落一次检查点，宿主确认再进入下一轮
+    if (!(await sendCheckpoint(session.exportContext(), []))) {
+      sendError('恢复补交检查点未被宿主确认，停止后续推理');
+      return;
+    }
+  }
+
   for (;;) {
     if (cancelled) {
       return; // 已取消，不再推进
