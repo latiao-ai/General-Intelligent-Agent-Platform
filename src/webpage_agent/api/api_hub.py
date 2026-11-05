@@ -755,6 +755,10 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
             fields['error'] = state['failure']
         if context is not None and context.lease_owner:
             # 有执行权就走带门禁的收尾：版本 + 待处理补充一起校验，一次事务。
+            # 第七阶段收口：Pi run 的终态快照必须标注版本化 Pi 快照 schema，
+            # 否则 finish_run_owned 会把 Pi 快照覆盖成普通 state（schema=1）。
+            from webpage_agent.agent import runtime_identity
+            is_pi = bool(state.get('pi_outcome')) or bool(state.get('pi_resume'))
             try:
                 committed = await self.store.finish_run_owned(
                     context, run_id=record.run_id, status=run_status,
@@ -767,7 +771,9 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
                     require_no_pending_inputs=require_pending_clear,
                     final_message=final_message,
                     final_message_key=final_message_key,
-                    session_id=record.session_id)
+                    session_id=record.session_id,
+                    snapshot_schema=(runtime_identity.PI_STATE_SCHEMA
+                                     if is_pi else None))
             except execution_control.LeaseLost:
                 logger.warning('run %s 收尾时已失租，不写终态', record.run_id)
                 return False

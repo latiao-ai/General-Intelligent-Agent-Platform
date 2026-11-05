@@ -154,6 +154,42 @@ class LeaseFencingTests(unittest.IsolatedAsyncioTestCase):
         assistant = [m for m in msgs if m['role'] == 'assistant']
         self.assertEqual(len(assistant), 1)
 
+    async def test_finish_run_owned_keeps_pi_snapshot_schema(self):
+        """Pi 收尾传 snapshot_schema=PI_STATE_SCHEMA，不把 Pi 快照覆盖成 schema=1。"""
+        from webpage_agent.agent import runtime_identity
+        from webpage_agent.governance import execution_control
+        await seed_run(self.store, run_id='r1')
+        claimed = await self.store.claim_run('worker-a', 60, run_id='r1')
+        ctx = execution_control.ExecutionContext(
+            run_id='r1', lease_owner='worker-a',
+            lease_epoch=int(claimed['lease_epoch']))
+        state = {'pi_outcome': 'answered', 'answer': 'x',
+                 'state_schema': runtime_identity.PI_STATE_SCHEMA}
+        ok = await self.store.finish_run_owned(
+            ctx, run_id='r1', status='succeeded', plan_version=1, state=state,
+            snapshot_schema=runtime_identity.PI_STATE_SCHEMA)
+        self.assertTrue(ok)
+        snap = await self.store.run_snapshot('r1')
+        self.assertEqual(snap['schema'], runtime_identity.PI_STATE_SCHEMA)
+
+    async def test_settle_action_keeps_pi_snapshot_schema(self):
+        """Pi 结算传 snapshot_schema，不把 Pi 快照覆盖成普通 state（schema=1）。"""
+        from webpage_agent.agent import runtime_identity
+        from webpage_agent.governance import execution_control
+        await seed_run(self.store, run_id='r1')
+        claimed = await self.store.claim_run('worker-a', 60, run_id='r1')
+        ctx = execution_control.ExecutionContext(
+            run_id='r1', lease_owner='worker-a',
+            lease_epoch=int(claimed['lease_epoch']))
+        await self.store.settle_action(
+            ctx, run_id='r1', plan_version=1, step_id='s1',
+            action_id='act_test', attempt_id=None, status='succeeded',
+            state={'state_schema': runtime_identity.PI_STATE_SCHEMA,
+                   'messages': []},
+            snapshot_schema=runtime_identity.PI_STATE_SCHEMA)
+        snap = await self.store.run_snapshot('r1')
+        self.assertEqual(snap['schema'], runtime_identity.PI_STATE_SCHEMA)
+
 
 class SameArgReplayTests(unittest.IsolatedAsyncioTestCase):
     """同参数的新调用与 replay 区分（逻辑调用身份）。"""

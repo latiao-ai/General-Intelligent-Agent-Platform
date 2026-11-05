@@ -126,6 +126,8 @@ export interface CheckpointMessage extends BaseMessage {
   messages: Array<Record<string, unknown>>;
   /** 待处理工具调用（已确定候选、尚未准入/完成）。 */
   pending_calls: Array<Record<string, unknown>>;
+  /** 最终答复候选（answered 前持久化，供恢复 resume_finish 补收尾）。 */
+  final_answer?: string;
 }
 
 /** 检查点持久化确认（Python → Node）。 */

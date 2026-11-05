@@ -504,6 +504,11 @@ class PiRuntime:
         self._snapshot['checkpoint_seq'] = seq
         self._snapshot['messages'] = new_messages
         self._snapshot['pending_calls'] = new_pending
+        # 最终答复候选：Node 在 answered 前把 end.answer 随检查点一起交回，
+        # 宿主持久化后才允许发 finished。恢复时 resume_finish 据此补收尾，
+        # 不重新推理（第七阶段收口）。
+        if msg.get('final_answer') is not None:
+            self._snapshot['final_answer_candidate'] = str(msg.get('final_answer'))
         self._snapshot['phase'] = (
             'awaiting_tools' if self._snapshot.get('pending_calls') else 'running')
         ok = await self._persist_snapshot()

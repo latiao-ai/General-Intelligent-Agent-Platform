@@ -203,16 +203,21 @@ const checkpointTimeoutMs = 30_000;
 function sendCheckpoint(
   messages: Array<Record<string, unknown>>,
   pendingCalls: Array<Record<string, unknown>>,
+  finalAnswer?: string,
 ): Promise<boolean> {
   const seq = ++checkpointSeq;
-  send({
+  const msg: { protocol_version: number; execution_id: string; type: string; checkpoint_seq: number; messages: Array<Record<string, unknown>>; pending_calls: Array<Record<string, unknown>>; final_answer?: string } = {
     protocol_version: PROTOCOL_VERSION,
     execution_id: executionId,
     type: 'checkpoint',
     checkpoint_seq: seq,
     messages,
     pending_calls: pendingCalls,
-  });
+  };
+  if (finalAnswer !== undefined) {
+    msg.final_answer = finalAnswer;
+  }
+  send(msg);
   return new Promise<boolean>((resolve) => {
     const timer = setTimeout(() => {
       pendingCheckpoints.delete(seq);
@@ -420,9 +425,10 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
 
     switch (end.kind) {
       case 'answered':
-        // 最终答复候选确定：先落检查点，宿主确认后才发 finished。
-        // 第七阶段收口：检查点失败/超时/失租 → 停止，不发 finished。
-        if (!(await sendCheckpoint(session.exportContext(), []))) {
+        // 最终答复候选确定：先落检查点（含最终答复候选），宿主确认后才发
+        // finished。这样「最终答复已产、进程崩溃」时恢复能按 resume_finish
+        // 只补收尾、不重新推理。第七阶段收口：检查点失败/超时/失租 → 停止。
+        if (!(await sendCheckpoint(session.exportContext(), [], end.answer))) {
           sendError('最终答复检查点未被宿主确认，停止收尾');
           return;
         }

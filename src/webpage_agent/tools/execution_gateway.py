@@ -261,6 +261,7 @@ async def governed_call(
     snapshot_state: dict | None = None,
     build_snapshot=None,
     require_ledger: bool = True,
+    snapshot_schema: int | None = None,
 ) -> GovernedResult:
     """执行一次受治理的工具调用。
 
@@ -564,7 +565,7 @@ async def governed_call(
             step_id=step_id, action_id=action_id, attempt_id=attempt_id,
             status='succeeded', receipt=receipt,
             step_status='succeeded', state=snapshot,
-            next_step_id=next_step_id)
+            next_step_id=next_step_id, snapshot_schema=snapshot_schema)
         receipt['observation_seq'] = int((settled or {}).get('observation_seq') or 0)
         # 成功后消费批准预留（reserved → consumed），幂等。
         if decision is not None and decision.approval_id and action_id:

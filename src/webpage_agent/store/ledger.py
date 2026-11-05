@@ -117,12 +117,14 @@ class ActionLedger:
                      attempt_id: str | None, status: str,
                      receipt: dict | None = None, error_type: str | None = None,
                      step_status: str | None = None, state: dict | None = None,
-                     next_step_id: str = '') -> dict:
+                     next_step_id: str = '',
+                     snapshot_schema: int | None = None) -> dict:
         return await self.store.settle_action(
             self.context, run_id=self.run_id, plan_version=self.plan_version,
             step_id=step_id, action_id=action_id, attempt_id=attempt_id,
             status=status, receipt=receipt, error_type=error_type,
-            step_status=step_status, state=state, next_step_id=next_step_id)
+            step_status=step_status, state=state, next_step_id=next_step_id,
+            snapshot_schema=snapshot_schema)
 
     async def fail_from_exception(self, *, step_id: str, action_id: str,
                                   attempt_id: str | None, exc: BaseException,

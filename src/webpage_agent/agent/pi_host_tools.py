@@ -275,10 +275,13 @@ class HostToolCaller:
         # 可信主体由 Python 持有（库里的 run 行），不是模型输出
         ctx = await execution_gateway.tool_context(step_id=step_id, action_id='')
 
-        # 受治理调用：授权 → 准入 → 撤权复查 → 真实调用 → 结算
+        # 受治理调用：授权 → 准入 → 撤权复查 → 真实调用 → 结算。快照标注为
+        # 版本化 Pi 快照（第七阶段收口），避免 settle 把 Pi 快照覆盖成普通 state。
+        from webpage_agent.agent import runtime_identity
         result = await execution_gateway.governed_call(
             tool=tool, args=args, step_id=step_id, state=state, ctx=ctx,
-            build_snapshot=build_snapshot)
+            build_snapshot=build_snapshot,
+            snapshot_schema=runtime_identity.PI_STATE_SCHEMA)
 
         if result.kind == 'replay':
             # 此前已成功：复用已有回执（不重新搜索）。重放从 receipt 恢复完整

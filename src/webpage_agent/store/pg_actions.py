@@ -296,7 +296,8 @@ class PgActions:
                             error_type: str | None = None,
                             step_status: str | None = None,
                             state: dict | None = None,
-                            next_step_id: str = '') -> dict:
+                            next_step_id: str = '',
+                            snapshot_schema: int | None = None) -> dict:
         """原子结算：动作 + attempt + 步骤 + 快照一次提交。
 
         "工具已返回但提交失败"时**不能推进内存游标继续下一步**：调用方会收到
@@ -336,7 +337,8 @@ class PgActions:
             if state is not None:
                 await self.save_snapshot(run_id, plan_version=plan_version, state=state,
                                          next_step_id=next_step_id, conn=conn,
-                                         observation_seq=int((water or {}).get('observation_seq') or 0))
+                                         observation_seq=int((water or {}).get('observation_seq') or 0),
+                                         snapshot_schema=snapshot_schema)
             return {'action_id': action_id, 'status': status,
                     'observation_seq': int((water or {}).get('observation_seq') or 0)}
 
@@ -351,7 +353,8 @@ class PgActions:
                                require_no_pending_inputs: bool = False,
                                final_message: str | None = None,
                                final_message_key: str = '',
-                               session_id: str = '') -> bool:
+                               session_id: str = '',
+                               snapshot_schema: int | None = None) -> bool:
         """带租约与**要求版本**条件地写 run 终态。返回 False = 已失去执行权(不写)。
 
         收尾也必须过版本门禁（文档 §5 第十一步）：旧版本跑出来的"完成"不能
@@ -405,7 +408,8 @@ class PgActions:
                     state=state, conn=conn, intent_version=current_intent,
                     processed_intent_version=int(
                         row.get('processed_intent_version') or 0),
-                    observation_seq=observation_seq, next_route=next_route)
+                    observation_seq=observation_seq, next_route=next_route,
+                    snapshot_schema=snapshot_schema)
             # 最终答复与终态同事务提交，按稳定去重键幂等（第七阶段）。
             if final_message is not None and session_id:
                 await self._run(
