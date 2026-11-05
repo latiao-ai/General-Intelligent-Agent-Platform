@@ -134,6 +134,8 @@ class PiRuntime:
         self._model_timeout_ms = model_timeout_ms
         # 模型请求握手：request_id → reservation，准入时存、结算时取。
         self._model_reservations: dict[str, Any] = {}
+        # 第七阶段：版本化 Pi 快照（检查点/恢复用），run() 里初始化。
+        self._snapshot: dict[str, Any] = {}
 
     async def run(
         self,
@@ -154,6 +156,13 @@ class PiRuntime:
         bridge = self._bridge or PiBridge()
         own_bridge = self._bridge is None
         answer_parts: list[str] = []
+
+        # 第七阶段：恢复/检查点用的版本化 Pi 快照。首次执行为 None，恢复时从
+        # state['pi_snapshot'] 取（Hub 的 _pi_resume_plan 已装配）。
+        from webpage_agent.agent import pi_snapshot
+        resume_snapshot = state.get('pi_snapshot') if isinstance(state, dict) else None
+        self._snapshot = dict(resume_snapshot) if resume_snapshot else \
+            pi_snapshot.new_snapshot(user_input=str(state.get('user_input') or ''))
 
         # 绑定宿主 sink：让 Pi 事件经统一的公共事件出口（emit_async）有序转交，
         # 与 LangGraph 节点内部事件走同一套 answer_delta / stage_start / stage_end 契约。
@@ -176,6 +185,13 @@ class PiRuntime:
             # 工具目录发送前校验：完整 JSON Schema，非法则明确报错
             proto.validate_tool_catalog(self._tools)
 
+            # 恢复上下文：有已提交的完整消息就带上，Node 据此重建、不重复追加
+            # 原始用户输入；无则走首次执行（pushUser + history）。
+            resume_messages = None
+            if resume_snapshot and isinstance(resume_snapshot.get('messages'), list) \
+                    and resume_snapshot['messages']:
+                resume_messages = resume_snapshot['messages']
+
             start = proto.make_message(
                 bridge.execution_id,
                 "start",
@@ -186,6 +202,7 @@ class PiRuntime:
                 model=self._model,
                 api_key=self._api_key,
                 model_timeout_ms=self._model_timeout_ms,
+                resume={'messages': resume_messages} if resume_messages else None,
             )
             await bridge.send(start)
 
@@ -201,6 +218,8 @@ class PiRuntime:
                     await self._handle_model_request(bridge, msg)
                 elif mtype == "model_usage":
                     await self._handle_model_usage(bridge, msg)
+                elif mtype == "checkpoint":
+                    await self._handle_checkpoint(bridge, msg)
                 elif mtype == "finished":
                     self._apply_finished(state, msg, bridge.execution_id)
                     break
@@ -373,6 +392,52 @@ class PiRuntime:
         ack = proto.make_message(
             bridge.execution_id, "model_usage_ack", request_id=request_id)
         await bridge.send(ack)
+
+    async def _handle_checkpoint(self, bridge: PiBridge, msg: dict) -> None:
+        """检查点握手：Node 在完整轮次结束 / 工具候选确定时导出版本化上下文，
+        宿主持久化后回 checkpoint_ack，Node 才允许后续派发。
+
+        第七阶段：快照里的 messages / pending_calls / checkpoint_seq 由这里更新
+        并落库（`pi_snapshot` 版式）。持久化失败**不回 ok=True**——否则 Node 会
+        认为进度已安全落库、继续派发，而实际上恢复会漏结果。
+        """
+        try:
+            proto.validate_checkpoint(msg, bridge.execution_id)
+        except ProtocolError as exc:
+            raise PiBridgeError(
+                f"非法 checkpoint：{exc}", stderr_tail=bridge.stderr_tail()
+            ) from exc
+        seq = int(msg["checkpoint_seq"])
+        self._snapshot['checkpoint_seq'] = seq
+        self._snapshot['messages'] = list(msg.get("messages") or [])
+        self._snapshot['pending_calls'] = list(msg.get("pending_calls") or [])
+        self._snapshot['phase'] = (
+            'awaiting_tools' if self._snapshot.get('pending_calls') else 'running')
+        ok = await self._persist_snapshot()
+        await bridge.send(proto.make_message(
+            bridge.execution_id, "checkpoint_ack", checkpoint_seq=seq, ok=ok))
+
+    async def _persist_snapshot(self) -> bool:
+        """把当前版本化 Pi 快照落库（经账本的 store）。无账本/无 store 返回 False。"""
+        from webpage_agent.agent import pi_snapshot
+        from webpage_agent.agent import runtime_identity
+        from webpage_agent.store import ledger as ledger_module
+        book = ledger_module.current_ledger()
+        if book is None or getattr(book, 'store', None) is None:
+            return False
+        try:
+            await book.store.save_snapshot(
+                book.run_id, plan_version=int(book.plan_version or 1),
+                state=pi_snapshot.serialize(self._snapshot),
+                snapshot_schema=runtime_identity.PI_STATE_SCHEMA,
+                intent_version=int(self._snapshot.get('intent_version') or 0),
+                processed_intent_version=int(
+                    self._snapshot.get('processed_intent_version') or 0),
+                observation_seq=int(self._snapshot.get('observation_seq') or 0))
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("持久化 Pi 快照失败：%s", exc)
+            return False
 
     async def _begin_model(self, request_id: str):
         """一次真实模型请求的准入：复用 core/services.begin_model_request。"""

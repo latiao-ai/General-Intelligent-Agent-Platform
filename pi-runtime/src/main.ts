@@ -23,6 +23,7 @@ import type { ToolCall } from '@mariozechner/pi-ai';
 
 import {
   PROTOCOL_VERSION,
+  type CheckpointAckMessage,
   type ErrorMessage,
   type EventMessage,
   type FinishedMessage,
@@ -30,6 +31,7 @@ import {
   type ModelRequestMessage,
   type ModelUsageMessage,
   type ReadyMessage,
+  type StartMessage,
   type ToolCallMessage,
 } from './protocol.js';
 import { PiSession } from './session.js';
@@ -169,6 +171,67 @@ function rejectAllModelRequests(reason: string): void {
   pendingModelUsage.clear();
 }
 
+// ---- 检查点握手（第七阶段） ----
+
+// 待确认的检查点：checkpoint_seq → resolve
+interface PendingCheckpoint {
+  resolve: (ok: boolean) => void;
+  timer: NodeJS.Timeout;
+}
+const pendingCheckpoints = new Map<number, PendingCheckpoint>();
+
+/** 检查点序号：单调递增，每次发检查点 +1。 */
+let checkpointSeq = 0;
+
+/** 检查点确认超时（毫秒）：宿主无应答时按失败处理（不阻塞，但恢复以库里为准）。 */
+const checkpointTimeoutMs = 30_000;
+
+/**
+ * 发版本化上下文检查点，等待宿主持久化确认后才返回（允许后续派发）。
+ *
+ * 边界：完整模型轮次结束、工具调用候选确定。只有宿主 ack 后，工具结果才
+ * 允许继续派发——否则进程在「结果已产出但没落库」之间崩溃，恢复会漏结果。
+ */
+function sendCheckpoint(
+  messages: Array<Record<string, unknown>>,
+  pendingCalls: Array<Record<string, unknown>>,
+): Promise<boolean> {
+  const seq = ++checkpointSeq;
+  send({
+    protocol_version: PROTOCOL_VERSION,
+    execution_id: executionId,
+    type: 'checkpoint',
+    checkpoint_seq: seq,
+    messages,
+    pending_calls: pendingCalls,
+  });
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingCheckpoints.delete(seq);
+      resolve(false); // 超时：宿主未确认，恢复以库里为准
+    }, checkpointTimeoutMs);
+    pendingCheckpoints.set(seq, { resolve, timer });
+  });
+}
+
+function handleCheckpointAck(msg: Extract<InboundMessage, { type: 'checkpoint_ack' }>): void {
+  const pending = pendingCheckpoints.get(msg.checkpoint_seq);
+  if (!pending) {
+    return;
+  }
+  pendingCheckpoints.delete(msg.checkpoint_seq);
+  clearTimeout(pending.timer);
+  pending.resolve(!!msg.ok);
+}
+
+function rejectAllCheckpoints(reason: string): void {
+  for (const [, pending] of pendingCheckpoints) {
+    clearTimeout(pending.timer);
+    pending.resolve(false);
+  }
+  pendingCheckpoints.clear();
+}
+
 // ---- 终结性消息（只发一次） ----
 
 function sendFinished(outcome: 'answered' | 'cancelled' | 'failed', fields: Partial<FinishedMessage> = {}): void {
@@ -233,6 +296,7 @@ function handleCancel(): void {
   controller?.abort();
   rejectAllPending('已取消');
   rejectAllModelRequests('已取消');
+  rejectAllCheckpoints('已取消');
   sendFinished('cancelled');
 }
 
@@ -241,6 +305,7 @@ function handleShutdown(): void {
   controller?.abort();
   rejectAllPending('进程关闭');
   rejectAllModelRequests('进程关闭');
+  rejectAllCheckpoints('进程关闭');
   process.exit(0);
 }
 
@@ -267,14 +332,19 @@ function dispatchToolCall(call: ToolCall): Promise<{ ok: boolean; result?: unkno
 }
 
 /** 运行一轮推理，串行处理工具调用。 */
-async function runTurn(input: string, systemPrompt?: string, history?: Array<{ role: 'user' | 'assistant'; content: string }>): Promise<void> {
+async function runTurn(input: string, systemPrompt?: string, history?: Array<{ role: 'user' | 'assistant'; content: string }>, resume?: StartMessage['resume']): Promise<void> {
   if (!session) {
     throw new Error('session 未初始化');
   }
-  if (history && history.length) {
-    session.pushHistory(history);
+  if (resume && Array.isArray(resume.messages) && resume.messages.length) {
+    // 恢复：用已提交的完整消息重建上下文，**不追加原始用户输入**
+    session.importContext(resume.messages);
+  } else {
+    if (history && history.length) {
+      session.pushHistory(history);
+    }
+    session.pushUser(input);
   }
-  session.pushUser(input);
 
   controller = new AbortController();
 
@@ -305,6 +375,8 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
 
     switch (end.kind) {
       case 'answered':
+        // 最终答复候选确定：先落检查点，宿主确认后再发 finished
+        await sendCheckpoint(session.exportContext(), []);
         sendFinished('answered', { answer: end.answer });
         return;
       case 'error':
@@ -319,6 +391,15 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
       case 'toolUse':
         break; // 继续串行回执工具
     }
+
+    // 工具调用候选已确定：先落检查点（含待处理调用），宿主确认后再派发。
+    // 这样「结果已产出但进程崩溃」时，恢复能重新交付同一结果而不重复执行。
+    const pendingCalls = toolCalls.map((c) => ({
+      call_id: c.id,
+      tool_name: c.name,
+      arguments: c.arguments ?? {},
+    }));
+    await sendCheckpoint(session.exportContext(), pendingCalls);
 
     // 逐个串行回执；若本轮有多个工具调用，取消后不再派发剩余
     for (const call of toolCalls) {
@@ -338,6 +419,9 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
         session.pushToolResult(call.id, call.name, reply.error ?? '工具执行失败', true);
       }
     }
+
+    // 工具结果已吸收进上下文：再落一次检查点，宿主确认后才进入下一轮推理
+    await sendCheckpoint(session.exportContext(), []);
   }
 }
 
@@ -378,7 +462,7 @@ async function handleStart(msg: Extract<InboundMessage, { type: 'start' }>): Pro
   });
 
   try {
-    await runTurn(msg.user_input, msg.system_prompt, msg.history);
+    await runTurn(msg.user_input, msg.system_prompt, msg.history, msg.resume);
   } catch (e) {
     if (controller?.signal.aborted || cancelled) {
       // 取消/关闭：只发一次 cancelled
@@ -436,6 +520,9 @@ rl.on('line', (line) => {
       break;
     case 'model_usage_ack':
       handleModelUsageAck(msg);
+      break;
+    case 'checkpoint_ack':
+      handleCheckpointAck(msg);
       break;
     case 'cancel':
       handleCancel();

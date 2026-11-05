@@ -89,12 +89,37 @@ export interface StartMessage extends BaseMessage {
   api_key?: string;
   /** 模型运行超时（毫秒） */
   model_timeout_ms?: number;
+  /**
+   * 恢复上下文（第七阶段）：携带已提交的完整模型消息（含 assistant/toolCall/
+   * toolResult 配对）。有 resume 时 Node 用它**重建** session 上下文，不再
+   * 追加原始用户输入——避免恢复后把同一句用户输入再发一遍。
+   */
+  resume?: {
+    messages: Array<Record<string, unknown>>;
+  };
 }
 
 /** 一次模型请求的准入请求：Node 在真正 stream() 前发，等待 allow/deny。 */
 export interface ModelRequestMessage extends BaseMessage {
   type: 'model_request';
   request_id: string;
+}
+
+/** 版本化上下文导出（Node → Python）：完整模型轮次结束 / 工具候选确定时发。 */
+export interface CheckpointMessage extends BaseMessage {
+  type: 'checkpoint';
+  checkpoint_seq: number;
+  /** 完整模型消息（assistant / toolCall / toolResult 配对）。 */
+  messages: Array<Record<string, unknown>>;
+  /** 待处理工具调用（已确定候选、尚未准入/完成）。 */
+  pending_calls: Array<Record<string, unknown>>;
+}
+
+/** 检查点持久化确认（Python → Node）。 */
+export interface CheckpointAckMessage extends BaseMessage {
+  type: 'checkpoint_ack';
+  checkpoint_seq: number;
+  ok: boolean;
 }
 
 /** 模型请求准入应答（Python → Node）。 */
@@ -146,6 +171,7 @@ export type InboundMessage =
   | ToolResultMessage
   | ModelAdmitMessage
   | ModelUsageAckMessage
+  | CheckpointAckMessage
   | ControlMessage;
 export type OutboundMessage =
   | ReadyMessage
@@ -153,5 +179,6 @@ export type OutboundMessage =
   | ToolCallMessage
   | ModelRequestMessage
   | ModelUsageMessage
+  | CheckpointMessage
   | FinishedMessage
   | ErrorMessage;

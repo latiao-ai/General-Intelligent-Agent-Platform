@@ -67,5 +67,44 @@ class PiSnapshotTests(unittest.TestCase):
         self.assertFalse(pi_snapshot.messages_ok('nope'))
 
 
+class CheckpointProtocolTests(unittest.TestCase):
+    """第七阶段：checkpoint 消息校验（Node → Python 的版本化上下文导出）。"""
+
+    def _checkpoint(self, **over):
+        from webpage_agent.agent import pi_protocol as proto
+        msg = {
+            'protocol_version': proto.PROTOCOL_VERSION,
+            'execution_id': 'exec-1',
+            'type': 'checkpoint',
+            'checkpoint_seq': 1,
+            'messages': [{'role': 'assistant', 'content': 'x'}],
+            'pending_calls': [{'call_id': 'c1', 'tool_name': 'web_search'}],
+        }
+        msg.update(over)
+        return msg
+
+    def test_valid_checkpoint_passes(self):
+        from webpage_agent.agent import pi_protocol as proto
+        proto.validate_checkpoint(self._checkpoint(), 'exec-1')
+
+    def test_checkpoint_requires_seq(self):
+        from webpage_agent.agent import pi_protocol as proto
+        with self.assertRaises(proto.ProtocolError):
+            proto.validate_checkpoint(self._checkpoint(checkpoint_seq='x'), 'exec-1')
+
+    def test_checkpoint_rejects_non_list_messages(self):
+        from webpage_agent.agent import pi_protocol as proto
+        with self.assertRaises(proto.ProtocolError):
+            proto.validate_checkpoint(self._checkpoint(messages='nope'), 'exec-1')
+
+    def test_checkpoint_ack_requires_ok(self):
+        from webpage_agent.agent import pi_protocol as proto
+        with self.assertRaises(proto.ProtocolError):
+            proto.validate_checkpoint_ack({
+                'protocol_version': proto.PROTOCOL_VERSION,
+                'execution_id': 'exec-1', 'type': 'checkpoint_ack',
+                'checkpoint_seq': 1}, 'exec-1')
+
+
 if __name__ == '__main__':
     unittest.main()

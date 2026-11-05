@@ -115,6 +115,39 @@ def validate_model_usage(msg: dict[str, Any], execution_id: str) -> None:
             raise ProtocolError(f"model_usage 的 {key} 必须是非负整数，收到 {value!r}")
 
 
+def validate_checkpoint(msg: dict[str, Any], execution_id: str) -> None:
+    """校验入站 checkpoint：版本化上下文导出。
+
+    Node 在「完整模型轮次结束 / 工具调用候选确定」等边界发检查点，宿主持久化
+    并确认后才允许后续派发。上下文含完整模型消息（assistant/toolCall/toolResult
+    配对）、检查点序号、待处理工具调用。
+    """
+    validate_envelope(msg, execution_id)
+    if msg["type"] != "checkpoint":
+        raise ProtocolError(f"期望 checkpoint，收到 {msg['type']!r}")
+    seq = msg.get("checkpoint_seq")
+    if not isinstance(seq, int) or seq < 0:
+        raise ProtocolError(f"checkpoint 的 checkpoint_seq 必须是非负整数，收到 {seq!r}")
+    messages = msg.get("messages")
+    if messages is not None and not isinstance(messages, list):
+        raise ProtocolError(f"checkpoint 的 messages 必须是列表，收到 {type(messages).__name__}")
+    pending = msg.get("pending_calls")
+    if pending is not None and not isinstance(pending, list):
+        raise ProtocolError(f"checkpoint 的 pending_calls 必须是列表，收到 {type(pending).__name__}")
+
+
+def validate_checkpoint_ack(msg: dict[str, Any], execution_id: str) -> None:
+    """校验出站 checkpoint_ack（Python → Node）：确认持久化。"""
+    validate_envelope(msg, execution_id)
+    if msg["type"] != "checkpoint_ack":
+        raise ProtocolError(f"期望 checkpoint_ack，收到 {msg['type']!r}")
+    if not isinstance(msg.get("checkpoint_seq"), int):
+        raise ProtocolError(
+            f"checkpoint_ack 的 checkpoint_seq 必须是整数，收到 {msg.get('checkpoint_seq')!r}")
+    if not isinstance(msg.get("ok"), bool):
+        raise ProtocolError(f"checkpoint_ack 的 ok 必须是布尔，收到 {msg.get('ok')!r}")
+
+
 def validate_finished(msg: dict[str, Any], execution_id: str) -> None:
     """校验入站 finished：outcome 必须是 answered/cancelled/failed。"""
     validate_envelope(msg, execution_id)
@@ -145,6 +178,7 @@ _INBOUND_VALIDATORS = {
     "tool_call": validate_tool_call,
     "model_request": validate_model_request,
     "model_usage": validate_model_usage,
+    "checkpoint": validate_checkpoint,
     "finished": validate_finished,
     "error": validate_envelope,
 }

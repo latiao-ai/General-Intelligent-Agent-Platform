@@ -180,6 +180,24 @@ export class PiSession {
   }
 
   /**
+   * 导出完整模型消息（版本化上下文，供宿主持久化到快照）。
+   *
+   * 只导出可 JSON 序列化的字段，保留 assistant / toolCall / toolResult 配对。
+   * 恢复时 `importContext` 据此重建 session，**不重新追加原始用户输入**。
+   */
+  exportContext(): Array<Record<string, unknown>> {
+    return this.context.messages.map((m) => ({ ...m }));
+  }
+
+  /**
+   * 导入已提交的完整模型消息（恢复）。**只重建 messages，不追加用户输入**——
+   * 原始用户输入已经在快照里，恢复时由宿主决定是否作为新轮次重新发起。
+   */
+  importContext(messages: Array<Record<string, unknown>>): void {
+    this.context.messages = messages.map((m) => ({ ...m })) as never;
+  }
+
+  /**
    * 跑一次推理。返回本轮终结状态（TurnEnd）。
    *
    * 关键：按 `stopReason` 精确区分停止原因，**不伪造正常停止消息兜底**。模型
