@@ -420,7 +420,9 @@ async def decide_next(state):
             [{**step, 'step_id': step.get('step_id')
               or f'p{int(plan.get("version") or 0) + 1}_s{index}'}
              for index, step in enumerate(kept, 1)], catalog,
-            completed_steps=_completed_step_definitions(state.get('step_outputs') or {}, plan.get('steps') or []),
+            completed_steps=_completed_step_definitions(
+                state.get('step_outputs') or {}, plan.get('steps') or [],
+                state.get('tool_results') or []),
             after_segment=str(data.get('after_segment')
                              or plan.get('after_segment') or 'verify'),
             observation_goal=str(data.get('observation_goal')
@@ -438,7 +440,9 @@ async def decide_next(state):
             metadata['completion_criteria'], normalized, catalog,
             metadata['result_locus'],
             completed_steps=_completed_step_definitions(
-                state.get('step_outputs') or {}, plan.get('steps') or []))
+                state.get('step_outputs') or {}, plan.get('steps') or [],
+                state.get('tool_results') or []),
+            prior_steps=plan.get('steps') or [])
         locus = metadata['result_locus']
         locus_issues = (
             [i for i in step_issues if i.get('severity') != 'warning']

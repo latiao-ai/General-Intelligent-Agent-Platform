@@ -942,7 +942,7 @@ async def revise_plan(state):
         normalized, issues2 = validate_plan(
             [{**step, 'step_id': step.get('step_id') or f'p{next_version}_s{index}'}
              for index, step in enumerate(kept, 1)], catalog,
-            completed_steps=_completed_step_definitions(outputs, old_steps),
+            completed_steps=_completed_step_definitions(outputs, old_steps, actions),
             after_segment=str(data.get('after_segment')
                              or previous.get('after_segment') or 'verify'),
             observation_goal=str(data.get('observation_goal')
@@ -958,7 +958,8 @@ async def revise_plan(state):
         metadata['completion_criteria'], criteria_issues = check_completion_criteria(
             metadata['completion_criteria'], normalized, catalog,
             metadata['result_locus'],
-            completed_steps=_completed_step_definitions(outputs, old_steps))
+            completed_steps=_completed_step_definitions(outputs, old_steps, actions),
+            prior_steps=old_steps)
         if criteria_issues:
             issues2 = issues2 + criteria_issues
             soft = [i for i in criteria_issues if i.get('severity') == 'warning']

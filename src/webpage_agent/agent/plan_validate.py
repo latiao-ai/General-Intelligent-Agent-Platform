@@ -17,10 +17,46 @@ from webpage_agent.tools import core as tool_module
 MAX_STEPS = settings.max_steps
 
 
-def _completed_step_definitions(outputs, steps):
-    known = {step['step_id']: step for step in steps}
-    return [known.get(key, {'step_id': key, 'tool': ''})
-            for key, value in outputs.items() if value.get('__status__') == 'succeeded']
+def _completed_step_definitions(outputs, steps, records=()):
+    """上一版计划里**真实成功过**的步骤定义。
+
+    `outputs` 是 `state['step_outputs']` 快照，但它不是唯一的事实来源：恢复、
+    跨轮续跑、以及观察节点拿到的状态里，这份快照可能是空的（快照只保证留下
+    计划元数据）。只认它就会得出"这一步没做过"的错误结论，进而把继承下来的
+    完成条件判成"指向不存在的步骤"。
+
+    动作账本（`actions`）与工具结果（`tool_results`）才是权威记录，两者取并集。
+    `records` 里每项支持 `__status__` / `execution_status` / `status` 三种写法，
+    因为这三个调用方各自拿的是不同形状的账本。
+    """
+    known = {str(step.get('step_id') or ''): step for step in steps or []}
+    done: dict[str, dict] = {}
+    for step_id, value in (outputs or {}).items():
+        if isinstance(value, dict) and value.get('__status__') == 'succeeded':
+            done[str(step_id)] = {'step_id': str(step_id)}
+    for item in records or ():
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get('__status__') or item.get('execution_status')
+                     or item.get('status') or '')
+        if status != 'succeeded':
+            continue
+        step_id = str(item.get('step_id') or '')
+        entry = {'step_id': step_id,
+                 'tool': str(item.get('tool') or item.get('tool_name') or ''),
+                 'tool_key': str(item.get('tool_key') or '')}
+        # 没有 step_id 的记录（老的账本行）按 tool_key 单列，别让它们互相覆盖
+        done[step_id or f'action:{entry["tool_key"]}'] = entry
+    definitions = []
+    for key, entry in done.items():
+        step = known.get(entry['step_id'])
+        if step is not None:
+            definitions.append({**step,
+                                **{k: v for k, v in entry.items() if v and k != 'step_id'}})
+        else:
+            definitions.append({'step_id': entry['step_id'],
+                                **{k: v for k, v in entry.items() if v and k != 'step_id'}})
+    return definitions
 
 
 def validate_plan(raw_steps: list[dict], catalog, *, completed_steps=(),
@@ -389,7 +425,7 @@ def produces_deployment(tool) -> bool:
 
 
 def check_completion_criteria(criteria, steps, catalog, locus: str = '',
-                              completed_steps=()) -> tuple[list[dict], list[dict]]:
+                              completed_steps=(), prior_steps=()) -> tuple[list[dict], list[dict]]:
     """完成条件必须能和**这份计划真能产出的东西**对上。
 
     三类问题，处理方式不同：
@@ -398,6 +434,9 @@ def check_completion_criteria(criteria, steps, catalog, locus: str = '',
       平台上的修改已经做完了，却因为"本地没有文件"报未完成，是最伤人的一种假失败。
     - **指向不存在的东西**（`tool_succeeded` 指向这份计划里没有的步骤/工具，或没写
       目标）：阻断，交回模型修——它可以改条件，也可以补上缺的那一步。
+      例外：指向**上一版计划里被放弃的只读步骤**时降级成 warning 并丢掉。那条
+      条件永远不可能再满足，留着它只会让每一次修订都撞同一堵墙；只读步骤没有
+      外部副作用，放弃它不产生"没做却说做完了"的风险。写/破坏性步骤仍然阻断。
     - **要证据但计划里没有产出方**（`deployment_receipt` 没有部署步骤、
       `answer_present` 没有作答步骤）：同样阻断，让模型补步骤或改条件。
 
@@ -405,6 +444,15 @@ def check_completion_criteria(criteria, steps, catalog, locus: str = '',
     工具名猜；`content_quality` 这类需要模型评价的条件不受影响。
     """
     known = {tool.name: tool for tool in catalog}
+    known_by_key = {str(getattr(tool, 'tool_key', '') or ''): tool for tool in catalog}
+
+    def _spec_of(step: dict):
+        """按公开名优先、内部标识兜底找回工具定义。"""
+        spec = known.get(str(step.get('tool') or ''))
+        if spec is None:
+            spec = known_by_key.get(str(step.get('tool_key') or ''))
+        return spec
+
     plan_steps = list(steps or [])
     specs = [known.get(str(step.get('tool') or '')) for step in plan_steps]
     step_ids = {str(step.get('step_id') or '') for step in plan_steps}
@@ -418,6 +466,20 @@ def check_completion_criteria(criteria, steps, catalog, locus: str = '',
         target_names.update(str(step.get(key) or '')
                             for key in ('step_id', 'tool', 'tool_key'))
     target_names.discard('')
+    # 上一版计划里有、但这版没接手也没做成功的步骤：任务已经放弃它。
+    abandoned = {}
+    for step in prior_steps or []:
+        names = {str(step.get(key) or '') for key in ('step_id', 'tool', 'tool_key')}
+        names.discard('')
+        if names & target_names:
+            continue
+        for name in names:
+            abandoned[name] = step
+    # 只把「能直接照抄的名字」回给模型：公开工具名与步骤号。
+    # 冒号形态（`mcp:server:tool`、`local:pkg:tool`）是内部身份，混进提示里会让
+    # 模型把 `mcp:libtv:read_project` 当成另一种可抄写法，进而自己"规范化"成
+    # `mcp_libtv_read_project`——那一步纯属节外生枝。匹配仍用完整集合，只改展示。
+    display_names = sorted(name for name in target_names if ':' not in name)
     has_local_output = any(produces_local_output(spec) for spec in specs
                            if spec is not None)
     has_local_file = any(produces_local_file(spec) for spec in specs
@@ -429,8 +491,7 @@ def check_completion_criteria(criteria, steps, catalog, locus: str = '',
         return (str(getattr(spec, 'capability', '') or '') == 'answers'
                 or str(getattr(spec, 'tool_key', '') or '').startswith('local:answers:'))
 
-    done_specs = [known.get(str(step.get('tool') or ''))
-                  for step in completed_steps or []]
+    done_specs = [_spec_of(step) for step in completed_steps or []]
     has_answer = any(_answers(spec) for spec in [*specs, *done_specs]
                      if spec is not None)
     platform = locus in ('platform_state', 'platform_change')
@@ -475,10 +536,29 @@ def check_completion_criteria(criteria, steps, catalog, locus: str = '',
                               '或工具名），否则核对时无从匹配'})
                 continue
             if target not in target_names:
+                dropped = abandoned.get(target)
+                if dropped is not None:
+                    spec = _spec_of(dropped)
+                    # 步骤自己记了 effect（计划落库时会带上），工具不在目录里也能判
+                    effect = str(getattr(spec, 'effect', '') or dropped.get('effect') or '')
+                    if effect == 'read':
+                        issues.append({
+                            'code': 'criterion_dropped_read_step', 'severity': 'warning',
+                            'detail': f'完成条件 tool_succeeded 指向 {target!r}，那是上一版'
+                                      '计划里已放弃的只读步骤，这次不再核对（只读没有外部'
+                                      '副作用）；如果仍需要这一步，请把它加回计划'})
+                        continue
+                    issues.append({
+                        'code': 'criterion_target_unknown',
+                        'detail': f'完成条件 tool_succeeded 指向 {target!r}，但这份计划里'
+                                  f'没有这个步骤或工具；它原本是上一版计划里的写步骤，'
+                                  f'不能就此放弃，请把它加回计划（可用：'
+                                  f'{", ".join(display_names)[:120]}）'})
+                    continue
                 issues.append({
                     'code': 'criterion_target_unknown',
                     'detail': f'完成条件 tool_succeeded 指向 {target!r}，但这份计划里'
-                              f'没有这个步骤或工具（可用：{", ".join(sorted(target_names))[:120]}）'})
+                              f'没有这个步骤或工具（可用：{", ".join(display_names)[:120]}）'})
                 continue
         kept.append(item)
     return kept, issues
