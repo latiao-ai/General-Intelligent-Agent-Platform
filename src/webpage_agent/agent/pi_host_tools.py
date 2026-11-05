@@ -226,12 +226,16 @@ class HostToolCaller:
         return self._registry
 
     async def call(self, *, call_id: str, tool_name: str,
-                   args: dict, state: dict) -> ToolReceipt:
+                   args: dict, state: dict, build_snapshot=None) -> ToolReceipt:
         """执行一次工具调用并返回模型回执。
 
         `call_id` 是桥接往返关联 ID（不进账本幂等键）；逻辑调用身份由
         `PiCallRegistry` 分配（run 内序号），`execution_gateway.governed_call`
         内的 `ActionLedger.admit` 据此分配 action_id / attempt_id。
+
+        `build_snapshot`：可选的 `(updates, tool_result) -> dict` 回调，在真实
+        调用成功、结算前被调用，把本次动作的恢复事实（含已提交工具结果引用）
+        写进快照，与 `settle_action` 同一事务提交（第七阶段）。
         """
         # 执行点再次解析并检查工具：只开放 web_search
         tool = _resolve_web_search()
@@ -255,7 +259,8 @@ class HostToolCaller:
 
         # 受治理调用：授权 → 准入 → 撤权复查 → 真实调用 → 结算
         result = await execution_gateway.governed_call(
-            tool=tool, args=args, step_id=step_id, state=state, ctx=ctx)
+            tool=tool, args=args, step_id=step_id, state=state, ctx=ctx,
+            build_snapshot=build_snapshot)
 
         if result.kind == 'replay':
             # 此前已成功：复用已有回执（不重新搜索）。重放从 receipt 恢复完整

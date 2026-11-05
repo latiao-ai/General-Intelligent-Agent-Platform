@@ -186,6 +186,35 @@ class GovernedCallGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.kind, 'replay')
         self.assertEqual(calls, [])
 
+    async def test_build_snapshot_receives_tool_result(self):
+        """第七阶段：build_snapshot 收到 (updates, tool_result)，快照在结算前构造。"""
+        store = _FakeStore(admit_status='admitted')
+        token = _bind_ledger(store, self._ctx())
+        tool, calls = _fake_tool()
+        captured = {}
+
+        def build_snapshot(updates, tool_result=None):
+            captured['updates'] = updates
+            captured['tool_result'] = tool_result
+            return {'step_outputs': {'s1': tool_result}}
+
+        try:
+            with patch('webpage_agent.tools.tool_policy.enforcement_enabled',
+                       return_value=False):
+                result = await execution_gateway.governed_call(
+                    tool=tool, args={'query': 'x'}, step_id='s1', state={},
+                    ctx=execution_gateway.tool_context_module.from_run(
+                        {'run_id': 'run1', 'tenant_id': 'acme'}),
+                    build_snapshot=build_snapshot)
+        finally:
+            ledger_module.unbind(token)
+        self.assertEqual(result.kind, 'succeeded')
+        self.assertIn('tool_result', captured)
+        self.assertIsNotNone(captured['tool_result'])
+        # 快照随结算同事务提交（settle_action 收到含本步输出的 state）
+        self.assertTrue(store.settled)
+        self.assertIn('step_outputs', store.settled[0].get('state') or {})
+
 
 class PiHostToolCallerTests(unittest.IsolatedAsyncioTestCase):
     """pi_host_tools：只开放 web_search，结果归一为模型内容。"""

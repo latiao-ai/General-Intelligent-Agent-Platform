@@ -1521,10 +1521,25 @@ async def run_step(state):
     # 共享网关：授权 → 预算 → 准入 → 撤权复查 → 真实调用 → 结果归一 → 结算。
     # run_step 只保留编排：选步/依赖/引用解析（上方）、图路由、补偿编排、游标推进。
     # 结算只在网关一处发生（run_step 不再自己调 book.settle / fail_from_exception）。
-    def build_snapshot(tool_updates: dict):
+    def build_snapshot(tool_updates: dict, tool_result: dict | None = None):
         merged = dict(state)
         merged.update(tool_updates)
-        merged['step_outputs'] = outputs
+        # 第七阶段：本步输出与结果日志**在快照构造时补齐**，而不是等结算后
+        # 再补——否则崩溃在「结算已提交但快照没写全」之间会丢本步结果。
+        # tool_result 由网关归一后传入（含 data_ref），这里与结算同事务落进快照。
+        marker = str(tool_updates.get('status', '') or '')
+        record = {k: v for k, v in tool_updates.items()
+                  if isinstance(v, (str, int, float, bool, dict, list))}
+        record['__status__'] = 'succeeded'
+        if marker:
+            record['status'] = marker
+        if tool_result is not None:
+            record['tool_result'] = tool_result
+        snap_outputs = dict(outputs)
+        snap_outputs[step_id] = record
+        merged['step_outputs'] = snap_outputs
+        merged['tool_results'] = list(state.get('tool_results') or []) + (
+            [tool_result] if tool_result is not None else [])
         merged['step_index'] = index + 1
         merged['step_label'] = tool.label
         return _snapshot_state(merged)

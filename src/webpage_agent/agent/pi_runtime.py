@@ -319,8 +319,29 @@ class PiRuntime:
             # 新调用（哪怕参数相同）分配新 ID。
             snapshot = (state.get('pi_snapshot') or {}) if isinstance(state, dict) else {}
             self._host_caller = HostToolCaller(PiCallRegistry(snapshot))
+
+        # 第七阶段：把本次动作的恢复事实（已提交工具结果引用）与 settle_action
+        # 同一事务写进快照。build_snapshot 在网关结算前被调用，返回序列化的
+        # 版本化 Pi 快照。tool_result 由网关归一（含 step_id/action_id/attempt_id/
+        # data_ref），这里只取结果引用，不把权限/租约混进快照。
+        from webpage_agent.agent import pi_snapshot
+
+        def build_snapshot(tool_updates: dict, tool_result=None):
+            self._snapshot['logical_call_seq'] = self._host_caller.registry.seq
+            committed = {
+                'step_id': str((tool_result or {}).get('step_id') or ''),
+                'action_id': str((tool_result or {}).get('action_id') or ''),
+                'attempt_id': str((tool_result or {}).get('attempt_id') or ''),
+                'data_ref': str((tool_result or {}).get('data_ref') or ''),
+            }
+            existing = list(self._snapshot.get('committed_tool_results') or [])
+            existing.append(committed)
+            self._snapshot['committed_tool_results'] = existing
+            return pi_snapshot.serialize(self._snapshot)
+
         receipt = await self._host_caller.call(
-            call_id=call_id, tool_name=tool_name, args=args, state=state)
+            call_id=call_id, tool_name=tool_name, args=args, state=state,
+            build_snapshot=build_snapshot)
         if receipt.ok:
             # 成功结算后合并认可增量回宿主 state（documents/usage/errors）
             if receipt.updates:

@@ -549,12 +549,14 @@ async def governed_call(
     receipt = {k: v for k, v in updates.items()
                if isinstance(v, (str, int, float, bool, dict, list))}
     receipt['tool_result'] = tool_result
-    # 构造待提交快照：build_snapshot 回调优先（可包含工具增量 + 游标推进），
-    # 否则用静态 snapshot_state。在真实调用后、结算前构造，避免「先宣布成功、
-    # 再补写关键恢复状态」。
+    # 构造待提交快照：build_snapshot 回调优先（可包含工具增量 + 游标推进 + 本步
+    # 结果记录），否则用静态 snapshot_state。在真实调用后、结算前构造，避免
+    # 「先宣布成功、再补写关键恢复状态」。回调收到 (tool_updates, tool_result)，
+    # 使调用方能把本步的归一结果一并写进快照（第七阶段：快照在本步输出与结果
+    # 日志**补齐后**构造，而不是在它们补齐前）。
     snapshot = None
     if build_snapshot is not None:
-        snapshot = build_snapshot(updates)
+        snapshot = build_snapshot(updates, tool_result=tool_result)
     elif snapshot_state is not None:
         snapshot = snapshot_state
     if book is not None and action_id:
