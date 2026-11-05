@@ -222,19 +222,26 @@ class PgRuns:
                             conn=None, intent_version: int | None = None,
                             processed_intent_version: int | None = None,
                             observation_seq: int | None = None,
-                            next_route: str = '') -> None:
+                            next_route: str = '',
+                            snapshot_schema: int | None = None) -> None:
         '''写运行快照（恢复所需的最小完整状态）。
 
         长正文与文件不进快照：它们走产物引用，快照里只留引用与索引。
         快照里的版本字段只用于**排障与核对**：恢复时以 `runs` 的版本为准，
         因为补充输入会改变 `runs.intent_version`，而快照可能还没来得及更新。
+
+        `snapshot_schema` 是快照状态格式的代次：LangGraph 用 1，Pi 用自己的
+        schema 代次（第七阶段）。之前写死 1，导致 Pi 快照无法标注版本；
+        现在显式传入，UPSERT 也同步更新，避免旧 schema 值残留。
         '''
+        schema = int(snapshot_schema if snapshot_schema is not None else 1)
         payload = json.dumps(state, ensure_ascii=False, default=str)
         sql = ('INSERT INTO run_snapshots (run_id, plan_version, snapshot_schema, '
                'state_json, next_step_id, artifact_namespace, updated_at, '
                'intent_version, processed_intent_version, observation_seq, next_route) '
                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) '
                'ON CONFLICT (run_id) DO UPDATE SET plan_version=EXCLUDED.plan_version, '
+               'snapshot_schema=EXCLUDED.snapshot_schema, '
                'state_json=EXCLUDED.state_json, next_step_id=EXCLUDED.next_step_id, '
                'artifact_namespace=EXCLUDED.artifact_namespace, '
                'updated_at=EXCLUDED.updated_at, '
@@ -242,7 +249,7 @@ class PgRuns:
                'processed_intent_version=EXCLUDED.processed_intent_version, '
                'observation_seq=EXCLUDED.observation_seq, '
                'next_route=EXCLUDED.next_route')
-        args = (run_id, int(plan_version or 1), 1, payload, next_step_id,
+        args = (run_id, int(plan_version or 1), schema, payload, next_step_id,
                 artifact_namespace, now(), int(intent_version or 0),
                 int(processed_intent_version or 0), int(observation_seq or 0),
                 str(next_route or ''))
@@ -263,6 +270,7 @@ class PgRuns:
             data['state'] = json.loads(data.get('state_json') or '{}')
         except ValueError:
             data['state'] = {}
+        data['schema'] = int(data.get('snapshot_schema') or 0)
         return data
 
     # ---------- 运行中补充输入 ----------
