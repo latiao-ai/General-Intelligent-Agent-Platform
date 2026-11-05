@@ -13,9 +13,9 @@ from webpage_agent.governance import execution_control
 from webpage_agent.store import ledger as ledger_module
 from webpage_agent.core import outcome as outcome_module
 from webpage_agent.capabilities.publishing import deploy_once
-from webpage_agent.agent.langgraph_runtime import LangGraphRuntime
+from webpage_agent.agent.runtime import get_runtime
+from webpage_agent.core.errors import RecursionBudgetExceeded
 from webpage_agent.core.files import save_json
-from langgraph.errors import GraphRecursionError
 
 logger = logging.getLogger(__name__)
 
@@ -92,23 +92,24 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     started = time.perf_counter()
     ledger_token = ledger_module.bind(ledger)
     try:
-        # 运行时边界：宿主负责准备状态与收尾，LangGraphRuntime 负责驱动图、
-        # 合并增量、记录耗时并透传节点内部事件。控制流异常与取消原样穿过，
-        # 由下面这段宿主收尾统一处理（§4.3、§7.2）。
+        # 运行时边界：宿主负责准备状态与收尾，运行时（经工厂取得，默认
+        # LangGraphRuntime）负责驱动图、合并增量、记录耗时并透传节点内部事件。
+        # 控制流异常与取消原样穿过，由下面这段宿主收尾统一处理（§4.3、§7.2）。
         async with asyncio.timeout(settings.task_timeout):
-            await LangGraphRuntime().run(
+            await get_runtime().run(
                 state, on_event=on_event, progress=progress)
     except (execution_control.LeaseLost, execution_control.ControlStopped):
         # 控制流异常必须**原样穿过**这一层：把它们包成 RuntimeError 会让
         # "失租"和"暂停"退化成普通失败，中枢再也没法区分该由谁收尾（§4.3、§7.2）。
         raise
-    except GraphRecursionError:
+    except RecursionBudgetExceeded as exc:
         # 保留已执行步骤和真实副作用，预算耗尽按可恢复的中断处理。
-        logger.warning('任务 %s 达到步数上限（%s），按可续跑收尾',
-                       task_id, settings.graph_recursion_limit)
+        # 这是运行时适配层折出的通用结果，宿主不感知底层是 LangGraph 还是 Pi。
+        limit = getattr(exc, 'limit', None) or settings.graph_recursion_limit
+        logger.warning('任务 %s 达到步数上限（%s），按可续跑收尾', task_id, limit)
         state['status'] = 'interrupted'
         state['failure'] = (
-            f'这一轮已经用满 {settings.graph_recursion_limit} 步预算，先停在这里；'
+            f'这一轮已经用满 {limit} 步预算，先停在这里；'
             '已经完成的步骤与产物都保留，可以从断点继续。')
     except Exception as exc:
         state['status'] = 'failed'
