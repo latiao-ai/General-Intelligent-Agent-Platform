@@ -124,6 +124,34 @@ def parse(raw: dict | None) -> dict:
     return _clean_state(raw)
 
 
+def parse_row(row: dict | None) -> dict:
+    """从 `store.run_snapshot()` 返回的**数据库行结构**里解析 Pi 快照。
+
+    `run_snapshot()` 返回 `{state: <解析后的 state_json>, schema: <snapshot_schema>,
+    ...其余 run_snapshots 列}`。快照内容在 `row['state']`，版本号以
+    `state.state_schema`（写入时由 `serialize` 烙上的代次）为准，缺失时退回
+    DB 列 `snapshot_schema`。
+
+    与 `parse` 的区别：`parse` 接受内部快照 dict，`parse_row` 接受 DB 行包装。
+    统一在这里做「取内容 + 严格解析」，调用方不再手工抽 `row['state']`。
+    """
+    if row is None:
+        raise SnapshotError('Pi 快照缺失')
+    if not isinstance(row, dict):
+        raise SnapshotError('Pi 快照损坏：不是对象')
+    state = row.get('state')
+    if state is None:
+        # 行存在但 state 为空：可能是损坏（state_json 解析失败被吞成 {}）。
+        raise SnapshotError('Pi 快照损坏：state 为空')
+    if not isinstance(state, dict):
+        raise SnapshotError('Pi 快照损坏：state 不是对象')
+    inner = dict(state)
+    # 版本号：优先快照内 state_schema（serialize 烙上的），退回 DB 列。
+    schema = int(inner.get('state_schema') or row.get('schema') or 0)
+    validate_schema(schema)
+    return _clean_state(inner)
+
+
 def messages_ok(messages: list) -> bool:
     """校验消息序列的配对：assistant 产出的 toolCall 必须被 toolResult 覆盖。
 

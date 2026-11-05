@@ -268,8 +268,10 @@ class PgRuns:
         data = dict(row)
         try:
             data['state'] = json.loads(data.get('state_json') or '{}')
-        except ValueError:
-            data['state'] = {}
+        except ValueError as exc:
+            # 第七阶段收口：损坏的 state_json 必须可被识别，不能吞成 {} 冒充空快照。
+            raise RuntimeError(
+                f'run {run_id} 的快照 state_json 损坏：{exc}') from exc
         data['schema'] = int(data.get('snapshot_schema') or 0)
         return data
 

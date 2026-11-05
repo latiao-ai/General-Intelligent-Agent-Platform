@@ -153,22 +153,48 @@ class HubRecoveryMixin:
         要求版本、宿主结果状态、完整模型消息、逻辑调用序号、待处理调用、
         已提交工具结果引用、最终答复候选）。
 
-        本方法只做「装配」，不做「决策」：读快照、校验版本、把原始用户输入与
-        快照里已提交的事实一起交回。具体的四类恢复决策（候选未准入继续准入 /
-        在途转待核实 / 结果已提交补 toolResult / 最终答复已提交补收尾）由
-        `pi_runtime` 的恢复入口按数据库事实决定，不在 Hub 层重算。
+        快照读取合同（第七阶段收口）——严格区分四种情况：
 
-        快照**缺失**（首次执行）返回 `pi_snapshot=None`；快照**损坏 / 版本
-        不兼容**抛异常明确停止（不回退 LangGraph、不假装空快照继续）。
+        - **首次执行**：无快照且无动作 → `pi_snapshot=None`，正常从头开始；
+        - **已有动作却缺快照**：有动作但读不到快照 → 转待核实，**不得退回空
+          状态重新执行**（否则会重复副作用）；
+        - **快照损坏**（state_json 解析失败 / state 为空）→ 抛异常停止；
+        - **版本不兼容**（state_schema 与当前不一致）→ 抛异常停止。
+
+        后三种都不退回空状态重新执行。
         """
         from webpage_agent.agent import runtime_identity
         from webpage_agent.agent import pi_snapshot
         from webpage_agent.agent import pi_recovery
-        raw = await self.store.run_snapshot(run_id)
+
+        actions = await self.store.actions_of(run_id)
+        raw = None
+        try:
+            raw = await self.store.run_snapshot(run_id)
+        except RuntimeError as exc:
+            # 快照损坏：明确停止，不退回空状态
+            raise pi_snapshot.SnapshotError(str(exc)) from exc
+
         snapshot = None
         if raw is not None:
-            snapshot = pi_snapshot.parse(raw)
-        actions = await self.store.actions_of(run_id) if snapshot is not None else []
+            # 有快照行：严格解析（版本不兼容在这里抛）
+            snapshot = pi_snapshot.parse_row(raw)
+        elif actions:
+            # 已有动作却缺快照：转待核实，不退回空状态重新执行
+            decision = pi_recovery.RecoveryDecision(
+                kind=pi_recovery.RESUME_RECONCILE,
+                reason='有动作但缺失快照，无法确定进度，需核实')
+            return {
+                'runtime_kind': runtime_identity.KIND_PI,
+                'intent_version': int(run.get('intent_version') or 0),
+                'processed_intent_version': int(
+                    run.get('processed_intent_version') or 0),
+                'plan_version': int(run.get('plan_version') or 1),
+                'pi_snapshot': None,
+                'pi_recovery': decision,
+                'user_input': str(run.get('goal') or ''),
+            }
+
         decision = pi_recovery.decide(
             snapshot, actions, str(run.get('status') or ''))
         resume = {

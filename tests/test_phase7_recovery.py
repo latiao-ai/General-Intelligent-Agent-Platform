@@ -24,6 +24,76 @@ def _require_pg(testcase):
         testcase.skipTest('需要 PG_TEST_DSN（指向一次性测试库，库名含 test）')
 
 
+class SnapshotReadContractTests(unittest.IsolatedAsyncioTestCase):
+    """第七阶段收口：快照读取合同（真实 DB 返回结构）。"""
+
+    async def asyncSetUp(self):
+        _require_pg(self)
+        await reset_db()
+        self.store = new_store()
+        await self.store.ready()
+
+    async def asyncTearDown(self):
+        await self.store.close()
+
+    async def test_pi_snapshot_roundtrip_through_real_db(self):
+        """save_snapshot(pi 快照) → run_snapshot() → parse_row 正确取回内容。"""
+        from webpage_agent.agent import pi_snapshot
+        from webpage_agent.agent import runtime_identity
+        await seed_run(self.store, run_id='r1')
+        inner = pi_snapshot.new_snapshot(phase='awaiting_tools', checkpoint_seq=4,
+                                         user_input='做个页面')
+        inner['messages'] = [
+            {'role': 'assistant', 'content': 'x'},
+            {'role': 'toolCall', 'content': 'call'},
+        ]
+        await self.store.save_snapshot(
+            'r1', plan_version=1, state=pi_snapshot.serialize(inner),
+            snapshot_schema=runtime_identity.PI_STATE_SCHEMA)
+        raw = await self.store.run_snapshot('r1')
+        # 真实 DB 返回结构：state + schema + 列
+        self.assertIn('state', raw)
+        self.assertIn('schema', raw)
+        parsed = pi_snapshot.parse_row(raw)
+        self.assertEqual(parsed['phase'], 'awaiting_tools')
+        self.assertEqual(parsed['checkpoint_seq'], 4)
+        self.assertEqual(len(parsed['messages']), 2)
+
+    async def test_corrupt_snapshot_raises_not_empty(self):
+        """state_json 损坏 → run_snapshot 抛异常，不吞成空快照。"""
+        await seed_run(self.store, run_id='r1')
+        async with self.store._lease() as conn:
+            await conn.execute(
+                "INSERT INTO run_snapshots (run_id, plan_version, snapshot_schema, "
+                "state_json, updated_at) VALUES ('r1', 1, 1, 'not-json{', 'x') "
+                "ON CONFLICT (run_id) DO UPDATE SET state_json='not-json{'")
+            await conn.commit()
+        with self.assertRaises(RuntimeError):
+            await self.store.run_snapshot('r1')
+
+    async def test_pi_resume_plan_actions_without_snapshot_reconciles(self):
+        """有动作却缺快照 → 转待核实，不退回空状态重新执行。"""
+        from webpage_agent.agent import pi_recovery
+        await seed_run(self.store, run_id='r1')
+        # 落一个动作（无快照）
+        async with self.store._lease() as conn:
+            await conn.execute(
+                "INSERT INTO actions (action_id, run_id, plan_version, step_id, "
+                "tool_key, args_hash, idempotency_key, effect, status, created_at, "
+                "updated_at) VALUES ('a1','r1',1,'pi:call:1','local:web:search',"
+                "'h','k','read','succeeded','x','x')")
+            await conn.commit()
+        hub = None
+        # 直接构造一个最小 Hub 实例调用 _pi_resume_plan
+        from webpage_agent.api.api_hub import Hub
+        hub = Hub(self.store)
+        run = await self.store.run('r1')
+        resume = await hub._pi_resume_plan('r1', run)
+        self.assertIsNone(resume['pi_snapshot'])
+        self.assertEqual(resume['pi_recovery'].kind, pi_recovery.RESUME_RECONCILE)
+        await hub.close()
+
+
 class LeaseFencingTests(unittest.IsolatedAsyncioTestCase):
     """旧代次/失租无法提交终态。"""
 
