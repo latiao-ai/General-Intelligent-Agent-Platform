@@ -19,11 +19,14 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from contextvars import ContextVar
 from typing import Awaitable, Callable, Optional
 
 from langgraph.config import get_stream_writer
+
+logger = logging.getLogger(__name__)
 
 # 各阶段的中文名，CLI / Streamlit / API 三处共用。
 STAGE_LABELS = {
@@ -63,6 +66,12 @@ def label_of(stage: str) -> str:
 Sink = Callable[[dict], Optional[Awaitable[None]]]
 _sink: ContextVar[Optional[Sink]] = ContextVar('pi_event_sink', default=None)
 
+# 待排空的异步事件：sink 返回协程时，不 ensure_future（那会产生未被跟踪、可能在
+# 执行终结前还没跑完的任务），而是收进这个按作用域隔离的队列，由调用方在终结前
+# 调 `drain_events()` 严格 await 完。保证「工具事件在终结前处理完」。
+_pending: ContextVar[list[Awaitable[None]]] = ContextVar('pi_event_pending',
+                                                        default=None)
+
 
 def bind_sink(sink: Optional[Sink]):
     """在当前异步作用域内绑定宿主 sink，返回一个用于解绑的 token。
@@ -72,17 +81,47 @@ def bind_sink(sink: Optional[Sink]):
         token = bind_sink(on_event)
         try:
             ... 驱动执行 ...
+            await drain_events()   # 终结前把未等待的异步事件排空
         finally:
             unbind_sink(token)
 
     正常结束、异常或取消路径都必须解绑，避免事件串到别的请求。
     """
+    if sink is not None:
+        _pending.set([])
     return _sink.set(sink)
 
 
 def unbind_sink(token) -> None:
     """解除 sink 绑定，恢复之前的作用域值。幂等。"""
     _sink.reset(token)
+    if _pending.get() is not None:
+        _pending.set(None)
+
+
+def _enqueue(coro: Awaitable[None]) -> None:
+    """把 sink 返回的协程收进当前作用域的待排空队列（不 ensure_future）。"""
+    queue = _pending.get()
+    if queue is not None:
+        queue.append(coro)
+
+
+async def drain_events() -> None:
+    """排空当前作用域内所有未等待的异步事件（按入队顺序严格 await）。
+
+    真实搜索里 `emit()` 是同步的，sink 若返回协程会先被收进队列，这里在
+    run() 终结前把它们全部 await 完，确保工具事件在终结前处理完、顺序不乱。
+    """
+    queue = _pending.get()
+    if not queue:
+        return
+    pending = list(queue)
+    queue.clear()
+    for coro in pending:
+        try:
+            await coro
+        except Exception:                              # noqa: BLE001
+            logger.warning('排空事件失败', exc_info=True)
 
 
 def emit(event: dict) -> None:
@@ -91,19 +130,16 @@ def emit(event: dict) -> None:
     优先走**作用域绑定的宿主 sink**（图外运行时也能交回宿主）；没有 sink 时
     回退到 LangGraph stream writer（原图行为）。两者都没有则静默跳过。
 
-    注意：`emit` 是**同步**函数，sink 若返回协程会在发射方被调度（fire-and-
-    forget 语义上由调用方负责 await）。节点内部的事件量很小，这一约定与原
-    LangGraph writer 的同步调用保持一致。
+    注意：`emit` 是**同步**函数，sink 若返回协程会被收进作用域的待排空队列
+    （不 ensure_future），由调用方在终结前 `await drain_events()` 排空——保证
+    异步事件不被丢失、不被乱序。节点内部的事件量很小，这一约定与原 LangGraph
+    writer 的同步调用保持一致。
     """
     sink = _sink.get()
     if sink is not None:
         result = sink(event)
-        # sink 可能返回协程；这里不 await（保持同步语义），由调用方决定是否
-        # 需要等待。若需要严格有序，运行时应用 await 版的 emit（见 _emit_async）。
         if result is not None and hasattr(result, '__await__'):
-            # 交给事件循环调度；错误会经 asyncio 上报，不静默吞掉。
-            import asyncio
-            asyncio.ensure_future(result)
+            _enqueue(result)
         return
     try:
         writer = get_stream_writer()

@@ -88,6 +88,33 @@ def validate_tool_call(msg: dict[str, Any], execution_id: str) -> None:
             )
 
 
+def validate_model_request(msg: dict[str, Any], execution_id: str) -> None:
+    """校验入站 model_request：唯一 request_id。"""
+    validate_envelope(msg, execution_id)
+    if msg["type"] != "model_request":
+        raise ProtocolError(f"期望 model_request，收到 {msg['type']!r}")
+    _require_str(msg, "request_id")
+
+
+def validate_model_usage(msg: dict[str, Any], execution_id: str) -> None:
+    """校验入站 model_usage：唯一 request_id、outcome 合法、usage 字段为非负整数。"""
+    validate_envelope(msg, execution_id)
+    if msg["type"] != "model_usage":
+        raise ProtocolError(f"期望 model_usage，收到 {msg['type']!r}")
+    _require_str(msg, "request_id")
+    outcome = msg.get("outcome")
+    if outcome not in ("succeeded", "failed", "cancelled"):
+        raise ProtocolError(f"非法 model_usage outcome：{outcome!r}")
+    usage = msg.get("usage")
+    if usage is not None and not isinstance(usage, dict):
+        raise ProtocolError(f"model_usage 的 usage 必须是对象，收到 {type(usage).__name__}")
+    for key in ("input_tokens", "output_tokens", "cache_read_tokens",
+                "cache_write_tokens", "total_tokens"):
+        value = (usage or {}).get(key)
+        if value is not None and (not isinstance(value, int) or value < 0):
+            raise ProtocolError(f"model_usage 的 {key} 必须是非负整数，收到 {value!r}")
+
+
 def validate_finished(msg: dict[str, Any], execution_id: str) -> None:
     """校验入站 finished：outcome 必须是 answered/cancelled/failed。"""
     validate_envelope(msg, execution_id)
@@ -116,6 +143,8 @@ _INBOUND_VALIDATORS = {
     "ready": validate_envelope,
     "event": validate_envelope,
     "tool_call": validate_tool_call,
+    "model_request": validate_model_request,
+    "model_usage": validate_model_usage,
     "finished": validate_finished,
     "error": validate_envelope,
 }
@@ -134,3 +163,119 @@ def make_message(execution_id: str, type_: str, **fields: Any) -> dict[str, Any]
     """构造一条带通用信封的消息。"""
     return {"protocol_version": PROTOCOL_VERSION, "execution_id": execution_id,
             "type": type_, **fields}
+
+
+# ---- 工具目录（完整 JSON Schema）----
+
+def validate_tool_decl(decl: dict[str, Any]) -> None:
+    """校验一条宿主工具声明：name、description、parameters 必须是完整 JSON Schema。
+
+    第五阶段起工具目录传递能力包 `Tool.args` 的完整 JSON Schema（含 type、
+    properties、required），不再用「字段名→类型字符串」的简化格式——简化格式
+    无法表达 required / 嵌套对象 / 数组元素约束。
+    """
+    if not isinstance(decl, dict):
+        raise ProtocolError(f"工具声明必须是对象，收到 {type(decl).__name__}")
+    _require_str(decl, "name")
+    if not isinstance(decl.get("description"), str):
+        raise ProtocolError(f"工具 {decl.get('name')!r} 的 description 必须是字符串")
+    schema = decl.get("parameters")
+    if not isinstance(schema, dict) or schema.get("type") != "object":
+        raise ProtocolError(
+            f"工具 {decl.get('name')!r} 的 parameters 必须是 JSON Schema object"
+        )
+    # properties 若存在必须是对象；required 若存在必须是字符串数组
+    props = schema.get("properties")
+    if props is not None and not isinstance(props, dict):
+        raise ProtocolError(f"工具 {decl.get('name')!r} 的 properties 必须是对象")
+    required = schema.get("required")
+    if required is not None and (not isinstance(required, list)
+                                 or not all(isinstance(x, str) for x in required)):
+        raise ProtocolError(f"工具 {decl.get('name')!r} 的 required 必须是字符串数组")
+
+
+def validate_tool_catalog(tools: Any) -> None:
+    """校验整个工具目录：必须是列表，逐条过 validate_tool_decl。
+
+    `[]` 是合法的（表示本轮无工具），不抛错。
+    """
+    if not isinstance(tools, list):
+        raise ProtocolError(f"工具目录必须是列表，收到 {type(tools).__name__}")
+    for decl in tools:
+        validate_tool_decl(decl)
+
+
+def validate_args_against_schema(args: dict[str, Any], schema: dict[str, Any]) -> None:
+    """按完整 JSON Schema 校验工具参数（子集：object/properties/required/标量/数组）。
+
+    覆盖真实 web_search 所需的约束：缺少必填字段（query）、字段类型错误、
+    嵌套对象与数组元素类型。不支持的 schema 关键字明确抛错，不静默放行。
+    """
+    if not isinstance(schema, dict):
+        raise ProtocolError("参数 schema 必须是对象")
+    if schema.get("type") != "object":
+        raise ProtocolError(f"工具参数顶层必须是 object，收到 {schema.get('type')!r}")
+    if not isinstance(args, dict):
+        raise ProtocolError(f"工具参数必须是对象，收到 {type(args).__name__}")
+
+    required = schema.get("required") or []
+    if not isinstance(required, list):
+        raise ProtocolError("required 必须是数组")
+    for key in required:
+        if key not in args:
+            raise ProtocolError(f"缺少必填参数：{key}")
+
+    properties = schema.get("properties") or {}
+    if not isinstance(properties, dict):
+        raise ProtocolError("properties 必须是对象")
+    for key, value in args.items():
+        sub = properties.get(key)
+        if sub is None:
+            # 未声明的字段：拒绝（web_search 等工具不接受未知字段）
+            raise ProtocolError(f"未声明的参数：{key}")
+        _validate_value(key, value, sub)
+
+
+def _validate_value(key: str, value: Any, sub: dict[str, Any]) -> None:
+    """递归校验单个参数值是否符合其 schema 节点。"""
+    if not isinstance(sub, dict):
+        raise ProtocolError(f"参数 {key!r} 的 schema 必须是对象")
+    kind = sub.get("type")
+    if kind == "string":
+        if not isinstance(value, str):
+            raise ProtocolError(f"参数 {key!r} 必须是字符串，收到 {type(value).__name__}")
+    elif kind == "number":
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ProtocolError(f"参数 {key!r} 必须是数字，收到 {type(value).__name__}")
+    elif kind == "integer":
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ProtocolError(f"参数 {key!r} 必须是整数，收到 {type(value).__name__}")
+    elif kind == "boolean":
+        if not isinstance(value, bool):
+            raise ProtocolError(f"参数 {key!r} 必须是布尔，收到 {type(value).__name__}")
+    elif kind == "array":
+        if not isinstance(value, list):
+            raise ProtocolError(f"参数 {key!r} 必须是数组，收到 {type(value).__name__}")
+        items = sub.get("items")
+        if isinstance(items, dict):
+            for i, item in enumerate(value):
+                _validate_value(f"{key}[{i}]", item, items)
+    elif kind == "object":
+        if not isinstance(value, dict):
+            raise ProtocolError(f"参数 {key!r} 必须是对象，收到 {type(value).__name__}")
+        sub_props = sub.get("properties") or {}
+        sub_required = sub.get("required") or []
+        for rk in sub_required:
+            if rk not in value:
+                raise ProtocolError(f"参数 {key!r} 缺少必填字段 {rk}")
+        for sk, sv in value.items():
+            sub_node = sub_props.get(sk)
+            if sub_node is None:
+                raise ProtocolError(f"参数 {key!r} 含未声明字段 {sk}")
+            _validate_value(f"{key}.{sk}", sv, sub_node)
+    elif kind is None:
+        # 无 type 约束：只保证可序列化
+        if not isinstance(value, _ALLOWED_ARG_TYPES):
+            raise ProtocolError(f"参数 {key!r} 类型不受支持：{type(value).__name__}")
+    else:
+        raise ProtocolError(f"参数 {key!r} 的 schema 类型不受支持：{kind!r}")

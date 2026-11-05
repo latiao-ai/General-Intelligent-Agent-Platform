@@ -27,11 +27,13 @@ import {
   type EventMessage,
   type FinishedMessage,
   type InboundMessage,
+  type ModelRequestMessage,
+  type ModelUsageMessage,
   type ReadyMessage,
   type ToolCallMessage,
 } from './protocol.js';
 import { PiSession } from './session.js';
-import { buildToolsFromHost, DEFAULT_TOOL_DECLS, toToolCallMessage } from './tools.js';
+import { buildToolsFromHost, toToolCallMessage } from './tools.js';
 
 // ---- 输出（stdout 只写协议） ----
 
@@ -71,6 +73,100 @@ function rejectAllPending(reason: string): void {
     pending.resolve({ ok: false, error: reason });
   }
   pendingTools.clear();
+}
+
+// ---- 模型请求准入/结算握手 ----
+
+// 待准入的模型请求：request_id → { resolve(allow), timer }
+interface PendingModelRequest {
+  resolve: (allow: boolean) => void;
+  timer: NodeJS.Timeout;
+}
+const pendingModelRequests = new Map<string, PendingModelRequest>();
+
+// 待结算确认的模型请求：request_id → { resolve, timer }
+interface PendingModelUsage {
+  resolve: () => void;
+  timer: NodeJS.Timeout;
+}
+const pendingModelUsage = new Map<string, PendingModelUsage>();
+
+/** 模型请求准入超时（毫秒）：宿主无应答时默认放行（兼容无治理 smoke 场景）。 */
+let modelRequestTimeoutMs = 30_000;
+
+/** 发 model_request 并等待宿主 model_admit。返回是否允许真正请求模型。 */
+function requestModelAdmission(requestId: string): Promise<boolean> {
+  const msg: ModelRequestMessage = {
+    protocol_version: PROTOCOL_VERSION,
+    execution_id: executionId,
+    type: 'model_request',
+    request_id: requestId,
+  };
+  send(msg);
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingModelRequests.delete(requestId);
+      resolve(true); // 超时默认放行：无治理宿主（smoke/测试）不拦
+    }, modelRequestTimeoutMs);
+    pendingModelRequests.set(requestId, { resolve, timer });
+  });
+}
+
+/** 发 model_usage 并等待宿主 model_usage_ack（结算确认）。 */
+function reportModelUsage(
+  requestId: string,
+  usage: { input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_write_tokens: number; total_tokens: number },
+  outcome: 'succeeded' | 'failed' | 'cancelled',
+): Promise<void> {
+  const msg: ModelUsageMessage = {
+    protocol_version: PROTOCOL_VERSION,
+    execution_id: executionId,
+    type: 'model_usage',
+    request_id: requestId,
+    outcome,
+    usage,
+  };
+  send(msg);
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      pendingModelUsage.delete(requestId);
+      resolve(); // 超时视为已结算：不阻塞主流程
+    }, modelRequestTimeoutMs);
+    pendingModelUsage.set(requestId, { resolve, timer });
+  });
+}
+
+function handleModelAdmit(msg: Extract<InboundMessage, { type: 'model_admit' }>): void {
+  const pending = pendingModelRequests.get(msg.request_id);
+  if (!pending) {
+    return; // 未知 request_id：忽略（可能已超时）
+  }
+  pendingModelRequests.delete(msg.request_id);
+  clearTimeout(pending.timer);
+  pending.resolve(!!msg.allow);
+}
+
+function handleModelUsageAck(msg: Extract<InboundMessage, { type: 'model_usage_ack' }>): void {
+  const pending = pendingModelUsage.get(msg.request_id);
+  if (!pending) {
+    return;
+  }
+  pendingModelUsage.delete(msg.request_id);
+  clearTimeout(pending.timer);
+  pending.resolve();
+}
+
+function rejectAllModelRequests(reason: string): void {
+  for (const [, pending] of pendingModelRequests) {
+    clearTimeout(pending.timer);
+    pending.resolve(false); // 取消/退出时不再放行模型请求
+  }
+  pendingModelRequests.clear();
+  for (const [, pending] of pendingModelUsage) {
+    clearTimeout(pending.timer);
+    pending.resolve();
+  }
+  pendingModelUsage.clear();
 }
 
 // ---- 终结性消息（只发一次） ----
@@ -136,6 +232,7 @@ function handleCancel(): void {
   cancelled = true;
   controller?.abort();
   rejectAllPending('已取消');
+  rejectAllModelRequests('已取消');
   sendFinished('cancelled');
 }
 
@@ -143,11 +240,18 @@ function handleShutdown(): void {
   log('收到 shutdown，退出');
   controller?.abort();
   rejectAllPending('进程关闭');
+  rejectAllModelRequests('进程关闭');
   process.exit(0);
 }
 
 /** 发送一次工具调用请求，等待 Python 回执（call_id → Promise）。 */
 function dispatchToolCall(call: ToolCall): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+  // 执行内重复 call_id 检查：同一个 call_id 已在等待回执，说明 Pi 重复派发，
+  // 明确报错而不是覆盖旧 Promise（否则旧的会永久挂起、新的丢失回执）。
+  if (pendingTools.has(call.id)) {
+    sendError(`重复的工具 call_id：${call.id}`);
+    return Promise.resolve({ ok: false, error: `重复的工具 call_id：${call.id}` });
+  }
   const msg: ToolCallMessage = toToolCallMessage(executionId, call);
   send(msg);
   return new Promise<{ ok: boolean; result?: unknown; error?: string }>((resolve) => {
@@ -194,6 +298,9 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
       onToolCall: (call) => {
         toolCalls.push(call);
       },
+      onModelRequest: (requestId) => requestModelAdmission(requestId),
+      onModelUsage: (requestId, usage, outcome) =>
+        reportModelUsage(requestId, usage, outcome),
     });
 
     switch (end.kind) {
@@ -223,9 +330,12 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
         // 等待回执期间被取消：不再 push 剩余结果
         return;
       }
-      session.pushToolResult(call.id, call.name, reply.result, reply.ok ? false : true);
-      if (!reply.ok) {
-        log(`工具 ${call.name} 回执为失败：`, reply.error ?? '未知错误');
+      // 失败回执：向模型传 reply.error（保留原始错误正文），不能继续传空的
+      // reply.result —— 否则模型会拿到「成功但结果为空」，无法区分失败。
+      if (reply.ok) {
+        session.pushToolResult(call.id, call.name, reply.result, false);
+      } else {
+        session.pushToolResult(call.id, call.name, reply.error ?? '工具执行失败', true);
       }
     }
   }
@@ -244,11 +354,11 @@ async function handleStart(msg: Extract<InboundMessage, { type: 'start' }>): Pro
     toolTimeoutMs = Math.max(1000, msg.model_timeout_ms);
   }
 
-  // 宿主工具目录真正生效：start 传入的工具声明转成 Pi 工具；失败则明确报错
+  // 宿主工具目录真正生效：start 传入的完整 JSON Schema 工具声明转成 Pi 工具；
+  // tools=[] 表示本轮无工具，**不回退** echo/add。失败则明确报错。
   let tools;
   try {
-    const decls = msg.tools && msg.tools.length ? msg.tools : DEFAULT_TOOL_DECLS;
-    tools = buildToolsFromHost(decls);
+    tools = buildToolsFromHost(msg.tools ?? []);
   } catch (e) {
     sendError(e instanceof Error ? e.message : String(e));
     return;
@@ -321,6 +431,12 @@ rl.on('line', (line) => {
     case 'tool_result':
       handleToolResult(msg);
       break;
+    case 'model_admit':
+      handleModelAdmit(msg);
+      break;
+    case 'model_usage_ack':
+      handleModelUsageAck(msg);
+      break;
     case 'cancel':
       handleCancel();
       break;
@@ -338,6 +454,7 @@ rl.on('close', () => {
   log('stdin EOF，清理退出');
   controller?.abort();
   rejectAllPending('宿主已退出');
+  rejectAllModelRequests('宿主已退出');
   session?.dispose();
   process.exit(0);
 });

@@ -124,14 +124,24 @@ class PiRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("status", state)
 
     async def test_tool_roundtrip_executes_python_tool(self):
-        # 假进程发 tool_call(add 17 25)，Python 执行内置假工具，回 42
+        # 假进程发 tool_call(web_search)，Python 执行注入的工具，回执
         bridge = _bridge()
         bridge._extra_env = {"FAKE_MODE": "tool"}
-        runtime = PiRuntime(bridge=bridge)
-        state = {"task_id": "x", "user_input": "17加25"}
+        calls = []
+
+        async def executor(name, args):
+            calls.append((name, args))
+            return True, {"results": [{"title": "t", "url": "https://x"}]}
+
+        runtime = PiRuntime(bridge=bridge, tool_executor=executor)
+        state = {"task_id": "x", "user_input": "搜一下"}
         result = await runtime.run(state)
         self.assertEqual(result["pi_outcome"], "answered")
-        self.assertEqual(result["answer"], "结果是 42")
+        self.assertEqual(result["answer"], "搜索结果")
+        # 工具确实被 Python 执行，参数符合 schema
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "web_search")
+        self.assertEqual(calls[0][1], {"query": "今天天气"})
 
     async def test_tool_failure_still_reports(self):
         # 假进程发 tool_call(nope)，Python 回工具错误，Pi 继续并答复
@@ -141,6 +151,25 @@ class PiRuntimeTests(unittest.IsolatedAsyncioTestCase):
         state = {"task_id": "x", "user_input": "测失败"}
         result = await runtime.run(state)
         self.assertEqual(result["pi_outcome"], "answered")
+
+    async def test_multi_tool_serial_dispatch(self):
+        # 同一轮多个工具调用：Python 逐个串行回执，参数分别正确
+        bridge = _bridge()
+        bridge._extra_env = {"FAKE_MODE": "multi_tool"}
+        calls = []
+
+        async def executor(name, args):
+            calls.append((name, args))
+            return True, {"results": [{"title": name, "url": "https://x"}]}
+
+        runtime = PiRuntime(bridge=bridge, tool_executor=executor)
+        state = {"task_id": "x", "user_input": "搜两个"}
+        result = await runtime.run(state)
+        self.assertEqual(result["pi_outcome"], "answered")
+        # 两个工具调用都被 Python 串行执行，参数正确
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([c[0] for c in calls], ["web_search", "web_search"])
+        self.assertEqual([c[1]["query"] for c in calls], ["a", "b"])
 
     async def test_events_forwarded_via_on_event(self):
         received = []
@@ -318,6 +347,21 @@ class PiBridgeTerminationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await bridge.close()
 
+    async def test_repeated_read_after_termination_raises(self):
+        # 终结后**重复读取**：连续多次 next_message 都应报错，不挂起、不吞。
+        # 哨兵只放一次，next_message 的前置检查保证第二次也不会重新阻塞。
+        bridge = _bridge()
+        bridge._extra_env = {"FAKE_MODE": "crash"}
+        try:
+            await bridge.start()
+            from webpage_agent.agent import pi_protocol as proto
+            await bridge.send(proto.make_message(bridge.execution_id, "start", user_input="hi"))
+            for _ in range(3):
+                with self.assertRaises(PiBridgeError):
+                    await asyncio.wait_for(bridge.next_message(), timeout=5.0)
+        finally:
+            await bridge.close()
+
     async def test_send_after_termination_rejected(self):
         # 终结后 send 应拒绝新请求
         bridge = _bridge()
@@ -369,21 +413,49 @@ class PiRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("errors", result)
 
     async def test_tool_error_body_preserved(self):
-        # 工具失败：回传时保留错误正文
+        # 工具参数类型错误：回传时保留错误正文（query 不是字符串）
         bridge = _bridge()
         bridge._extra_env = {"FAKE_MODE": "tool_err"}
         runtime = PiRuntime(bridge=bridge)
-        state = {"task_id": "x", "user_input": "bad add"}
+        state = {"task_id": "x", "user_input": "bad search"}
         result = await runtime.run(state)
-        # add 参数非法 → 工具执行器返回 False，错误正文回传，Pi 答复
+        # query 类型非法 → 按完整 JSON Schema 校验拒绝，错误正文回传，Pi 答复
         self.assertEqual(result["pi_outcome"], "answered")
+
+    async def test_missing_required_query_rejected(self):
+        # 缺少必填 query：按完整 JSON Schema 校验在搜索前拒绝
+        bridge = _bridge()
+        bridge._extra_env = {"FAKE_MODE": "missing_query"}
+        runtime = PiRuntime(bridge=bridge)
+        state = {"task_id": "x", "user_input": "search without query"}
+        result = await runtime.run(state)
+        self.assertEqual(result["pi_outcome"], "answered")
+
+    async def test_tool_catalog_defaults_to_web_search(self):
+        # 默认工具目录只开放 web_search（稳定键 local:web:search），无 echo/add
+        runtime = PiRuntime()
+        names = [t["name"] for t in runtime._tools]
+        self.assertEqual(names, ["web_search"])
+        # web_search 参数是完整 JSON Schema（type/properties/required）
+        ws = runtime._tools[0]
+        self.assertEqual(ws["parameters"]["type"], "object")
+        self.assertIn("query", ws["parameters"]["properties"])
+        self.assertEqual(ws["parameters"]["required"], ["query"])
+
+    async def test_empty_tool_catalog_means_no_tools(self):
+        # tools=[] 表示本轮无工具，不回退 echo/add
+        runtime = PiRuntime(tools=[])
+        self.assertEqual(runtime._tools, [])
 
     async def test_disallowed_tool_rejected(self):
         # 宿主工具目录不含该工具：Python 侧拒绝执行并回工具错误，不静默放行
         bridge = _bridge()
         bridge._extra_env = {"FAKE_MODE": "tool_fail"}  # 发 tool_call(nope)
         runtime = PiRuntime(bridge=bridge, tools=[
-            {"name": "echo", "description": "回显", "parameters": {"text": "string"}},
+            {"name": "echo", "description": "回显",
+             "parameters": {"type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"]}},
         ])
         state = {"task_id": "x", "user_input": "nope"}
         result = await runtime.run(state)
@@ -391,7 +463,7 @@ class PiRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["pi_outcome"], "answered")
 
     async def test_custom_tool_catalog_reaches_node(self):
-        # 宿主传入的工具目录（含 parameters schema）应进入 start 消息。
+        # 宿主传入的工具目录（含完整 JSON Schema）应进入 start 消息。
         # 用假进程验证：不依赖真实模型/真实 main.ts。
         captured = {}
 
@@ -418,14 +490,18 @@ class PiRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
         tools = [{"name": "add", "description": "加法",
-                  "parameters": {"a": "integer", "b": "integer"}}]
+                  "parameters": {"type": "object",
+                                 "properties": {"a": {"type": "integer"},
+                                                "b": {"type": "integer"}},
+                                 "required": ["a", "b"]}}]
         runtime = PiRuntime(bridge=_ProbeBridge(), tools=tools)
         state = {"task_id": "x", "user_input": "hi"}
         await runtime.run(state)
         sent_tools = captured["start"]["tools"]
         self.assertEqual(sent_tools, tools)
-        # schema 确实带上了 parameters
-        self.assertEqual(sent_tools[0]["parameters"], {"a": "integer", "b": "integer"})
+        # schema 确实带上了完整 JSON Schema（type/properties/required）
+        self.assertEqual(sent_tools[0]["parameters"]["type"], "object")
+        self.assertEqual(sent_tools[0]["parameters"]["required"], ["a", "b"])
 
     async def test_same_state_reference_preserved(self):
         # 同一 state 引用：正常与异常路径都不重新绑定 state

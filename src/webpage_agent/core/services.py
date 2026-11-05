@@ -280,6 +280,47 @@ async def _note_provider_request() -> None:
     await hook()
 
 
+async def begin_model_request(model: str | None = None, purpose: str = 'pi_turn'):
+    """一次真实模型请求的**准入**：预算 hook + 预留费用。
+
+    Pi 每次真正调用 `stream()` 前经 Node 的 `model_request` 握手走到这里。
+    复用 structured_call / chat_reply 的同一条预算与预留链，不另起一套。
+    返回 reservation（可能为 None，表示无治理 scope 不落账）。
+    """
+    await _note_provider_request()
+    return await governance.reserve(model=model or settings.llm_model,
+                                    purpose=purpose)
+
+
+async def end_model_request(reservation, *, usage=None, succeeded: bool = False) -> None:
+    """一次真实模型请求的**结算**：按实测/估算 token 结算，不填零。
+
+    usage 是「按安装版本语义」转换后的字典（含 input_tokens / output_tokens /
+    cache_read_tokens / cache_write_tokens）。缺 usage（失败/取消/进程退出）时
+    沿用 governance.finish 的保守估算（按配置上界），不填零。
+
+    缓存 token（cache_read_tokens / cache_write_tokens）只作对账事实，不进计费：
+    本库的计费模型（governance.finish 的 _measured_tokens）只认 input/output，
+    cache 命中的 token 已计入 input_tokens，这里不重复累计，也不把 cache 字段
+    误当成 input/output 的替代。
+    """
+    # 归一成 governance.finish 期望的 input_tokens/output_tokens 形状
+    normalized = usage
+    if isinstance(usage, dict):
+        incoming = usage.get('input_tokens')
+        outgoing = usage.get('output_tokens')
+        # 两个都是非负整数才视为「实测」。全 0（失败/取消时 Node 上报的占位
+        # 0）不算实测——一次真实请求必然产生 token，0 只会是「拿不到真实数据」，
+        # 这时必须走保守估算，否则失败请求会被记成没花钱、额度闸形同虚设。
+        if (type(incoming) is int and type(outgoing) is int
+                and incoming >= 0 and outgoing >= 0
+                and not (incoming == 0 and outgoing == 0)):
+            normalized = {'input_tokens': incoming, 'output_tokens': outgoing}
+        else:
+            normalized = None
+    await governance.finish(reservation, usage=normalized, succeeded=succeeded)
+
+
 async def structured_call(
     schema, system: str, user: str, model: str | None = None, attempts: int = 2,
     disable_thinking: bool = False, on_draft=None, draft_interval: float = 1.0,

@@ -244,8 +244,17 @@ class PiBridge:
         """取一条消息。
 
         正常返回一条有效消息。若子进程退出 / EOF / 协议错误已发生且队列已无
-        有效消息，抛 `PiBridgeError`——绝不在无消息时永久挂起。
+        有效消息，抛 `PiBridgeError`——绝不在无消息时永久挂起，也**不因哨兵被
+        消费过一次就重新阻塞**（终结后重复读取每次都报错，而不是第二次卡住）。
         """
+        # 已终结且队列里没有有效消息：直接报终结原因，不阻塞。
+        # 哨兵只放一次，这里的前置检查保证「终结后重复读取」每次都明确报错。
+        if self._termination_reason is not None and self._queue.empty():
+            raise PiBridgeError(
+                self._termination_reason or "子进程已退出，无更多消息",
+                stderr_tail=self.stderr_tail(),
+            )
+
         if timeout is None:
             item = await self._queue.get()
         else:

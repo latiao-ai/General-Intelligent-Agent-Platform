@@ -532,3 +532,62 @@ class UsageLedgerTests(unittest.IsolatedAsyncioTestCase):
         consumed = (await self.store.run('refund-run'))['consumed']
         self.assertEqual(consumed['provider_requests'], 1)
         self.assertEqual(consumed['tool_calls'], 1)
+
+
+class EndModelRequestTests(unittest.IsolatedAsyncioTestCase):
+    """end_model_request 的 usage 归一化：全零/缺失走保守估算，不填零。
+
+    不碰 PostgreSQL，直接 mock governance.finish 断言传给它的 usage 形状。
+    这是第五阶段「失败保守估算不填零」的关键防线：一次真实请求必然产生
+    token，0 只能是「拿不到真实数据」，绝不能记成没花钱。
+    """
+
+    async def _capture(self, usage, succeeded=False):
+        captured = {}
+
+        async def fake_finish(reservation, *, usage=None, succeeded=False):
+            captured['usage'] = usage
+            captured['succeeded'] = succeeded
+
+        with patch.object(governance, 'finish', fake_finish):
+            await services.end_model_request(
+                ('store', 'charge', 0.0, 'token', 'llm'),
+                usage=usage, succeeded=succeeded)
+        return captured
+
+    async def test_all_zero_usage_falls_back_to_estimate(self):
+        # 失败/取消时 Node 上报全 0：不能当实测，走保守估算（usage=None）
+        captured = await self._capture(
+            {'input_tokens': 0, 'output_tokens': 0,
+             'cache_read_tokens': 0, 'cache_write_tokens': 0,
+             'total_tokens': 0},
+            succeeded=False)
+        self.assertIsNone(captured['usage'])
+        self.assertFalse(captured['succeeded'])
+
+    async def test_missing_usage_falls_back_to_estimate(self):
+        captured = await self._capture(None, succeeded=False)
+        self.assertIsNone(captured['usage'])
+
+    async def test_nonzero_usage_passes_measured_tokens(self):
+        captured = await self._capture(
+            {'input_tokens': 120, 'output_tokens': 30,
+             'cache_read_tokens': 500, 'cache_write_tokens': 10,
+             'total_tokens': 150},
+            succeeded=True)
+        # cache 字段只作对账事实，不进计费：只传 input/output
+        self.assertEqual(captured['usage'],
+                         {'input_tokens': 120, 'output_tokens': 30})
+        self.assertTrue(captured['succeeded'])
+
+    async def test_cache_only_usage_does_not_masquerade_as_measured(self):
+        # input/output 缺失但 cache 有值：仍不能当实测，走保守估算
+        captured = await self._capture(
+            {'cache_read_tokens': 500, 'cache_write_tokens': 10},
+            succeeded=True)
+        self.assertIsNone(captured['usage'])
+
+    async def test_negative_or_non_int_usage_rejected(self):
+        captured = await self._capture(
+            {'input_tokens': -1, 'output_tokens': '30'}, succeeded=True)
+        self.assertIsNone(captured['usage'])

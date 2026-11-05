@@ -59,13 +59,26 @@ export interface ErrorMessage extends BaseMessage {
 
 // ---- Python → Node ----
 
+/** 宿主传入的工具声明：name + 描述 + 完整 JSON Schema 参数。
+ *
+ * `parameters` 是完整的 JSON Schema object（含 type/properties/required），
+ * 直接来自能力包 `Tool.args`。空的 tools 数组表示「本轮没有任何工具」，
+ * Node 不得回退到内置 echo/add。
+ */
+export interface HostToolDecl {
+  name: string;
+  description: string;
+  /** 完整 JSON Schema（type=object，可含 properties/required/嵌套对象/数组）。 */
+  parameters: Record<string, unknown>;
+}
+
 /** 开始一轮：输入、上下文、允许的工具目录、运行限制 */
 export interface StartMessage extends BaseMessage {
   type: 'start';
   user_input: string;
   system_prompt?: string;
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;
-  tools: Array<{ name: string; description: string; parameters: Record<string, string> }>;
+  tools: HostToolDecl[];
   model: {
     id: string;
     base_url: string;
@@ -76,6 +89,42 @@ export interface StartMessage extends BaseMessage {
   api_key?: string;
   /** 模型运行超时（毫秒） */
   model_timeout_ms?: number;
+}
+
+/** 一次模型请求的准入请求：Node 在真正 stream() 前发，等待 allow/deny。 */
+export interface ModelRequestMessage extends BaseMessage {
+  type: 'model_request';
+  request_id: string;
+}
+
+/** 模型请求准入应答（Python → Node）。 */
+export interface ModelAdmitMessage extends BaseMessage {
+  type: 'model_admit';
+  request_id: string;
+  /** allow=1 才可真正请求模型；否则 Node 不得 stream。 */
+  allow: boolean;
+  /** deny 时的原因。 */
+  reason?: string;
+}
+
+/** 模型用量结算上报（Node → Python）。 */
+export interface ModelUsageMessage extends BaseMessage {
+  type: 'model_usage';
+  request_id: string;
+  outcome: 'succeeded' | 'failed' | 'cancelled';
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_tokens?: number;
+    cache_write_tokens?: number;
+    total_tokens?: number;
+  };
+}
+
+/** 模型用量结算确认（Python → Node）。 */
+export interface ModelUsageAckMessage extends BaseMessage {
+  type: 'model_usage_ack';
+  request_id: string;
 }
 
 /** 工具回执：同一 call_id 的成功结果或工具错误 */
@@ -92,10 +141,17 @@ export interface ControlMessage extends BaseMessage {
   type: 'cancel' | 'shutdown';
 }
 
-export type InboundMessage = StartMessage | ToolResultMessage | ControlMessage;
+export type InboundMessage =
+  | StartMessage
+  | ToolResultMessage
+  | ModelAdmitMessage
+  | ModelUsageAckMessage
+  | ControlMessage;
 export type OutboundMessage =
   | ReadyMessage
   | EventMessage
   | ToolCallMessage
+  | ModelRequestMessage
+  | ModelUsageMessage
   | FinishedMessage
   | ErrorMessage;

@@ -22,6 +22,20 @@
     - **不写业务终态 `status`**：`answered` 只是「本轮有有效答复」的技术事实，
       记入 `pi_outcome`；业务成功与否由宿主的 `core.outcome.final_status()`
       判定（业务失败也可能带着答复文本）。运行时不越权做终态归一。
+
+第五阶段（本阶段第一组修改）：
+
+    - 工具目录改为**完整 JSON Schema**（能力包 `Tool.args`，含 type/properties/
+      required/嵌套对象/数组），Python 执行前按同一 schema 校验，缺少 query、
+      类型错误都在搜索前拒绝；`tools=[]` 表示本轮无工具，**不回退** echo/add；
+    - 模型请求握手：Node 每次 stream 前后发 model_request / model_usage，
+      Python 准入/结算后回 model_admit / model_usage_ack；
+    - 真实工具走 `HostToolCaller` → `execution_gateway.governed_call` 的完整治理链
+      （授权 → 准入 → 撤权复查 → 真实调用 → 结算）：**成功结算前不向 Pi 发成功
+      回执**（只有 `governed_call` 返回 `succeeded` 即结算完成后才回 ok=True），
+      结算失败异常向上传播、停止后续模型执行；
+    - 模型 usage 结算失败不阻断 ack（模型已跑完，usage 是事后记账），但「全零
+      或缺失 usage」在 `core.services.end_model_request` 里走保守估算、不填零。
 """
 from __future__ import annotations
 
@@ -35,6 +49,7 @@ from webpage_agent.agent.pi_protocol import ProtocolError
 from webpage_agent.observe.events import (
     answer_delta,
     bind_sink,
+    drain_events,
     emit_async,
     stage_start,
     unbind_sink,
@@ -43,30 +58,31 @@ from webpage_agent.observe.events import (
 logger = logging.getLogger(__name__)
 
 # 工具执行器：接收 (tool_name, arguments) 返回 (ok, result)。测试可注入替身。
+# 第五阶段起，真实执行的工具通过 execution_gateway 走完整治理；这个 executor
+# 只作为独立 smoke 与单元测试的注入点，不再内置 echo/add 假工具。
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[tuple[bool, Any]]]
 
-# 默认测试工具目录：名称、描述、参数 schema（字段名 → 类型字符串）。
-# 与 Node 侧 tools.ts 的 DEFAULT_TOOL_DECLS 对应。
-_DEFAULT_TOOLS = [
-    {"name": "echo", "description": "回显传入的字符串，用于验证工具调用往返。",
-     "parameters": {"text": "string"}},
-    {"name": "add", "description": "计算两个整数之和。",
-     "parameters": {"a": "integer", "b": "integer"}},
-]
+
+def _tool_decl(tool) -> dict[str, Any]:
+    """把一个能力包 Tool 转成桥接协议里的工具声明（完整 JSON Schema）。"""
+    return {
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.args,
+    }
 
 
-async def _default_tool_executor(name: str, args: dict[str, Any]) -> tuple[bool, Any]:
-    """内置假工具：echo 回显、add 整数加法。"""
-    if name == "echo":
-        return True, str(args.get("text", ""))
-    if name == "add":
-        try:
-            a = int(args.get("a", 0))
-            b = int(args.get("b", 0))
-            return True, a + b
-        except (TypeError, ValueError) as exc:
-            return False, f"参数非法：{exc}"
-    return False, f"未知工具：{name}"
+def default_tool_catalog() -> list[dict[str, Any]]:
+    """Pi 默认可用的真实工具目录：只开放 web_search（稳定键 local:web:search）。
+
+    不开放其它工具：本阶段 Pi 只支持单次独立执行里的公开网页检索，不做 MCP
+    写操作。`tools=[]`（显式传入空）表示本轮无工具，**不回退**到任何假工具。
+    """
+    from webpage_agent.capabilities import registry
+    for tool in registry.load():
+        if tool.tool_key == "local:web:search":
+            return [_tool_decl(tool)]
+    return []
 
 
 class PiRuntime:
@@ -81,6 +97,7 @@ class PiRuntime:
         *,
         bridge: PiBridge | None = None,
         tool_executor: ToolExecutor | None = None,
+        host_caller=None,
         tools: list[dict[str, Any]] | None = None,
         model: dict[str, str] | None = None,
         api_key: str | None = None,
@@ -88,8 +105,13 @@ class PiRuntime:
         model_timeout_ms: int | None = None,
     ) -> None:
         self._bridge = bridge
-        self._tool_executor = tool_executor or _default_tool_executor
-        self._tools = tools if tools is not None else _DEFAULT_TOOLS
+        # tool_executor 是测试注入的假工具替身；host_caller 是真实受治理调用对象
+        # （默认 None → 惰性创建 HostToolCaller，只开放 web_search）。
+        self._tool_executor = tool_executor
+        self._host_caller = host_caller
+        # tools=None 表示用默认目录（web_search）；tools=[] 表示本轮无工具。
+        # 不再回退到 echo/add。
+        self._tools = tools if tools is not None else default_tool_catalog()
         self._model = model or {
             "id": "deepseek-v4-1-flash",
             "base_url": "https://www.hi-x.cn/v1",
@@ -99,6 +121,8 @@ class PiRuntime:
         self._api_key = api_key
         self._system_prompt = system_prompt
         self._model_timeout_ms = model_timeout_ms
+        # 模型请求握手：request_id → reservation，准入时存、结算时取。
+        self._model_reservations: dict[str, Any] = {}
 
     async def run(
         self,
@@ -127,16 +151,24 @@ class PiRuntime:
         try:
             await bridge.start()
 
-            # 构造 start 消息：输入、上下文、工具目录、模型与运行限制
+            # 构造 start 消息：输入、上下文、工具目录、模型与运行限制。
+            # 限制历史与输入长度，避免把无限长的上下文发给模型。
+            from webpage_agent.core.config import settings
+            max_input = int(getattr(settings, 'run_input_max_chars', 4000) or 4000)
+            user_input = str(state.get("user_input", "") or "")[:max_input]
             history = []
             for item in state.get("history") or []:
                 if isinstance(item, dict) and item.get("role") in ("user", "assistant"):
-                    history.append({"role": item["role"], "content": str(item.get("content", ""))})
+                    content = str(item.get("content", "") or "")[:max_input]
+                    history.append({"role": item["role"], "content": content})
+
+            # 工具目录发送前校验：完整 JSON Schema，非法则明确报错
+            proto.validate_tool_catalog(self._tools)
 
             start = proto.make_message(
                 bridge.execution_id,
                 "start",
-                user_input=str(state.get("user_input", "")),
+                user_input=user_input,
                 system_prompt=self._system_prompt,
                 history=history,
                 tools=self._tools,
@@ -154,6 +186,10 @@ class PiRuntime:
                     await self._handle_event(msg, answer_parts)
                 elif mtype == "tool_call":
                     await self._handle_tool_call(bridge, msg)
+                elif mtype == "model_request":
+                    await self._handle_model_request(bridge, msg)
+                elif mtype == "model_usage":
+                    await self._handle_model_usage(bridge, msg)
                 elif mtype == "finished":
                     self._apply_finished(state, msg, bridge.execution_id)
                     break
@@ -177,7 +213,13 @@ class PiRuntime:
                     logger.warning("取消清理失败：%s", exc)
             raise
         finally:
+            # 终结前先排空所有未等待的异步事件（真实搜索里的同步 emit 会入队），
+            # 确保工具事件在终结前按序处理完，再解绑 sink、回收子进程。
             if token is not None:
+                try:
+                    await drain_events()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("排空事件失败：%s", exc)
                 unbind_sink(token)
             if own_bridge:
                 await bridge.close()
@@ -209,25 +251,116 @@ class PiRuntime:
         tool_name = msg["tool_name"]
         args = msg["arguments"]
 
-        # 再次校验允许目录：工具必须在宿主声明的目录里，参数类型符合 schema
+        # 再次校验允许目录：工具必须在宿主声明的目录里，参数符合完整 JSON Schema
         allowed = self._allowed_tool(tool_name)
         if allowed is None:
             await self._send_tool_error(bridge, call_id, f"工具未在允许目录：{tool_name}")
             return
-        if not self._args_match_schema(args, allowed["parameters"]):
-            await self._send_tool_error(bridge, call_id, f"参数不符合 schema：{args!r}")
+        try:
+            proto.validate_args_against_schema(args, allowed["parameters"])
+        except ProtocolError as exc:
+            await self._send_tool_error(bridge, call_id, f"参数不符合 schema：{exc}")
             return
 
-        ok, result = await self._tool_executor(tool_name, args)
-        reply = proto.make_message(
-            bridge.execution_id,
-            "tool_result",
-            call_id=call_id,
-            ok=ok,
-            result=result if ok else None,
-            error=None if ok else str(result),
-        )
+        if self._tool_executor is not None:
+            # 测试注入的假工具替身
+            ok, result = await self._tool_executor(tool_name, args)
+            reply = proto.make_message(
+                bridge.execution_id,
+                "tool_result",
+                call_id=call_id,
+                ok=ok,
+                result=result if ok else None,
+                error=None if ok else str(result),
+            )
+            await bridge.send(reply)
+            return
+
+        # 真实受治理调用：走 HostToolCaller（授权 → 准入 → 撤权复查 → 真实调用 → 结算）
+        if self._host_caller is None:
+            from webpage_agent.agent.pi_host_tools import HostToolCaller
+            self._host_caller = HostToolCaller()
+        receipt = await self._host_caller.call(
+            call_id=call_id, tool_name=tool_name, args=args, state={})
+        if receipt.ok:
+            reply = proto.make_message(
+                bridge.execution_id,
+                "tool_result",
+                call_id=call_id,
+                ok=True,
+                result=receipt.content,
+            )
+        else:
+            reply = proto.make_message(
+                bridge.execution_id,
+                "tool_result",
+                call_id=call_id,
+                ok=False,
+                result=None,
+                error=receipt.error,
+            )
         await bridge.send(reply)
+
+    async def _handle_model_request(self, bridge: PiBridge, msg: dict) -> None:
+        """模型请求准入握手：Node 请求真正调用模型前，宿主检查预算并放行/拒绝。
+
+        复用 core/services.begin_model_request（预算 hook + governance.reserve）。
+        拒绝时回 allow=False，Node 不得 stream。
+        """
+        try:
+            proto.validate_model_request(msg, bridge.execution_id)
+        except ProtocolError as exc:
+            raise PiBridgeError(
+                f"非法 model_request：{exc}", stderr_tail=bridge.stderr_tail()
+            ) from exc
+        request_id = msg["request_id"]
+        try:
+            reservation = await self._begin_model(request_id)
+        except Exception as exc:  # noqa: BLE001 预算耗尽/无 scope 都按拒绝处理
+            logger.warning("模型请求准入失败：%s", exc)
+            await bridge.send(proto.make_message(
+                bridge.execution_id, "model_admit", request_id=request_id, allow=False,
+                reason=getattr(exc, 'safe_message', None) or type(exc).__name__))
+            return
+        self._model_reservations[request_id] = reservation
+        await bridge.send(proto.make_message(
+            bridge.execution_id, "model_admit", request_id=request_id, allow=True))
+
+    async def _handle_model_usage(self, bridge: PiBridge, msg: dict) -> None:
+        """模型用量结算握手：Node 上报 usage，宿主结算后回 ack。
+
+        复用 core/services.end_model_request（governance.finish）。缺 usage 时
+        保守估算，不填零。结算完成后回 ack，Node 才允许下一轮模型请求。
+        """
+        try:
+            proto.validate_model_usage(msg, bridge.execution_id)
+        except ProtocolError as exc:
+            raise PiBridgeError(
+                f"非法 model_usage：{exc}", stderr_tail=bridge.stderr_tail()
+            ) from exc
+        request_id = msg["request_id"]
+        reservation = self._model_reservations.pop(request_id, None)
+        usage = msg.get("usage")
+        outcome = msg.get("outcome")
+        try:
+            await self._end_model(reservation, usage=usage, succeeded=(outcome == "succeeded"))
+        except Exception as exc:  # noqa: BLE001 结算失败记录，不阻断 ack（Node 需继续）
+            logger.warning("模型用量结算失败：%s", exc)
+        ack = proto.make_message(
+            bridge.execution_id, "model_usage_ack", request_id=request_id)
+        await bridge.send(ack)
+
+    async def _begin_model(self, request_id: str):
+        """一次真实模型请求的准入：复用 core/services.begin_model_request。"""
+        from webpage_agent.core import services as services_module
+        return await services_module.begin_model_request(
+            model=self._model.get("id"), purpose="pi_turn")
+
+    async def _end_model(self, reservation, *, usage=None, succeeded: bool) -> None:
+        """一次真实模型请求的结算：复用 core/services.end_model_request。"""
+        from webpage_agent.core import services as services_module
+        await services_module.end_model_request(
+            reservation, usage=usage, succeeded=succeeded)
 
     async def _send_tool_error(self, bridge: PiBridge, call_id: str, error: str) -> None:
         """回执一个工具错误（保留错误正文）。"""
@@ -242,21 +375,6 @@ class PiRuntime:
             if tool.get("name") == name:
                 return tool
         return None
-
-    @staticmethod
-    def _args_match_schema(args: dict[str, Any], schema: dict[str, str]) -> bool:
-        """按参数 schema 校验参数类型（string/number/boolean/integer）。"""
-        for key, kind in schema.items():
-            if key not in args:
-                continue  # 缺省字段允许（默认假工具给缺省值）
-            value = args[key]
-            if kind == "string" and not isinstance(value, str):
-                return False
-            if kind in ("number", "integer") and not isinstance(value, (int, float)):
-                return False
-            if kind == "boolean" and not isinstance(value, bool):
-                return False
-        return True
 
     def _apply_finished(self, state: dict, msg: dict, execution_id: str) -> None:
         """把本轮终结结果映射回 state（只写宿主认可的结果字段）。

@@ -7,6 +7,7 @@
  * 模型端点来自宿主通过 start 消息传入（含凭据），Node 侧据此构造一个
  * OpenAI 兼容的自定义 Model。凭据只经初始化通道传递，绝不写命令行参数或日志。
  */
+import { randomUUID } from 'node:crypto';
 import {
   stream,
   type AssistantMessage,
@@ -67,6 +68,44 @@ export function extractText(message: AssistantMessage): string {
     }
   }
   return parts.join('');
+}
+
+/** 已知的「正常停止」原因：只有 stop / length 算正常回答。
+ *
+ * 模型侧新增停止语义时（例如未来版本加了新的 stopReason 字符串），未知值
+ * 会被 `classifyTurnEnd` 判成 error，而不是静默当作成功——这样才不会把
+ * 「模型其实出错了」误报成「回答成功」。
+ */
+const KNOWN_STOP: ReadonlySet<string> = new Set(['stop', 'length']);
+
+/**
+ * 按停止原因把一次推理归类为 TurnEnd（不依赖 stream 的副作用，纯函数）。
+ *
+ * 优先级：error/aborted 优先于 toolUse，toolUse 优先于正常停止；未知停止原因
+ * 一律按 error 处理，绝不伪造正常停止兜底。
+ *
+ * @param reason 最终消息的 stopReason（可能缺失或未知字符串）
+ * @param sawToolCall 本轮是否出现过 toolcall_end（Pi 要调用工具）
+ * @param streamError 显式错误消息（error 事件），优先于 stopReason
+ */
+export function classifyTurnEnd(
+  reason: string | null | undefined,
+  sawToolCall: boolean,
+  streamError: string | null,
+): 'answered' | 'toolUse' | 'error' | 'aborted' {
+  if (streamError || reason === 'error') {
+    return 'error';
+  }
+  if (reason === 'aborted') {
+    return 'aborted';
+  }
+  if (reason === 'toolUse' || sawToolCall) {
+    return 'toolUse';
+  }
+  if (reason === undefined || reason === null || !KNOWN_STOP.has(reason)) {
+    return 'error';
+  }
+  return 'answered';
 }
 
 export class PiSession {
@@ -148,18 +187,63 @@ export class PiSession {
    *
    * 注意：Node 侧必须**持续读输入**，不能在推理期间阻塞事件循环去 await 单个
    * 工具回执——那个等待由 main.ts 的消息循环负责，通过 call_id → Promise 完成。
+   *
+   * 模型请求准入/结算：每次真正 `stream()` 前调用 `handlers.onModelRequest`
+   * （返回 false 表示宿主拒绝，本轮不请求模型）；stream 结束后调用
+   * `handlers.onModelUsage` 上报用量与结果，宿主结算确认后才允许下一轮。
    */
   async run(
     signal: AbortSignal,
     handlers: {
       onTextDelta: (delta: string) => void;
       onToolCall: (toolCall: import('@mariozechner/pi-ai').ToolCall) => void;
+      onModelRequest: (requestId: string) => Promise<boolean>;
+      onModelUsage: (
+        requestId: string,
+        usage: {
+          input_tokens: number;
+          output_tokens: number;
+          cache_read_tokens: number;
+          cache_write_tokens: number;
+          total_tokens: number;
+        },
+        outcome: 'succeeded' | 'failed' | 'cancelled',
+      ) => Promise<void>;
     },
   ): Promise<TurnEnd> {
     let answer = '';
     let sawToolCall = false;
     let finalMessage: AssistantMessage | null = null;
     let streamError: string | null = null;
+
+    const requestId = randomUUID();
+
+    // 准入：宿主检查控制/预算并预留费用。deny 则本轮不请求模型。
+    const allowed = await handlers.onModelRequest(requestId);
+    if (!allowed) {
+      return {
+        kind: 'error',
+        error: '模型请求被宿主拒绝',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: answer }],
+          api: this.model.api,
+          provider: this.model.provider,
+          model: this.model.id,
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            totalTokens: 0,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: 'error',
+          errorMessage: '模型请求被宿主拒绝',
+          timestamp: Date.now(),
+        },
+      };
+    }
 
     const s = stream(this.model, this.context, {
       signal,
@@ -200,6 +284,20 @@ export class PiSession {
       }
     }
 
+    // 结算：无论成功/失败/取消都要上报，缺 usage 时由宿主保守估算，不填零。
+    const outcome: 'succeeded' | 'failed' | 'cancelled' =
+      streamError || (finalMessage?.stopReason === 'error')
+        ? 'failed'
+        : (finalMessage?.stopReason === 'aborted' ? 'cancelled' : 'succeeded');
+    const u = finalMessage?.usage;
+    await handlers.onModelUsage(requestId, {
+      input_tokens: u?.input ?? 0,
+      output_tokens: u?.output ?? 0,
+      cache_read_tokens: u?.cacheRead ?? 0,
+      cache_write_tokens: u?.cacheWrite ?? 0,
+      total_tokens: u?.totalTokens ?? 0,
+    }, outcome);
+
     if (!finalMessage) {
       // 无有效最终消息：明确失败，不做伪造
       return {
@@ -229,18 +327,18 @@ export class PiSession {
     // 记录这条 assistant 消息，供后续继续（工具回执后再跑）
     this.context.messages.push(finalMessage);
 
-    // 按 stopReason 判定：error/aborted 优先于 toolUse/stop
+    // 按 stopReason 判定：error/aborted 优先于 toolUse/stop；未知停止原因按 error。
     const reason = finalMessage.stopReason;
-    if (streamError || reason === 'error') {
-      return { kind: 'error', error: streamError ?? '模型运行失败', message: finalMessage };
+    const kind = classifyTurnEnd(reason, sawToolCall, streamError);
+    if (kind === 'error') {
+      return { kind: 'error', error: streamError ?? (reason === 'error' ? '模型运行失败' : `未知的停止原因：${String(reason)}`), message: finalMessage };
     }
-    if (reason === 'aborted') {
+    if (kind === 'aborted') {
       return { kind: 'aborted', message: finalMessage };
     }
-    if (reason === 'toolUse' || sawToolCall) {
+    if (kind === 'toolUse') {
       return { kind: 'toolUse', message: finalMessage };
     }
-    // stop / length（或缺失）都视为正常回答
     return { kind: 'answered', answer: answer || extractText(finalMessage), message: finalMessage };
   }
 
