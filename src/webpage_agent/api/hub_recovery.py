@@ -138,6 +138,43 @@ class HubRecoveryMixin:
                 'asked_questions': asked, 'clarification': clarified,
                 'step_index': _resume_index(steps, actions)}
 
+    async def _pi_resume_plan(self, run_id: str, run: dict) -> dict:
+        """Pi 恢复装配：读版本化 Pi 快照，构造续跑所需的 resume 上下文。
+
+        与 LangGraph 的 `_resume_plan` 不同：Pi 没有「图计划 + 步骤游标」，
+        它的恢复事实来自 `run_snapshots` 里的版本化 Pi 快照（阶段、检查点序号、
+        要求版本、宿主结果状态、完整模型消息、逻辑调用序号、待处理调用、
+        已提交工具结果引用、最终答复候选）。
+
+        本方法只做「装配」，不做「决策」：读快照、校验版本、把原始用户输入与
+        快照里已提交的事实一起交回。具体的四类恢复决策（候选未准入继续准入 /
+        在途转待核实 / 结果已提交补 toolResult / 最终答复已提交补收尾）由
+        `pi_runtime` 的恢复入口按数据库事实决定，不在 Hub 层重算。
+        """
+        from webpage_agent.agent import runtime_identity
+        snapshot = await self._recovery_state(run_id)
+        # 版本校验：Pi 快照必须带 state schema 代次；不兼容则明确停止，
+        # 不退回 LangGraph 路径。
+        schema = int((snapshot or {}).get('state_schema') or 0)
+        if schema and schema != runtime_identity.PI_STATE_SCHEMA:
+            raise runtime_identity.IncompatibleRuntimeVersion(
+                run_id, runtime_identity.KIND_PI, 'runtime_state_schema',
+                schema, runtime_identity.PI_STATE_SCHEMA)
+        resume = {
+            'runtime_kind': runtime_identity.KIND_PI,
+            'intent_version': int(run.get('intent_version') or 0),
+            'processed_intent_version': int(
+                run.get('processed_intent_version') or 0),
+            'plan_version': int(run.get('plan_version') or 1),
+            # 快照里的恢复事实（由 pi_runtime 解释）
+            'pi_snapshot': snapshot or {},
+        }
+        # 保留用户原始输入：恢复后**不重复追加**原始输入，只把快照里未完成
+        # 的处理位置交回。原始输入从 run_inputs 或 task 取，而不是把快照的
+        # messages 当成新输入再发一遍。
+        resume['user_input'] = str((snapshot or {}).get('user_input') or '')
+        return resume
+
     async def _settle_round(self, record: 'TaskRecord', state: dict, status: str, *,
                             context, close_instruction, close_open_stage) -> None:
         """一轮执行结束的收尾：先过门禁，再落记录与事件。

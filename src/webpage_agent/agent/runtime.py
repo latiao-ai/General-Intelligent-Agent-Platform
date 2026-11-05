@@ -88,15 +88,27 @@ class Runtime(Protocol):
         ...
 
 
-def get_runtime() -> Runtime:
+def get_runtime(kind: str = '') -> Runtime:
     """运行时工厂：宿主经这里取运行时，而不是写死具体实现。
 
-    生产默认返回 `LangGraphRuntime`；测试可以通过 `patch` 掉本函数注入替代
-    实现（例如一个只记录调用、不改状态的假运行时），从而在不驱动真实图
-    的前提下验证宿主的收尾、终态与落盘行为。
+    第七阶段起按**引擎归属**分流：
 
-    刻意**不**做数据库字段、注册中心、插件发现或全局引擎切换配置——那些
-    留给 Pi 接入阶段。这里只是一个轻量的依赖注入点。
+    - `kind` 为空（CLI 直调 / 无账本单测）→ 返回 `LangGraphRuntime`（生产默认）；
+    - `kind == 'pi'` → 返回 `PiRuntime`；
+    - 未知 `kind` → 抛 `UnknownRuntimeKind`，**不回退默认引擎**。
+
+    调用方（`run_task` / Hub）负责从 `store.runtime_identity(run_id)` 读已存归属
+    再传到这里。测试仍可 `patch` 本函数注入替身。
     """
-    from webpage_agent.agent.langgraph_runtime import LangGraphRuntime
-    return LangGraphRuntime()
+    from webpage_agent.agent import runtime_identity
+
+    normalized = runtime_identity.normalize_kind(kind) if kind else ''
+    if not kind:
+        normalized = runtime_identity.KIND_LANGGRAPH
+    if normalized == runtime_identity.KIND_LANGGRAPH:
+        from webpage_agent.agent.langgraph_runtime import LangGraphRuntime
+        return LangGraphRuntime()
+    if normalized == runtime_identity.KIND_PI:
+        from webpage_agent.agent.pi_runtime import PiRuntime
+        return PiRuntime()
+    raise runtime_identity.UnknownRuntimeKind('<new-run>', kind)

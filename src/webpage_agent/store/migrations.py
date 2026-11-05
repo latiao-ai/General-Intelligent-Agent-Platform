@@ -27,7 +27,9 @@ GOVERNANCE = 'v2_production_governance'
 RUN_TRACE = 'v3_run_trace'
 # 用途与估算标记单独一个版本：改 SCHEMA 里的 DO 块不会作用到已经记过基线的库。
 USAGE_DETAIL = 'v4_provider_usage_detail'
-LATEST = USAGE_DETAIL
+# 引擎归属：runs 增加 runtime_kind / runtime_version / runtime_state_schema。
+RUNTIME_OWNERSHIP = 'v5_runtime_ownership'
+LATEST = RUNTIME_OWNERSHIP
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -57,6 +59,10 @@ CREATE INDEX IF NOT EXISTS idx_provider_charges_tenant_day ON provider_charges(t
 ALTER TABLE provider_charges ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT '';
 ALTER TABLE provider_charges ADD COLUMN IF NOT EXISTS tokens_estimated BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_provider_charges_run ON provider_charges(run_id);
+'''), (RUNTIME_OWNERSHIP, '''
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_kind TEXT NOT NULL DEFAULT 'langgraph';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_state_schema INTEGER NOT NULL DEFAULT 1;
 '''))
 
 

@@ -188,6 +188,10 @@ class Settings:
     # 连续"没有新进展"的容忍次数：相同指纹重复出现就停，而不是继续烧预算。
     run_max_no_progress: int = max(1, int(
         os.getenv('RUN_MAX_NO_PROGRESS', '2')))
+    # 新建 run 的默认引擎类型（langgraph | pi）。只影响**新建**任务；
+    # 恢复时读库里已存的 runs.runtime_kind，绝不回退到这里。
+    # 第七阶段默认仍为 langgraph，暂不切换生产全局默认。
+    default_runtime_kind: str = os.getenv('DEFAULT_RUNTIME_KIND', 'langgraph').strip().lower()
 
     # ---------- 身份（webpage_agent/api/auth.py / webpage_agent/governance/ticket_auth.py） ----------
     # off      = 不介入，保持单用户行为（默认，本地开发与既有测试不受影响）

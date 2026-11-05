@@ -17,20 +17,34 @@ class PgRuns:
     async def create_run(self, run_id: str, task_id: str, *, budget: dict | None = None,
                    tenant_id: str = 'default', status: str = 'queued',
                    owner_user_id: str = 'default', owner_role: str = 'member',
-                   platform_id: str | None = None) -> None:
+                   platform_id: str | None = None,
+                   runtime_kind: str | None = None) -> None:
+        # 引擎归属在**创建时**确定：默认走全局 default_runtime_kind（只影响新建），
+        # 显式传入则用传入值。恢复时不走这里，读库里已存的归属。
+        from webpage_agent.agent import runtime_identity
+        kind = runtime_identity.normalize_kind(
+            runtime_kind or runtime_identity.default_kind())
+        if not kind:
+            raise runtime_identity.UnknownRuntimeKind(
+                run_id, runtime_kind or '')
+        version = runtime_identity.version_for_kind(kind)
+        schema = runtime_identity.schema_for_kind(kind)
         stamp = now()
         async with self._lease() as conn:
             await conn.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', ('retention:'+task_id,))
             await self._run(conn, 'INSERT INTO runs (run_id, task_id, tenant_id, status, '
                 'budget_json, consumed_json, owner_user_id, owner_role, platform_id, platform_subject, '
+                'runtime_kind, runtime_version, runtime_state_schema, '
                 'created_at, updated_at, trace_id) '
                 'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '
                 "COALESCE(%s, (SELECT platform_id FROM runs WHERE task_id=%s ORDER BY created_at LIMIT 1), ''), "
-                "COALESCE((SELECT platform_subject FROM runs WHERE task_id=%s ORDER BY created_at LIMIT 1), ''), %s, %s, %s)",
+                "COALESCE((SELECT platform_subject FROM runs WHERE task_id=%s ORDER BY created_at LIMIT 1), ''), "
+                '%s, %s, %s, %s, %s, %s)',
                 (run_id, task_id, tenant_id, status,
                  json.dumps(budget or {}, ensure_ascii=False), '{}',
                  str(owner_user_id or 'default'), str(owner_role or 'member'),
                  platform_id, task_id, task_id,
+                 kind, int(version), int(schema),
                  stamp, stamp, telemetry.trace_id.get() or uuid.uuid4().hex))
             await self._run(conn, 'UPDATE tasks_meta SET current_run_id=%s WHERE task_id=%s',
                 (run_id, task_id))
@@ -40,6 +54,37 @@ class PgRuns:
         async with self._lease() as conn:
             row = await self._one(conn, 'SELECT * FROM runs WHERE run_id=%s', (run_id,))
         return _decode_run(dict(row)) if row else None
+
+    async def runtime_identity(self, run_id: str) -> dict:
+        """读并校验 run 的引擎归属（恢复/分流入口的唯一权威来源）。
+
+        返回 `{kind, version, state_schema}`；未知引擎抛 `UnknownRuntimeKind`，
+        不兼容版本抛 `IncompatibleRuntimeVersion`。**不回退默认引擎**。
+        """
+        from webpage_agent.agent import runtime_identity
+        row = await self.run(run_id)
+        if row is None:
+            raise runtime_identity.UnknownRuntimeKind(run_id, '<missing>')
+        kind = runtime_identity.normalize_kind(str(row.get('runtime_kind') or ''))
+        if not kind:
+            # 存量 run 没有这列（旧库迁移前）或值未知：按默认回填 LangGraph 属存量，
+            # 但「写了一个不认识的值」必须阻断，不能静默退回。
+            stored = str(row.get('runtime_kind') or '')
+            if stored in ('', None):
+                kind = runtime_identity.KIND_LANGGRAPH
+            else:
+                raise runtime_identity.UnknownRuntimeKind(run_id, stored)
+        version = int(row.get('runtime_version') or 0)
+        schema = int(row.get('runtime_state_schema') or 0)
+        expected_version = runtime_identity.version_for_kind(kind)
+        expected_schema = runtime_identity.schema_for_kind(kind)
+        if version and version != expected_version:
+            raise runtime_identity.IncompatibleRuntimeVersion(
+                run_id, kind, 'runtime_version', version, expected_version)
+        if schema and schema != expected_schema:
+            raise runtime_identity.IncompatibleRuntimeVersion(
+                run_id, kind, 'runtime_state_schema', schema, expected_schema)
+        return {'kind': kind, 'version': version, 'state_schema': schema}
 
     async def update_run(self, run_id: str, **fields) -> None:
         allowed = {'status', 'plan_version', 'intent_version',

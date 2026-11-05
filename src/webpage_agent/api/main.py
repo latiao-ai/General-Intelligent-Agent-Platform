@@ -95,8 +95,16 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         # 运行时边界：宿主负责准备状态与收尾，运行时（经工厂取得，默认
         # LangGraphRuntime）负责驱动图、合并增量、记录耗时并透传节点内部事件。
         # 控制流异常与取消原样穿过，由下面这段宿主收尾统一处理（§4.3、§7.2）。
+        #
+        # 第七阶段：按 run 的引擎归属分流。有账本时从库里读已存归属（在解释旧
+        # 计划之前），Pi 走 PiRuntime；无账本（CLI 直调）走默认 LangGraph。
+        runtime_kind = ''
+        if ledger is not None and getattr(ledger, 'store', None) is not None \
+                and run_id:
+            from webpage_agent.agent import runtime_identity
+            runtime_kind = await runtime_identity.resolve_kind(ledger.store, run_id)
         async with asyncio.timeout(settings.task_timeout):
-            await get_runtime().run(
+            await get_runtime(runtime_kind).run(
                 state, on_event=on_event, progress=progress)
     except (execution_control.LeaseLost, execution_control.ControlStopped):
         # 控制流异常必须**原样穿过**这一层：把它们包成 RuntimeError 会让

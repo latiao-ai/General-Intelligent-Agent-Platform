@@ -78,7 +78,10 @@ CREATE TABLE IF NOT EXISTS runs (
     error               TEXT,
     compensated_at      TEXT,
     created_at          TEXT NOT NULL,
-    updated_at          TEXT NOT NULL
+    updated_at          TEXT NOT NULL,
+    runtime_kind        TEXT NOT NULL DEFAULT 'langgraph',
+    runtime_version     INTEGER NOT NULL DEFAULT 1,
+    runtime_state_schema INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, lease_expires_at);
@@ -622,6 +625,12 @@ ALTER TABLE actions ADD COLUMN IF NOT EXISTS phase TEXT NOT NULL DEFAULT '';
 ALTER TABLE actions ADD COLUMN IF NOT EXISTS external_task_id TEXT NOT NULL DEFAULT '';
 -- 已验证的现场上下文（当前项目 / 选中对象）。浏览器自报的 JSON 不能直接当它用。
 ALTER TABLE tasks_meta ADD COLUMN IF NOT EXISTS scene_context_json TEXT NOT NULL DEFAULT '';
+
+-- run 的引擎归属：由哪个引擎驱动（langgraph | pi）、运行时实现版本、状态格式版本。
+-- 恢复入口据此分流；存量 run 默认回填 langgraph，新 run 创建时确定归属。
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_kind TEXT NOT NULL DEFAULT 'langgraph';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_state_schema INTEGER NOT NULL DEFAULT 1;
 
 -- 费用明细的完整快照。v2 里那张表是给「已经记过基线、还没有这张表」的存量库建的，
 -- 而且建完就不再执行。用途和估算标记必须写在这里，verify_schema 才认得出

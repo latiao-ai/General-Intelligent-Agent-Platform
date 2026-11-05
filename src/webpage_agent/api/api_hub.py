@@ -244,6 +244,11 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
         epoch = int(run.get('lease_epoch') or 0)
         owner = str(run.get('lease_owner') or '')
 
+        # 第七阶段：在读取/解释旧计划之前先确定运行时。未知引擎或版本不兼容
+        # 在这里抛异常（不回退默认引擎），由上层收尾。
+        from webpage_agent.agent import runtime_identity
+        runtime_kind = await runtime_identity.resolve_kind(self.store, run_id)
+
         task = await self.store.task(task_id)
         if task is None:
             # 执行者收尾：带上领取时的 owner + epoch。若此刻已被别人接手，
@@ -279,46 +284,54 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
 
         # 计划：有就恢复，没有才规划。**空计划不等于"没有计划"**——
         # `{'steps': []} or None` 会得到一个非空字典，正是旧代码的坑。
-        plan = await self.store.plan(run_id) or {}
-        steps = plan.get('steps') or []
-        actions = await self.store.actions_of(run_id)
-        snapshot_state = await self._recovery_state(run_id)
-        waiting = {
-            'asked_questions': [str(q) for q in (snapshot_state.get('asked_questions') or [])
-                                if str(q).strip()],
-            'clarification': str(snapshot_state.get('clarification') or ''),
-            'intent_version': int(run.get('intent_version') or 0),
-            'processed_intent_version': int(run.get('processed_intent_version') or 0),
-        }
-        if steps:
-            plan_version = int(plan.get('version') or 1)
-            context = context.with_plan_version(plan_version)
-            resume_plan = {'steps': steps, 'summary': plan.get('goal') or '续跑',
-                           'plan_version': plan_version,
-                           'step_index': _resume_index(steps, actions),
-                           **waiting}
-            if actions:
-                # 落库 + 投递都要 await：这里本来就在协程里，"同步投递"只会
-                # 得到一个没被 await 的协程（事件静默丢失）。
-                await record.publish(action(
-                    '沿用已提交的计划',
-                    f'{len(steps)} 步 · 第 {resume_plan["step_index"] + 1} 步继续',
-                    '↩️'))
-        elif actions:
-            # 有动作却没有计划：这不该发生。**不能拿新规划冒充恢复**——那会绕开
-            # 原有动作身份，可能重复副作用。
-            logger.error('run %s 有 %s 个动作但没有计划，转待核实',
-                         run_id, len(actions))
-            # 执行者收尾：这是我们领到的 run，写结论必须带上自己的租约
-            await self.store.update_run_owned(
-                run_id, lease_owner=owner, lease_epoch=epoch,
-                status='needs_reconcile', error='有动作但缺失计划，需人工核实')
-            record.status = 'needs_reconcile'
-            await record.persist(status='needs_reconcile', state=record.state)
-            return record
+        # 第七阶段：这段「图计划 + 步骤游标」的恢复解释**只属于 LangGraph**。
+        # Pi 有动作却没有「图计划」是**正常状态**——它有自己的版本化快照装配，
+        # 不套用「有动作但没有图计划就异常」这条 LangGraph 规则。
+        if runtime_kind == runtime_identity.KIND_LANGGRAPH:
+            plan = await self.store.plan(run_id) or {}
+            steps = plan.get('steps') or []
+            actions = await self.store.actions_of(run_id)
+            snapshot_state = await self._recovery_state(run_id)
+            waiting = {
+                'asked_questions': [str(q) for q in (snapshot_state.get('asked_questions') or [])
+                                    if str(q).strip()],
+                'clarification': str(snapshot_state.get('clarification') or ''),
+                'intent_version': int(run.get('intent_version') or 0),
+                'processed_intent_version': int(run.get('processed_intent_version') or 0),
+            }
+            if steps:
+                plan_version = int(plan.get('version') or 1)
+                context = context.with_plan_version(plan_version)
+                resume_plan = {'steps': steps, 'summary': plan.get('goal') or '续跑',
+                               'plan_version': plan_version,
+                               'step_index': _resume_index(steps, actions),
+                               **waiting}
+                if actions:
+                    # 落库 + 投递都要 await：这里本来就在协程里，"同步投递"只会
+                    # 得到一个没被 await 的协程（事件静默丢失）。
+                    await record.publish(action(
+                        '沿用已提交的计划',
+                        f'{len(steps)} 步 · 第 {resume_plan["step_index"] + 1} 步继续',
+                        '↩️'))
+            elif actions:
+                # 有动作却没有计划：这不该发生。**不能拿新规划冒充恢复**——那会绕开
+                # 原有动作身份，可能重复副作用。
+                logger.error('run %s 有 %s 个动作但没有计划，转待核实',
+                             run_id, len(actions))
+                # 执行者收尾：这是我们领到的 run，写结论必须带上自己的租约
+                await self.store.update_run_owned(
+                    run_id, lease_owner=owner, lease_epoch=epoch,
+                    status='needs_reconcile', error='有动作但缺失计划，需人工核实')
+                record.status = 'needs_reconcile'
+                await record.persist(status='needs_reconcile', state=record.state)
+                return record
+            else:
+                # 停在追问、计划还没提交：下一轮仍要带着问过的问题和版本，不能从零规划
+                resume_plan = waiting
         else:
-            # 停在追问、计划还没提交：下一轮仍要带着问过的问题和版本，不能从零规划
-            resume_plan = waiting
+            # Pi：用自己的版本化快照装配恢复（第七阶段）。不读 plans/steps，
+            # 不套 LangGraph 的「有动作但没图计划就异常」。
+            resume_plan = await self._pi_resume_plan(run_id, run)
 
         history = await self.history(record.session_id)
         prior = await self.prior_context(record.session_id)
@@ -330,7 +343,11 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
         # 所有步骤都已结算、但 run 没来得及收尾（进程在"最后一次结算"与
         # "写终态"之间消失）：这里只剩收尾，**不能**再跑一遍图——图拿不到
         # 上一次的 step_outputs，只会得出"什么都没有产出"（文档 §5.4）。
-        if resume_plan and resume_plan.get('steps') and resume_plan['step_index'] >= len(resume_plan['steps']) \
+        # 这条「看快照收尾」的捷径也只属于 LangGraph 的步骤游标；Pi 的
+        # 收尾决策走它自己的快照与恢复决策表。
+        if runtime_kind == runtime_identity.KIND_LANGGRAPH \
+                and resume_plan and resume_plan.get('steps') \
+                and resume_plan['step_index'] >= len(resume_plan['steps']) \
                 and not self._needs_observation():
             snapshot = await self._recovery_state(run_id)
             if not snapshot.get('step_outputs'):
