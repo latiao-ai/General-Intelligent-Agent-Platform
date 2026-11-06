@@ -225,7 +225,17 @@ def _verified(output: dict) -> bool:
 
     只有回执里带了状态才可能"未核实"（写请求可能成功了，但回执看不懂）；
     没有状态说明就是"调用成功即视为已核实"。这里不按工具名特判。
+
+    第十阶段第 7/9 点：平台写工具（object_id / new_revision / modified_fields）
+    必须有**独立回读匹配**证据才视为已核实。回读证据在 `readback`（回读结果）
+    与 `readback_match`（是否匹配）；缺回读或回读不匹配时，写效果不得当作
+    「已核实」——否则模型用解释文本宣告完成会误判成功。
     """
+    # 平台写工具：必须有回读证据且匹配
+    if output.get('object_id') or output.get('new_revision') or output.get('write_result'):
+        if output.get('readback_match') is True:
+            return True
+        return False
     deployment = output.get('deployment')
     if isinstance(deployment, dict) and deployment.get('status'):
         return deployment.get('status') == 'success'

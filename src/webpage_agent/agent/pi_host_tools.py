@@ -32,15 +32,18 @@ from webpage_agent.tools import execution_gateway
 
 logger = logging.getLogger(__name__)
 
-# 本阶段 Pi 同步开放的真实工具白名单（稳定键）。**显式声明**，不是「自动开放
-# 所有只读工具」——只有列在这里、且能力包声明 effect=read 的工具才会被执行点
-# 解析放行。默认只开放 web_search，保持既有行为；新增只读工具需显式加入并
-# 确认其 effect=read，再经测试验证结果归一。
+# 本阶段 Pi 同步开放的**只读**工具白名单（稳定键）。显式声明，不是「自动开放
+# 所有只读工具」。默认只开放 web_search，保持既有行为；新增只读工具（如平台
+# 的 get_object / get_operation）需显式加入，确认 effect=read 后再放行。
 SYNC_READ_TOOL_KEYS = ('local:web:search',)
 
-# 异步能力只开放固定合同：协议任务（mcp-task）与显式选中的文件合同。这里不
-# 枚举异步工具——异步受理由 `core.async_contracts` / `integrations.mcp_tasks`
-# 的固定合同机制驱动，Pi 侧不额外放行任何异步写工具。
+# 本阶段 Pi 同步开放的**写**工具白名单（稳定键）。**默认空**——写工具绝不默认
+# 开放。第十阶段仅启用受控平台的 update_object（经显式配置注入，见
+# `pi_tool_catalog()`），生产不开放通用写工具。
+WRITE_TOOL_KEYS: tuple[str, ...] = ()
+
+# 第九阶段保留别名（向后兼容旧测试引用）：只读白名单。
+READ_TOOL_KEYS = SYNC_READ_TOOL_KEYS
 
 # 单条来源给模型的正文摘录上限（字符）。正文太长只摘开头，避免撑爆上下文。
 SNIPPET_MAX_CHARS = 400
@@ -51,7 +54,13 @@ MAX_SOURCES = 8
 # 合并回宿主 state 时允许写入的**认可字段**（白名单）。工具返回的增量里只有这些
 # 键会被合并，其余（status、phase 等内部字段）一律丢弃，避免任意结果覆盖身份、
 # 租约、任务状态等宿主字段。
-_MERGEABLE_KEYS = ('documents', 'usage', 'errors')
+# 第十阶段第 7 点：扩展以保存通用写结果的完整引用（对象 ID / 操作 ID / revision /
+# 修改字段 / mcp_calls 结果引用），供回读核验与恢复使用——但只认这几个字段，
+# 不让工具增量覆盖身份、租约或终态。
+_MERGEABLE_KEYS = ('documents', 'usage', 'errors',
+                   'mcp_calls', 'object_id', 'operation_id', 'revision',
+                   'new_revision', 'modified_fields', 'write_result',
+                   'readback', 'readback_match')
 
 
 @dataclass
@@ -81,15 +90,19 @@ class ToolReceipt:
     contract_version: int = 1
     # 本地登记的 external task 身份（第八阶段收口第 1 点）：本地匹配主键。
     external_task_id: str = ''
+    # 需要批准（第十阶段第 5 点）：保留 approval_id 与原调用关联，供批准后恢复
+    # 原候选。不是失败——动作尚未发出，用户确认后继续。
+    needs_approval: bool = False
+    approval_id: str = ''
 
 
 def _resolve_web_search():
-    """执行点再次解析并检查工具：只认**显式白名单**里的只读工具。
+    """执行点解析只读工具：从**可信目录**按 `SYNC_READ_TOOL_KEYS` 白名单查找。
 
-    第九阶段去硬编码：不再写死 `local:web:search` 这一个键，而是从可信目录
-    （能力包 registry）里按 `SYNC_READ_TOOL_KEYS` 白名单查找，并校验其
-    `effect == 'read'`。白名单里声明了但能力包没注册、或 effect 不是 read
-    的工具，一律不放行。
+    第九阶段去硬编码：不再写死 `local:web:search`，而是从能力包 registry 里按
+    白名单查找并校验 `effect == 'read'`。第十阶段改为按请求工具名唯一匹配
+    （见 `HostToolCaller.resolve_tool`），此函数保留为「默认目录下解析第一个
+    白名单只读工具」的兼容入口（测试引用）。
     """
     allowed = {key for key in SYNC_READ_TOOL_KEYS}
     for tool in registry.load():
@@ -139,6 +152,13 @@ def _receipt_content(updates: dict, tool_name: str) -> dict:
     if errors:
         result['errors'] = [{'stage': e.get('stage'), 'type': e.get('type')}
                             for e in errors if isinstance(e, dict)]
+    # 第十阶段第 7 点：写工具（如 update_object）的回执带对象 ID / 操作 ID /
+    # revision / 修改字段，必须原样保留给模型，供回读核验与恢复（不丢字段）。
+    for key in ('object_id', 'operation_id', 'new_revision', 'revision',
+                'modified_fields', 'write_result', 'readback',
+                'readback_match'):
+        if key in updates:
+            result[key] = updates[key]
     return result
 
 
@@ -290,16 +310,46 @@ class HostToolCaller:
     """
 
     def __init__(self, registry: PiCallRegistry | None = None,
-                 executor=None) -> None:
+                 executor=None, tools_catalog: list | None = None) -> None:
         self._registry = registry or PiCallRegistry()
-        # 可注入的工具执行器（测试用）：覆盖真实 web_search 的 tool.run，但仍走
-        # 完整的受治理结算链路（授权 → 准入 → 撤权复查 → 结算），产生 action/
-        # attempt，用于无网络/无外部依赖下验证恢复不变量。
+        # 可注入的工具执行器（测试用）：覆盖真实 tool.run，但仍走完整的受治理
+        # 结算链路，用于无网络/无外部依赖下验证恢复不变量。
         self._executor = executor
+        # 工具目录（第十阶段）：一组 Tool 对象，供按**请求工具名唯一匹配**。
+        # None 表示回退到「只读白名单里的默认工具」（本地能力包 registry）。
+        self._tools_catalog = tools_catalog
 
     @property
     def registry(self) -> PiCallRegistry:
         return self._registry
+
+    def resolve_tool(self, tool_name: str):
+        """按请求工具名**唯一匹配**一个 Tool（第十阶段）。
+
+        纪律：不能取「白名单首项」。工具目录里按 name 精确匹配，且必须落在
+        读/写白名单内；读工具校验 effect=read，写工具校验 effect != read 且
+        键在 WRITE_TOOL_KEYS 里。匹配不到或不在白名单 → 返回 None（拒绝）。
+
+        无显式目录时回退到本地能力包 registry（只读白名单）。
+        """
+        catalog = self._tools_catalog
+        if catalog is None:
+            from webpage_agent.capabilities import registry as _reg
+            catalog = list(_reg.load())
+        allowed_read = set(SYNC_READ_TOOL_KEYS)
+        allowed_write = set(WRITE_TOOL_KEYS)
+        for tool in catalog:
+            if getattr(tool, 'name', '') != tool_name:
+                continue
+            key = getattr(tool, 'tool_key', '') or tool_name
+            effect = str(getattr(tool, 'effect', '') or 'unknown')
+            if key in allowed_read and effect == 'read':
+                return tool
+            if key in allowed_write:
+                return tool
+            # 名字匹配但不在白名单 → 拒绝（不返回，交给上层报「未开放」）
+            return None
+        return None
 
     async def call(self, *, call_id: str, tool_name: str,
                    args: dict, state: dict, build_snapshot=None) -> ToolReceipt:
@@ -313,15 +363,13 @@ class HostToolCaller:
         调用成功、结算前被调用，把本次动作的恢复事实（含已提交工具结果引用）
         写进快照，与 `settle_action` 同一事务提交（第七阶段）。
         """
-        # 执行点再次解析并检查工具：只开放显式白名单里的只读工具（第九阶段）。
-        tool = _resolve_web_search()
+        # 执行点再次解析并检查工具：按请求工具名唯一匹配，且必须在读/写白名单
+        # 内（第十阶段）。不能取「白名单首项」——不同工具名必须匹配到不同工具。
+        tool = self.resolve_tool(tool_name)
         if tool is None:
             return ToolReceipt(
                 ok=False,
-                error=f'真实工具不可用（白名单未放行任何只读工具）')
-        if tool.name != tool_name:
-            return ToolReceipt(
-                ok=False, error=f'工具未开放：{tool_name}（仅 {tool.name}）')
+                error=f'工具未开放或不在白名单：{tool_name}')
 
         tool_key = tool.tool_key or tool.name
         # 逻辑调用身份：宿主分配并持久化的 run 内序号，与参数哈希解耦。
@@ -332,6 +380,13 @@ class HostToolCaller:
         except RuntimeError as exc:
             return ToolReceipt(ok=False, error=str(exc), step_id='')
 
+        # 第十阶段第 4 点：宿主分配逻辑调用身份后，复用 execution_arguments 生成
+        # **最终发送参数**（含幂等键注入）。授权、审批指纹、账本准入、远端发送
+        # 必须针对同一份最终参数——不能各用各的。
+        from webpage_agent.tools import core as tools_core
+        book = ledger_module.current_ledger()
+        final_args = tools_core.execution_arguments(tool, args, step_id, book)
+
         # 可信主体由 Python 持有（库里的 run 行），不是模型输出
         ctx = await execution_gateway.tool_context(step_id=step_id, action_id='')
 
@@ -339,20 +394,25 @@ class HostToolCaller:
         # 版本化 Pi 快照（第七阶段收口），避免 settle 把 Pi 快照覆盖成普通 state。
         from webpage_agent.agent import runtime_identity
         result = await execution_gateway.governed_call(
-            tool=tool, args=args, step_id=step_id, state=state, ctx=ctx,
+            tool=tool, args=final_args, step_id=step_id, state=state, ctx=ctx,
             build_snapshot=build_snapshot,
             snapshot_schema=runtime_identity.PI_STATE_SCHEMA,
             executor=self._executor)
 
         if result.kind == 'replay':
-            # 此前已成功：复用已有回执（不重新搜索）。重放从 receipt 恢复完整
-            # 结果（含 documents），缺内容时明确报错，不重新搜索冒充重放。
+            # 此前已成功：复用已有回执（不重新执行）。重放从 receipt 恢复完整
+            # 结果。读工具要求有 documents，写工具要求有结果引用（object_id 或
+            # write_result 或 mcp_calls），缺内容时明确报错，不重新执行冒充重放。
             replay = result.replay if isinstance(result.replay, dict) else {}
-            if not isinstance(replay.get('documents'), list):
+            effect = str(getattr(tool, 'effect', '') or 'unknown')
+            has_content = isinstance(replay.get('documents'), list) or \
+                bool(replay.get('object_id') or replay.get('write_result')
+                     or replay.get('mcp_calls') or replay.get('new_revision'))
+            if not has_content:
                 return ToolReceipt(
                     ok=False, action_id=result.action_id,
                     attempt_id=result.attempt_id, step_id=step_id,
-                    error='重放缺少搜索结果内容（documents），不能重新搜索冒充重放')
+                    error='重放缺少结果内容，不能重新执行冒充重放')
             # 复用已有结果：调用身份标记为 delivered，不再作为 pending 导出。
             self._registry.mark(call_id, 'delivered')
             return ToolReceipt(
@@ -396,7 +456,9 @@ class HostToolCaller:
             return ToolReceipt(ok=False, error=result.error or '没有可执行的运行',
                                step_id=step_id)
         if result.kind == 'needs_approval':
-            return ToolReceipt(ok=False, error=result.error or '需要批准',
+            return ToolReceipt(ok=False, needs_approval=True,
+                               approval_id=result.approval_id,
+                               error=result.error or '需要批准',
                                step_id=step_id)
         if result.kind == 'blocked':
             return ToolReceipt(ok=False, error=result.error or '结果未定，需核实',

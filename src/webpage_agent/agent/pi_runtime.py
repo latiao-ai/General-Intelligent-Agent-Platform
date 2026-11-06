@@ -106,6 +106,49 @@ def default_tool_catalog() -> list[dict[str, Any]]:
     return declared
 
 
+async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
+    """第十阶段：Pi 的完整工具目录 = 本地只读白名单 + MCP 平台工具。
+
+    返回 `(decls, tool_objects)`：
+    - `decls`：发给 Node 的 JSON Schema 声明；
+    - `tool_objects`：带执行器的 Tool 对象列表（HostToolCaller 按请求工具名
+      唯一匹配用）。
+
+    读/写白名单分别来自 `pi_host_tools.SYNC_READ_TOOL_KEYS` /
+    `WRITE_TOOL_KEYS`；MCP 工具经 `tools/core.mcp_tools()` 发现（真实 transport）。
+    默认不开放写工具（`WRITE_TOOL_KEYS` 空）；第十阶段测试显式配置写白名单后
+    才启用受控平台的 update_object。
+    """
+    from webpage_agent.agent import pi_host_tools
+    from webpage_agent.tools import core as tools_core
+    from webpage_agent.capabilities import registry as cap_registry
+
+    read_keys = set(pi_host_tools.SYNC_READ_TOOL_KEYS)
+    write_keys = set(pi_host_tools.WRITE_TOOL_KEYS)
+    tool_objects: list = []
+
+    # 本地只读工具
+    for tool in cap_registry.load():
+        if tool.tool_key in read_keys and str(tool.effect or '') == 'read':
+            tool_objects.append(tool)
+
+    # MCP 工具（读/写白名单按 tool_key = mcp:<server>:<name> 匹配）
+    try:
+        mcp = await tools_core.mcp_tools()
+    except Exception:                                # noqa: BLE001
+        mcp = []
+    for tool in mcp:
+        key = getattr(tool, 'tool_key', '') or ''
+        effect = str(getattr(tool, 'effect', '') or 'unknown')
+        if key in read_keys and effect == 'read':
+            tool_objects.append(tool)
+        elif key in write_keys:
+            tool_objects.append(tool)
+
+    decls = [_tool_decl(t) for t in tool_objects]
+    return decls, tool_objects
+
+
 class PiRuntime:
     """通过 Node 桥接驱动 Pi，实现 Runtime 契约。
 
@@ -126,15 +169,19 @@ class PiRuntime:
         model_timeout_ms: int | None = None,
         mock_script: list[dict[str, Any]] | None = None,
         tool_runner: ToolExecutor | None = None,
+        tool_objects: list | None = None,
     ) -> None:
         self._bridge = bridge
         # tool_executor 是测试注入的假工具替身；host_caller 是真实受治理调用对象
-        # （默认 None → 惰性创建 HostToolCaller，只开放 web_search）。
+        # （默认 None → 惰性创建 HostToolCaller）。
         self._tool_executor = tool_executor
         self._host_caller = host_caller
         # tools=None 表示用默认目录（web_search）；tools=[] 表示本轮无工具。
         # 不再回退到 echo/add。
         self._tools = tools if tools is not None else default_tool_catalog()
+        # 第十阶段：Tool 对象目录（含执行器），供 HostToolCaller 按请求工具名
+        # 唯一匹配（读/写白名单）。None 时 HostToolCaller 回退到本地能力 registry。
+        self._tool_objects = tool_objects
         self._model = model or {
             "id": "deepseek-v4-1-flash",
             "base_url": "https://www.hi-x.cn/v1",
@@ -425,7 +472,8 @@ class PiRuntime:
                         raise RuntimeError(str(result))
                     return result if isinstance(result, dict) else {}
             self._host_caller = HostToolCaller(
-                PiCallRegistry(self._snapshot), executor=executor)
+                PiCallRegistry(self._snapshot), executor=executor,
+                tools_catalog=self._tool_objects)
 
         # 第七阶段：把本次动作的恢复事实（已提交工具结果引用）与 settle_action
         # 同一事务写进快照。build_snapshot 在网关结算前被调用，返回序列化的
@@ -484,6 +532,33 @@ class PiRuntime:
         receipt = await self._host_caller.call(
             call_id=call_id, tool_name=tool_name, args=args, state=state,
             build_snapshot=build_snapshot)
+        if receipt.needs_approval:
+            # 第十阶段第 5 点：需要批准。动作尚未发出（授权层 ApprovalRequired），
+            # 不是失败。把等待审批事实（approval_id + 原调用关联）写进快照，
+            # 结束本轮、释放进程；批准后按快照恢复原候选重新检查权限/版本/revision。
+            self._host_caller.registry.mark(call_id, 'accepted')
+            self._snapshot['phase'] = 'awaiting_approval'
+            binding = self._host_caller.registry._bindings.get(call_id) or {}
+            awaiting = list(self._snapshot.get('awaiting_approval') or [])
+            awaiting.append({
+                'call_id': call_id,
+                'logical_call_id': str(binding.get('logical_call_id') or ''),
+                'tool_name': tool_name,
+                'tool_key': str(binding.get('tool_key') or ''),
+                'arguments': dict(args or {}),
+                'approval_id': str(receipt.approval_id or ''),
+                'status': 'awaiting_approval',
+            })
+            self._snapshot['awaiting_approval'] = awaiting
+            # 等待审批事实落库（与 accepted 类似，持久化后才回 Node 结束本轮）。
+            from webpage_agent.agent import pi_snapshot as _snap
+            state['_pi_snapshot'] = _snap.serialize(self._snapshot)
+            reply = proto.make_message(
+                bridge.execution_id, "tool_result", call_id=call_id,
+                ok=False, result=None, error='',
+                needs_approval=True, approval_id=receipt.approval_id)
+            await bridge.send(reply)
+            return
         if receipt.accepted:
             # 第八阶段第 5 点：远端已受理、结果未定。宿主确认等待事实落库后，
             # Node 结束本轮执行、释放进程；等待期间不再请求模型。

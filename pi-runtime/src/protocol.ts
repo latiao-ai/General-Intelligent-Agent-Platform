@@ -206,6 +206,12 @@ export interface ToolResultMessage extends BaseMessage {
   accepted?: boolean;
   /** 远端任务身份（accepted 时随回执带回，供恢复关联）。 */
   remote_task_id?: string;
+  /** 需要批准（第十阶段）：动作尚未发出，宿主已持久化等待审批事实。Node 应
+   *  结束本轮、释放进程等待唤醒（同 accepted），不得把「需要批准」当错误让
+   *  模型继续尝试。 */
+  needs_approval?: boolean;
+  /** 批准 ID（needs_approval 时随回执带回，供批准后恢复原候选）。 */
+  approval_id?: string;
 }
 
 /** 停止执行 / 关闭进程 */

@@ -197,6 +197,14 @@ class HubRecoveryMixin:
 
         decision = pi_recovery.decide(
             snapshot, actions, str(run.get('status') or ''))
+        # 第十阶段第 5 点：等待审批的恢复。快照有 awaiting_approval 事实时，查
+        # 审批表决定：已批准 → 恢复原候选（RESUME_ADMIT，重新检查权限/版本/revision/
+        # 审批有效性）；仍 pending/已拒绝/过期 → 继续等待或待核实，不盲目重发。
+        if snapshot and snapshot.get('awaiting_approval') \
+                and decision.kind == pi_recovery.RESUME_WAIT:
+            awaiting = list(snapshot.get('awaiting_approval') or [])
+            decision = await self._decide_approval_recovery(
+                run_id, awaiting, snapshot)
         # 第八阶段第 5 点：恢复时**先判断外部任务**。快照有 awaiting_calls（已受理
         # 的外部调用）时，按外部任务状态决定等待/交付/待核实，**不套用**普通
         # pending 重派发规则——否则会把已受理的提交重新执行（重复副作用）。
@@ -244,10 +252,74 @@ class HubRecoveryMixin:
                 'recovery': decision.to_dict(),
             },
         }
-        # 保留用户原始输入：恢复后**不重复追加**原始输入，只把快照里未完成
-        # 的处理位置交回。原始输入从快照取（首次执行则交给 run_task 的 user_input）。
-        resume['user_input'] = str((snapshot or {}).get('user_input') or '')
+        # 第十阶段第 6 点：恢复时把**新增要求内容真正注入 Pi**，不只是更新版本号。
+        # 快照里的原始输入 + 尚未纳入计划提交的补充输入，合并成一句完整要求交给
+        # Pi 决策；否则「版本号升了但模型没看到新要求」，旧候选仍会按旧要求继续。
+        from webpage_agent.agent import run_inputs as run_inputs_module
+        base_input = str((snapshot or {}).get('user_input') or '')
+        pending_inputs = []
+        try:
+            if hasattr(self.store, 'pending_run_inputs'):
+                pending_inputs = await self.store.pending_run_inputs(run_id)
+        except Exception:                          # noqa: BLE001
+            logger.warning('读待处理补充失败 run=%s', run_id, exc_info=True)
+        resume['user_input'] = run_inputs_module.merged_requirement(
+            base_input, pending_inputs)
         return resume
+
+    async def _decide_approval_recovery(self, run_id: str, awaiting: list,
+                                        snapshot: dict) -> 'RecoveryDecision':
+        """等待审批的恢复决策（第十阶段第 5 点）。
+
+        查每个待审批调用的 approval 状态：
+        - 已批准（approved）→ 恢复原候选（RESUME_ADMIT，原 call_id/参数），
+          由执行点重新检查权限、要求版本、对象 revision 与审批有效性；
+        - 仍 pending → 继续等待（RESUME_WAIT），不重新推理；
+        - 已拒绝/撤销/过期 → 转待核实（RESUME_RECONCILE），不盲目重发。
+        """
+        from webpage_agent.agent import pi_recovery
+        approved_calls: list[dict] = []
+        any_pending = False
+        any_bad = False
+        for item in awaiting:
+            if not isinstance(item, dict):
+                continue
+            approval_id = str(item.get('approval_id') or '')
+            if not approval_id:
+                any_bad = True
+                continue
+            try:
+                row = await self.store.approval(approval_id)
+            except Exception:                      # noqa: BLE001
+                row = None
+            status = str((row or {}).get('status') or '')
+            if status == 'approved':
+                approved_calls.append({
+                    'call_id': str(item.get('call_id') or ''),
+                    'tool_name': str(item.get('tool_name') or ''),
+                    'arguments': dict(item.get('arguments') or {}),
+                })
+            elif status == 'pending':
+                any_pending = True
+            else:
+                # rejected / revoked / expired / 未知
+                any_bad = True
+        if approved_calls:
+            # 已批准：恢复原候选（原 call_id/参数），执行点重新检查授权有效性。
+            return pi_recovery.RecoveryDecision(
+                kind=pi_recovery.RESUME_ADMIT, pending_calls=approved_calls,
+                reason='审批已批准，恢复原候选重新检查权限与版本')
+        if any_bad:
+            return pi_recovery.RecoveryDecision(
+                kind=pi_recovery.RESUME_RECONCILE,
+                reason='审批被拒绝/撤销/过期，需核实')
+        if any_pending:
+            return pi_recovery.RecoveryDecision(
+                kind=pi_recovery.RESUME_WAIT, pending_calls=[],
+                reason='审批仍待处理，继续等待')
+        return pi_recovery.RecoveryDecision(
+            kind=pi_recovery.RESUME_RECONCILE,
+            reason='等待审批事实缺失有效关联，需核实')
 
     async def _assemble_deliver_results(self, refs: list[dict]) -> list[dict] | None:
         """把外部任务的完成结果读回，装配成可注入 Node 的 deliver_results。

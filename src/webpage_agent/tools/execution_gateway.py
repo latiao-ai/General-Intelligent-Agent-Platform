@@ -96,9 +96,17 @@ async def tool_context(step_id: str = '', action_id: str = ''):
 
 
 def plan_intent(state: dict) -> int | None:
-    """这份计划的依据版本。**只取已提交计划里的值**，不取模型自报的版本。"""
+    """这份计划的依据版本。**只取已提交计划里的值**，不取模型自报的版本。
+
+    第十阶段：Pi 运行时没有「图计划」，决策消费的版本经 `state['intent_version']`
+    展平传入（见 run_task）。这里在无 `plan` 时回退到顶层 `intent_version`，
+    让 Pi 的每个工具调用同样携带决策版本、由准入事务比较——否则 Pi 的工具
+    调用会绕过「新要求到达后旧候选不得继续」的门禁。
+    """
     value = (state.get('plan') or {}).get('intent_version')
-    return int(value) if value else None
+    if value is None:
+        value = state.get('intent_version')
+    return int(value) if value is not None else None
 
 
 async def check_boundary(state: dict) -> str:
@@ -649,6 +657,10 @@ async def governed_call(
     receipt = {k: v for k, v in updates.items()
                if isinstance(v, (str, int, float, bool, dict, list))}
     receipt['tool_result'] = tool_result
+    # 第十阶段第 4 点：持久化**最终参数**（含幂等键注入后的完整参数），让恢复能
+    # 读回「同一次调用」的真实参数，而不是用模型重发的参数冒充原调用。授权、
+    # 审批指纹、账本准入、远端发送针对的正是这份最终参数。
+    receipt['final_args'] = dict(args or {})
     # 第八阶段收口第 2 点：accepted 时**先**装配 external（含 external_task_id），
     # 再把 external 交给 build_snapshot，让 awaiting_calls 在结算的同一事务里
     # 随快照写入。不能依赖结算返回后的第二次快照写补齐关键关联——否则崩溃在

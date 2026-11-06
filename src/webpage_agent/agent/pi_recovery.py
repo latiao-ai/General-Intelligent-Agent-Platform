@@ -123,6 +123,15 @@ def decide(snapshot: dict | None, actions: list[dict], run_status: str) -> Recov
             return RecoveryDecision(kind=RESUME_DELIVER, tool_results=to_deliver,
                                     reason='工具结果已提交但 Node 未吸收，补 toolResult 再继续')
 
+    # 3.5 等待审批（第十阶段第 5 点）：快照记录了 awaiting_approval 事实。审批
+    # 是否已批准需要查 approvals 表（宿主 `_pi_resume_plan` 负责），这里保守
+    # 返回 RESUME_WAIT，把「是否已批准」留给宿主按审批状态决定转 RESUME_ADMIT。
+    awaiting_approval = list(snapshot.get('awaiting_approval') or [])
+    if awaiting_approval:
+        return RecoveryDecision(
+            kind=RESUME_WAIT, pending_calls=[],
+            reason='有待审批的调用，等待审批结论')
+
     # 4. 调用候选已存、尚未准入 → 沿用原身份继续准入
     pending = list(snapshot.get('pending_calls') or [])
     if pending:

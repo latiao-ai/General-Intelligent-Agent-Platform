@@ -64,6 +64,8 @@ interface PendingTool {
     error?: string;
     accepted?: boolean;
     remote_task_id?: string;
+    needs_approval?: boolean;
+    approval_id?: string;
   }) => void;
   timer: NodeJS.Timeout;
 }
@@ -311,6 +313,8 @@ function handleToolResult(msg: Extract<InboundMessage, { type: 'tool_result' }>)
     error: msg.error,
     accepted: !!msg.accepted,
     remote_task_id: msg.remote_task_id,
+    needs_approval: !!msg.needs_approval,
+    approval_id: msg.approval_id,
   });
 }
 
@@ -335,7 +339,7 @@ function handleShutdown(): void {
 }
 
 /** 发送一次工具调用请求，等待 Python 回执（call_id → Promise）。 */
-function dispatchToolCall(call: ToolCall): Promise<{ ok: boolean; result?: unknown; error?: string; accepted?: boolean; remote_task_id?: string }> {
+function dispatchToolCall(call: ToolCall): Promise<{ ok: boolean; result?: unknown; error?: string; accepted?: boolean; remote_task_id?: string; needs_approval?: boolean; approval_id?: string }> {
   // 执行内重复 call_id 检查：同一个 call_id 已在等待回执，说明 Pi 重复派发，
   // 明确报错而不是覆盖旧 Promise（否则旧的会永久挂起、新的丢失回执）。
   if (pendingTools.has(call.id)) {
@@ -344,7 +348,7 @@ function dispatchToolCall(call: ToolCall): Promise<{ ok: boolean; result?: unkno
   }
   const msg: ToolCallMessage = toToolCallMessage(executionId, call);
   send(msg);
-  return new Promise<{ ok: boolean; result?: unknown; error?: string; accepted?: boolean; remote_task_id?: string }>((resolve) => {
+  return new Promise<{ ok: boolean; result?: unknown; error?: string; accepted?: boolean; remote_task_id?: string; needs_approval?: boolean; approval_id?: string }>((resolve) => {
     const timer = setTimeout(() => {
       const pending = pendingTools.get(call.id);
       if (pending) {
@@ -509,6 +513,12 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
       // 第八阶段：远端已受理、结果未定 → 结束本轮、释放进程等待唤醒。
       // 不注入 toolResult、不继续请求模型。
       if (reply.accepted) {
+        sendFinished('waiting');
+        return;
+      }
+      // 第十阶段：需要批准 → 同 accepted，结束本轮等待唤醒。不把「需要批准」
+      // 当错误让模型继续尝试。
+      if (reply.needs_approval) {
         sendFinished('waiting');
         return;
       }
