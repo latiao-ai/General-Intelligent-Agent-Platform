@@ -32,6 +32,7 @@ RESUME_RECONCILE = 'resume_reconcile'  # 动作在途/未知：转待核实
 RESUME_DELIVER = 'resume_deliver'      # 结果已提交、Node 未吸收：补 toolResult 再继续
 RESUME_FINISH = 'resume_finish'        # 最终答复已提交、run 未收尾：只补收尾
 RESUME_BLOCK = 'resume_block'          # 结果未知的只读调用：保守阻断
+RESUME_WAIT = 'resume_wait'            # 已受理的外部任务未完成：继续等待，不重新推理
 
 
 @dataclass
@@ -165,3 +166,60 @@ def conservative_block(action: dict) -> bool:
     effect = str(action.get('effect') or '')
     status = _action_status(action)
     return effect == 'read' and status == 'unknown'
+
+
+# 外部任务开放状态（仍在等远端结果）。
+_OPEN_EXTERNAL = ('accepted', 'running', 'materializing')
+
+
+def decide_external(snapshot: dict | None, external_tasks: list[dict]) -> RecoveryDecision:
+    """按「已受理外部任务」的状态产出恢复决策（第八阶段第 5 点）。
+
+    恢复时**先判断外部任务**，不能把普通 pending 重派发规则套到已受理任务上：
+
+    - 还有开放（accepted/running/materializing）的外部任务 → `RESUME_WAIT`：
+      继续等待，不重新推理、不重派发，不重复提交；
+    - 已受理但外部任务已 `completed` → 由宿主按原 toolCall ID 注入一次
+      toolResult 再继续（见宿主吸收路径，这里返回 `RESUME_DELIVER` 的补交事实
+      由宿主另行装配）；
+    - 外部任务 `failed` / `cancelled` / `unknown` / 缺失 → `RESUME_RECONCILE`：
+      转待核实，不盲目重提。
+
+    无 `awaiting_calls`（快照没有受理事实）时返回 None（交给常规 decide）。
+    """
+    awaiting = list((snapshot or {}).get('awaiting_calls') or [])
+    if not awaiting:
+        return None
+    # 按 remote_task_id 关联（awaiting 事实与 external task 都带这个），
+    # 退回 action_id / logical_call_id / step_id。
+    by_remote = {str(t.get('remote_task_id') or ''): str(t.get('state') or '')
+                 for t in (external_tasks or []) if isinstance(t, dict)}
+    by_action = {str(t.get('action_id') or ''): str(t.get('state') or '')
+                 for t in (external_tasks or []) if isinstance(t, dict)}
+    any_open = False
+    any_completed = False
+    for item in awaiting:
+        if not isinstance(item, dict):
+            continue
+        remote = str(item.get('remote_task_id') or '')
+        state = ''
+        if remote and remote in by_remote:
+            state = by_remote[remote]
+        if not state:
+            for key in (item.get('action_id'), item.get('logical_call_id'),
+                        item.get('call_id'), item.get('step_id')):
+                if key and str(key) in by_action:
+                    state = by_action[str(key)]
+                    break
+        if state in _OPEN_EXTERNAL or state == '':
+            any_open = True
+        elif state == 'completed':
+            any_completed = True
+    if any_open:
+        return RecoveryDecision(kind=RESUME_WAIT, pending_calls=[],
+                                reason='已受理的外部任务尚未完成，继续等待')
+    if any_completed:
+        return RecoveryDecision(kind=RESUME_DELIVER, tool_results=[],
+                                reason='外部任务已完成，待宿主按原 toolCall ID 注入结果')
+    return RecoveryDecision(kind=RESUME_RECONCILE,
+                            reason='外部任务结束但结果未定，需核实')

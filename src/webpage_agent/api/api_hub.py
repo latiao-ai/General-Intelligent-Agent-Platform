@@ -757,12 +757,27 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
             # 有执行权就走带门禁的收尾：版本 + 待处理补充一起校验，一次事务。
             # 第七阶段收口：Pi run 的终态快照必须标注版本化 Pi 快照 schema，
             # 否则 finish_run_owned 会把 Pi 快照覆盖成普通 state（schema=1）。
+            # 第八阶段第 1 点：Pi 收尾提交**真正的版本化 Pi 快照**（来自
+            # runtime 序列化到 state['_pi_snapshot'] 的结构），而不是给普通宿主
+            # state 打 Pi schema 标签——普通 state 没有 messages/pending_calls/
+            # checkpoint_seq 等恢复事实，恢复会拿它当 Pi 快照解析失败或错乱。
             from webpage_agent.agent import runtime_identity
-            is_pi = bool(state.get('pi_outcome')) or bool(state.get('pi_resume'))
+            from webpage_agent.agent import pi_snapshot
+            is_pi = bool(state.get('_pi_snapshot')) or bool(state.get('pi_resume'))
+            snapshot_state = state
+            if is_pi:
+                raw_snapshot = state.get('_pi_snapshot')
+                if isinstance(raw_snapshot, dict):
+                    # 真正的版本化 Pi 快照：再规整一次（剥离任何混入的宿主字段），
+                    # 保证落库的是最小完整的 Pi 快照，而不是普通 state。
+                    try:
+                        snapshot_state = pi_snapshot.serialize(raw_snapshot)
+                    except Exception:      # noqa: BLE001
+                        snapshot_state = raw_snapshot
             try:
                 committed = await self.store.finish_run_owned(
                     context, run_id=record.run_id, status=run_status,
-                    error=fields.get('error'), state=state,
+                    error=fields.get('error'), state=snapshot_state,
                     observation_seq=int(state.get('observation_seq') or 0),
                     next_route=str(state.get('next_route') or ''),
                     expected_intent_version=expected_intent_version,

@@ -197,6 +197,18 @@ class HubRecoveryMixin:
 
         decision = pi_recovery.decide(
             snapshot, actions, str(run.get('status') or ''))
+        # 第八阶段第 5 点：恢复时**先判断外部任务**。快照有 awaiting_calls（已受理
+        # 的外部调用）时，按外部任务状态决定等待/交付/待核实，**不套用**普通
+        # pending 重派发规则——否则会把已受理的提交重新执行（重复副作用）。
+        external_tasks = []
+        if snapshot and snapshot.get('awaiting_calls'):
+            try:
+                external_tasks = await self.store.external_tasks_of_run(run_id)
+            except Exception:                      # noqa: BLE001
+                logger.warning('读外部任务失败 run=%s', run_id, exc_info=True)
+            ext_decision = pi_recovery.decide_external(snapshot, external_tasks)
+            if ext_decision is not None:
+                decision = ext_decision
         # 第七阶段收口：恢复输入用**单一字段** `pi_resume` 承载（快照 + 恢复决策），
         # 不在顶层与 resume_plan 里同时维护两份。run_task 把它原样放进
         # state['pi_resume']，PiRuntime.run() 只从这里读。

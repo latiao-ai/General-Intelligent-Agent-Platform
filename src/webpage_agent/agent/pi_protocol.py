@@ -149,12 +149,12 @@ def validate_checkpoint_ack(msg: dict[str, Any], execution_id: str) -> None:
 
 
 def validate_finished(msg: dict[str, Any], execution_id: str) -> None:
-    """校验入站 finished：outcome 必须是 answered/cancelled/failed。"""
+    """校验入站 finished：outcome 必须是 answered/cancelled/failed/waiting。"""
     validate_envelope(msg, execution_id)
     if msg["type"] != "finished":
         raise ProtocolError(f"期望 finished，收到 {msg['type']!r}")
     outcome = msg.get("outcome")
-    if outcome not in ("answered", "cancelled", "failed"):
+    if outcome not in ("answered", "cancelled", "failed", "waiting"):
         raise ProtocolError(f"非法 finished outcome：{outcome!r}")
 
 

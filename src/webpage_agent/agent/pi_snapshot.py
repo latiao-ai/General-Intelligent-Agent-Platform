@@ -38,6 +38,7 @@ _SNAPSHOT_KEYS = (
     'messages',
     'logical_call_seq',
     'pending_calls',
+    'awaiting_calls',
     'committed_tool_results',
     'final_answer_candidate',
     'user_input',
@@ -176,6 +177,7 @@ def new_snapshot(*, phase: str = 'started', checkpoint_seq: int = 0,
         'messages': [],
         'logical_call_seq': 0,
         'pending_calls': [],
+        'awaiting_calls': [],
         'committed_tool_results': [],
         'final_answer_candidate': None,
         'user_input': str(user_input or ''),
@@ -195,6 +197,7 @@ def _clean_state(state: dict) -> dict:
         'messages': list(state.get('messages') or []),
         'logical_call_seq': int(state.get('logical_call_seq') or 0),
         'pending_calls': list(state.get('pending_calls') or []),
+        'awaiting_calls': list(state.get('awaiting_calls') or []),
         'committed_tool_results': list(state.get('committed_tool_results') or []),
         'final_answer_candidate': state.get('final_answer_candidate'),
         'user_input': str(state.get('user_input') or ''),
@@ -205,6 +208,23 @@ def _clean_state(state: dict) -> dict:
 def serialize(state: dict) -> dict:
     """把快照 state 规整成可落库的 dict（剥离权限/租约等非快照字段）。"""
     return _clean_state(state)
+
+
+def _is_blank_state(raw: dict) -> bool:
+    """判断一份快照内容是否**空白**（不能作为可恢复事实，也不能被清洗成默认值）。
+
+    第八阶段第 1 点：空快照（`{}`）**不得**被 `_clean_state` 清洗成一份可继续
+    执行的默认快照——那会让恢复误判为「首次执行、无事实」而从头重新推理，
+    重复副作用。真正的 Pi 快照一定由 `serialize` 写过、带 `state_schema` 与
+    至少一个核心字段（phase / messages / checkpoint_seq）。这里判断是否空白。
+    """
+    if not raw:
+        return True
+    # 只有 state_schema 而没有其它任何核心字段，也视为空白（等于没写内容）。
+    core = ('phase', 'messages', 'checkpoint_seq', 'pending_calls',
+            'committed_tool_results', 'final_answer_candidate', 'user_input',
+            'logical_call_seq')
+    return not any(raw.get(key) is not None for key in core)
 
 
 def parse(raw: dict | None) -> dict:
@@ -218,6 +238,8 @@ def parse(raw: dict | None) -> dict:
         raise SnapshotError('Pi 快照缺失')
     if not isinstance(raw, dict):
         raise SnapshotError('Pi 快照损坏：不是对象')
+    if _is_blank_state(raw):
+        raise SnapshotError('Pi 快照损坏：内容为空，不能清洗成可执行的默认值')
     schema = int((raw.get('state_schema') or raw.get('schema') or 0))
     validate_schema(schema)
     return _clean_state(raw)
@@ -245,6 +267,8 @@ def parse_row(row: dict | None) -> dict:
     if not isinstance(state, dict):
         raise SnapshotError('Pi 快照损坏：state 不是对象')
     inner = dict(state)
+    if _is_blank_state(inner):
+        raise SnapshotError('Pi 快照损坏：内容为空，不能清洗成可执行的默认值')
     # 版本号：优先快照内 state_schema（serialize 烙上的），退回 DB 列。
     schema = int(inner.get('state_schema') or row.get('schema') or 0)
     validate_schema(schema)

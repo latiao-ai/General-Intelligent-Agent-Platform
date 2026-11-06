@@ -126,6 +126,18 @@ class ActionLedger:
             step_status=step_status, state=state, next_step_id=next_step_id,
             snapshot_schema=snapshot_schema)
 
+    async def settle_accepted(self, *, step_id: str, action_id: str,
+                              attempt_id: str | None, receipt: dict,
+                              external: dict, state: dict | None = None,
+                              next_step_id: str = '',
+                              snapshot_schema: int | None = None) -> dict:
+        """结算「已受理」：动作回执 + external task 同事务提交（第八阶段第 4 点）。"""
+        return await self.store.settle_action_accepted(
+            self.context, run_id=self.run_id, plan_version=self.plan_version,
+            step_id=step_id, action_id=action_id, attempt_id=attempt_id,
+            receipt=receipt, external=external, state=state,
+            next_step_id=next_step_id, snapshot_schema=snapshot_schema)
+
     async def fail_from_exception(self, *, step_id: str, action_id: str,
                                   attempt_id: str | None, exc: BaseException,
                                   effect: str | None = None,

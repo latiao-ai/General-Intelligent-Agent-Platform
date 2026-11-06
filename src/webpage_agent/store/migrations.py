@@ -31,7 +31,10 @@ USAGE_DETAIL = 'v4_provider_usage_detail'
 RUNTIME_OWNERSHIP = 'v5_runtime_ownership'
 # 最终答复去重：messages 增 dedupe_key（部分唯一索引），恢复补收尾幂等。
 FINAL_ANSWER_DEDUPE = 'v6_final_answer_dedupe'
-LATEST = FINAL_ANSWER_DEDUPE
+# 外部任务取消意图：external_tasks 增 cancel_requested（区分本地停止/远端取消请求/
+# 远端已确认取消）。第八阶段第 9 点。
+EXTERNAL_CANCEL_INTENT = 'v7_external_cancel_intent'
+LATEST = EXTERNAL_CANCEL_INTENT
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -69,6 +72,8 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_state_schema INTEGER NOT NULL 
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS dedupe_key TEXT NOT NULL DEFAULT '';
 CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_dedupe
     ON messages(session_id, dedupe_key) WHERE dedupe_key <> '';
+'''), (EXTERNAL_CANCEL_INTENT, '''
+ALTER TABLE external_tasks ADD COLUMN IF NOT EXISTS cancel_requested INTEGER NOT NULL DEFAULT 0;
 '''))
 
 

@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -201,6 +202,9 @@ class GovernedResult:
     settled: bool = False
     # 原始异常（failed 时保留，供调用方做 read 工具可恢复失败的精确区分）
     exc: Any = None
+    # 已受理（accepted）时的远端任务身份与合同（第八阶段第 3 点）
+    remote_task_id: str = ''
+    contract_id: str = ''
 
 
 def _result_payload(updates: dict):
@@ -210,6 +214,62 @@ def _result_payload(updates: dict):
             return updates[key]
     return {key: value for key, value in updates.items()
             if isinstance(value, (str, int, float, bool, dict, list))}
+
+
+async def _external_registration(book, ctx, *, tool_key: str,
+                                 remote_task_id: str, idempotency_key: str,
+                                 contract_id: str, contract_version: int,
+                                 step_id: str) -> dict:
+    """装配一次「已受理」外部任务的登记字段（第八阶段第 4 点）。
+
+    从账本 run 行取 tenant / owner / credential 归属；从合同取轮询间隔与截止
+    时间。`submission_key` 用 remote id（无 remote id 时用幂等键），`item_key`
+    用逻辑调用身份（step_id），保证 `(run_id, action_id, item_key)` 唯一。
+    """
+    import time as _time
+    from webpage_agent.core import async_contracts
+    now = _time.time()
+    contract = async_contracts.match_id(
+        contract_id, int(contract_version) if contract_version else None)
+    poll_interval = float(getattr(contract, 'poll_interval_seconds', 5) or 5)
+    deadline = float(getattr(contract, 'deadline_seconds', 1800) or 1800)
+    tenant_id = 'default'
+    owner_user_id = 'default'
+    credential_subject = ''
+    platform_id = ''
+    if ctx is not None:
+        tenant_id = str(getattr(ctx, 'tenant_id', None) or 'default')
+        owner_user_id = str(getattr(ctx, 'user_id', None) or 'default')
+    store = getattr(book, 'store', None)
+    run_id = getattr(book, 'run_id', '')
+    if store is not None and run_id:
+        try:
+            run = await store.run(run_id)
+            if run:
+                tenant_id = str(run.get('tenant_id') or tenant_id)
+                owner_user_id = str(run.get('owner_user_id') or owner_user_id)
+                credential_subject = str(run.get('platform_subject') or '')
+                platform_id = str(run.get('platform_id') or '')
+        except Exception:                                # noqa: BLE001
+            logger.warning('读取 run 归属失败 run=%s', run_id, exc_info=True)
+    submission_key = remote_task_id or idempotency_key or step_id
+    return {
+        'external_task_id': 'et_' + uuid.uuid4().hex[:16],
+        'remote_task_id': remote_task_id,
+        'tenant_id': tenant_id,
+        'owner_user_id': owner_user_id,
+        'server_binding_id': '',
+        'credential_binding': '',
+        'credential_subject': credential_subject,
+        'tool_key': tool_key,
+        'contract_id': contract_id,
+        'contract_version': int(contract_version or 1),
+        'accepted_result_id': '',
+        'submission_key': submission_key,
+        'item_key': step_id,
+        'deadline_at': now + deadline,
+        'next_poll_at': now + poll_interval,
+    }
 
 
 def build_tool_result(state: dict, *, step_id: str, tool_key: str,
@@ -530,10 +590,39 @@ async def governed_call(
     marker = str(updates.pop('status', '') or '')
     async_accepted = bool(updates.pop('async_accepted', False))
     remote_task_id = str(updates.pop('remote_task_id', '') or '')
+    idempotency_key = str(updates.pop('idempotency_key', '') or '')
     contract_id = str(updates.pop('contract_id', '') or '')
     contract_version = updates.pop('contract_version', 1)
-    updates.pop('execution_status', None)
+    execution_status = str(updates.pop('execution_status', '') or '')
     updates.pop('phase', None)
+
+    # 第八阶段第 3 点：accepted 回执不能当成最终成功，也不能让 Pi 误以为拿到
+    # 生成结果。区分三种结局：
+    #   - async_accepted（有 remote id 或幂等键）→ 结算为 accepted，登记外部任务；
+    #   - execution_status == 'unknown'（提交结果未知）→ 转待核实，不盲目重提；
+    #   - 其余 → 同步完成，走 succeeded 结算。
+    reconcile_unknown = bool(
+        not async_accepted and execution_status in ('unknown', 'needs_reconcile'))
+
+    if reconcile_unknown:
+        # 提交结果未知：动作未确认落地，也不能盲目重提（重提 = 再产生副作用）。
+        # 结算为 unknown + needs_reconcile，交由人工/恢复核实。不消费批准预留
+        # （可能已花掉额度）。
+        if book is not None and action_id:
+            await book.settle(
+                step_id=step_id, action_id=action_id, attempt_id=attempt_id,
+                status='unknown',
+                receipt={'error_code': 'E_ASYNC_SUBMIT_UNKNOWN',
+                         'phase': 'needs_reconcile',
+                         'certainty': 'unknown', 'effect': effect},
+                error_type='E_ASYNC_SUBMIT_UNKNOWN',
+                step_status='unknown', state=snapshot_state,
+                next_step_id=next_step_id, snapshot_schema=snapshot_schema)
+        return GovernedResult(
+            kind='blocked', action_id=action_id, attempt_id=attempt_id,
+            error='提交结果未知（无 remote id 且无幂等键），需核实后再继续',
+            error_code='E_ASYNC_SUBMIT_UNKNOWN', certainty='unknown',
+            effect=effect, settled=bool(book is not None and action_id))
 
     tool_result, data_ref = build_tool_result(
         state, step_id=step_id, tool_key=tool_key, tool_name=name,
@@ -545,25 +634,43 @@ async def governed_call(
         tool_result['remote_task_id'] = remote_task_id
         tool_result['contract_id'] = contract_id
         tool_result['contract_version'] = contract_version
+        if idempotency_key:
+            tool_result['idempotency_key'] = idempotency_key
     if marker:
         updates['status'] = marker
 
-    # 结算（成功）：动作 + attempt + 步骤 + 快照一次提交。receipt 保留完整内容
-    # （含 list/dict），不丢掉来源清单等可恢复数据。结算失败向上抛，不推进游标。
+    # 结算：receipt 保留完整内容（含 list/dict）。构造待提交快照：build_snapshot
+    # 回调优先（可包含工具增量 + 游标推进 + 本步结果记录），否则用静态
+    # snapshot_state。在真实调用后、结算前构造，避免「先宣布成功、再补写关键
+    # 恢复状态」。
     receipt = {k: v for k, v in updates.items()
                if isinstance(v, (str, int, float, bool, dict, list))}
     receipt['tool_result'] = tool_result
-    # 构造待提交快照：build_snapshot 回调优先（可包含工具增量 + 游标推进 + 本步
-    # 结果记录），否则用静态 snapshot_state。在真实调用后、结算前构造，避免
-    # 「先宣布成功、再补写关键恢复状态」。回调收到 (tool_updates, tool_result)，
-    # 使调用方能把本步的归一结果一并写进快照（第七阶段：快照在本步输出与结果
-    # 日志**补齐后**构造，而不是在它们补齐前）。
     snapshot = None
     if build_snapshot is not None:
         snapshot = build_snapshot(updates, tool_result=tool_result)
     elif snapshot_state is not None:
         snapshot = snapshot_state
     if book is not None and action_id:
+        if async_accepted:
+            # 第八阶段第 4 点：accepted 结算 + external task 登记同一事务原子提交。
+            # 动作写 accepted（非 succeeded），远端业务尚未完成。
+            external = await _external_registration(
+                book, ctx, tool_key=tool_key, remote_task_id=remote_task_id,
+                idempotency_key=idempotency_key, contract_id=contract_id,
+                contract_version=contract_version, step_id=step_id)
+            settled = await book.settle_accepted(
+                step_id=step_id, action_id=action_id, attempt_id=attempt_id,
+                receipt=receipt, external=external, state=snapshot,
+                next_step_id=next_step_id, snapshot_schema=snapshot_schema)
+            receipt['observation_seq'] = int(
+                (settled or {}).get('observation_seq') or 0)
+            # accepted 不消费批准预留（动作尚未真正完成，预留保留到结果交付）。
+            return GovernedResult(
+                kind='accepted', action_id=action_id, attempt_id=attempt_id,
+                updates=updates, receipt=receipt, effect=effect, settled=True,
+                tool_result=tool_result, data_ref=data_ref,
+                remote_task_id=remote_task_id, contract_id=contract_id)
         settled = await book.settle(
             step_id=step_id, action_id=action_id, attempt_id=attempt_id,
             status='succeeded', receipt=receipt,

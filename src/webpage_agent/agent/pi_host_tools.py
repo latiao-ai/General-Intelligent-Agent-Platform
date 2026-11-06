@@ -54,6 +54,9 @@ class ToolReceipt:
     `ok` 为 True 时 `content` 是结构化结果（来源列表）；为 False 时 `error`
     是原始错误正文（保留，不吞）。`updates` 是**已结算、可合并回宿主 state**
     的认可增量（成功时非空）。
+
+    第八阶段第 3 点：`accepted` 为 True 表示「远端已受理、结果未定」——这不是
+    成功，也不是失败，Pi 不得把它当最终结果继续推理，而应结束本轮等待唤醒。
     """
     ok: bool
     content: Any = None
@@ -64,6 +67,11 @@ class ToolReceipt:
     step_id: str = ''
     # 已结算的认可增量（合并回 state 用）
     updates: dict | None = None
+    # 已受理（accepted）标记与远端任务身份
+    accepted: bool = False
+    remote_task_id: str = ''
+    contract_id: str = ''
+    contract_version: int = 1
 
 
 def _resolve_web_search():
@@ -148,14 +156,19 @@ class PiCallRegistry:
     """
 
     def __init__(self, snapshot: dict | None = None) -> None:
-        # call_id -> {'logical_call_id', 'tool_name', 'tool_key', 'args_hash',
-        #             'seq', 'status'}
+        # call_id -> {'logical_call_id', 'tool_name', 'tool_key', 'arguments',
+        #             'args_hash', 'seq', 'status'}
         self._bindings: dict[str, dict] = {}
         self._seq = 0
         self._restore(snapshot)
 
     def _restore(self, snapshot: dict | None) -> None:
-        """从快照的 pending_calls（唯一结构）重建已分配的调用身份与序号。"""
+        """从快照的 pending_calls（唯一结构）重建已分配的调用身份与序号。
+
+        第八阶段第 1 点：恢复时**完整**重建参数与工具绑定（arguments / tool_key /
+        args_hash），不能只回填逻辑 ID——否则结算当前调用时无法核对其参数与
+        工具是否与派发时一致，同轮尚未派发的候选也会因为缺参数而无法继续。
+        """
         if not snapshot:
             return
         calls = snapshot.get('pending_calls') or []
@@ -172,6 +185,7 @@ class PiCallRegistry:
                 'logical_call_id': logical,
                 'tool_name': str(item.get('tool_name') or ''),
                 'tool_key': str(item.get('tool_key') or ''),
+                'arguments': dict(item.get('arguments') or {}),
                 'args_hash': str(item.get('args_hash') or ''),
                 'seq': int(item.get('seq') or 0),
                 'status': str(item.get('status') or 'pending'),
@@ -188,10 +202,14 @@ class PiCallRegistry:
         args_digest = ledger_module.args_hash(args)
         existing = self._bindings.get(call_id)
         if existing is not None:
-            # 同一 call_id：复用原身份，但参数必须一致
+            # 同一 call_id：复用原身份，但参数与工具绑定必须一致
             if existing.get('args_hash') and existing['args_hash'] != args_digest:
                 raise RuntimeError(
                     f'逻辑调用 {existing["logical_call_id"]} 的参数已变化，拒绝复用')
+            if existing.get('tool_key') and existing['tool_key'] != tool_key:
+                raise RuntimeError(
+                    f'逻辑调用 {existing["logical_call_id"]} 的工具绑定已变化'
+                    f'（{existing["tool_key"]} → {tool_key}），拒绝复用')
             return existing['logical_call_id']
         # 新调用：分配新序号（哪怕参数与历史上某次相同）
         self._seq += 1
@@ -200,6 +218,7 @@ class PiCallRegistry:
             'logical_call_id': logical,
             'tool_name': tool_name,
             'tool_key': tool_key,
+            'arguments': dict(args or {}),
             'args_hash': args_digest,
             'seq': self._seq,
             'status': 'pending',
@@ -207,18 +226,29 @@ class PiCallRegistry:
         return logical
 
     def mark(self, call_id: str, status: str) -> None:
-        """更新某个调用的处理状态（pending → admitted/succeeded/delivered）。"""
+        """更新某个调用的处理状态（pending → admitted/succeeded/delivered）。
+
+        只动**这个 call_id** 自己的绑定，不影响同轮尚未派发的其它候选——
+        结算当前调用绝不能把同轮别的 pending 候选一并清掉或改状态。
+        """
         binding = self._bindings.get(call_id)
         if binding is not None:
             binding['status'] = status
 
     def pending_calls(self) -> list[dict]:
-        """导出待处理调用清单（唯一版本化结构，写进快照）。"""
+        """导出**尚未派发/尚未完成**的调用清单（唯一版本化结构，写进快照）。
+
+        第八阶段第 1 点：已交付/已成功（`delivered` / `succeeded`）的调用
+        **不得**再次作为 pending 导出——否则恢复时会把已完成的调用当新候选
+        重新派发，重复执行工具。只导出 `pending` / `admitted` 两类。
+        """
         from webpage_agent.agent import pi_snapshot
-        return pi_snapshot.normalize_pending_calls([
+        active = [
             {'call_id': call_id, **binding}
             for call_id, binding in self._bindings.items()
-        ])
+            if str(binding.get('status') or 'pending') in ('pending', 'admitted')
+        ]
+        return pi_snapshot.normalize_pending_calls(active)
 
     def node_call_key(self, call_id: str, tool_name: str) -> str:
         """兼容旧调用点：桥接 call_id + 工具名。第七阶段起内部按 call_id 绑定。"""
@@ -298,6 +328,8 @@ class HostToolCaller:
                     ok=False, action_id=result.action_id,
                     attempt_id=result.attempt_id, step_id=step_id,
                     error='重放缺少搜索结果内容（documents），不能重新搜索冒充重放')
+            # 复用已有结果：调用身份标记为 delivered，不再作为 pending 导出。
+            self._registry.mark(call_id, 'delivered')
             return ToolReceipt(
                 ok=True, content=_search_receipt(replay),
                 action_id=result.action_id, attempt_id=result.attempt_id,
@@ -309,6 +341,8 @@ class HostToolCaller:
             import os as _os
             if _os.environ.get('PI_CRASH_AFTER_SETTLE') == '1':
                 _os._exit(0)
+            # 结算成功：标记 delivered，该调用不再作为 pending 导出（第八阶段第 1 点）。
+            self._registry.mark(call_id, 'delivered')
             return ToolReceipt(
                 ok=True, content=_search_receipt(result.updates),
                 action_id=result.action_id, attempt_id=result.attempt_id,
@@ -317,6 +351,15 @@ class HostToolCaller:
             return ToolReceipt(ok=False, error=result.error,
                                action_id=result.action_id,
                                attempt_id=result.attempt_id, step_id=step_id)
+        if result.kind == 'accepted':
+            # 第八阶段第 3 点：远端已受理、结果未定。不是成功也不是失败——
+            # Pi 不得把受理当最终结果继续推理。标记 accepted 并带远端任务身份，
+            # 由上层（pi_runtime）结束本轮、进入持久等待。
+            return ToolReceipt(
+                ok=False, accepted=True, error='',
+                action_id=result.action_id, attempt_id=result.attempt_id,
+                step_id=step_id, remote_task_id=result.remote_task_id,
+                contract_id=result.contract_id)
         if result.kind == 'no_run':
             return ToolReceipt(ok=False, error=result.error or '没有可执行的运行',
                                step_id=step_id)

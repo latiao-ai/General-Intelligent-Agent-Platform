@@ -272,6 +272,9 @@ class Settings:
         item.strip() for item in os.getenv('AUTH_ALLOWED_ORIGINS', '').split(',')
         if item.strip())
     async_contracts_file: str = os.getenv('ASYNC_CONTRACTS_FILE', '').strip()
+    # 显式选中的异步合同（`contract_id:version` 逗号分隔）。第八阶段第 2 点：
+    # 不自动启用仓库里的示例合同，只有显式列出的合同才参与提交匹配与轮询。
+    async_contracts_enabled: str = os.getenv('ASYNC_CONTRACTS_ENABLED', '').strip()
     result_gc_grace_seconds: int = max(0, int(
         os.getenv('RESULT_GC_GRACE_SECONDS', '86400')))
 

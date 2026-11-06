@@ -282,6 +282,49 @@ class PgRuns:
         async with self._lease() as own:
             await self._run(own, sql, args)
 
+    async def save_snapshot_owned(self, run_id: str, *, plan_version: int,
+                                  state: dict, lease_owner: str,
+                                  lease_epoch: int,
+                                  next_step_id: str = '',
+                                  artifact_namespace: str = '',
+                                  intent_version: int | None = None,
+                                  processed_intent_version: int | None = None,
+                                  observation_seq: int | None = None,
+                                  next_route: str = '',
+                                  snapshot_schema: int | None = None) -> bool:
+        """把快照写入与租约校验放进**同一事务**，返回 False = 已失租（不写）。
+
+        第七阶段 `_persist_snapshot` 之前是「先 `verify_lease` 再独立
+        `save_snapshot`」两步：两步之间租约可能被接管，过期执行者仍能把快照
+        写进库里覆盖新执行者的进度。这里把「校验 owner + epoch + 未过期」与
+        「UPSERT 快照」合进一个事务，条件不满足就一行都不写、返回 False。
+
+        实现：锁住 run 行（`FOR UPDATE`）读 owner/epoch/expires，校验通过再
+        写快照，同一事务提交。失租/状态不符返回 False，不抛 LeaseLost——
+        调用方（检查点确认）据此回 ok=False 让 Node 停止，而不是炸掉整条桥接。
+        """
+        from webpage_agent.governance import execution_control
+        async with self._lease() as conn:
+            row = await self._one(
+                conn, 'SELECT lease_owner, lease_epoch, lease_expires_at '
+                'FROM runs WHERE run_id=%s FOR UPDATE', (run_id,))
+            if row is None:
+                return False
+            if str(row.get('lease_owner') or '') != str(lease_owner) \
+                    or int(row.get('lease_epoch') or 0) != int(lease_epoch):
+                return False
+            expires = float(row.get('lease_expires_at') or 0)
+            if expires and expires < time.time():
+                return False
+            await self.save_snapshot(
+                run_id, plan_version=plan_version, state=state,
+                next_step_id=next_step_id, artifact_namespace=artifact_namespace,
+                conn=conn, intent_version=intent_version,
+                processed_intent_version=processed_intent_version,
+                observation_seq=observation_seq, next_route=next_route,
+                snapshot_schema=snapshot_schema)
+            return True
+
     async def run_snapshot(self, run_id: str) -> dict | None:
         async with self._lease() as conn:
             row = await self._one(conn, 'SELECT * FROM run_snapshots WHERE run_id=%s',

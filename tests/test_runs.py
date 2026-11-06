@@ -750,11 +750,13 @@ class StatusVocabularyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_run_status_vocabulary_is_closed(self):
         from webpage_agent.core import outcome
-        # 冻结契约：要加状态值，就得连这份清单一起改，是有意识的决定
+        # 冻结契约：要加状态值，就得连这份清单一起改，是有意识的决定。
+        # 第八阶段新增 `waiting_external`（Pi 退出并长期等待远端异步结果）。
         self.assertEqual(sorted(outcome.RUN_STATUSES), [
             'cancelled', 'failed', 'interrupted', 'needs_reconcile',
             'partially_succeeded', 'paused', 'queued', 'reconciling',
-            'running', 'succeeded', 'waiting_approval', 'waiting_input'])
+            'running', 'succeeded', 'waiting_approval', 'waiting_external',
+            'waiting_input'])
         for word in ('answered', 'local_ready', 'deployed', 'deploy_needs_check',
                      'compensated'):
             self.assertNotIn(word, outcome.RUN_STATUSES, word)

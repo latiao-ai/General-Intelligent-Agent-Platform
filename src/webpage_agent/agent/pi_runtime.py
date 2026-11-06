@@ -173,23 +173,30 @@ class PiRuntime:
         self._snapshot = dict(resume_snapshot) if resume_snapshot else \
             pi_snapshot.new_snapshot(user_input=str(state.get('user_input') or ''))
 
-        # 恢复决策。resume_finish / resume_reconcile / resume_block 属于
-        # 「不重新推理」的结局，在进入桥接前直接写回 state 收尾。
+        # 恢复决策。resume_finish / resume_reconcile / resume_block / resume_wait
+        # 属于「不重新推理」的结局，在进入桥接前直接写回 state 收尾。
         # recovery 是 dict（pi_resume 里 to_dict 后），用 .get 读。
         recovery = (pi_resume or {}).get('recovery') if pi_resume else None
         if isinstance(recovery, dict) and recovery.get('kind') in (
-                'resume_finish', 'resume_reconcile', 'resume_block'):
+                'resume_finish', 'resume_reconcile', 'resume_block',
+                'resume_wait'):
             kind = recovery['kind']
             if kind == 'resume_finish':
                 state['answer'] = recovery.get('final_answer') or ''
                 state['pi_outcome'] = 'answered'
                 state['status'] = 'succeeded'
+            elif kind == 'resume_wait':
+                # 第八阶段第 5 点：已受理的外部任务未完成，继续等待。不重新推理、
+                # 不重派发。run 停在 waiting_external，释放执行资源。
+                state['pi_outcome'] = 'waiting'
+                state['status'] = 'waiting_external'
             else:
                 state['pi_outcome'] = 'failed'
                 state['status'] = 'needs_reconcile'
                 state.setdefault('errors', []).append({
                     'stage': 'pi', 'type': 'RecoveryBlocked',
                     'detail': recovery.get('reason') or '结果未定，需核实后再继续'})
+            state['_pi_snapshot'] = pi_snapshot.serialize(self._snapshot)
             return state
 
         # 绑定宿主 sink：让 Pi 事件经统一的公共事件出口（emit_async）有序转交，
@@ -308,6 +315,11 @@ class PiRuntime:
             if own_bridge:
                 await bridge.close()
 
+        # 第八阶段第 1 点：把**真正的版本化 Pi 快照**序列化后交给宿主，供收尾时
+        # 落库。宿主的 `_finish_run` 据此提交版本化 Pi 快照（经 `pi_snapshot.
+        # serialize` 的结构），而不是给普通宿主 state 打 Pi schema 标签。
+        from webpage_agent.agent import pi_snapshot as _snap
+        state['_pi_snapshot'] = _snap.serialize(self._snapshot)
         return state
 
     async def _handle_event(self, msg: dict, answer_parts: list[str]) -> None:
@@ -412,6 +424,43 @@ class PiRuntime:
         receipt = await self._host_caller.call(
             call_id=call_id, tool_name=tool_name, args=args, state=state,
             build_snapshot=build_snapshot)
+        if receipt.accepted:
+            # 第八阶段第 5 点：远端已受理、结果未定。宿主确认等待事实落库后，
+            # Node 结束本轮执行、释放进程；等待期间不再请求模型。把 accepted
+            # 调用标记为 `accepted`（区别于 pending 重派发），记录到快照的
+            # `awaiting_calls`（含原 call_id / 逻辑 ID / 远端任务身份），持久化。
+            self._host_caller.registry.mark(call_id, 'accepted')
+            self._snapshot['phase'] = 'awaiting_external'
+            self._snapshot['pending_calls'] = (
+                self._host_caller.registry.pending_calls())
+            # 记录受理事实：原 assistant toolCall 与调用位置保留在 messages 里，
+            # 这里只登记「哪个调用在等哪个远端任务」。
+            awaiting = list(self._snapshot.get('awaiting_calls') or [])
+            binding = self._host_caller.registry._bindings.get(call_id) or {}
+            awaiting.append({
+                'call_id': call_id,
+                'logical_call_id': str(binding.get('logical_call_id') or ''),
+                'tool_name': tool_name,
+                'tool_key': str(binding.get('tool_key') or ''),
+                'arguments': dict(args or {}),
+                'remote_task_id': receipt.remote_task_id,
+                'contract_id': receipt.contract_id,
+                'contract_version': int(receipt.contract_version or 1),
+                'status': 'awaiting',
+            })
+            self._snapshot['awaiting_calls'] = awaiting
+            persisted = await self._persist_snapshot()
+            if not persisted:
+                # 等待事实没落库：不能放行 Node 结束——否则结果漏跟踪。
+                raise PiBridgeError(
+                    '已受理的等待事实持久化失败，停止执行',
+                    stderr_tail=bridge.stderr_tail())
+            reply = proto.make_message(
+                bridge.execution_id, "tool_result", call_id=call_id,
+                ok=False, result=None, error='',
+                accepted=True, remote_task_id=receipt.remote_task_id)
+            await bridge.send(reply)
+            return
         if receipt.ok:
             # 成功结算后合并认可增量回宿主 state（documents/usage/errors）
             if receipt.updates:
@@ -541,16 +590,21 @@ class PiRuntime:
             bridge.execution_id, "checkpoint_ack", checkpoint_seq=seq, ok=ok))
 
     async def _persist_snapshot(self) -> bool:
-        """把当前版本化 Pi 快照落库（经账本的 store，校验租约/代次）。
+        """把当前版本化 Pi 快照落库（租约校验 + 序号检查 + 写入同一事务）。
 
         - **无账本**（独立 smoke / CLI 直调）：没有持久化目标，检查点确认视为
           空操作、放行（返回 True）——这不等于「提交失败」，而是根本没有治理
           账本可写，与 `governed_call` 的兼容路径一致。
         - **有账本但 store 缺失 / 持久化失败 / 失租**：返回 False，停止。
+
+        第八阶段第 1 点：租约校验与快照写入**必须同一事务**。之前是
+        「先 `verify_lease` 再独立 `save_snapshot`」两步，两步之间租约可能被
+        接管，过期执行者仍能覆盖新执行者的快照。现在走 `save_snapshot_owned`
+        （锁 run 行 → 校验 owner/epoch/expires → UPSERT 快照，同一事务），
+        失租返回 False、一行都不写。
         """
         from webpage_agent.agent import pi_snapshot
         from webpage_agent.agent import runtime_identity
-        from webpage_agent.governance import execution_control
         from webpage_agent.store import ledger as ledger_module
         book = ledger_module.current_ledger()
         if book is None:
@@ -561,23 +615,27 @@ class PiRuntime:
             return False
         context = getattr(book, 'context', None)
         try:
+            # 序号检查 + 租约校验 + 写入：序号检查在内存侧（本进程内单调），
+            # 租约校验与写入在库里同一事务（跨进程 fencing）。有执行权则走
+            # 原子门禁；无执行权（context 为空，独立路径已在上方无账本分支返回）
+            # 走普通 save_snapshot（这里 context 为空意味着有账本但无执行权，
+            # 属异常，保守拒绝）。
             if context is not None and getattr(context, 'lease_owner', None):
-                # 校验租约：owner + epoch 必须仍是当前执行者（拒绝过期执行者）。
-                await book.store.verify_lease(
-                    book.run_id,
+                committed = await book.store.save_snapshot_owned(
+                    book.run_id, plan_version=int(book.plan_version or 1),
+                    state=pi_snapshot.serialize(self._snapshot),
                     lease_owner=getattr(context, 'lease_owner', ''),
-                    lease_epoch=getattr(context, 'lease_epoch', 0))
-            await book.store.save_snapshot(
-                book.run_id, plan_version=int(book.plan_version or 1),
-                state=pi_snapshot.serialize(self._snapshot),
-                snapshot_schema=runtime_identity.PI_STATE_SCHEMA,
-                intent_version=int(self._snapshot.get('intent_version') or 0),
-                processed_intent_version=int(
-                    self._snapshot.get('processed_intent_version') or 0),
-                observation_seq=int(self._snapshot.get('observation_seq') or 0))
-            return True
-        except execution_control.LeaseLost:
-            logger.warning('持久化 Pi 快照时已失租，拒绝写入')
+                    lease_epoch=getattr(context, 'lease_epoch', 0),
+                    snapshot_schema=runtime_identity.PI_STATE_SCHEMA,
+                    intent_version=int(self._snapshot.get('intent_version') or 0),
+                    processed_intent_version=int(
+                        self._snapshot.get('processed_intent_version') or 0),
+                    observation_seq=int(self._snapshot.get('observation_seq') or 0))
+                if not committed:
+                    logger.warning('持久化 Pi 快照时已失租，拒绝写入')
+                    return False
+                return True
+            logger.error('有账本但无执行上下文，无法原子持久化 Pi 快照')
             return False
         except Exception as exc:  # noqa: BLE001
             logger.warning("持久化 Pi 快照失败：%s", exc)
@@ -659,6 +717,13 @@ class PiRuntime:
             )
             # 第七阶段收口：失败同样清除旧 answer，避免 final_status 误判成功。
             state.pop("answer", None)
+        elif outcome == "waiting":
+            # 第八阶段第 5 点：远端已受理、结果未定。本轮**不是**失败也不是成功，
+            # 而是「持久等待」——run 停在 waiting_external，等 Worker 从原远端
+            # 任务取得结果后唤醒。不得因残留旧 answer 归一为成功。
+            state["pi_outcome"] = "waiting"
+            state["status"] = "waiting_external"
+            state.pop("answer", None)
         else:
-            # validate_finished 已保证 outcome 只可能是上述三者，此分支防御性兜底
+            # validate_finished 已保证 outcome 只可能是上述四者，此分支防御性兜底
             state["pi_outcome"] = "failed"

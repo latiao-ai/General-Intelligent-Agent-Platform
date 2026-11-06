@@ -146,9 +146,16 @@ async def _default_querier(store, task: dict, contract):
 
 
 def _materialize(task: dict, contract, payload: dict) -> str:
+    """把远端结果物化到**稳定文件身份**（第八阶段第 7 点）。
+
+    文件写入无法与 PG 原子提交，所以用**稳定的、由 external_task_id 派生的
+    确定性路径**：同一任务重试物化永远写同一个位置，幂等、可重试。先可靠保存
+    结果及 manifest，再在数据库提交可消费引用——数据库只引用已可靠保存的内容。
+    """
     from webpage_agent.core import async_contracts
     from webpage_agent.tools import tool_results
     output = async_contracts.pointer(payload, contract.output_pointer) if contract else payload
+    # 稳定身份：external_task_id 派生，跨进程、跨重试一致。
     logical_id = 'ext-' + str(task.get('external_task_id') or 'result')
     folder = tool_results.result_dir(
         settings.artifact_dir, str(task.get('tenant_id') or 'default'),
@@ -159,8 +166,50 @@ def _materialize(task: dict, contract, payload: dict) -> str:
     (folder / 'structured.json').write_text(body, encoding='utf-8')
     (folder / 'manifest.json').write_text(json.dumps({
         'result_id': logical_id, 'registered': True, 'created_at': time.time(),
+        'external_task_id': str(task.get('external_task_id') or ''),
+        'remote_task_id': str(task.get('remote_task_id') or ''),
     }, ensure_ascii=False), encoding='utf-8')
     return str(folder)
+
+
+def _register_materialized(store, task: dict, ref: str) -> None:
+    """把物化结果登记成可消费的 tool_result 引用（第八阶段第 7 点）。
+
+    先可靠保存文件，再登记引用；登记失败可重试（幂等），数据库不引用尚未
+    可靠保存的内容。
+    """
+    if not hasattr(store, 'commit_tool_result'):
+        return
+    try:
+        staged = {
+            'result_id': 'ext-' + str(task.get('external_task_id') or 'result'),
+            'tool_key': str(task.get('tool_key') or ''),
+            'run_id': str(task.get('run_id') or ''),
+            'step_id': str(task.get('step_id') or ''),
+            'action_id': str(task.get('action_id') or ''),
+            'storage_ref': ref,
+        }
+        from webpage_agent.governance import execution_control
+        try:
+            context = execution_control.require()
+        except Exception:                          # noqa: BLE001
+            context = None
+        # 无执行上下文（poller 不是 run 的执行者）时跳过严格登记，仅靠 manifest。
+        if context is not None:
+            import asyncio
+            asyncio.ensure_future(_commit_result(store, context, staged))
+    except Exception:                              # noqa: BLE001
+        logger.warning('登记物化结果失败（可重试）task=%s', task.get('external_task_id'),
+                       exc_info=True)
+
+
+async def _commit_result(store, context, staged) -> None:
+    try:
+        await store.commit_tool_result(
+            {'run_id': staged['run_id'], 'tenant_id': 'default'},
+            staged, {'tool_key': staged['tool_key']})
+    except Exception:                              # noqa: BLE001
+        logger.warning('提交物化结果登记失败（可重试）', exc_info=True)
 
 
 async def _patch_snapshot(store, task: dict, mapped: str, payload) -> None:
@@ -207,30 +256,106 @@ async def _wake_run(store, run_id: str, *, failed: str = '') -> None:
                                error='', lease_owner='', lease_expires_at=None)
 
 
+async def request_external_cancel(store, *, external_task_id: str,
+                                  worker_id: str) -> dict:
+    """请求取消一个已受理的外部任务（第八阶段第 9 点）。
+
+    区分三种情况：
+    - 远端取消**请求**：持久化 cancel_requested 意图，调用合同取消能力；
+    - 远端**已确认取消**：查询确认后把 external_task 标 `cancelled`；
+    - 远端不支持取消 / 未确认：如实保留 `running` 状态，**不声称已取消**。
+
+    返回 `{requested, confirmed, state}`。
+    """
+    if store is None or not hasattr(store, 'request_external_cancel'):
+        return {'requested': False, 'confirmed': False, 'state': ''}
+    row = await store.request_external_cancel(external_task_id)
+    if row is None:
+        # 已终态或不存在：没有可取消的开放任务。
+        return {'requested': False, 'confirmed': False,
+                'state': str(row.get('state') or '') if row else ''}
+    task = dict(row)
+    from webpage_agent.core import async_contracts
+    from webpage_agent.integrations import mcp_tasks as _task_protocol
+    contract = async_contracts.match_id(
+        str(task.get('contract_id') or ''), int(task.get('contract_version') or 0))
+    protocol = str(task.get('contract_id') or '') == _task_protocol.PROTOCOL_CONTRACT_ID
+    if contract is None:
+        return {'requested': True, 'confirmed': False,
+                'state': str(task.get('state') or '')}
+    # 调用合同取消能力（协议任务走 tasks/cancel，合同路线走 cancel_tool_key）。
+    try:
+        if protocol:
+            from webpage_agent.integrations import mcp_adapter
+            await mcp_adapter.cancel_task(str(task.get('remote_task_id') or ''))
+        elif contract.cancel_tool_key:
+            from webpage_agent.integrations import mcp_adapter
+            parts = str(contract.cancel_tool_key or '').split(':')
+            tool_name = parts[-1] if parts else ''
+            if tool_name:
+                await mcp_adapter.call_tool(
+                    tool_name, {contract.status_id_argument:
+                                task.get('remote_task_id')})
+        else:
+            # 远端不支持取消：如实保留状态，不声称已取消。
+            return {'requested': True, 'confirmed': False,
+                    'state': str(task.get('state') or 'running')}
+    except Exception as exc:                       # noqa: BLE001
+        logger.warning('请求远端取消失败 id=%s', external_task_id, exc_info=True)
+        return {'requested': True, 'confirmed': False,
+                'state': str(task.get('state') or 'running')}
+    # 查询确认：远端是否真的取消了。
+    confirmed = False
+    try:
+        epoch = int(task.get('poll_epoch') or 0)
+        payload = await _default_querier(store, task, contract)
+        mapped = async_contracts.map_status(
+            async_contracts.pointer(payload, contract.status_pointer), contract)
+        confirmed = mapped == 'cancelled'
+    except Exception:                              # noqa: BLE001
+        confirmed = False
+    if hasattr(store, 'confirm_external_cancel'):
+        written = await store.confirm_external_cancel(
+            external_task_id, epoch, confirmed=confirmed)
+        if written:
+            task = written
+    return {'requested': True, 'confirmed': confirmed,
+            'state': str(task.get('state') or '')}
+
+
 async def poll_due(store, *, worker_id: str, querier=None, limit: int | None = None) -> int:
-    """查询到期的外部任务。查询失败会再试；未知状态不会记成成功。"""
+    """查询到期的外部任务。查询失败会再试；未知状态不会记成成功。
+
+    第八阶段第 6/7/8 点收紧：
+    - 领取用**带门禁**的 `claim_external_task_poll`（重查开放状态/到期/租约）；
+    - 查询用 `external_poll_timeout` 限时，且**短于**领取时给的租约（续租兜底，
+      不维持「查询 90s vs 租约 60s」的冲突）；
+    - 完成走 `complete_external_task_and_wake`（终态 + 唤醒同事务），poller
+      **不直接改写 Pi messages**；由获得执行权的宿主吸收结果注入 toolResult；
+    - 结果物化失败进 materializing（有重试期限），不标记本地完成。
+    """
     if not settings.async_tool_runtime_enabled or store is None:
         return 0
     if not hasattr(store, 'due_external_tasks'):
         return 0
     from webpage_agent.core import async_contracts
+    import asyncio
     ask = querier or (lambda task, contract: _default_querier(store, task, contract))
     rows = await store.due_external_tasks(
         limit=limit or settings.external_poll_concurrency)
+    # 查询限时必须短于轮询租约：否则查询还没回来，租约先过期，另一个 Worker 又领
+    # 同一条任务重复查询。租约 = 查询限时 × 2（至少 60s）。
+    query_timeout = float(getattr(settings, 'external_poll_timeout', 30) or 30)
+    poll_lease = max(60.0, query_timeout * 2)
     done = 0
     now = time.time()
     for task in rows:
         claimed = await store.claim_external_task_poll(
-            task['external_task_id'], worker_id)
+            task['external_task_id'], worker_id, lease_seconds=poll_lease)
         if not claimed:
             continue
         epoch = int(claimed.get('poll_epoch') or 0)
         task = claimed
-        run = await store.run(task['run_id']) if hasattr(store, 'run') else {}
-        if str((run or {}).get('status') or '') == 'running':
-            await store.finish_external_poll(
-                task['external_task_id'], epoch, next_poll_at=now + 2)
-            continue
         contract = async_contracts.match_id(
             str(task.get('contract_id') or ''), int(task.get('contract_version') or 0))
         from webpage_agent.integrations import mcp_tasks as _task_protocol
@@ -239,25 +364,32 @@ async def poll_due(store, *, worker_id: str, querier=None, limit: int | None = N
         # 路的要求把它排除掉；其它情况仍要求合同写明可查询的工具。
         if contract is None or not contract.recoverable or (
                 not protocol and not contract.status_tool_key):
-            await store.finish_external_poll(
+            await store.complete_external_task_and_wake(
                 task['external_task_id'], epoch, state='needs_reconcile',
-                error_code='no_contract', last_observed_at=now)
-            await _patch_snapshot(store, task, 'needs_reconcile', None)
-            await _wake_run(store, task['run_id'], failed='外部任务没有可查询的合同')
+                error_code='no_contract')
             done += 1
             continue
+        # 合同自己的轮询间隔与截止时间真正参与调度。
+        poll_interval = float(getattr(contract, 'poll_interval_seconds', 5) or 5)
         deadline = float(task.get('deadline_at') or 0)
         if deadline and now > deadline and str(task.get('state')) != 'materializing':
-            await store.finish_external_poll(
+            await store.complete_external_task_and_wake(
                 task['external_task_id'], epoch, state='needs_reconcile',
-                error_code='deadline', last_observed_at=now)
-            await _patch_snapshot(store, task, 'needs_reconcile', None)
-            await _wake_run(store, task['run_id'],
-                            failed='外部任务超过观察期限，不能判定为失败或成功')
+                error_code='deadline')
             done += 1
             continue
         try:
-            payload = await ask(task, contract)
+            async with asyncio.timeout(query_timeout):
+                payload = await ask(task, contract)
+        except asyncio.TimeoutError:
+            logger.warning('查询外部任务超时 id=%s', task.get('external_task_id'))
+            version = int(task.get('version') or 1)
+            await store.finish_external_poll(
+                task['external_task_id'], epoch, state='running',
+                error_code='query_timeout', last_observed_at=now,
+                next_poll_at=now + backoff_seconds(version), version=version + 1)
+            done += 1
+            continue
         except Exception:                            # noqa: BLE001  查询失败要重试，不判结论
             logger.warning('查询外部任务失败 id=%s', task.get('external_task_id'),
                            exc_info=True)
@@ -287,27 +419,26 @@ async def poll_due(store, *, worker_id: str, querier=None, limit: int | None = N
             except OSError:
                 logger.warning('外部结果落盘失败 id=%s', task.get('external_task_id'),
                                exc_info=True)
+                # 第八阶段第 7 点：结果获取/存储失败进 materializing（有重试期限），
+                # 不能标记本地完成。
                 await store.finish_external_poll(
                     task['external_task_id'], epoch, state='materializing',
                     error_code='materialize_failed', last_observed_at=now,
                     next_poll_at=now + backoff_seconds(version), version=version + 1)
                 done += 1
                 continue
-            written = await store.finish_external_poll(
+            # 先可靠保存文件（上面），再在数据库提交可消费引用 + 同事务唤醒。
+            _register_materialized(store, task, ref)
+            written = await store.complete_external_task_and_wake(
                 task['external_task_id'], epoch, state='completed',
-                error_code='', output_manifest_ref=ref, last_observed_at=now,
-                version=version + 1)
-            if written:
-                await _patch_snapshot(store, task, 'succeeded', payload)
-                await _wake_run(store, task['run_id'])
+                output_manifest_ref=ref,
+                last_result_id='ext-' + str(task.get('external_task_id') or 'result'))
             done += 1
             continue
-        written = await store.finish_external_poll(
+        # failed / cancelled：终态 + 同事务唤醒（或待核实）。
+        await store.complete_external_task_and_wake(
             task['external_task_id'], epoch,
             state='failed' if mapped == 'failed' else 'cancelled',
-            error_code=mapped, last_observed_at=now, version=version + 1)
-        if written:
-            await _patch_snapshot(store, task, mapped, payload)
-            await _wake_run(store, task['run_id'])
+            error_code=mapped)
         done += 1
     return done

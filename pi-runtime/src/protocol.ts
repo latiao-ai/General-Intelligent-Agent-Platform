@@ -43,8 +43,9 @@ export interface ToolCallMessage extends BaseMessage {
 /** 本轮终结结果 */
 export interface FinishedMessage extends BaseMessage {
   type: 'finished';
-  /** answered | cancelled | failed —— 只表示本轮结束，不自动代表业务成功 */
-  outcome: 'answered' | 'cancelled' | 'failed';
+  /** answered | cancelled | failed | waiting —— 只表示本轮结束，不自动代表业务成功。
+   *  waiting：远端已受理、结果未定，宿主确认等待事实落库后结束本轮、释放进程。 */
+  outcome: 'answered' | 'cancelled' | 'failed' | 'waiting';
   /** outcome=answered 时的最终答复文本 */
   answer?: string;
   /** outcome=failed 时的错误说明 */
@@ -187,6 +188,11 @@ export interface ToolResultMessage extends BaseMessage {
   ok: boolean;
   result?: unknown;
   error?: string;
+  /** 远端已受理、结果未定（第八阶段）：Node 不得把受理当最终结果继续推理，
+   *  应结束本轮并释放进程等待唤醒。 */
+  accepted?: boolean;
+  /** 远端任务身份（accepted 时随回执带回，供恢复关联）。 */
+  remote_task_id?: string;
 }
 
 /** 停止执行 / 关闭进程 */

@@ -58,7 +58,13 @@ let terminalSent = false;
 
 // 待响应的工具调用：call_id → { resolve, timer }
 interface PendingTool {
-  resolve: (msg: { ok: boolean; result?: unknown; error?: string }) => void;
+  resolve: (msg: {
+    ok: boolean;
+    result?: unknown;
+    error?: string;
+    accepted?: boolean;
+    remote_task_id?: string;
+  }) => void;
   timer: NodeJS.Timeout;
 }
 const pendingTools = new Map<string, PendingTool>();
@@ -247,7 +253,7 @@ function rejectAllCheckpoints(reason: string): void {
 
 // ---- 终结性消息（只发一次） ----
 
-function sendFinished(outcome: 'answered' | 'cancelled' | 'failed', fields: Partial<FinishedMessage> = {}): void {
+function sendFinished(outcome: 'answered' | 'cancelled' | 'failed' | 'waiting', fields: Partial<FinishedMessage> = {}): void {
   if (terminalSent) {
     return;
   }
@@ -299,7 +305,13 @@ function handleToolResult(msg: Extract<InboundMessage, { type: 'tool_result' }>)
   }
   pendingTools.delete(msg.call_id);
   clearTimeout(pending.timer);
-  pending.resolve({ ok: msg.ok, result: msg.result, error: msg.error });
+  pending.resolve({
+    ok: msg.ok,
+    result: msg.result,
+    error: msg.error,
+    accepted: !!msg.accepted,
+    remote_task_id: msg.remote_task_id,
+  });
 }
 
 function handleCancel(): void {
@@ -323,7 +335,7 @@ function handleShutdown(): void {
 }
 
 /** 发送一次工具调用请求，等待 Python 回执（call_id → Promise）。 */
-function dispatchToolCall(call: ToolCall): Promise<{ ok: boolean; result?: unknown; error?: string }> {
+function dispatchToolCall(call: ToolCall): Promise<{ ok: boolean; result?: unknown; error?: string; accepted?: boolean; remote_task_id?: string }> {
   // 执行内重复 call_id 检查：同一个 call_id 已在等待回执，说明 Pi 重复派发，
   // 明确报错而不是覆盖旧 Promise（否则旧的会永久挂起、新的丢失回执）。
   if (pendingTools.has(call.id)) {
@@ -332,7 +344,7 @@ function dispatchToolCall(call: ToolCall): Promise<{ ok: boolean; result?: unkno
   }
   const msg: ToolCallMessage = toToolCallMessage(executionId, call);
   send(msg);
-  return new Promise<{ ok: boolean; result?: unknown; error?: string }>((resolve) => {
+  return new Promise<{ ok: boolean; result?: unknown; error?: string; accepted?: boolean; remote_task_id?: string }>((resolve) => {
     const timer = setTimeout(() => {
       const pending = pendingTools.get(call.id);
       if (pending) {
@@ -477,6 +489,12 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
       const reply = await dispatchToolCall(call);
       if (cancelled) {
         // 等待回执期间被取消：不再 push 剩余结果
+        return;
+      }
+      // 第八阶段：远端已受理、结果未定 → 结束本轮、释放进程等待唤醒。
+      // 不注入 toolResult、不继续请求模型。
+      if (reply.accepted) {
+        sendFinished('waiting');
         return;
       }
       // 失败回执：向模型传 reply.error（保留原始错误正文），不能继续传空的

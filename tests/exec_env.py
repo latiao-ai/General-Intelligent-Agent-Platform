@@ -37,7 +37,10 @@ TEST_TABLES = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
                'action_attempts', 'actions', 'steps', 'plans', 'run_snapshots',
                'run_inputs', 'run_input_processing', 'run_decisions',
                'runs', 'tasks_meta', 'events', 'tasks', 'session_memory',
-               'session_summaries', 'messages', 'sessions', 'request_keys')
+               'session_summaries', 'messages', 'sessions', 'request_keys',
+               'external_tasks', 'tool_result_manifests', 'tool_result_parts',
+               'tool_authorizations', 'approvals', 'approval_reservations',
+               'run_decisions', 'provider_charges')
 
 
 def valid_test_dsn(dsn):

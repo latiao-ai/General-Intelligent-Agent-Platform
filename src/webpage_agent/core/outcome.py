@@ -28,6 +28,8 @@ logger = logging.getLogger(__name__)
 RUN_STATUSES = frozenset({
     'queued', 'running', 'reconciling',
     'waiting_input', 'waiting_approval',
+    # 已受理的外部异步任务未完成：Pi 退出并长期等待，由 Worker 唤醒（第八阶段）。
+    'waiting_external',
     # paused：安全暂停，等人显式 resume。**不是**失败也不是完成。
     'paused',
     'succeeded', 'partially_succeeded', 'needs_reconcile',
@@ -36,7 +38,8 @@ RUN_STATUSES = frozenset({
 ACTIVE_RUN_STATUSES = frozenset({'queued', 'running', 'reconciling'})
 # "本次执行已退出"但"目标还没最终结束"的状态：paused / waiting_input 都属于这一类，
 # 前端不再转圈，但也不能当作完成。
-STOPPED_RUN_STATUSES = frozenset({'paused', 'waiting_input', 'waiting_approval'})
+STOPPED_RUN_STATUSES = frozenset({'paused', 'waiting_input', 'waiting_approval',
+                                  'waiting_external'})
 TERMINAL_RUN_STATUSES = RUN_STATUSES - ACTIVE_RUN_STATUSES
 # 需要人工看一眼的状态：结果没核实 / 有副作用没收回。
 ATTENTION_RUN_STATUSES = frozenset({'needs_reconcile', 'partially_succeeded'})
