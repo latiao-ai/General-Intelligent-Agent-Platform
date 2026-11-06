@@ -147,35 +147,74 @@ async def drain_jobs(hub: Hub, worker_id: str, limit: int = 5) -> int:
     return done
 
 
-async def drain_chat_turns(hub: Hub, worker_id: str, limit: int) -> int:
-    """消费聊天 turn（第十一阶段第 1 点）。
+async def drain_chat_turns(hub: Hub, worker_id: str, limit: int) -> list[asyncio.Task]:
+    """领取聊天 turn 并**非阻塞地**派出执行任务（第十一阶段 A 组第 1 点）。
 
     聊天 turn 与业务 run **分池**：业务长任务、外部轮询吃的是 run 的并发额度，
     聊天走 `session_chat_concurrency` 自己的额度，不会互相阻塞。
 
-    开关必须在调度入口读取：聊天/查询都关闭时直接不领，避免「接纳后永久搁置」。
-    同会话串行由 `claim_turn` 的 advisory lock 保证；不同会话按并发额度并行。
+    这里只领取 + `create_task` 派发，**不 await 执行完成**——否则一条聊天 turn
+    的真实模型调用会拖住整个主循环，让业务 run 和外部轮询全部饿死。返回派发的
+    任务列表，由调用方（`main_loop`）加入 in-flight 集合统一收口。
     """
     from webpage_agent.core.config import settings as _settings
     if not (_settings.session_chat_enabled or _settings.session_query_enabled):
-        return 0
+        return []
     limit = max(1, int(limit or 1))
-    claimed = 0
     tasks: list[asyncio.Task] = []
     for _ in range(limit):
         turn = await hub.store.claim_turn(
             worker_id, _settings.session_turn_lease_seconds)
         if turn is None:
             break
-        claimed += 1
         tasks.append(asyncio.create_task(
             hub.execute_claimed_turn(turn), name=f'turn:{turn["turn_id"]}'))
-    if tasks:
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for r in results:
-            if isinstance(r, BaseException):
-                logger.warning('聊天 turn 执行异常', exc_info=r)
-    return claimed
+    return tasks
+
+
+async def _run_one_spawned(hub: Hub, run: dict, worker_id: str) -> None:
+    """执行一条已领取的业务 run（在独立 task 里，异常只影响本条）。"""
+    try:
+        await asyncio.wait_for(hub.execute_claimed_run(run),
+                               timeout=settings.task_timeout * 2)
+    except asyncio.TimeoutError:
+        await _mark_owned(hub, run, worker_id, status='reconciling',
+                          error='执行超过预算窗口')
+        logger.warning('run %s 执行超过预算窗口', run['run_id'])
+    except asyncio.CancelledError:
+        current = await hub.store.run(run['run_id']) or {}
+        if not current.get('cancel_requested_at'):
+            raise
+        logger.info('run %s 已按请求取消', run['run_id'])
+    except execution_control.LeaseLost as exc:
+        logger.warning('run %s 执行权已转移：%s', run['run_id'], exc)
+    except Exception as exc:                       # noqa: BLE001
+        logger.exception('run %s 执行异常', run['run_id'])
+        try:
+            await _mark_owned(hub, run, worker_id, status='failed',
+                              error=type(exc).__name__)
+        except Exception:                          # noqa: BLE001
+            logger.warning('run %s 失败状态写入也失败', run['run_id'],
+                           exc_info=True)
+
+
+async def drain_runs_spawned(hub: Hub, worker_id: str) -> list[asyncio.Task]:
+    """领取业务 run 并**非阻塞地**派出（第十一阶段 A 组第 1 点）。
+
+    业务 run 的并发上限由 `hub.at_capacity()`（进程内 in-flight）约束；这里领取
+    后 spawn 独立 task 就返回，不 await 执行完成。返回派发的任务列表。
+    """
+    if hub.at_capacity():
+        logger.info('本进程执行中的运行已达 %s，暂不领取',
+                    settings.max_concurrent_runs)
+        return []
+    run = await hub.store.claim_run(worker_id, settings.run_lease_seconds)
+    if run is None:
+        return []
+    logger.info('领取 run=%s epoch=%s', run['run_id'], run['lease_epoch'])
+    print(f'[worker] 领取 run={run["run_id"]} epoch={run["lease_epoch"]}')
+    return [asyncio.create_task(_run_one_spawned(hub, run, worker_id),
+                                name=f'run:{run["run_id"]}')]
 
 
 async def main_loop(hub: Hub, worker_id: str, once: bool,
@@ -193,8 +232,16 @@ async def main_loop(hub: Hub, worker_id: str, once: bool,
     stats = await hub.reconcile(owner=worker_id)
     logger.info('启动对账 %s', stats)
     print(f'[worker] 启动对账: {stats}')
+
+    # 聊天 turn 与业务 run 的 in-flight 任务集合：主循环只领取 + 派发，
+    # 不 await 执行完成，保证三者互不阻塞（第十一阶段 A 组第 1 点）。
+    inflight: set[asyncio.Task] = set()
+
     while True:
+        # 1. 后台作业（session_summary 等，快速领取执行）
         worked = await drain_jobs(hub, worker_id)
+
+        # 2. 外部轮询（独立，不阻塞聊天/业务领取）
         if settings.async_tool_runtime_enabled:
             from webpage_agent.core import external_tasks
             try:
@@ -202,16 +249,31 @@ async def main_loop(hub: Hub, worker_id: str, once: bool,
                     hub.store, worker_id=worker_id)
             except Exception:                      # noqa: BLE001
                 logger.exception('外部任务轮询失败')
+
+        # 3. 聊天 turn 与业务 run：各自领取 + 派发，不等待完成
         if not jobs_only:
-            # 聊天 turn 独立额度，不占用业务 run 的并发名额
             try:
-                worked += await drain_chat_turns(
-                    hub, worker_id, settings.session_chat_concurrency)
+                inflight.update(await drain_chat_turns(
+                    hub, worker_id, settings.session_chat_concurrency))
             except Exception:                      # noqa: BLE001
                 logger.exception('聊天 turn 消费失败')
-            if await run_once(hub, worker_id):
-                worked += 1
+            try:
+                inflight.update(await drain_runs_spawned(hub, worker_id))
+            except Exception:                      # noqa: BLE001
+                logger.exception('业务 run 领取失败')
+
+        # 4. 收口已完成的任务（回收 done task，避免泄漏）
+        if inflight:
+            done, inflight = await asyncio.wait(inflight, timeout=0)
+            for t in done:
+                exc = t.exception()
+                if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                    logger.warning('后台执行任务异常收口: %s', exc, exc_info=exc)
+
         if once:
+            # once 模式：等已派发的任务跑完再退出，否则 task 被提前回收。
+            if inflight:
+                await asyncio.gather(*inflight, return_exceptions=True)
             return
         if not worked:
             await asyncio.sleep(interval)

@@ -981,6 +981,7 @@ async def post_session_message(session_id: str, payload: SessionMessageRequest,
     返回 409。路由成聊天/查询/控制，闲聊不建任务、不更新任何 intent_version。
     """
     from webpage_agent.store.pg_store import TurnRequestConflict
+    from webpage_agent.api.hub_messages import CapabilityDisabled
     try:
         result = await hub.accept_session_message(
             session_id, request_id=payload.request_id, message=payload.message,
@@ -990,6 +991,8 @@ async def post_session_message(session_id: str, payload: SessionMessageRequest,
                             detail='该 request_id 已用于不同内容的请求') from None
     except PermissionError:
         raise HTTPException(status_code=404, detail='会话不存在') from None
+    except CapabilityDisabled as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from None
     return result
 
 

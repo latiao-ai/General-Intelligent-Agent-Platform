@@ -306,13 +306,14 @@ class PgAuth:
             await self._run(conn, 'INSERT INTO session_turns '
                 '(turn_id, session_id, turn_seq, request_id, request_hash, message, '
                 ' target_task_id, target_run_id, kind, status, source_turn_id, '
-                ' candidates_json, clarification, created_at, updated_at) '
-                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                ' candidates_json, clarification, execution_generation, '
+                ' tenant_id, owner_user_id, created_at, updated_at) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
                 (turn_id, session_id, turn_seq, request_id, request_hash, message,
                  target_task_id, target_run_id, kind, 'accepted',
                  source_turn_id or '',
                  json.dumps(candidates or [], ensure_ascii=False),
-                 clarification or '', stamp, stamp))
+                 clarification or '', 0, tenant_id, owner_user_id, stamp, stamp))
             # 用户消息（同事务）
             await self._run(conn, 'INSERT INTO messages (session_id, role, content, created_at, dedupe_key) '
                 'VALUES (%s,%s,%s,%s,%s)',
@@ -335,16 +336,20 @@ class PgAuth:
         return dict(row) if row else None
 
     async def chat_history(self, session_id: str, exclude_turn_id: str) -> list[dict]:
-        """聊天上下文：该 turn 之前的 user/assistant 消息。
+        """聊天上下文：当前 turn 之前的 user/assistant 消息（按完成消息水位截断）。
 
-        排除当前 turn 的 user 消息（dedupe_key = `turn:{turn_id}`）与所有
-        assistant 答复的去重键，避免「历史里同时出现当前输入」导致重复。
+        第十一阶段 A 组第 3 点：只读当前 turn 用户消息**之前**已完成的消息，不读入
+        **之后已接纳但尚未执行的用户输入**。以当前 turn 用户消息的 `id` 为上界
+        （`dedupe_key = turn:{exclude_turn_id}`），保证同会话按接纳顺序构造上下文；
+        不同会话由 `session_id` 天然隔离。
         """
         async with self._lease() as conn:
             rows = await self._all(conn,
                 'SELECT role, content FROM messages WHERE session_id=%s '
-                'AND (dedupe_key <> %s OR dedupe_key = %s) ORDER BY id',
-                (session_id, f'turn:{exclude_turn_id}', ''))
+                'AND id < COALESCE((SELECT MIN(id) FROM messages '
+                '   WHERE session_id=%s AND dedupe_key=%s), 9223372036854775807) '
+                'ORDER BY id',
+                (session_id, session_id, f'turn:{exclude_turn_id}'))
         return [{'role': r['role'], 'content': r['content']} for r in rows
                 if r['role'] in ('user', 'assistant')]
 
@@ -463,11 +468,15 @@ class PgAuth:
     async def settle_turn(self, turn_id: str, *, status: str,
                           answer: str = '', error: str = '',
                           lease_owner: str = '', lease_epoch: int = 0,
-                          execution_generation: int = 0) -> bool:
+                          execution_generation: int = 0,
+                          require_running: bool = True) -> bool:
         """结算 turn（第十一阶段第 2/3 点）：原子提交答复 + 终态 + 事件 + 消息。
 
-        带租约门禁（owner + epoch + 代次）：过期执行者写回无效。**失租返回
-        False，调用方据此停止，不能再发布成功结果**。
+        带租约门禁（owner + epoch + 代次 + running 状态 + 租约有效期）：过期执行者
+        写回无效。**失租返回 False，调用方据此停止，不能再发布成功结果**。
+
+        第十一阶段 A 组第 2 点：结算事务同时检查 owner、epoch、running 状态和租约
+        有效期；失租后拒绝答复写入。
 
         最终 assistant 消息、turn 终态在同一事务提交，用稳定去重键
         `(session_id, turn-answer:{turn_id})` 保证「答复提交前崩溃」「提交后
@@ -479,13 +488,23 @@ class PgAuth:
                 (turn_id,))
             if row is None:
                 return False
+            now_ts = time.time()
             if lease_owner:
+                # 租约门禁：owner + epoch + 代次 + running 状态 + 租约未过期。
+                # 失租（任一不符）→ 不写答复、不写终态。
+                cond = ('turn_id=%s AND lease_owner=%s AND lease_epoch=%s '
+                        'AND execution_generation=%s')
+                params: list = [turn_id, lease_owner, lease_epoch,
+                                execution_generation]
+                if require_running:
+                    cond += " AND status='running' AND lease_expires_at > %s"
+                    params.append(now_ts)
                 cur = await self._run(conn,
                     'UPDATE session_turns SET status=%s, answer=%s, error=%s, '
-                    'updated_at=%s WHERE turn_id=%s AND lease_owner=%s AND lease_epoch=%s',
-                    (status, answer, error, now(), turn_id, lease_owner, lease_epoch))
+                    'lease_expires_at=0, updated_at=%s WHERE ' + cond,
+                    (status, answer, error, now(), *params))
                 if not cur.rowcount:
-                    # 失租（owner/epoch 已变）：不写答复、不写终态
+                    # 失租（owner/epoch/代次/running/租约任一不符）：不写答复
                     return False
             else:
                 await self._run(conn,

@@ -974,29 +974,35 @@ function chatTurnDone(status) {
     .includes(status);
 }
 
-// 轮询 timeline，直到该 turn 执行出终态（第十一阶段第 7 点）。
+// 轮询 timeline，直到该 turn 执行出终态（第十一阶段第 7 点 / A 组第 4 点）。
 // 消息 POST 只持久接纳，答复由 Worker 后台生成；只在发送后拉一次时间线会看不到
 // 后台生成的答复。这里按 turn_id 轮询，终态后刷新会话，刷新/重试复用原 request ID。
+//
+// A 组第 4 点：多 turn 并存——用 `S.sessionId` 判断是否切走，**不用 sessionEpoch**。
+// 否则第一个 turn 完成触发 openSession 会递增 epoch，把其他 pending turn 的轮询
+// 全部误杀（"一个 turn 完成使其他轮询失效"）。
 async function pollChatReply(turnId, sessionId) {
-  const epoch = S.sessionEpoch || 0;
   const deadline = Date.now() + 120000;   // 最多轮询 120s
   while (Date.now() < deadline) {
-    if (epoch !== S.sessionEpoch) return;  // 用户已切走，放弃本次轮询
+    if (S.sessionId !== sessionId) return;  // 用户已切走，放弃本次轮询
     await new Promise(r => setTimeout(r, 800));
     try {
-      const res = await checkAuth(await fetch(
+      const res = checkAuth(await fetch(
         `${API_PREFIX}/sessions/${sessionId}/timeline`));
       if (!res.ok) continue;
       const data = await res.json();
       const turn = (data.chat_turns || []).find(t => t.turn_id === turnId);
       if (turn && chatTurnDone(turn.status)) {
-        openSession(sessionId, {keepWorkspace: true});
+        // 终态：幂等全量刷新（openSession 是幂等的，重复调用安全）
+        if (S.sessionId === sessionId) {
+          openSession(sessionId, {keepWorkspace: true});
+        }
         return;
       }
     } catch { /* 网络抖动，下一轮继续 */ }
   }
   // 超时兜底：最后再拉一次，至少不丢已经落库的答复
-  if (epoch === S.sessionEpoch) openSession(sessionId, {keepWorkspace: true});
+  if (S.sessionId === sessionId) openSession(sessionId, {keepWorkspace: true});
 }
 
 // 给**当前任务**补一句要求。
@@ -1015,8 +1021,9 @@ async function postRunInput(text, requestId) {
   try {
     return await checkAuth(await fetch(url, options));
   } catch (err) {
-    // 网络层失败：请求可能已经到了服务端，用同一个 requestId 再试一次
-    return await fetch(url, options);
+    // 网络层失败：请求可能已经到了服务端，用同一个 requestId 再试一次。
+    // 重试也必须过 checkAuth，否则 401 时不会触发登录失效处理（A 组第 4 点）。
+    return await checkAuth(await fetch(url, options));
   }
 }
 

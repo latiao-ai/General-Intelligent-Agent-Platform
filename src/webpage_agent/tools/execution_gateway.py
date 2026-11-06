@@ -85,7 +85,30 @@ async def tool_context(step_id: str = '', action_id: str = ''):
         logger.warning('读取 run 失败 run=%s', context_.run_id, exc_info=True)
         return None
     if not run:
-        return None
+        # 第十一阶段 A 组第 5 点：会话 turn（chat/query）没有业务 run 行，用
+        # turn_id 作为执行身份。可信主体回退到 session_turns 表的
+        # tenant_id / owner_user_id（接纳时已落库），**不依赖业务 run 碰巧
+        # 提供身份**，也不伪造一个"看起来像真的"主体。
+        turn = None
+        turn_reader = getattr(store, 'turn', None)
+        if callable(turn_reader):
+            try:
+                turn = await turn_reader(context_.run_id)
+            except Exception:                        # noqa: BLE001
+                logger.warning('读取 turn 失败 turn=%s', context_.run_id,
+                               exc_info=True)
+                turn = None
+        if not turn:
+            return None
+        tenant_id = str(turn.get('tenant_id') or '') or 'default'
+        user_id = str(turn.get('owner_user_id') or '') or 'default'
+        return tool_context_module.from_run(
+            {'run_id': context_.run_id, 'tenant_id': tenant_id,
+             'owner_user_id': user_id},
+            user_id=user_id, role='member',
+            step_id=step_id, action_id=action_id,
+            intent_version=0, plan_version=1,
+            authenticated=bool(tenant_id) and user_id != 'default')
     user_id = str(run.get('owner_user_id') or '') or 'default'
     role = str(run.get('owner_role') or '') or 'member'
     return tool_context_module.from_run(

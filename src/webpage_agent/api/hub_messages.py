@@ -32,6 +32,38 @@ def request_hash(message: str, target: str) -> str:
     return hashlib.sha256(body.encode('utf-8')).hexdigest()
 
 
+class CapabilityDisabled(RuntimeError):
+    """某项会话能力被开关关闭，且关闭时明确拒绝（不接纳后搁置）。
+
+    A 组第 5 点：API 接纳、Worker 调度、执行入口三处都用同一判断；关闭时抛此
+    异常，由 API 层映射为明确的 HTTP 错误，而不是先落 turn 再等 Worker 判失败。
+    """
+
+    def __init__(self, kind: str, reason: str = ''):
+        self.kind = kind
+        super().__init__(reason or f'{kind} 能力未开放')
+
+
+def kind_enabled(kind: str) -> bool:
+    """统一的能力开关判断（A 组第 5 点）：API 接纳、Worker 调度、执行入口共用。
+
+    - `chat` → `settings.session_chat_enabled`
+    - `query` → `settings.session_query_enabled`
+    - `control` → `settings.session_task_control_enabled`
+    - `ambiguous` → 总是 True（它是路由中间态，追问不是"能力"）
+    - 其余（未知）→ 关闭（保守拒绝）。
+    """
+    if kind == 'chat':
+        return settings.session_chat_enabled
+    if kind == 'query':
+        return settings.session_query_enabled
+    if kind == 'control':
+        return settings.session_task_control_enabled
+    if kind == 'ambiguous':
+        return True
+    return False
+
+
 # 控制动词：明确要操作某个任务。只有命中这些词 + 有明确目标，才路由到 control。
 _CONTROL_VERBS = ('建', '创建', '新建', '列出', '查进度', '补充', '暂停', '恢复',
                   '继续', '取消', '停止', '停下', '修改', '改')
@@ -158,13 +190,22 @@ class HubSessionMessageMixin:
         clarification = ''
         if route.get('kind') == 'ambiguous':
             clarification = self._ambiguous_prompt(message, candidates, active)
+
+        # 能力开关统一判断（A 组第 5 点）：接纳层对 chat/query 关闭时明确拒绝，
+        # 不落 turn 搁置。`control` / `ambiguous` 总是接纳——control 的写能力
+        # （建/暂停/取消/补充）开关是**分项**的，须在执行层（`_control_answer`）
+        # 按具体意图逐一检查；「查进度」是只读、总是开放。
+        route_kind = route.get('kind') or 'chat'
+        if route_kind in ('chat', 'query') and not kind_enabled(route_kind):
+            raise CapabilityDisabled(route_kind)
+
         try:
             result = await self.store.create_turn(
                 turn_id, session_id, request_id=request_id,
                 request_hash=fingerprint, message=message,
                 target_task_id=route.get('target_task_id') or '',
                 target_run_id=route.get('target_run_id') or '',
-                kind=route.get('kind') or 'chat',
+                kind=route_kind,
                 tenant_id=tenant, owner_user_id=owner,
                 candidates=candidates, clarification=clarification,
                 source_turn_id=source_turn_id)
@@ -259,21 +300,24 @@ class HubSessionMessageMixin:
         if claimed is None:
             return False
         kind = str(claimed.get('kind') or 'chat')
+        gen = int(claimed.get('execution_generation') or 0)
+        epoch = int(claimed.get('lease_epoch') or 0)
+        lease_owner = claimed.get('lease_owner')
         if kind == 'chat' and not settings.session_chat_enabled:
             # 聊天开关关闭：不能搁置，明确结算为失败并说明原因
             await self.store.settle_turn(
                 claimed['turn_id'], status='failed',
                 error='聊天能力未开放（SESSION_CHAT_ENABLED=false）',
-                lease_owner=claimed.get('lease_owner'),
-                lease_epoch=int(claimed.get('lease_epoch') or 0),
+                lease_owner=lease_owner, lease_epoch=epoch,
+                execution_generation=gen,
                 answer='抱歉，聊天能力当前未开放。')
             return True
         if kind == 'query' and not settings.session_query_enabled:
             await self.store.settle_turn(
                 claimed['turn_id'], status='failed',
                 error='查询能力未开放（SESSION_QUERY_ENABLED=false）',
-                lease_owner=claimed.get('lease_owner'),
-                lease_epoch=int(claimed.get('lease_epoch') or 0),
+                lease_owner=lease_owner, lease_epoch=epoch,
+                execution_generation=gen,
                 answer='抱歉，查询能力当前未开放。')
             return True
         await self.execute_claimed_turn(claimed)
@@ -287,7 +331,8 @@ class HubSessionMessageMixin:
         - `control`：走宿主控制工具（建任务/补充/暂停/恢复/取消，逐项检查归属权限）；
         - `ambiguous`：追问（候选关联已存，下一条回答能继续澄清）。
 
-        结算检查 owner/epoch，失租停止执行、不写答复（第 2/3 点）。
+        第十一阶段 A 组第 2 点：执行期间续租（看守协程）；结算检查 owner + epoch +
+        代次 + running 状态 + 租约有效期，失租停止执行、不写答复。
         """
         turn_id = str(claimed['turn_id'])
         kind = str(claimed.get('kind') or 'chat')
@@ -297,6 +342,13 @@ class HubSessionMessageMixin:
         lease_epoch = int(claimed.get('lease_epoch') or 0)
         execution_generation = int(claimed.get('execution_generation') or 0)
 
+        # 续租看守：长执行（真实模型）期间定期续租，失租则取消执行。
+        lease_ttl = float(settings.session_turn_lease_seconds)
+        renew_task = asyncio.create_task(
+            self._renew_turn_guard(turn_id, lease_owner, lease_epoch,
+                                   lease_ttl),
+            name=f'turn-renew:{turn_id}')
+
         try:
             if kind in ('chat', 'query'):
                 answer = await self._run_pi_chat(claimed)
@@ -304,7 +356,8 @@ class HubSessionMessageMixin:
                     return None
                 ok = await self.store.settle_turn(
                     turn_id, status='succeeded', answer=answer,
-                    lease_owner=lease_owner, lease_epoch=lease_epoch)
+                    lease_owner=lease_owner, lease_epoch=lease_epoch,
+                    execution_generation=execution_generation)
                 if not ok:
                     # 失租：停止，不再发布成功结果（第 2/3 点）
                     logger.warning('turn %s 结算时已失租，丢弃答复', turn_id)
@@ -318,7 +371,8 @@ class HubSessionMessageMixin:
             # 未知 kind：保守结算失败，不搁置
             await self.store.settle_turn(
                 turn_id, status='failed', error=f'未知 turn 类型 {kind}',
-                lease_owner=lease_owner, lease_epoch=lease_epoch)
+                lease_owner=lease_owner, lease_epoch=lease_epoch,
+                execution_generation=execution_generation)
             return None
         except asyncio.CancelledError:
             raise
@@ -326,8 +380,36 @@ class HubSessionMessageMixin:
             logger.exception('turn %s 执行异常', turn_id)
             await self.store.settle_turn(
                 turn_id, status='failed', error=type(exc).__name__,
-                lease_owner=lease_owner, lease_epoch=lease_epoch)
+                lease_owner=lease_owner, lease_epoch=lease_epoch,
+                execution_generation=execution_generation)
             return None
+        finally:
+            renew_task.cancel()
+            try:
+                await renew_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _renew_turn_guard(self, turn_id: str, owner: str,
+                                lease_epoch: int, ttl: float) -> None:
+        """turn 长执行续租看守（第十一阶段 A 组第 2 点）。
+
+        每 1/3 租约续一次；连续续租失败说明已失租，取消当前执行任务，避免
+        「失租后仍继续执行并尝试写答复」。清理（cancel）不能覆盖原异常——这里
+        只负责取消，不吞执行异常。
+        """
+        interval = max(1.0, ttl / 3.0)
+        current = asyncio.current_task()
+        while True:
+            await asyncio.sleep(interval)
+            ok = await self.store.renew_turn_lease(
+                turn_id, owner, ttl, lease_epoch=lease_epoch)
+            if not ok:
+                logger.warning('turn %s 续租失败，已失租', turn_id)
+                # 失租：取消执行协程（父任务）——失租后不应继续执行
+                if current is not None:
+                    current.cancel()
+                return
 
     # ---------- 聊天 / 查询：真实 Pi 执行 ----------
 
@@ -397,15 +479,28 @@ class HubSessionMessageMixin:
 
         runtime = self._build_pi_runtime(tools=tools, tool_objects=tool_objects)
 
-        # 独立 turn 执行身份：billing scope 用 turn_id 作为 run_id 标识。
+        # 独立 turn 执行身份（A 组第 5 点）：
+        # - billing scope 用 turn_id 作为 run_id 标识（费用结算独立于业务 run）；
+        # - 绑定 ExecutionContext（run_id=turn_id），让只读工具经 `tool_context`
+        #   的 turn 回退取得**当前用户**的可信主体（tenant_id / owner_user_id 已
+        #   在接纳时落库到 session_turns），不依赖业务 run 碰巧提供身份。
         from webpage_agent.governance import core as governance
+        from webpage_agent.governance import execution_control
+        owner_user_id = str(claimed.get('owner_user_id') or 'default')
+        exec_ctx = execution_control.ExecutionContext(
+            run_id=turn_id,
+            lease_owner=str(claimed.get('lease_owner') or ''),
+            lease_epoch=int(claimed.get('lease_epoch') or 0))
         billing_token = governance.bind(self.store, tenant_id, turn_id)
+        context_token = execution_control.bind(exec_ctx)
         try:
             state = {
                 'user_input': message,
                 'history': history,
                 'task_id': turn_id,
                 'run_id': turn_id,
+                'owner_user_id': owner_user_id,
+                'tenant_id': tenant_id,
                 'documents': [], 'mcp_calls': [], 'errors': [], 'usage': [],
                 'status': 'created',
             }
@@ -416,6 +511,7 @@ class HubSessionMessageMixin:
                 return '抱歉，我暂时无法回答这个问题。'
             return answer
         finally:
+            execution_control.unbind(context_token)
             governance.unbind(billing_token)
 
     # ---------- 控制 / 歧义 ----------
@@ -432,12 +528,14 @@ class HubSessionMessageMixin:
         target_task_id = str(claimed.get('target_task_id') or '')
         lease_owner = str(claimed.get('lease_owner') or '')
         lease_epoch = int(claimed.get('lease_epoch') or 0)
+        execution_generation = int(claimed.get('execution_generation') or 0)
 
         answer = await self._control_answer(
             claimed, message, session_id, target_task_id)
         ok = await self.store.settle_turn(
             turn_id, status='succeeded', answer=answer,
-            lease_owner=lease_owner, lease_epoch=lease_epoch)
+            lease_owner=lease_owner, lease_epoch=lease_epoch,
+            execution_generation=execution_generation)
         if not ok:
             return None
         return {'turn_id': turn_id, 'kind': 'control', 'answer': answer,
@@ -577,11 +675,13 @@ class HubSessionMessageMixin:
         clarification = str(claimed.get('clarification') or '')
         lease_owner = str(claimed.get('lease_owner') or '')
         lease_epoch = int(claimed.get('lease_epoch') or 0)
+        execution_generation = int(claimed.get('execution_generation') or 0)
         answer = clarification or '我不确定你想操作哪个任务，请指明目标。'
         # ambiguous 结算为 waiting_clarification（明确等待，不再被领取执行）
         ok = await self.store.settle_turn(
             turn_id, status='waiting_clarification', answer=answer,
-            lease_owner=lease_owner, lease_epoch=lease_epoch)
+            lease_owner=lease_owner, lease_epoch=lease_epoch,
+            execution_generation=execution_generation)
         if not ok:
             return None
         return {'turn_id': turn_id, 'kind': 'ambiguous', 'answer': answer,

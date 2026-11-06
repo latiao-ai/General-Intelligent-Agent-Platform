@@ -41,7 +41,10 @@ SESSION_TURNS = 'v8_session_turns'
 # clarification（追问文案）、execution_generation（执行代次，区分 lease_epoch 的
 # 领取代次——每次重新领取都 +1，用于「过期 running 重领」与「同会话串行」判定）。
 TURN_FOLLOWUP = 'v9_turn_followup'
-LATEST = TURN_FOLLOWUP
+# 会话 turn 可信主体：tenant_id / owner_user_id（供只读查询工具从 turn 本身取得
+# 当前用户身份，不依赖业务 run 碰巧提供）。第十一阶段 A 组第 5 点。
+TURN_PRINCIPAL = 'v10_turn_principal'
+LATEST = TURN_PRINCIPAL
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -116,6 +119,11 @@ ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS clarification TEXT NOT NULL D
 ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS execution_generation INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_session_turns_claim2
     ON session_turns(session_id, status, lease_expires_at);
+'''), (TURN_PRINCIPAL, '''
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS owner_user_id TEXT NOT NULL DEFAULT 'default';
+CREATE INDEX IF NOT EXISTS idx_session_turns_principal
+    ON session_turns(tenant_id, owner_user_id);
 '''))
 
 
