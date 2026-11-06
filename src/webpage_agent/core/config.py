@@ -178,6 +178,10 @@ class Settings:
     # 聊天 turn 与业务 run 分别预留的并发额度（避免长业务阻塞聊天）。
     session_chat_concurrency: int = max(1, int(
         os.getenv('SESSION_CHAT_CONCURRENCY', '2')))
+    # 聊天 turn 的租约时长（秒）。聊天执行会起 Node 子进程 + 模型调用，租约需
+    # 覆盖一次完整答复；过期 running 会被新执行者重新领取（递增执行代次）。
+    session_turn_lease_seconds: float = max(15.0, float(
+        os.getenv('SESSION_TURN_LEASE_SECONDS', '120')))
     # ---------- 结果观察与自主决策（《智能体中台说明书》） ----------
     # 功能开关：关掉时观察节点只做程序事实采集，不调用模型（等价于"按计划跑完"）。
     observe_enabled: bool = (

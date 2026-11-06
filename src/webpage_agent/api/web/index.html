@@ -968,6 +968,37 @@ async function postSessionMessage(text, requestId, targetTaskId) {
   }
 }
 
+// 聊天 turn 终态：这些状态下 Worker 已经执行完、答复已落库，可以停止轮询。
+function chatTurnDone(status) {
+  return ['succeeded', 'failed', 'waiting_clarification', 'cancelled']
+    .includes(status);
+}
+
+// 轮询 timeline，直到该 turn 执行出终态（第十一阶段第 7 点）。
+// 消息 POST 只持久接纳，答复由 Worker 后台生成；只在发送后拉一次时间线会看不到
+// 后台生成的答复。这里按 turn_id 轮询，终态后刷新会话，刷新/重试复用原 request ID。
+async function pollChatReply(turnId, sessionId) {
+  const epoch = S.sessionEpoch || 0;
+  const deadline = Date.now() + 120000;   // 最多轮询 120s
+  while (Date.now() < deadline) {
+    if (epoch !== S.sessionEpoch) return;  // 用户已切走，放弃本次轮询
+    await new Promise(r => setTimeout(r, 800));
+    try {
+      const res = await checkAuth(await fetch(
+        `${API_PREFIX}/sessions/${sessionId}/timeline`));
+      if (!res.ok) continue;
+      const data = await res.json();
+      const turn = (data.chat_turns || []).find(t => t.turn_id === turnId);
+      if (turn && chatTurnDone(turn.status)) {
+        openSession(sessionId, {keepWorkspace: true});
+        return;
+      }
+    } catch { /* 网络抖动，下一轮继续 */ }
+  }
+  // 超时兜底：最后再拉一次，至少不丢已经落库的答复
+  if (epoch === S.sessionEpoch) openSession(sessionId, {keepWorkspace: true});
+}
+
 // 给**当前任务**补一句要求。
 // 关键：不打断、不新建任务、不换 EventSource——原任务继续跑，只是下个边界改计划。
 // requestId 会跟着这一条消息走到最后：网络失败重试时必须复用同一个 ID，
@@ -1106,12 +1137,16 @@ async function sendSessionMessage(text) {
       }
     } else {
       // 接纳成功：kind 是 chat/query/control/ambiguous，turn 已在后台处理。
-      S.sessionId = S.sessionId;  // 保持会话
       if (data.kind === 'ambiguous') {
         addMessage('assistant', '你说的目标有多个任务，请指明要操作哪一个。');
       }
-      // 重新拉取时间线，展示聊天 turn 与任务卡。
-      if (S.sessionId) openSession(S.sessionId, {keepWorkspace: true});
+      // Worker 在后台异步执行 turn、生成答复。这里**不能只拉一次时间线**——
+      // 否则后台生成的答复对用户不可见。按 turn_id 轮询直到终态再刷新。
+      if (data.turn_id && S.sessionId) {
+        pollChatReply(data.turn_id, S.sessionId);
+      } else if (S.sessionId) {
+        openSession(S.sessionId, {keepWorkspace: true});
+      }
     }
   } catch (err) {
     addMessage('assistant', '提交失败：' + err.message);

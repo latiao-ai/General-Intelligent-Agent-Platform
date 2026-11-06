@@ -261,12 +261,18 @@ class PgAuth:
                           request_id: str, request_hash: str, message: str,
                           target_task_id: str = '', target_run_id: str = '',
                           kind: str = 'chat', tenant_id: str = 'default',
-                          owner_user_id: str = 'default') -> dict:
+                          owner_user_id: str = 'default',
+                          source_turn_id: str = '',
+                          candidates: list | None = None,
+                          clarification: str = '') -> dict:
         """用户消息 + 待执行 turn + 接纳事件同事务提交。
 
         幂等：`(session_id, request_id)` 唯一。同一 request_id 同一 request_hash
         返回原 turn（replayed=True）；不同 request_hash 抛 `TurnRequestConflict`。
         返回 `{turn_id, message_id, status, replayed, ...}`。
+
+        第十一阶段：`source_turn_id` 关联追问链（歧义追问后下一条回答能继续澄清），
+        `candidates`/`clarification` 保存歧义候选关联（控制去重与持久追问）。
         """
         stamp = now()
         async with self._lease() as conn:
@@ -290,7 +296,8 @@ class PgAuth:
                         'status': existing['status'], 'replayed': True,
                         'message_id': 0, 'kind': existing['kind'],
                         'target_task_id': existing['target_task_id'],
-                        'target_run_id': existing['target_run_id']}
+                        'target_run_id': existing['target_run_id'],
+                        'turn_seq': int(existing.get('turn_seq') or 0)}
             # 分配 turn_seq（锁住会话后 MAX+1，不用猜）
             seq_row = await self._one(conn,
                 'SELECT COALESCE(MAX(turn_seq),0) AS n FROM session_turns WHERE session_id=%s',
@@ -298,10 +305,14 @@ class PgAuth:
             turn_seq = int((seq_row or {}).get('n') or 0) + 1
             await self._run(conn, 'INSERT INTO session_turns '
                 '(turn_id, session_id, turn_seq, request_id, request_hash, message, '
-                ' target_task_id, target_run_id, kind, status, created_at, updated_at) '
-                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                ' target_task_id, target_run_id, kind, status, source_turn_id, '
+                ' candidates_json, clarification, created_at, updated_at) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
                 (turn_id, session_id, turn_seq, request_id, request_hash, message,
-                 target_task_id, target_run_id, kind, 'accepted', stamp, stamp))
+                 target_task_id, target_run_id, kind, 'accepted',
+                 source_turn_id or '',
+                 json.dumps(candidates or [], ensure_ascii=False),
+                 clarification or '', stamp, stamp))
             # 用户消息（同事务）
             await self._run(conn, 'INSERT INTO messages (session_id, role, content, created_at, dedupe_key) '
                 'VALUES (%s,%s,%s,%s,%s)',
@@ -323,6 +334,20 @@ class PgAuth:
                                   (turn_id,))
         return dict(row) if row else None
 
+    async def chat_history(self, session_id: str, exclude_turn_id: str) -> list[dict]:
+        """聊天上下文：该 turn 之前的 user/assistant 消息。
+
+        排除当前 turn 的 user 消息（dedupe_key = `turn:{turn_id}`）与所有
+        assistant 答复的去重键，避免「历史里同时出现当前输入」导致重复。
+        """
+        async with self._lease() as conn:
+            rows = await self._all(conn,
+                'SELECT role, content FROM messages WHERE session_id=%s '
+                'AND (dedupe_key <> %s OR dedupe_key = %s) ORDER BY id',
+                (session_id, f'turn:{exclude_turn_id}', ''))
+        return [{'role': r['role'], 'content': r['content']} for r in rows
+                if r['role'] in ('user', 'assistant')]
+
     async def turns_of(self, session_id: str) -> list[dict]:
         async with self._lease() as conn:
             rows = await self._all(conn,
@@ -330,24 +355,84 @@ class PgAuth:
                 (session_id,))
         return [dict(r) for r in rows]
 
-    async def claim_turn(self, owner: str, ttl: float,
-                         *, session_id: str) -> dict | None:
-        """领取一个待执行的聊天 turn（按 session 内 turn_seq 顺序，有界）。"""
+    async def pending_turns(self, limit: int = 50) -> list[dict]:
+        """跨会话领取待执行的聊天 turn（不同会话可有界并发）。
+
+        `accepted`（待执行）或 `running` 且租约已过期（执行者失联，重新领取）。
+        按 turn_seq 正序，只取未过期的；不区分 session，由调用方做并发额度控制。
+        """
         now_ts = time.time()
         async with self._lease() as conn:
-            await self._run(conn,
-                "SELECT pg_advisory_xact_lock(hashtext('turn:' || %s))",
-                (session_id,))
-            row = await self._one(conn,
-                "SELECT * FROM session_turns WHERE session_id=%s AND status IN ('accepted','retry') "
-                "AND (lease_expires_at=0 OR lease_expires_at < %s) "
-                'ORDER BY turn_seq LIMIT 1 FOR UPDATE SKIP LOCKED',
-                (session_id, now_ts))
+            rows = await self._all(conn,
+                "SELECT * FROM session_turns WHERE status IN ('accepted','retry') "
+                "OR (status='running' AND lease_expires_at > 0 AND lease_expires_at < %s) "
+                'ORDER BY created_at LIMIT %s',
+                (now_ts, int(limit or 50)))
+        return [dict(r) for r in rows]
+
+    async def claim_turn(self, owner: str, ttl: float,
+                         *, session_id: str = '') -> dict | None:
+        """原子领取一个聊天 turn（第十一阶段第 2 点）。
+
+        同一会话只能有一个**有效执行中**的聊天 turn：领取前先检查该会话是否
+        已有未过期的 running turn，有则跳过（保证同会话串行）。不同会话可并发。
+
+        支持过期 running 重新领取：租约已过期的 running turn 视为执行者失联，
+        重新领取并递增 `execution_generation`（执行代次，区分 lease_epoch 的
+        领取代次）与 `lease_epoch`。`session_id` 给定时只领该会话，否则跨会话
+        领一条（有界并发由调用方的额度控制）。
+        """
+        now_ts = time.time()
+        async with self._lease() as conn:
+            if session_id:
+                await self._run(conn,
+                    "SELECT pg_advisory_xact_lock(hashtext('turn:' || %s))",
+                    (session_id,))
+                # 同会话串行：已有未过期 running turn 时不再领
+                active = await self._one(conn,
+                    "SELECT 1 FROM session_turns WHERE session_id=%s AND status='running' "
+                    'AND lease_expires_at > %s LIMIT 1', (session_id, now_ts))
+                if active is not None:
+                    return None
+                row = await self._one(conn,
+                    "SELECT * FROM session_turns WHERE session_id=%s AND "
+                    "(status IN ('accepted','retry') OR "
+                    " (status='running' AND lease_expires_at>0 AND lease_expires_at<%s)) "
+                    'ORDER BY turn_seq LIMIT 1 FOR UPDATE SKIP LOCKED',
+                    (session_id, now_ts))
+            else:
+                # 跨会话领取：按 created_at 正序。同会话串行仍要保证，所以先取
+                # 候选列表再逐条尝试（用 advisory lock 保证同会话互斥）。
+                candidates = await self._all(conn,
+                    "SELECT turn_id, session_id FROM session_turns WHERE "
+                    "(status IN ('accepted','retry') OR "
+                    " (status='running' AND lease_expires_at>0 AND lease_expires_at<%s)) "
+                    'ORDER BY created_at LIMIT 200', (now_ts,))
+                row = None
+                for cand in candidates:
+                    sid = cand['session_id']
+                    await self._run(conn,
+                        "SELECT pg_advisory_xact_lock(hashtext('turn:' || %s))",
+                        (sid,))
+                    active = await self._one(conn,
+                        "SELECT 1 FROM session_turns WHERE session_id=%s AND status='running' "
+                        'AND lease_expires_at > %s LIMIT 1', (sid, now_ts))
+                    if active is not None:
+                        continue
+                    row = await self._one(conn,
+                        "SELECT * FROM session_turns WHERE turn_id=%s AND "
+                        "(status IN ('accepted','retry') OR "
+                        " (status='running' AND lease_expires_at>0 AND lease_expires_at<%s)) "
+                        'FOR UPDATE SKIP LOCKED',
+                        (cand['turn_id'], now_ts))
+                    if row is not None:
+                        break
             if row is None:
                 return None
             await self._run(conn,
                 'UPDATE session_turns SET status=%s, lease_owner=%s, '
-                'lease_expires_at=%s, lease_epoch=lease_epoch+1, updated_at=%s '
+                'lease_expires_at=%s, lease_epoch=lease_epoch+1, '
+                'execution_generation=execution_generation+1, updated_at=%s '
                 'WHERE turn_id=%s',
                 ('running', owner, now_ts + ttl, now(), row['turn_id']))
             await conn.commit()
@@ -355,25 +440,70 @@ class PgAuth:
         out['status'] = 'running'
         out['lease_owner'] = owner
         out['lease_epoch'] = int(out.get('lease_epoch') or 0) + 1
+        out['execution_generation'] = int(out.get('execution_generation') or 0) + 1
         return out
+
+    async def renew_turn_lease(self, turn_id: str, owner: str, ttl: float,
+                               *, lease_epoch: int) -> bool:
+        """聊天 turn 长执行续租（第十一阶段第 2 点）。
+
+        返回 False = 已失租（owner/epoch 不符或租约已过期），执行者应停止。
+        与 run 的 renew_lease 同口径：epoch 与领取时一致、租约未过期才续。
+        """
+        current = time.time()
+        async with self._lease() as conn:
+            cur = await self._run(
+                conn, "UPDATE session_turns SET lease_expires_at=%s, updated_at=%s "
+                "WHERE turn_id=%s AND lease_owner=%s AND lease_epoch=%s "
+                "AND status='running' AND lease_expires_at > %s",
+                (current + ttl, now(), turn_id, owner, int(lease_epoch), current))
+            await conn.commit()
+            return cur.rowcount > 0
 
     async def settle_turn(self, turn_id: str, *, status: str,
                           answer: str = '', error: str = '',
-                          lease_owner: str = '', lease_epoch: int = 0) -> bool:
-        """结算 turn（带租约门禁：过期执行者写回无效）。"""
+                          lease_owner: str = '', lease_epoch: int = 0,
+                          execution_generation: int = 0) -> bool:
+        """结算 turn（第十一阶段第 2/3 点）：原子提交答复 + 终态 + 事件 + 消息。
+
+        带租约门禁（owner + epoch + 代次）：过期执行者写回无效。**失租返回
+        False，调用方据此停止，不能再发布成功结果**。
+
+        最终 assistant 消息、turn 终态在同一事务提交，用稳定去重键
+        `(session_id, turn-answer:{turn_id})` 保证「答复提交前崩溃」「提交后
+        响应丢失」均可恢复、不丢答复、不重复答复。
+        """
         async with self._lease() as conn:
+            row = await self._one(conn,
+                'SELECT * FROM session_turns WHERE turn_id=%s FOR UPDATE',
+                (turn_id,))
+            if row is None:
+                return False
             if lease_owner:
                 cur = await self._run(conn,
-                    'UPDATE session_turns SET status=%s, answer=%s, error=%s, updated_at=%s '
-                    'WHERE turn_id=%s AND lease_owner=%s AND lease_epoch=%s',
+                    'UPDATE session_turns SET status=%s, answer=%s, error=%s, '
+                    'updated_at=%s WHERE turn_id=%s AND lease_owner=%s AND lease_epoch=%s',
                     (status, answer, error, now(), turn_id, lease_owner, lease_epoch))
+                if not cur.rowcount:
+                    # 失租（owner/epoch 已变）：不写答复、不写终态
+                    return False
             else:
-                cur = await self._run(conn,
-                    'UPDATE session_turns SET status=%s, answer=%s, error=%s, updated_at=%s '
-                    'WHERE turn_id=%s',
+                await self._run(conn,
+                    'UPDATE session_turns SET status=%s, answer=%s, error=%s, '
+                    'updated_at=%s WHERE turn_id=%s',
                     (status, answer, error, now(), turn_id))
+            # 最终答复消息（同事务、稳定去重键）
+            if answer:
+                await self._run(conn,
+                    'INSERT INTO messages (session_id, role, content, created_at, dedupe_key) '
+                    'VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING',
+                    (row['session_id'], 'assistant', answer, now(),
+                     f'turn-answer:{turn_id}'))
+            await self._run(conn,
+                'UPDATE sessions SET updated_at=%s WHERE session_id=%s',
+                (now(), row['session_id']))
             await conn.commit()
-        return bool(cur.rowcount)
+        return True
 
     async def finish_turn_message(self, session_id: str, content: str,
                                   *, dedupe_key: str = '') -> None:

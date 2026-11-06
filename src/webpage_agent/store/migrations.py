@@ -37,7 +37,11 @@ EXTERNAL_CANCEL_INTENT = 'v7_external_cancel_intent'
 # 会话 turn：独立聊天 turn 记录（第十一阶段）。请求指纹、顺序、状态、引擎身份、
 # 租约、执行代次、关联业务 run。
 SESSION_TURNS = 'v8_session_turns'
-LATEST = SESSION_TURNS
+# 会话 turn 追问与歧义：source_turn_id（追问链）、candidates_json（歧义候选）、
+# clarification（追问文案）、execution_generation（执行代次，区分 lease_epoch 的
+# 领取代次——每次重新领取都 +1，用于「过期 running 重领」与「同会话串行」判定）。
+TURN_FOLLOWUP = 'v9_turn_followup'
+LATEST = TURN_FOLLOWUP
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -105,6 +109,13 @@ CREATE INDEX IF NOT EXISTS idx_session_turns_session
     ON session_turns(session_id, turn_seq);
 CREATE INDEX IF NOT EXISTS idx_session_turns_claim
     ON session_turns(status, lease_expires_at);
+'''), (TURN_FOLLOWUP, '''
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS source_turn_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS candidates_json TEXT NOT NULL DEFAULT '';
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS clarification TEXT NOT NULL DEFAULT '';
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS execution_generation INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_session_turns_claim2
+    ON session_turns(session_id, status, lease_expires_at);
 '''))
 
 

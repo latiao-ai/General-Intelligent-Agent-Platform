@@ -147,6 +147,37 @@ async def drain_jobs(hub: Hub, worker_id: str, limit: int = 5) -> int:
     return done
 
 
+async def drain_chat_turns(hub: Hub, worker_id: str, limit: int) -> int:
+    """消费聊天 turn（第十一阶段第 1 点）。
+
+    聊天 turn 与业务 run **分池**：业务长任务、外部轮询吃的是 run 的并发额度，
+    聊天走 `session_chat_concurrency` 自己的额度，不会互相阻塞。
+
+    开关必须在调度入口读取：聊天/查询都关闭时直接不领，避免「接纳后永久搁置」。
+    同会话串行由 `claim_turn` 的 advisory lock 保证；不同会话按并发额度并行。
+    """
+    from webpage_agent.core.config import settings as _settings
+    if not (_settings.session_chat_enabled or _settings.session_query_enabled):
+        return 0
+    limit = max(1, int(limit or 1))
+    claimed = 0
+    tasks: list[asyncio.Task] = []
+    for _ in range(limit):
+        turn = await hub.store.claim_turn(
+            worker_id, _settings.session_turn_lease_seconds)
+        if turn is None:
+            break
+        claimed += 1
+        tasks.append(asyncio.create_task(
+            hub.execute_claimed_turn(turn), name=f'turn:{turn["turn_id"]}'))
+    if tasks:
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for r in results:
+            if isinstance(r, BaseException):
+                logger.warning('聊天 turn 执行异常', exc_info=r)
+    return claimed
+
+
 async def main_loop(hub: Hub, worker_id: str, once: bool,
                     jobs_only: bool, interval: float) -> None:
     from webpage_agent.observe import runtime_check
@@ -172,6 +203,12 @@ async def main_loop(hub: Hub, worker_id: str, once: bool,
             except Exception:                      # noqa: BLE001
                 logger.exception('外部任务轮询失败')
         if not jobs_only:
+            # 聊天 turn 独立额度，不占用业务 run 的并发名额
+            try:
+                worked += await drain_chat_turns(
+                    hub, worker_id, settings.session_chat_concurrency)
+            except Exception:                      # noqa: BLE001
+                logger.exception('聊天 turn 消费失败')
             if await run_once(hub, worker_id):
                 worked += 1
         if once:
