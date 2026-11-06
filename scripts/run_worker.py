@@ -235,7 +235,10 @@ async def main_loop(hub: Hub, worker_id: str, once: bool,
 
     # 聊天 turn 与业务 run 的 in-flight 任务集合：主循环只领取 + 派发，
     # 不 await 执行完成，保证三者互不阻塞（第十一阶段 A 组第 1 点）。
+    # 聊天 turn 单独计数（chat_inflight），按**实际在途数量**限流：只有当前在途
+    # 聊天数 < session_chat_concurrency 才继续领，否则本轮跳过（定点修复 1）。
     inflight: set[asyncio.Task] = set()
+    chat_inflight: set[asyncio.Task] = set()
 
     while True:
         # 1. 后台作业（session_summary 等，快速领取执行）
@@ -252,22 +255,34 @@ async def main_loop(hub: Hub, worker_id: str, once: bool,
 
         # 3. 聊天 turn 与业务 run：各自领取 + 派发，不等待完成
         if not jobs_only:
-            try:
-                inflight.update(await drain_chat_turns(
-                    hub, worker_id, settings.session_chat_concurrency))
-            except Exception:                      # noqa: BLE001
-                logger.exception('聊天 turn 消费失败')
+            # 聊天 turn 实际在途限流：额度 = 总额度 - 当前在途聊天数（定点修复 1）。
+            chat_quota = max(0, int(settings.session_chat_concurrency)
+                             - len(chat_inflight))
+            if chat_quota > 0:
+                try:
+                    chat_tasks = await drain_chat_turns(
+                        hub, worker_id, chat_quota)
+                    chat_inflight.update(chat_tasks)
+                    inflight.update(chat_tasks)
+                except Exception:                  # noqa: BLE001
+                    logger.exception('聊天 turn 消费失败')
             try:
                 inflight.update(await drain_runs_spawned(hub, worker_id))
             except Exception:                      # noqa: BLE001
                 logger.exception('业务 run 领取失败')
 
-        # 4. 收口已完成的任务（回收 done task，避免泄漏）
+        # 4. 收口已完成的任务（回收 done task，避免泄漏）。
+        #    定点修复 3：已取消的任务 `t.exception()` 会抛 CancelledError，必须先
+        #    用 `t.cancelled()` 判断，否则一个被取消的 turn/run 会带走整个主循环。
         if inflight:
             done, inflight = await asyncio.wait(inflight, timeout=0)
             for t in done:
+                chat_inflight.discard(t)
+                if t.cancelled():
+                    logger.info('后台执行任务已取消回收: %s', t.get_name())
+                    continue
                 exc = t.exception()
-                if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                if exc is not None:
                     logger.warning('后台执行任务异常收口: %s', exc, exc_info=exc)
 
         if once:

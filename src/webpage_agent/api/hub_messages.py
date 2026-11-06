@@ -342,11 +342,15 @@ class HubSessionMessageMixin:
         lease_epoch = int(claimed.get('lease_epoch') or 0)
         execution_generation = int(claimed.get('execution_generation') or 0)
 
-        # 续租看守：长执行（真实模型）期间定期续租，失租则取消执行。
+        # 续租看守：长执行（真实模型）期间定期续租，失租则取消**父执行**。
+        # 定点修复 2：guard 必须取消的是父执行协程（当前这个 execute_claimed_turn
+        # 的运行 task），而不是 guard 自己。用 asyncio.current_task() 在创建 guard
+        # 之前取父 task 传进去。
         lease_ttl = float(settings.session_turn_lease_seconds)
+        parent_task = asyncio.current_task()
         renew_task = asyncio.create_task(
             self._renew_turn_guard(turn_id, lease_owner, lease_epoch,
-                                   lease_ttl),
+                                   lease_ttl, parent_task=parent_task),
             name=f'turn-renew:{turn_id}')
 
         try:
@@ -391,24 +395,25 @@ class HubSessionMessageMixin:
                 pass
 
     async def _renew_turn_guard(self, turn_id: str, owner: str,
-                                lease_epoch: int, ttl: float) -> None:
+                                lease_epoch: int, ttl: float,
+                                *, parent_task: asyncio.Task | None = None) -> None:
         """turn 长执行续租看守（第十一阶段 A 组第 2 点）。
 
-        每 1/3 租约续一次；连续续租失败说明已失租，取消当前执行任务，避免
+        每 1/3 租约续一次；连续续租失败说明已失租，取消**父执行协程**，避免
         「失租后仍继续执行并尝试写答复」。清理（cancel）不能覆盖原异常——这里
-        只负责取消，不吞执行异常。
+        只负责取消父执行，不吞执行异常。
+
+        定点修复 2：取消目标必须是父执行 task（`parent_task`），不是 guard 自己。
         """
         interval = max(1.0, ttl / 3.0)
-        current = asyncio.current_task()
         while True:
             await asyncio.sleep(interval)
             ok = await self.store.renew_turn_lease(
                 turn_id, owner, ttl, lease_epoch=lease_epoch)
             if not ok:
-                logger.warning('turn %s 续租失败，已失租', turn_id)
-                # 失租：取消执行协程（父任务）——失租后不应继续执行
-                if current is not None:
-                    current.cancel()
+                logger.warning('turn %s 续租失败，已失租，取消父执行', turn_id)
+                if parent_task is not None and not parent_task.done():
+                    parent_task.cancel()
                 return
 
     # ---------- 聊天 / 查询：真实 Pi 执行 ----------
