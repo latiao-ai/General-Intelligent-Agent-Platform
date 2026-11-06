@@ -53,9 +53,11 @@ from webpage_agent.api.hub_session import HubSessionMixin
 from webpage_agent.api.hub_inputs import HubInputsMixin
 from webpage_agent.api.hub_compensation import HubCompensationMixin
 from webpage_agent.api.hub_recovery import HubRecoveryMixin, _resume_index
+from webpage_agent.api.hub_messages import HubSessionMessageMixin
 
 
-class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixin):
+class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
+          HubCompensationMixin, HubRecoveryMixin):
     """会话与任务注册表。持久部分在 PostgreSQL，实时队列通过数据库通知跨进程补读。"""
 
     # 内存里最多留多少个任务记录（查过的历史任务不必永久驻留）

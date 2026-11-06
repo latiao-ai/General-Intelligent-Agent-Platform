@@ -34,7 +34,10 @@ FINAL_ANSWER_DEDUPE = 'v6_final_answer_dedupe'
 # 外部任务取消意图：external_tasks 增 cancel_requested（区分本地停止/远端取消请求/
 # 远端已确认取消）。第八阶段第 9 点。
 EXTERNAL_CANCEL_INTENT = 'v7_external_cancel_intent'
-LATEST = EXTERNAL_CANCEL_INTENT
+# 会话 turn：独立聊天 turn 记录（第十一阶段）。请求指纹、顺序、状态、引擎身份、
+# 租约、执行代次、关联业务 run。
+SESSION_TURNS = 'v8_session_turns'
+LATEST = SESSION_TURNS
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -74,6 +77,34 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_dedupe
     ON messages(session_id, dedupe_key) WHERE dedupe_key <> '';
 '''), (EXTERNAL_CANCEL_INTENT, '''
 ALTER TABLE external_tasks ADD COLUMN IF NOT EXISTS cancel_requested INTEGER NOT NULL DEFAULT 0;
+'''), (SESSION_TURNS, '''
+CREATE TABLE IF NOT EXISTS session_turns (
+    turn_id            TEXT PRIMARY KEY,
+    session_id         TEXT NOT NULL,
+    turn_seq           INTEGER NOT NULL,
+    request_id         TEXT NOT NULL,
+    request_hash       TEXT NOT NULL DEFAULT '',
+    message            TEXT NOT NULL,
+    target_task_id     TEXT NOT NULL DEFAULT '',
+    target_run_id      TEXT NOT NULL DEFAULT '',
+    kind               TEXT NOT NULL DEFAULT 'chat',
+    status             TEXT NOT NULL DEFAULT 'accepted',
+    engine_kind        TEXT NOT NULL DEFAULT '',
+    engine_version     INTEGER NOT NULL DEFAULT 0,
+    lease_owner        TEXT NOT NULL DEFAULT '',
+    lease_expires_at   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    lease_epoch        INTEGER NOT NULL DEFAULT 0,
+    answer             TEXT NOT NULL DEFAULT '',
+    error              TEXT NOT NULL DEFAULT '',
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_session_turns_request
+    ON session_turns(session_id, request_id);
+CREATE INDEX IF NOT EXISTS idx_session_turns_session
+    ON session_turns(session_id, turn_seq);
+CREATE INDEX IF NOT EXISTS idx_session_turns_claim
+    ON session_turns(status, lease_expires_at);
 '''))
 
 

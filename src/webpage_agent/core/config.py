@@ -162,6 +162,22 @@ class Settings:
     # 一次运行最多因补充要求修订几次计划。超过就停下来等用户显式继续——
     # 无限修订等于让一次任务永远不结束，而且每一次都要一次模型调用。
     run_max_revisions: int = max(1, int(os.getenv('RUN_MAX_REVISIONS', '3')))
+
+    # ---------- 会话聊天（第十一阶段：正式会话入口） ----------
+    # 显式能力开关，逐项开放。默认只开「聊天 + 查询」；创建业务任务、修改、
+    # 暂停、取消等控制能力需显式打开并经正式链路验证后启用。
+    session_chat_enabled: bool = (
+        os.getenv('SESSION_CHAT_ENABLED', 'true').strip().lower() == 'true')
+    session_query_enabled: bool = (
+        os.getenv('SESSION_QUERY_ENABLED', 'true').strip().lower() == 'true')
+    # 业务任务创建/控制：写能力未补验前保持关闭。
+    session_task_create_enabled: bool = (
+        os.getenv('SESSION_TASK_CREATE_ENABLED', 'false').strip().lower() == 'true')
+    session_task_control_enabled: bool = (
+        os.getenv('SESSION_TASK_CONTROL_ENABLED', 'false').strip().lower() == 'true')
+    # 聊天 turn 与业务 run 分别预留的并发额度（避免长业务阻塞聊天）。
+    session_chat_concurrency: int = max(1, int(
+        os.getenv('SESSION_CHAT_CONCURRENCY', '2')))
     # ---------- 结果观察与自主决策（《智能体中台说明书》） ----------
     # 功能开关：关掉时观察节点只做程序事实采集，不调用模型（等价于"按计划跑完"）。
     observe_enabled: bool = (

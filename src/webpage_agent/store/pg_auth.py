@@ -9,7 +9,7 @@ import uuid
 
 import psycopg
 
-from webpage_agent.store.pg_store import TicketAlreadyUsed, now
+from webpage_agent.store.pg_store import TicketAlreadyUsed, TurnRequestConflict, now
 
 class PgAuth:
     """PgAuth 方法组。见模块说明。"""
@@ -254,6 +254,132 @@ class PgAuth:
                 (session_id, after_id))
         return [{'id': r['id'], 'role': r['role'], 'content': r['content']}
                 for r in rows]
+
+    # ---------- 会话 turn（第十一阶段） ----------
+
+    async def create_turn(self, turn_id: str, session_id: str, *,
+                          request_id: str, request_hash: str, message: str,
+                          target_task_id: str = '', target_run_id: str = '',
+                          kind: str = 'chat', tenant_id: str = 'default',
+                          owner_user_id: str = 'default') -> dict:
+        """用户消息 + 待执行 turn + 接纳事件同事务提交。
+
+        幂等：`(session_id, request_id)` 唯一。同一 request_id 同一 request_hash
+        返回原 turn（replayed=True）；不同 request_hash 抛 `TurnRequestConflict`。
+        返回 `{turn_id, message_id, status, replayed, ...}`。
+        """
+        stamp = now()
+        async with self._lease() as conn:
+            # 会话归属：不存在则创建（归属当前主体），存在则校验归属
+            await self._run(conn, 'INSERT INTO sessions '
+                '(session_id, tenant_id, owner_user_id, created_at, updated_at) '
+                'VALUES (%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING',
+                (session_id, tenant_id, owner_user_id, stamp, stamp))
+            sess = await self._one(conn, 'SELECT * FROM sessions WHERE session_id=%s FOR UPDATE',
+                                   (session_id,))
+            if (sess['tenant_id'], sess['owner_user_id']) != (tenant_id, owner_user_id):
+                raise PermissionError('会话不属于当前主体')
+            # 幂等：同 request_id 已存在
+            existing = await self._one(conn,
+                'SELECT * FROM session_turns WHERE session_id=%s AND request_id=%s',
+                (session_id, request_id))
+            if existing:
+                if existing['request_hash'] != request_hash:
+                    raise TurnRequestConflict(request_id)
+                return {'turn_id': existing['turn_id'],
+                        'status': existing['status'], 'replayed': True,
+                        'message_id': 0, 'kind': existing['kind'],
+                        'target_task_id': existing['target_task_id'],
+                        'target_run_id': existing['target_run_id']}
+            # 分配 turn_seq（锁住会话后 MAX+1，不用猜）
+            seq_row = await self._one(conn,
+                'SELECT COALESCE(MAX(turn_seq),0) AS n FROM session_turns WHERE session_id=%s',
+                (session_id,))
+            turn_seq = int((seq_row or {}).get('n') or 0) + 1
+            await self._run(conn, 'INSERT INTO session_turns '
+                '(turn_id, session_id, turn_seq, request_id, request_hash, message, '
+                ' target_task_id, target_run_id, kind, status, created_at, updated_at) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                (turn_id, session_id, turn_seq, request_id, request_hash, message,
+                 target_task_id, target_run_id, kind, 'accepted', stamp, stamp))
+            # 用户消息（同事务）
+            await self._run(conn, 'INSERT INTO messages (session_id, role, content, created_at, dedupe_key) '
+                'VALUES (%s,%s,%s,%s,%s)',
+                (session_id, 'user', message, stamp, f'turn:{turn_id}'))
+            msg_row = await self._one(conn,
+                'SELECT id FROM messages WHERE session_id=%s AND dedupe_key=%s',
+                (session_id, f'turn:{turn_id}'))
+            await self._run(conn, 'UPDATE sessions SET updated_at=%s WHERE session_id=%s',
+                            (stamp, session_id))
+            await conn.commit()
+        return {'turn_id': turn_id, 'message_id': int((msg_row or {}).get('id') or 0),
+                'status': 'accepted', 'replayed': False, 'kind': kind,
+                'target_task_id': target_task_id, 'target_run_id': target_run_id,
+                'turn_seq': turn_seq}
+
+    async def turn(self, turn_id: str) -> dict | None:
+        async with self._lease() as conn:
+            row = await self._one(conn, 'SELECT * FROM session_turns WHERE turn_id=%s',
+                                  (turn_id,))
+        return dict(row) if row else None
+
+    async def turns_of(self, session_id: str) -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(conn,
+                'SELECT * FROM session_turns WHERE session_id=%s ORDER BY turn_seq',
+                (session_id,))
+        return [dict(r) for r in rows]
+
+    async def claim_turn(self, owner: str, ttl: float,
+                         *, session_id: str) -> dict | None:
+        """领取一个待执行的聊天 turn（按 session 内 turn_seq 顺序，有界）。"""
+        now_ts = time.time()
+        async with self._lease() as conn:
+            await self._run(conn,
+                "SELECT pg_advisory_xact_lock(hashtext('turn:' || %s))",
+                (session_id,))
+            row = await self._one(conn,
+                "SELECT * FROM session_turns WHERE session_id=%s AND status IN ('accepted','retry') "
+                "AND (lease_expires_at=0 OR lease_expires_at < %s) "
+                'ORDER BY turn_seq LIMIT 1 FOR UPDATE SKIP LOCKED',
+                (session_id, now_ts))
+            if row is None:
+                return None
+            await self._run(conn,
+                'UPDATE session_turns SET status=%s, lease_owner=%s, '
+                'lease_expires_at=%s, lease_epoch=lease_epoch+1, updated_at=%s '
+                'WHERE turn_id=%s',
+                ('running', owner, now_ts + ttl, now(), row['turn_id']))
+            await conn.commit()
+        out = dict(row)
+        out['status'] = 'running'
+        out['lease_owner'] = owner
+        out['lease_epoch'] = int(out.get('lease_epoch') or 0) + 1
+        return out
+
+    async def settle_turn(self, turn_id: str, *, status: str,
+                          answer: str = '', error: str = '',
+                          lease_owner: str = '', lease_epoch: int = 0) -> bool:
+        """结算 turn（带租约门禁：过期执行者写回无效）。"""
+        async with self._lease() as conn:
+            if lease_owner:
+                cur = await self._run(conn,
+                    'UPDATE session_turns SET status=%s, answer=%s, error=%s, updated_at=%s '
+                    'WHERE turn_id=%s AND lease_owner=%s AND lease_epoch=%s',
+                    (status, answer, error, now(), turn_id, lease_owner, lease_epoch))
+            else:
+                cur = await self._run(conn,
+                    'UPDATE session_turns SET status=%s, answer=%s, error=%s, updated_at=%s '
+                    'WHERE turn_id=%s',
+                    (status, answer, error, now(), turn_id))
+            await conn.commit()
+        return bool(cur.rowcount)
+
+    async def finish_turn_message(self, session_id: str, content: str,
+                                  *, dedupe_key: str = '') -> None:
+        """写聊天答复消息（assistant），带去重键。"""
+        await self.append_message(session_id, 'assistant', content,
+                                  dedupe_key=dedupe_key or '')
 
     async def memory(self, session_id: str) -> dict:
         """会话记忆；没有就是空摘要 + 空事实 + upto=0。"""

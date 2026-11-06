@@ -950,6 +950,24 @@ async function postTask(text, key) {
   }
 }
 
+// 会话消息入口（第十一阶段）：普通输入统一提交到这里，服务端路由成聊天/查询/
+// 控制。requestId 复用原 ID 重试，服务端返回原 turn 而不是重复接纳。
+async function postSessionMessage(text, requestId, targetTaskId) {
+  const options = {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({request_id: requestId, message: text,
+                          ...(targetTaskId ? {target_task_id: targetTaskId} : {})}),
+  };
+  const url = `${API_PREFIX}/sessions/${S.sessionId}/messages`;
+  try {
+    return await checkAuth(await fetch(url, options));
+  } catch (err) {
+    // 网络层失败：请求可能已到服务端，复用原 requestId 重试一次
+    return await checkAuth(await fetch(url, options));
+  }
+}
+
 // 给**当前任务**补一句要求。
 // 关键：不打断、不新建任务、不换 EventSource——原任务继续跑，只是下个边界改计划。
 // requestId 会跟着这一条消息走到最后：网络失败重试时必须复用同一个 ID，
@@ -1061,34 +1079,48 @@ async function send() {
   const text = $('msg').value.trim();
   if (!text) return;
   $('msg').value = '';
-  // 目标还没结束（在跑，或停在等人/等批准/暂停/待核实）：这句话是补充。
-  // 只有目标已经结束，发送才会在当前会话里开一轮新任务。
-  if (goalOpen()) {
-    const requestId = addInputBubble(text);
-    const resumeWait = !S.running && S.runStatus === 'waiting_input';
-    $('send').disabled = true;
-    W.sending = true;
-    workspaceControls();
-    try {
-      if (resumeWait) {
-        setRunning(true);
-        startNewTurn();
-        openStream(S.taskId);
+  // 第十一阶段：普通输入统一走会话消息入口（服务端路由成聊天/查询/控制），
+  // **不再**因「存在开放任务」就把输入自动当成补充投递——那会把闲聊也塞进
+  // 正在跑的业务任务。明确目标的补充/控制保留独立入口（run 卡片上的按钮）。
+  await sendSessionMessage(text);
+}
+
+async function sendSessionMessage(text) {
+  W.sending = true;
+  workspaceControls();
+  addMessage('user', text);
+  $('send').disabled = true;
+  const requestId = newIdempotencyKey();
+  try {
+    const res = await postSessionMessage(text, requestId, null);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (res.status === 409) {
+        // 同一 requestId 已用于不同内容（理论上不会：requestId 每次新生成）。
+        addMessage('assistant', '请求冲突，请重新发送。');
+      } else {
+        const detail = typeof data.detail === 'string' ? data.detail : '';
+        throw new Error(res.status === 401
+          ? '请先通过平台登录，再进入智能体。'
+          : (detail || ('HTTP ' + res.status)));
       }
-      const ok = await sendRunInput(text, requestId);
-      if (!ok) {
-        $('msg').value = text;      // 没提交成功就把草稿还回去
-        if (resumeWait) setRunning(false);
+    } else {
+      // 接纳成功：kind 是 chat/query/control/ambiguous，turn 已在后台处理。
+      S.sessionId = S.sessionId;  // 保持会话
+      if (data.kind === 'ambiguous') {
+        addMessage('assistant', '你说的目标有多个任务，请指明要操作哪一个。');
       }
-    } finally {
-      W.sending = false;
-      $('send').disabled = false;
-      workspaceControls();
-      $('msg').focus();
+      // 重新拉取时间线，展示聊天 turn 与任务卡。
+      if (S.sessionId) openSession(S.sessionId, {keepWorkspace: true});
     }
-    return;
+  } catch (err) {
+    addMessage('assistant', '提交失败：' + err.message);
+    if (!$('msg').value) $('msg').value = text;
+  } finally {
+    W.sending = false;
+    $('send').disabled = false;
+    workspaceControls();
   }
-  await startNewTask(text);
 }
 
 async function startNewTask(text) {
@@ -1111,13 +1143,8 @@ async function startNewTask(text) {
     const res = checkAuth(await postTask(text, idempotencyKey));
     if (!res.ok) {
       const error = await res.json().catch(() => ({}));
-      if (res.status === 409 && error.detail?.code === 'session_goal_open') {
-        await openSession(S.sessionId, {keepWorkspace: true});
-        S.taskId = error.detail.task_id; S.runId = error.detail.run_id;
-        const requestId = addInputBubble(text);
-        if (!await sendRunInput(text, requestId) && !$('msg').value) $('msg').value = text;
-        return;
-      }
+      // 第十一阶段：**不再**在 409 session_goal_open 时自动把输入改投成对旧任务
+      // 的补充。明确目标的补充/控制走独立入口；普通输入统一走 messages 入口。
       const detail = typeof error.detail === 'string' ? error.detail : '';
       throw new Error(res.status === 401
         ? '请先通过平台登录，再进入智能体。'
