@@ -873,12 +873,20 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
         跨进程不能直接 cancel 一个 asyncio.Task，只能往库里写标记，由持有租约
         的执行者在自己那一侧轮询到再停（见 `_guard`）。以前这里只看内存、却
         无条件把 run 标成 cancelled —— 进程外的任务其实还在跑，界面说停了。
+
+        第八阶段收口第 7 点：也接受 `waiting_external`（持久等待中的 run）。等待
+        中的 run 没有活跃执行者，取消要**持久化取消意图**，再对每个开放的外部
+        任务发远端取消请求并查询确认（区分本地停止 / 远端取消请求 / 远端确认
+        取消）。远端不支持取消时如实保留状态，不声称已取消。
         """
         run = await self.store.run(run_id)
-        if run is None or run['status'] not in {'queued', 'running', 'reconciling'}:
+        if run is None or run['status'] not in {'queued', 'running', 'reconciling',
+                                                 'waiting_external'}:
             return False
         if run.get('cancel_requested_at'):
             return True
+        if run['status'] == 'waiting_external':
+            return await self._cancel_waiting_run(run_id, run)
         record = self.tasks.get(run['task_id'])
         if record is not None and record.live and record.run_id == run_id:
             record._task.cancel()
@@ -887,6 +895,42 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
         # 由持有租约的一方在自己那一侧读到再停。
         await self.store.update_run(run_id, cancel_requested_at=now())
         logger.info('run %s 已写入取消请求（执行者在其他进程）', run_id)
+        return True
+
+    async def _cancel_waiting_run(self, run_id: str, run: dict) -> bool:
+        """取消一个持久等待中的 run：持久化取消意图 + 远端取消请求 + 查询确认。
+
+        第八阶段收口第 7 点：区分三种情况——
+        - **本地停止**：run 侧标 cancel_requested_at，不再被唤醒；
+        - **远端取消请求**：对每个开放外部任务调合同取消能力（请求可能失败）；
+        - **远端确认取消**：查询确认后 external task 标 cancelled，run 进
+          cancelled/needs_reconcile。远端不支持取消时如实保留 waiting_external，
+          **不声称任务已取消**。
+        """
+        from webpage_agent.core import external_tasks as ext
+        # 先本地登记取消意图（run 侧）：不再被 complete 唤醒。
+        await self.store.update_run(run_id, cancel_requested_at=now())
+        tasks = await self.store.external_tasks_of_run(run_id)
+        open_tasks = [t for t in tasks
+                      if str(t.get('state') or '') in ('accepted', 'running',
+                                                       'materializing')]
+        confirmed_cancel = 0
+        for task in open_tasks:
+            result = await ext.request_external_cancel(
+                self.store, external_task_id=str(task.get('external_task_id') or ''),
+                worker_id=f'cancel-{run_id}')
+            if result.get('confirmed'):
+                confirmed_cancel += 1
+        if confirmed_cancel:
+            # 所有开放任务都已确认取消 → run 标记 cancelled（不复活、不误报）。
+            await self.store.update_run(run_id, status='cancelled',
+                                        waiting_external=0,
+                                        cancel_requested_at=now())
+            logger.info('run %s 等待中的外部任务已确认取消', run_id)
+            return True
+        # 远端未确认取消 / 不支持取消：如实保留状态（仍是 waiting_external），
+        # 不声称已取消——由后续轮询或人工核实决定结局。
+        logger.info('run %s 取消意图已登记，远端取消未确认（保留等待状态）', run_id)
         return True
 
     async def close(self) -> None:

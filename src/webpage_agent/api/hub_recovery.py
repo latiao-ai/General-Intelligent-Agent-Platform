@@ -207,8 +207,29 @@ class HubRecoveryMixin:
             except Exception:                      # noqa: BLE001
                 logger.warning('读外部任务失败 run=%s', run_id, exc_info=True)
             ext_decision = pi_recovery.decide_external(snapshot, external_tasks)
-            if ext_decision is not None:
+            # 第八阶段收口第 3 点：已有最终答复（resume_finish）时，**不被**旧的
+            # awaiting 覆盖为「继续等待/交付」。最终答复说明外部结果早已消费、后续
+            # 已推理完成，只需补收尾，不能退回外部等待。
+            if ext_decision is not None and decision.kind != pi_recovery.RESUME_FINISH:
                 decision = ext_decision
+                # 第八阶段收口第 3 点：外部任务已完成 → 读回已登记的结果，装配成
+                # 可直接注入 Node 的 deliver_results（原 toolCallId + 结果内容）。
+                # 结果读回失败（结果没真正可消费）→ 转待核实，不能装成已交付。
+                if ext_decision.kind == pi_recovery.RESUME_DELIVER:
+                    try:
+                        deliver = await self._assemble_deliver_results(
+                            ext_decision.tool_results)
+                        if deliver is None:
+                            decision = pi_recovery.RecoveryDecision(
+                                kind=pi_recovery.RESUME_RECONCILE,
+                                reason='外部任务已完成但结果无法读回，需核实')
+                        else:
+                            ext_decision.deliver_results = deliver
+                    except Exception:              # noqa: BLE001
+                        logger.warning('装配外部结果失败 run=%s', run_id, exc_info=True)
+                        decision = pi_recovery.RecoveryDecision(
+                            kind=pi_recovery.RESUME_RECONCILE,
+                            reason='外部结果装配失败，需核实')
         # 第七阶段收口：恢复输入用**单一字段** `pi_resume` 承载（快照 + 恢复决策），
         # 不在顶层与 resume_plan 里同时维护两份。run_task 把它原样放进
         # state['pi_resume']，PiRuntime.run() 只从这里读。
@@ -227,6 +248,48 @@ class HubRecoveryMixin:
         # 的处理位置交回。原始输入从快照取（首次执行则交给 run_task 的 user_input）。
         resume['user_input'] = str((snapshot or {}).get('user_input') or '')
         return resume
+
+    async def _assemble_deliver_results(self, refs: list[dict]) -> list[dict] | None:
+        """把外部任务的完成结果读回，装配成可注入 Node 的 deliver_results。
+
+        第八阶段收口第 3 点：交付的是**已登记、可消费**的结果内容（经标准结果
+        存储登记），不是 status 包或文件路径。读回失败返回 None（调用方转待核实）。
+
+        返回每项：`{call_id, tool_name, result, is_error}`，Node 据此 pushToolResult。
+        """
+        from webpage_agent.tools import tool_results as tr
+        from webpage_agent.core.config import settings as cfg
+        assembled: list[dict] = []
+        for ref in (refs or []):
+            if not isinstance(ref, dict):
+                continue
+            result_id = str(ref.get('last_result_id') or '')
+            call_id = str(ref.get('call_id') or '')
+            if not result_id or not call_id:
+                # 缺 result 引用或原 toolCallId：无法交付，转待核实。
+                return None
+            manifest = None
+            try:
+                manifest = await self.store.result_manifest(result_id)
+            except Exception:                      # noqa: BLE001
+                manifest = None
+            if manifest is None:
+                # 结果未登记（不是可消费结果）→ 待核实。
+                return None
+            try:
+                content = tr.read_structured(str(cfg.artifact_dir), manifest)
+            except Exception:                      # noqa: BLE001
+                content = None
+            if content is None:
+                # 结构化结果读不回（损坏/缺失）→ 待核实。
+                return None
+            assembled.append({
+                'call_id': call_id,
+                'tool_name': str(ref.get('tool_name') or ''),
+                'result': content,
+                'is_error': False,
+            })
+        return assembled
 
     async def _settle_round(self, record: 'TaskRecord', state: dict, status: str, *,
                             context, close_instruction, close_open_stage) -> None:
@@ -250,13 +313,20 @@ class HubRecoveryMixin:
         # （waiting_input / failed / paused）允许留着，那正是它们在等的东西。
         # 最终答复与终态同事务提交，用稳定去重键（final:<run_id>）保证恢复
         # 补收尾不重复追加（第七阶段）。
+        # 第八阶段收口第 10 点：waiting_external 是「持久等待」，**不是终态**，
+        # 不能写最终答复——否则「任务结束，状态：waiting_external」这条兜底文案
+        # 会占掉 final:<run_id> 去重键，导致后续真正终态（succeeded）的最终答复
+        # 被去重、用户看到的答复停留在「等待中」。
         final_key = f'final:{record.run_id}'
+        final_message = None
+        if status != 'waiting_external':
+            final_message = reply
         committed = await self._finish_run(
             record, state, status, context=context,
             expected_intent_version=state.get('intent_version'),
             require_pending_clear=status in ('succeeded', 'partially_succeeded',
                                              'needs_reconcile'),
-            final_message=reply, final_message_key=final_key)
+            final_message=final_message, final_message_key=final_key)
         if not committed:
             # 第七阶段：失租（finish_run_owned 落空）后**禁止追加最终消息**。
             # 终态与最终答复由新执行者按恢复决策补收尾，这里不再写 assistant

@@ -226,15 +226,20 @@ class PiRuntime:
             resume_seq = 0
             resume_mode = None
             resume_pending = None
+            resume_deliver = None
             if resume_snapshot and isinstance(resume_snapshot.get('messages'), list) \
                     and resume_snapshot['messages']:
                 resume_messages = resume_snapshot['messages']
                 resume_seq = int(resume_snapshot.get('checkpoint_seq') or 0)
                 # 第七阶段收口：按恢复决策给 Node 模式（admit/deliver）与待重派发
-                # 的原调用（含原 call_id）。resume_finish/reconcile/block 已在
+                # 的原调用（含原 call_id）。resume_finish/reconcile/block/wait 已在
                 # 上面提前返回，不会走到这里。
                 kind = recovery.get('kind', '') if isinstance(recovery, dict) else ''
-                pending = list(resume_snapshot.get('pending_calls') or [])
+                # 第八阶段收口第 4 点：待重派发的原调用以**恢复决策**里的
+                # pending_calls 为准（decide / decide_external 都按快照装配，
+                # decide_external 的 RESUME_DELIVER 会带上剩余未派发的同步候选）。
+                pending = (recovery.get('pending_calls') or []) \
+                    if isinstance(recovery, dict) else []
                 if kind in ('resume_admit', 'resume_deliver') and pending:
                     resume_mode = 'admit' if kind == 'resume_admit' else 'deliver'
                     resume_pending = [
@@ -243,6 +248,20 @@ class PiRuntime:
                          'arguments': dict(p.get('arguments') or {})}
                         for p in pending if isinstance(p, dict)
                     ]
+                # 第八阶段收口第 3 点：外部任务已完成、结果已读回 → 交给 Node
+                # 直接注入 toolResult（不重新派发），再继续推理。deliver_results
+                # 由 Hub 装配（含原 toolCallId + 结果内容）。
+                if kind == 'resume_deliver':
+                    deliver = (recovery.get('deliver_results') or []) \
+                        if isinstance(recovery, dict) else []
+                    if deliver:
+                        resume_deliver = [
+                            {'call_id': str(d.get('call_id') or ''),
+                             'tool_name': str(d.get('tool_name') or ''),
+                             'result': d.get('result'),
+                             'is_error': bool(d.get('is_error'))}
+                            for d in deliver if isinstance(d, dict)
+                        ]
 
             resume_field = None
             if resume_messages:
@@ -251,6 +270,8 @@ class PiRuntime:
                 if resume_mode:
                     resume_field['mode'] = resume_mode
                     resume_field['pending_calls'] = resume_pending or []
+                if resume_deliver:
+                    resume_field['deliver_results'] = resume_deliver
 
             start = proto.make_message(
                 bridge.execution_id,
@@ -402,8 +423,14 @@ class PiRuntime:
         # data_ref），这里只取结果引用，不把权限/租约混进快照。
         from webpage_agent.agent import pi_snapshot
 
-        def build_snapshot(tool_updates: dict, tool_result=None):
+        def build_snapshot(tool_updates: dict, tool_result=None, external=None):
             self._snapshot['logical_call_seq'] = self._host_caller.registry.seq
+            # 第八阶段收口第 4 点：accepted 时**先把当前调用标记为 accepted**，
+            # 再导出 pending_calls——否则这个已受理的调用会以 pending 状态残留
+            # 在快照里，恢复时被当作待重派发候选再次执行（重复副作用）。
+            if external is not None and \
+                    (tool_result or {}).get('execution_status') == 'accepted':
+                self._host_caller.registry.mark(call_id, 'accepted')
             # 第七阶段收口：把 registry 已分配的逻辑调用身份**回填**进快照的
             # pending_calls。Node 发的检查点里 logical_call_id 是空占位（Node
             # 不知道宿主分配的逻辑 ID），恢复时必须从这里读回原 ID，否则同一次
@@ -419,6 +446,29 @@ class PiRuntime:
             existing = list(self._snapshot.get('committed_tool_results') or [])
             existing.append(committed)
             self._snapshot['committed_tool_results'] = existing
+            # 第八阶段收口第 2 点：accepted 时把受理事实（awaiting_calls）在
+            # 结算事务里随快照一起写入，不再依赖结算后的第二次快照写补齐。
+            # external 由网关在 settle_accepted 前装配并传入，含 external_task_id
+            # / action_id / remote_task_id / contract 等本地匹配主键。
+            if external is not None and (tool_result or {}).get('execution_status') == 'accepted':
+                self._snapshot['phase'] = 'awaiting_external'
+                binding = self._host_caller.registry._bindings.get(call_id) or {}
+                awaiting = list(self._snapshot.get('awaiting_calls') or [])
+                awaiting.append({
+                    'call_id': call_id,
+                    'logical_call_id': str(binding.get('logical_call_id') or ''),
+                    'tool_name': tool_name,
+                    'tool_key': str(binding.get('tool_key') or ''),
+                    'arguments': dict(args or {}),
+                    'external_task_id': str(external.get('external_task_id') or ''),
+                    'action_id': str(external.get('action_id')
+                                     or (tool_result or {}).get('action_id') or ''),
+                    'remote_task_id': str(external.get('remote_task_id') or ''),
+                    'contract_id': str(external.get('contract_id') or ''),
+                    'contract_version': int(external.get('contract_version') or 1),
+                    'status': 'awaiting',
+                })
+                self._snapshot['awaiting_calls'] = awaiting
             return pi_snapshot.serialize(self._snapshot)
 
         receipt = await self._host_caller.call(
@@ -426,35 +476,14 @@ class PiRuntime:
             build_snapshot=build_snapshot)
         if receipt.accepted:
             # 第八阶段第 5 点：远端已受理、结果未定。宿主确认等待事实落库后，
-            # Node 结束本轮执行、释放进程；等待期间不再请求模型。把 accepted
-            # 调用标记为 `accepted`（区别于 pending 重派发），记录到快照的
-            # `awaiting_calls`（含原 call_id / 逻辑 ID / 远端任务身份），持久化。
+            # Node 结束本轮执行、释放进程；等待期间不再请求模型。
+            # 第八阶段收口第 2 点：受理事实（awaiting_calls，含 external_task_id /
+            # action_id / logical_call_id）已在 settle_accepted 的同一事务里随
+            # 快照写入（见 build_snapshot），这里**不再二次持久化**——否则崩溃在
+            # 「accepted 已提交、awaiting 未落库」之间会漏跟踪。只把 registry
+            # 标记为 accepted（区别于 pending 重派发），并回 accepted 回执给 Node。
             self._host_caller.registry.mark(call_id, 'accepted')
             self._snapshot['phase'] = 'awaiting_external'
-            self._snapshot['pending_calls'] = (
-                self._host_caller.registry.pending_calls())
-            # 记录受理事实：原 assistant toolCall 与调用位置保留在 messages 里，
-            # 这里只登记「哪个调用在等哪个远端任务」。
-            awaiting = list(self._snapshot.get('awaiting_calls') or [])
-            binding = self._host_caller.registry._bindings.get(call_id) or {}
-            awaiting.append({
-                'call_id': call_id,
-                'logical_call_id': str(binding.get('logical_call_id') or ''),
-                'tool_name': tool_name,
-                'tool_key': str(binding.get('tool_key') or ''),
-                'arguments': dict(args or {}),
-                'remote_task_id': receipt.remote_task_id,
-                'contract_id': receipt.contract_id,
-                'contract_version': int(receipt.contract_version or 1),
-                'status': 'awaiting',
-            })
-            self._snapshot['awaiting_calls'] = awaiting
-            persisted = await self._persist_snapshot()
-            if not persisted:
-                # 等待事实没落库：不能放行 Node 结束——否则结果漏跟踪。
-                raise PiBridgeError(
-                    '已受理的等待事实持久化失败，停止执行',
-                    stderr_tail=bridge.stderr_tail())
             reply = proto.make_message(
                 bridge.execution_id, "tool_result", call_id=call_id,
                 ok=False, result=None, error='',

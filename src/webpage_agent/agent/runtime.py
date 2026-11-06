@@ -125,8 +125,21 @@ def get_runtime(kind: str = '') -> Runtime:
                 mock_script = None
         # 受控工具执行器（测试专用）：PI_MOCK_TOOL=1 时，web_search 走确定性
         # mock 结果（仍经完整受治理结算链路），不依赖真实网络。
+        # 第八阶段收口第 10 点：PI_MOCK_ASYNC=1 时，web_search 走「异步受理」回执
+        # （async_accepted + 受控远端任务身份），用于端到端验证提交→等待→轮询→
+        # 唤醒→交付→答复的完整链路，不依赖真实 MCP 供应商。
         tool_runner = None
-        if _os.environ.get('PI_MOCK_TOOL') == '1':
+        if _os.environ.get('PI_MOCK_ASYNC') == '1':
+            async def tool_runner(name: str, args: dict):
+                return True, {
+                    'async_accepted': True,
+                    'remote_task_id': _os.environ.get(
+                        'PI_MOCK_REMOTE_ID', 'job-mock-1'),
+                    'contract_id': _os.environ.get(
+                        'PI_MOCK_CONTRACT_ID', 'mcp-task'),
+                    'contract_version': 1,
+                }
+        elif _os.environ.get('PI_MOCK_TOOL') == '1':
             async def tool_runner(name: str, args: dict):
                 return True, {
                     'documents': [{

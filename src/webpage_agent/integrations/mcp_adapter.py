@@ -795,7 +795,12 @@ async def call_tool_as_task(tool_name: str, arguments: dict,
 
 
 async def task_status(task_id: str, server=None, *, token: str | None = None):
-    """`tasks/get`：查协议任务状态；已完成时顺带把结果取回来。"""
+    """`tasks/get`：查协议任务状态；已完成时顺带把结果取回来。
+
+    第八阶段收口第 8 点：取结果失败**不得**继续把任务当作 completed 返回——
+    否则下游会误判 succeeded 并物化出空结果。取结果失败时返回明确「结果未就绪」
+    标记（status 折成 running 之外的可识别值），让轮询重试，而不是宣告完成。
+    """
     from mcp import types as mcp_types
     async with asyncio.timeout(90):
         async with connect_session(server, token=token) as session:
@@ -805,9 +810,13 @@ async def task_status(task_id: str, server=None, *, token: str | None = None):
                     final = await session.experimental.get_task_result(
                         str(task_id), mcp_types.CallToolResult)
                     payload['result'] = result_payload(final)
-                except Exception:  # noqa: BLE001  取结果失败不改变"已完成"这个事实
+                except Exception:  # noqa: BLE001  取结果失败=结果未就绪，不能宣告完成
                     logger.warning('任务已完成但取结果失败 task=%s', task_id,
                                    exc_info=True)
+                    # 结果未就绪：状态仍记 completed（远端事实），但额外标记
+                    # result_pending，让下游（poll_due）识别为「结果未就绪」而
+                    # 进入 materializing 重试，不误判 succeeded。
+                    payload['result_pending'] = True
             return payload
 
 

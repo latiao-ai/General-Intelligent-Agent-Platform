@@ -1571,6 +1571,30 @@ async def run_step(state):
                 'step_outputs': outputs, 'status': 'waiting_approval',
                 'next_route': 'stop', 'failure': result.error,
                 'approval_id': result.approval_id}
+    if result.kind == 'accepted':
+        # 第八阶段收口第 9 点：远端已受理、结果未定。保留外部等待事实：本步
+        # **不写成最终成功**（否则依赖它的后续步骤会拿到「已完成」的假象提前
+        # 执行），run 停在等待状态，等 Worker 从远端取得结果后唤醒、由宿主吸收
+        # 结果再继续。step_index **不推进**（停在当前步，恢复时从这里继续）。
+        # 把 accepted 结果写进 tool_results（execution_status='accepted'），让
+        # 观察节点识别 waiting_async 并路由到 wait_async，避免「步骤没推进」被
+        # 观察误判为「还有确定步骤」而死循环。
+        outputs[step_id] = {'__status__': 'accepted',
+                            'remote_task_id': result.remote_task_id,
+                            'external_task_id': result.external_task_id}
+        accepted_result = result.tool_result or {
+            'step_id': step_id, 'tool_key': tool.tool_key or name,
+            'execution_status': 'accepted', 'phase': 'accepted',
+            'remote_task_id': result.remote_task_id,
+            'action_id': action_id}
+        accepted_result['execution_status'] = 'accepted'
+        accepted_result['phase'] = 'accepted'
+        return {'step_index': index, 'step_label': tool.label,
+                'step_outputs': outputs, 'status': 'waiting_external',
+                'next_route': 'stop',
+                'tool_results': list(state.get('tool_results') or [])
+                + [accepted_result],
+                'failure': '已受理，等待远端结果'}
     if result.kind == 'denied':
         errors = list(state.get('errors') or []) + [
             {'stage': name, 'type': 'AuthorizationDenied',

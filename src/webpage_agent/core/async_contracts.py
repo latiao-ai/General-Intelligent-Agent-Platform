@@ -29,6 +29,10 @@ class AsyncContract:
     # 要么有可查询的 remote id，要么有幂等键/提交结果核实方式；两者都没有时，
     # 提交结果未知必须转待核实，不能盲目重提。
     idempotency_key_pointer: str = ''
+    # 用幂等键查任务的工具键（第八阶段收口第 8 点）：首发合同若只返回提交幂等键
+    # 而没有 remote id，必须声明「能用幂等键查任务」的映射能力，否则无法持续
+    # 查询任务进度，不允许进入正常等待（转待核实）。
+    idempotency_lookup_tool_key: str = ''
 
 
 def pointer(document, path: str):
@@ -94,7 +98,9 @@ def load() -> list[AsyncContract]:
             poll_interval_seconds=float(row.get('poll_interval_seconds') or 5),
             deadline_seconds=float(row.get('deadline_seconds') or 1800),
             recoverable=recoverable,
-            idempotency_key_pointer=str(row.get('idempotency_key_pointer') or '')))
+            idempotency_key_pointer=str(row.get('idempotency_key_pointer') or ''),
+            idempotency_lookup_tool_key=str(
+                row.get('idempotency_lookup_tool_key') or '')))
     return found
 
 
@@ -245,11 +251,20 @@ def acceptance(tool_key: str, payload: dict | None) -> dict:
     idem = pointer(payload, contract.idempotency_key_pointer) \
         if contract.idempotency_key_pointer else None
     if isinstance(idem, (str, int, float)) and str(idem).strip():
-        return {'async_accepted': True, 'remote_task_id': '',
+        # 第八阶段收口第 8 点：只有幂等键、没有 remote id 时，必须有「用幂等键
+        # 查任务」的映射能力（`idempotency_lookup_tool_key`）才能进入正常等待；
+        # 没有则无法持续查询任务进度，转待核实，不能假装能跟踪。
+        if contract.idempotency_lookup_tool_key:
+            return {'async_accepted': True, 'remote_task_id': '',
+                    'idempotency_key': str(idem).strip(),
+                    'contract_id': contract.contract_id,
+                    'contract_version': contract.version,
+                    'execution_status': 'accepted', 'phase': 'accepted'}
+        return {'async_accepted': False, 'execution_status': 'unknown',
+                'phase': 'needs_reconcile',
                 'idempotency_key': str(idem).strip(),
                 'contract_id': contract.contract_id,
-                'contract_version': contract.version,
-                'execution_status': 'accepted', 'phase': 'accepted'}
+                'contract_version': contract.version}
     # 既无 remote id 又无幂等键：提交结果未知，必须转待核实，不能盲目重提。
     return {'async_accepted': False, 'execution_status': 'unknown',
             'phase': 'needs_reconcile',

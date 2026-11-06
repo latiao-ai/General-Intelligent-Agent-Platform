@@ -45,6 +45,10 @@ class RecoveryDecision:
     final_answer: str | None = None
     # 需要继续准入的候选调用（RESUME_ADMIT 时非空）
     pending_calls: list[dict] = None
+    # 已受理外部任务完成后、待注入 Node 的最终结果（RESUME_DELIVER 时非空，
+    # 第八阶段收口第 3 点）。每项：{call_id, tool_name, result, is_error}，
+    # Node 据此 pushToolResult 后继续推理，**不重新派发**（结果已拿到）。
+    deliver_results: list[dict] = None
     # 说明（排障用）
     reason: str = ''
 
@@ -53,6 +57,8 @@ class RecoveryDecision:
             self.tool_results = []
         if self.pending_calls is None:
             self.pending_calls = []
+        if self.deliver_results is None:
+            self.deliver_results = []
 
     def to_dict(self) -> dict:
         """转成可 JSON 序列化的 dict（恢复事实随 pi_resume 进入 state 落盘用）。"""
@@ -61,6 +67,7 @@ class RecoveryDecision:
             'tool_results': list(self.tool_results),
             'final_answer': self.final_answer,
             'pending_calls': list(self.pending_calls),
+            'deliver_results': list(self.deliver_results),
             'reason': self.reason,
         }
 
@@ -190,36 +197,76 @@ def decide_external(snapshot: dict | None, external_tasks: list[dict]) -> Recove
     awaiting = list((snapshot or {}).get('awaiting_calls') or [])
     if not awaiting:
         return None
-    # 按 remote_task_id 关联（awaiting 事实与 external task 都带这个），
-    # 退回 action_id / logical_call_id / step_id。
-    by_remote = {str(t.get('remote_task_id') or ''): str(t.get('state') or '')
+    # 第八阶段收口第 1 点：本地匹配主键是 external_task_id + action_id +
+    # logical_call_id；remote_task_id 仅远端查询身份，不能单独用于本地匹配。
+    # 按这三类键各建一张「完整任务 dict」索引（不只 state，还需 last_result_id /
+    # output_manifest_ref 供交付装配），优先 external_task_id，退回 action_id，
+    # 再退回 logical_call_id。
+    by_ext = {str(t.get('external_task_id') or ''): t
+              for t in (external_tasks or []) if isinstance(t, dict)}
+    by_action = {str(t.get('action_id') or ''): t
                  for t in (external_tasks or []) if isinstance(t, dict)}
-    by_action = {str(t.get('action_id') or ''): str(t.get('state') or '')
-                 for t in (external_tasks or []) if isinstance(t, dict)}
+    by_logical = {str(t.get('step_id') or ''): t
+                  for t in (external_tasks or []) if isinstance(t, dict)}
     any_open = False
-    any_completed = False
+    any_terminal_bad = False   # 有 failed / cancelled / 其它非 completed 终态
+    to_deliver: list[dict] = []
+    # 第八阶段收口第 3 点：用「messages 里是否已有该 call_id 的 toolResult」作为
+    # 吸收水位。已吸收的 completed 结果**不再重复交付**——重复恢复不重复追加结果。
+    from webpage_agent.agent import pi_snapshot as _snap
+    absorbed_ids = _snap.tool_result_ids((snapshot or {}).get('messages') or [])
     for item in awaiting:
         if not isinstance(item, dict):
             continue
-        remote = str(item.get('remote_task_id') or '')
-        state = ''
-        if remote and remote in by_remote:
-            state = by_remote[remote]
-        if not state:
-            for key in (item.get('action_id'), item.get('logical_call_id'),
-                        item.get('call_id'), item.get('step_id')):
-                if key and str(key) in by_action:
-                    state = by_action[str(key)]
-                    break
-        if state in _OPEN_EXTERNAL or state == '':
+        task = None
+        for key, index in (
+                (item.get('external_task_id'), by_ext),
+                (item.get('action_id'), by_action),
+                (item.get('logical_call_id'), by_logical),
+                (item.get('step_id'), by_logical)):
+            if key and str(key) in index:
+                task = index[str(key)]
+                break
+        if task is None:
+            # 第八阶段收口第 1 点：缺少关联记录 → 转待核实，**不能**当「继续
+            # 等待」。否则登记丢失/错位时 run 会永久挂在 waiting_external。
+            return RecoveryDecision(kind=RESUME_RECONCILE,
+                                    reason='有受理事实但缺少外部任务关联记录，需核实')
+        state = str(task.get('state') or '')
+        if state in _OPEN_EXTERNAL:
             any_open = True
         elif state == 'completed':
-            any_completed = True
+            call_id = str(item.get('call_id') or '')
+            # 已吸收（messages 里有对应 toolResult）→ 不再交付。
+            if call_id and call_id in absorbed_ids:
+                continue
+            to_deliver.append({
+                'call_id': call_id,
+                'logical_call_id': str(item.get('logical_call_id') or ''),
+                'tool_name': str(item.get('tool_name') or ''),
+                'external_task_id': str(task.get('external_task_id') or ''),
+                'action_id': str(task.get('action_id') or ''),
+                'last_result_id': str(task.get('last_result_id') or ''),
+                'output_manifest_ref': str(task.get('output_manifest_ref') or ''),
+            })
+        else:
+            # failed / cancelled / 未知终态 → 结果不可交付，需核实。
+            any_terminal_bad = True
     if any_open:
         return RecoveryDecision(kind=RESUME_WAIT, pending_calls=[],
                                 reason='已受理的外部任务尚未完成，继续等待')
-    if any_completed:
-        return RecoveryDecision(kind=RESUME_DELIVER, tool_results=[],
-                                reason='外部任务已完成，待宿主按原 toolCall ID 注入结果')
-    return RecoveryDecision(kind=RESUME_RECONCILE,
-                            reason='外部任务结束但结果未定，需核实')
+    if to_deliver:
+        # 第八阶段收口第 4 点：外部结果交付时，**同时带上**剩余未派发的同步调用
+        # （快照 pending_calls 里那些还没 accepted 的候选）。恢复时 Node 先注入
+        # 外部结果（deliver_results），再按原顺序重派发这些 pending——不重新生成
+        # 候选、不丢失调用。
+        pending = list((snapshot or {}).get('pending_calls') or [])
+        return RecoveryDecision(kind=RESUME_DELIVER, tool_results=to_deliver,
+                                pending_calls=pending,
+                                reason='外部任务已完成，注入结果后按原顺序处理剩余调用')
+    if any_terminal_bad:
+        return RecoveryDecision(kind=RESUME_RECONCILE,
+                                reason='外部任务结束但结果未定（失败/取消），需核实')
+    # 没有待交付（可能已全部吸收）且没有开放/异常任务：交给常规 decide 收尾。
+    return RecoveryDecision(kind=RESUME_ADMIT, pending_calls=[],
+                            reason='外部任务结果已全部吸收，继续常规恢复')

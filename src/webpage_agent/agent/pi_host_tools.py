@@ -72,6 +72,8 @@ class ToolReceipt:
     remote_task_id: str = ''
     contract_id: str = ''
     contract_version: int = 1
+    # 本地登记的 external task 身份（第八阶段收口第 1 点）：本地匹配主键。
+    external_task_id: str = ''
 
 
 def _resolve_web_search():
@@ -355,11 +357,18 @@ class HostToolCaller:
             # 第八阶段第 3 点：远端已受理、结果未定。不是成功也不是失败——
             # Pi 不得把受理当最终结果继续推理。标记 accepted 并带远端任务身份，
             # 由上层（pi_runtime）结束本轮、进入持久等待。
+            # 第八阶段收口第 10 点：故障注入钩子（测试专用）。accepted 已结算
+            # （action accepted + external task 已登记）后、Node 尚未退出前，
+            # 模拟进程崩溃——验证「accepted 已提交」的恢复不重复提交远端。
+            import os as _os
+            if _os.environ.get('PI_CRASH_AFTER_ACCEPTED') == '1':
+                _os._exit(0)
             return ToolReceipt(
                 ok=False, accepted=True, error='',
                 action_id=result.action_id, attempt_id=result.attempt_id,
                 step_id=step_id, remote_task_id=result.remote_task_id,
-                contract_id=result.contract_id)
+                contract_id=result.contract_id,
+                external_task_id=result.external_task_id)
         if result.kind == 'no_run':
             return ToolReceipt(ok=False, error=result.error or '没有可执行的运行',
                                step_id=step_id)

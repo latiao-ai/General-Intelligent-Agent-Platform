@@ -254,13 +254,16 @@ class _PollStore:
         self.task['poll_epoch'] += 1
         return dict(self.task)
 
-    async def finish_external_poll(self, external_task_id, epoch, **fields):
+    async def finish_external_poll(self, external_task_id, epoch, owner='',
+                                   **fields):
         self.task.update(fields)
         return dict(self.task)
 
     async def complete_external_task_and_wake(self, external_task_id, epoch, *,
-                                              state, output_manifest_ref='',
-                                              last_result_id='', error_code=''):
+                                              owner='', state,
+                                              output_manifest_ref='',
+                                              last_result_id='', error_code='',
+                                              staged=None, envelope=None):
         # 第八阶段：poller 不直接改写快照，只做「终态 + 唤醒 run」同事务。
         self.task['state'] = state
         self.task['error_code'] = error_code

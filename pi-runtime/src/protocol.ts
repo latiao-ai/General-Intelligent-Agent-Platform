@@ -121,6 +121,16 @@ export interface StartMessage extends BaseMessage {
       tool_name: string;
       arguments: Record<string, unknown>;
     }>;
+    /**
+     * 已受理外部任务完成后、宿主读回并装配的最终结果（第八阶段收口第 3 点）。
+     * Node 恢复时**直接注入** toolResult（不重新派发工具），再继续模型推理。
+     */
+    deliver_results?: Array<{
+      call_id: string;
+      tool_name: string;
+      result: unknown;
+      is_error: boolean;
+    }>;
   };
 }
 

@@ -151,11 +151,11 @@ class PollFencingTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(epoch_b, epoch_a)
         # 旧 poller（worker-a, epoch_a）写回 → 无效（返回 None）
         written = await self.store.finish_external_poll(
-            'et1', epoch_a, state='completed')
+            'et1', epoch_a, owner='worker-a', state='completed')
         self.assertIsNone(written)
         # 新 poller 写回成功
         written_b = await self.store.finish_external_poll(
-            'et1', epoch_b, state='completed')
+            'et1', epoch_b, owner='worker-b', state='completed')
         self.assertIsNotNone(written_b)
 
     async def test_claim_requires_open_state(self):
@@ -167,6 +167,31 @@ class PollFencingTests(unittest.IsolatedAsyncioTestCase):
             await conn.commit()
         claimed = await self.store.claim_external_task_poll('et1', 'worker-a', 60)
         self.assertIsNone(claimed)
+
+    async def test_lease_expired_but_epoch_unchanged_cannot_write(self):
+        """第八阶段收口第 6 点：租约已过期但 epoch 未变化 → 写回无效。"""
+        await self._register()
+        claimed = await self.store.claim_external_task_poll('et1', 'worker-a', 60)
+        epoch = int(claimed['poll_epoch'])
+        # 租约过期，但 epoch 不变（没有别的 Worker 领取）
+        async with self.store._lease() as conn:
+            await conn.execute(
+                "UPDATE external_tasks SET poll_lease_expires_at=0 "
+                "WHERE external_task_id='et1'")
+            await conn.commit()
+        written = await self.store.finish_external_poll(
+            'et1', epoch, owner='worker-a', state='running')
+        self.assertIsNone(written)
+
+    async def test_wrong_owner_cannot_write(self):
+        """第八阶段收口第 6 点：owner 不符 → 写回无效。"""
+        await self._register()
+        claimed = await self.store.claim_external_task_poll('et1', 'worker-a', 60)
+        epoch = int(claimed['poll_epoch'])
+        # 别的 worker 用相同 epoch 写回 → 无效（owner 不符）
+        written = await self.store.finish_external_poll(
+            'et1', epoch, owner='worker-b', state='running')
+        self.assertIsNone(written)
 
 
 class CompleteAndWakeTests(unittest.IsolatedAsyncioTestCase):
@@ -209,8 +234,8 @@ class CompleteAndWakeTests(unittest.IsolatedAsyncioTestCase):
         claimed = await self.store.claim_external_task_poll('et1', 'worker-a', 60)
         epoch = int(claimed['poll_epoch'])
         written = await self.store.complete_external_task_and_wake(
-            'et1', epoch, state='completed', output_manifest_ref='/tmp/ref',
-            last_result_id='ext-et1')
+            'et1', epoch, owner='worker-a', state='completed',
+            output_manifest_ref='/tmp/ref', last_result_id='ext-et1')
         self.assertIsNotNone(written)
         task = await self.store.external_task('et1')
         self.assertEqual(task['state'], 'completed')
@@ -226,7 +251,8 @@ class CompleteAndWakeTests(unittest.IsolatedAsyncioTestCase):
         claimed = await self.store.claim_external_task_poll('et1', 'worker-a', 60)
         epoch = int(claimed['poll_epoch'])
         written = await self.store.complete_external_task_and_wake(
-            'et1', epoch, state='completed', output_manifest_ref='/tmp/ref')
+            'et1', epoch, owner='worker-a', state='completed',
+            output_manifest_ref='/tmp/ref')
         self.assertIsNotNone(written)  # 任务仍完成
         run = await self.store.run('r1')
         self.assertEqual(run['status'], 'cancelled')  # run 不被复活
@@ -236,13 +262,26 @@ class CompleteAndWakeTests(unittest.IsolatedAsyncioTestCase):
         claimed = await self.store.claim_external_task_poll('et1', 'worker-a', 60)
         epoch = int(claimed['poll_epoch'])
         await self.store.complete_external_task_and_wake(
-            'et1', epoch, state='completed', output_manifest_ref='/tmp/ref')
+            'et1', epoch, owner='worker-a', state='completed',
+            output_manifest_ref='/tmp/ref')
         # 重复完成（同一 epoch，但任务已 completed）→ 状态不符，返回 None
         again = await self.store.complete_external_task_and_wake(
-            'et1', epoch, state='completed', output_manifest_ref='/tmp/ref2')
+            'et1', epoch, owner='worker-a', state='completed',
+            output_manifest_ref='/tmp/ref2')
         self.assertIsNone(again)
         task = await self.store.external_task('et1')
         self.assertEqual(task['output_manifest_ref'], '/tmp/ref')
+
+    async def test_failed_and_cancelled_lead_to_needs_reconcile(self):
+        """第八阶段收口第 5 点：failed/cancelled 终态 → run 进 needs_reconcile。"""
+        await self._waiting_run()
+        claimed = await self.store.claim_external_task_poll('et1', 'worker-a', 60)
+        epoch = int(claimed['poll_epoch'])
+        written = await self.store.complete_external_task_and_wake(
+            'et1', epoch, owner='worker-a', state='failed')
+        self.assertIsNotNone(written)
+        run = await self.store.run('r1')
+        self.assertEqual(run['status'], 'needs_reconcile')
 
 
 class PiWaitProtocolTests(unittest.TestCase):
@@ -293,33 +332,47 @@ class RecoveryExternalTests(unittest.TestCase):
     def test_open_external_task_waits(self):
         from webpage_agent.agent import pi_recovery
         snap = self._snapshot([{'call_id': 'c1', 'logical_call_id': 'pi:call:1',
-                                'remote_task_id': 'job-9'}])
+                                'external_task_id': 'et1', 'action_id': 'act1'}])
         decision = pi_recovery.decide_external(
-            snap, [{'remote_task_id': 'job-9', 'state': 'running'}])
+            snap, [{'external_task_id': 'et1', 'action_id': 'act1',
+                    'state': 'running'}])
         self.assertEqual(decision.kind, pi_recovery.RESUME_WAIT)
 
     def test_completed_external_task_delivers(self):
         from webpage_agent.agent import pi_recovery
         snap = self._snapshot([{'call_id': 'c1', 'logical_call_id': 'pi:call:1',
-                                'remote_task_id': 'job-9'}])
+                                'external_task_id': 'et1', 'action_id': 'act1'}])
         decision = pi_recovery.decide_external(
-            snap, [{'remote_task_id': 'job-9', 'state': 'completed'}])
+            snap, [{'external_task_id': 'et1', 'action_id': 'act1',
+                    'state': 'completed'}])
         self.assertEqual(decision.kind, pi_recovery.RESUME_DELIVER)
 
     def test_failed_external_task_reconciles(self):
         from webpage_agent.agent import pi_recovery
         snap = self._snapshot([{'call_id': 'c1', 'logical_call_id': 'pi:call:1',
-                                'remote_task_id': 'job-9'}])
+                                'external_task_id': 'et1', 'action_id': 'act1'}])
         decision = pi_recovery.decide_external(
-            snap, [{'remote_task_id': 'job-9', 'state': 'failed'}])
+            snap, [{'external_task_id': 'et1', 'action_id': 'act1',
+                    'state': 'failed'}])
         self.assertEqual(decision.kind, pi_recovery.RESUME_RECONCILE)
 
     def test_cancelled_external_task_reconciles(self):
         from webpage_agent.agent import pi_recovery
         snap = self._snapshot([{'call_id': 'c1', 'logical_call_id': 'pi:call:1',
-                                'remote_task_id': 'job-9'}])
+                                'external_task_id': 'et1', 'action_id': 'act1'}])
         decision = pi_recovery.decide_external(
-            snap, [{'remote_task_id': 'job-9', 'state': 'cancelled'}])
+            snap, [{'external_task_id': 'et1', 'action_id': 'act1',
+                    'state': 'cancelled'}])
+        self.assertEqual(decision.kind, pi_recovery.RESUME_RECONCILE)
+
+    def test_missing_association_reconciles(self):
+        """第八阶段收口第 1 点：缺关联记录 → 待核实，不能当「继续等待」。"""
+        from webpage_agent.agent import pi_recovery
+        snap = self._snapshot([{'call_id': 'c1', 'logical_call_id': 'pi:call:1',
+                                'external_task_id': 'et1', 'action_id': 'act1'}])
+        # external_tasks 里没有任何能对上 external_task_id / action_id 的记录
+        decision = pi_recovery.decide_external(
+            snap, [{'external_task_id': 'et-other', 'state': 'running'}])
         self.assertEqual(decision.kind, pi_recovery.RESUME_RECONCILE)
 
     def test_no_awaiting_calls_returns_none(self):

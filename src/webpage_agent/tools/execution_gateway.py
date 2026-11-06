@@ -205,6 +205,9 @@ class GovernedResult:
     # 已受理（accepted）时的远端任务身份与合同（第八阶段第 3 点）
     remote_task_id: str = ''
     contract_id: str = ''
+    # 本地登记的 external task 身份（第八阶段收口第 1 点）：本地匹配主键，
+    # 与 action_id / logical_call_id 一起构成持久关联；remote_task_id 仅远端查询用。
+    external_task_id: str = ''
 
 
 def _result_payload(updates: dict):
@@ -646,19 +649,32 @@ async def governed_call(
     receipt = {k: v for k, v in updates.items()
                if isinstance(v, (str, int, float, bool, dict, list))}
     receipt['tool_result'] = tool_result
+    # 第八阶段收口第 2 点：accepted 时**先**装配 external（含 external_task_id），
+    # 再把 external 交给 build_snapshot，让 awaiting_calls 在结算的同一事务里
+    # 随快照写入。不能依赖结算返回后的第二次快照写补齐关键关联——否则崩溃在
+    # 「accepted 已提交、awaiting 未落库」之间会漏跟踪。
+    external = None
+    if book is not None and action_id and async_accepted:
+        external = await _external_registration(
+            book, ctx, tool_key=tool_key, remote_task_id=remote_task_id,
+            idempotency_key=idempotency_key, contract_id=contract_id,
+            contract_version=contract_version, step_id=step_id)
+        # 第八阶段收口第 1 点：action_id 是本地匹配主键之一，与 external_task_id /
+        # logical_call_id 一起持久化，供恢复时精确定位外部任务。
+        external['action_id'] = action_id
     snapshot = None
     if build_snapshot is not None:
-        snapshot = build_snapshot(updates, tool_result=tool_result)
+        if external is not None:
+            snapshot = build_snapshot(
+                updates, tool_result=tool_result, external=external)
+        else:
+            snapshot = build_snapshot(updates, tool_result=tool_result)
     elif snapshot_state is not None:
         snapshot = snapshot_state
     if book is not None and action_id:
         if async_accepted:
             # 第八阶段第 4 点：accepted 结算 + external task 登记同一事务原子提交。
             # 动作写 accepted（非 succeeded），远端业务尚未完成。
-            external = await _external_registration(
-                book, ctx, tool_key=tool_key, remote_task_id=remote_task_id,
-                idempotency_key=idempotency_key, contract_id=contract_id,
-                contract_version=contract_version, step_id=step_id)
             settled = await book.settle_accepted(
                 step_id=step_id, action_id=action_id, attempt_id=attempt_id,
                 receipt=receipt, external=external, state=snapshot,
@@ -670,7 +686,8 @@ async def governed_call(
                 kind='accepted', action_id=action_id, attempt_id=attempt_id,
                 updates=updates, receipt=receipt, effect=effect, settled=True,
                 tool_result=tool_result, data_ref=data_ref,
-                remote_task_id=remote_task_id, contract_id=contract_id)
+                remote_task_id=remote_task_id, contract_id=contract_id,
+                external_task_id=str(external.get('external_task_id') or ''))
         settled = await book.settle(
             step_id=step_id, action_id=action_id, attempt_id=attempt_id,
             status='succeeded', receipt=receipt,

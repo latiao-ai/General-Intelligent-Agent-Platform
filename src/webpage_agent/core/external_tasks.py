@@ -100,7 +100,10 @@ async def remember_waiting(state: dict, waiting: list) -> bool:
             action_id=action_id,
             accepted_result_id=str(item.get('result_id') or ''),
             submission_key=str(item.get('submission_key') or remote),
-            item_key=str(item.get('item_key') or str(index)),
+            # 第八阶段收口第 9 点：item_key 用 step_id（与 settle_action_accepted
+            # 一致），命中 (run_id, action_id, item_key) 唯一约束即幂等——共享
+            # 网关已在 accepted 结算里登记过，这里不会重复建第二个外部任务。
+            item_key=str(item.get('step_id') or item.get('item_key') or str(index)),
             deadline_at=now + float(settings.external_wait_deadline),
             next_poll_at=now + float(settings.external_poll_base_seconds))
         wrote = True
@@ -145,71 +148,47 @@ async def _default_querier(store, task: dict, contract):
         server=server, token=token)
 
 
-def _materialize(task: dict, contract, payload: dict) -> str:
-    """把远端结果物化到**稳定文件身份**（第八阶段第 7 点）。
+def _materialize(task: dict, contract, payload: dict) -> dict:
+    """把远端结果物化到**稳定文件身份**，返回待登记的 staged（第八阶段收口第 8 点）。
 
-    文件写入无法与 PG 原子提交，所以用**稳定的、由 external_task_id 派生的
-    确定性路径**：同一任务重试物化永远写同一个位置，幂等、可重试。先可靠保存
-    结果及 manifest，再在数据库提交可消费引用——数据库只引用已可靠保存的内容。
+    用 `stage_result` 产出标准结构（result_id / parts / raw_ref / completeness），
+    result_id 由 external_task_id 派生（`ext-<external_task_id>`），跨进程、跨
+    重试一致——同一任务重试物化永远写同一个位置，幂等、可重试。先可靠保存结果，
+    再由调用方在结算事务里 `commit_result_in_tx` 登记可消费引用——数据库只引用
+    已可靠保存的内容。
+
+    返回的 staged 交给 `complete_external_task_and_wake` 在同一事务登记，不能
+    仅保存状态包/文件路径就标记 completed（否则读回时拿不到可消费结果）。
     """
     from webpage_agent.core import async_contracts
-    from webpage_agent.tools import tool_results
+    from webpage_agent.tools import tool_results as tr
     output = async_contracts.pointer(payload, contract.output_pointer) if contract else payload
-    # 稳定身份：external_task_id 派生，跨进程、跨重试一致。
-    logical_id = 'ext-' + str(task.get('external_task_id') or 'result')
-    folder = tool_results.result_dir(
-        settings.artifact_dir, str(task.get('tenant_id') or 'default'),
-        logical_id)
-    folder.mkdir(parents=True, exist_ok=True)
-    import json
-    body = json.dumps(output, ensure_ascii=False, default=str)
-    (folder / 'structured.json').write_text(body, encoding='utf-8')
-    (folder / 'manifest.json').write_text(json.dumps({
-        'result_id': logical_id, 'registered': True, 'created_at': time.time(),
-        'external_task_id': str(task.get('external_task_id') or ''),
-        'remote_task_id': str(task.get('remote_task_id') or ''),
-    }, ensure_ascii=False), encoding='utf-8')
-    return str(folder)
+    result_id = 'ext-' + str(task.get('external_task_id') or 'result')
+    tenant_id = str(task.get('tenant_id') or 'default')
+    # 用标准采集结构：structured 统一保存可 JSON 化的结果（非对象结果包成
+    # {'result': ...}，保证交付时 read_structured 能读回），不丢。
+    structured = output if isinstance(output, dict) else {'result': output}
+    captured = tr.CapturedResult(structured=structured)
+    return tr.stage_result(
+        settings.artifact_dir, captured, tenant_id=tenant_id, result_id=result_id)
 
 
-def _register_materialized(store, task: dict, ref: str) -> None:
-    """把物化结果登记成可消费的 tool_result 引用（第八阶段第 7 点）。
+def _envelope_for(task: dict, staged: dict) -> dict:
+    """构造结果登记信封（v2），供 commit_result_in_tx 使用。
 
-    先可靠保存文件，再登记引用；登记失败可重试（幂等），数据库不引用尚未
-    可靠保存的内容。
+    归属来自 external task（租户/用户/run/step/action/tool_key），不是内容 hash
+    或目录名；业务状态是 succeeded（结果已确认完成并物化）。
     """
-    if not hasattr(store, 'commit_tool_result'):
-        return
-    try:
-        staged = {
-            'result_id': 'ext-' + str(task.get('external_task_id') or 'result'),
-            'tool_key': str(task.get('tool_key') or ''),
-            'run_id': str(task.get('run_id') or ''),
-            'step_id': str(task.get('step_id') or ''),
-            'action_id': str(task.get('action_id') or ''),
-            'storage_ref': ref,
-        }
-        from webpage_agent.governance import execution_control
-        try:
-            context = execution_control.require()
-        except Exception:                          # noqa: BLE001
-            context = None
-        # 无执行上下文（poller 不是 run 的执行者）时跳过严格登记，仅靠 manifest。
-        if context is not None:
-            import asyncio
-            asyncio.ensure_future(_commit_result(store, context, staged))
-    except Exception:                              # noqa: BLE001
-        logger.warning('登记物化结果失败（可重试）task=%s', task.get('external_task_id'),
-                       exc_info=True)
-
-
-async def _commit_result(store, context, staged) -> None:
-    try:
-        await store.commit_tool_result(
-            {'run_id': staged['run_id'], 'tenant_id': 'default'},
-            staged, {'tool_key': staged['tool_key']})
-    except Exception:                              # noqa: BLE001
-        logger.warning('提交物化结果登记失败（可重试）', exc_info=True)
+    return {
+        'tool_key': str(task.get('tool_key') or ''),
+        'schema_hash': '',
+        'contract_version': str(task.get('contract_version') or ''),
+        'transport_status': 'ok',
+        'business_status': 'succeeded',
+        'verification_status': 'not_applicable',
+        'summary': {},
+        'structured_ref': str(staged.get('raw_ref') or ''),
+    }
 
 
 async def _patch_snapshot(store, task: dict, mapped: str, payload) -> None:
@@ -316,7 +295,7 @@ async def request_external_cancel(store, *, external_task_id: str,
         confirmed = False
     if hasattr(store, 'confirm_external_cancel'):
         written = await store.confirm_external_cancel(
-            external_task_id, epoch, confirmed=confirmed)
+            external_task_id, epoch, owner=worker_id, confirmed=confirmed)
         if written:
             task = written
     return {'requested': True, 'confirmed': confirmed,
@@ -365,7 +344,8 @@ async def poll_due(store, *, worker_id: str, querier=None, limit: int | None = N
         if contract is None or not contract.recoverable or (
                 not protocol and not contract.status_tool_key):
             await store.complete_external_task_and_wake(
-                task['external_task_id'], epoch, state='needs_reconcile',
+                task['external_task_id'], epoch, owner=worker_id,
+                state='needs_reconcile',
                 error_code='no_contract')
             done += 1
             continue
@@ -374,7 +354,8 @@ async def poll_due(store, *, worker_id: str, querier=None, limit: int | None = N
         deadline = float(task.get('deadline_at') or 0)
         if deadline and now > deadline and str(task.get('state')) != 'materializing':
             await store.complete_external_task_and_wake(
-                task['external_task_id'], epoch, state='needs_reconcile',
+                task['external_task_id'], epoch, owner=worker_id,
+                state='needs_reconcile',
                 error_code='deadline')
             done += 1
             continue
@@ -385,7 +366,8 @@ async def poll_due(store, *, worker_id: str, querier=None, limit: int | None = N
             logger.warning('查询外部任务超时 id=%s', task.get('external_task_id'))
             version = int(task.get('version') or 1)
             await store.finish_external_poll(
-                task['external_task_id'], epoch, state='running',
+                task['external_task_id'], epoch, owner=worker_id,
+                state='running',
                 error_code='query_timeout', last_observed_at=now,
                 next_poll_at=now + backoff_seconds(version), version=version + 1)
             done += 1
@@ -395,19 +377,32 @@ async def poll_due(store, *, worker_id: str, querier=None, limit: int | None = N
                            exc_info=True)
             version = int(task.get('version') or 1)
             await store.finish_external_poll(
-                task['external_task_id'], epoch, state='running',
+                task['external_task_id'], epoch, owner=worker_id,
+                state='running',
                 error_code='query_failed', last_observed_at=now,
                 next_poll_at=now + backoff_seconds(version), version=version + 1)
             done += 1
             continue
         if not isinstance(payload, dict):
             payload = {}
+        # 第八阶段收口第 8 点：远端 reported completed 但结果未就绪（取结果失败）
+        # → 进入 materializing 重试，**不误判 succeeded**。结果获取/存储失败有
+        # 重试期限（backoff），不标记本地完成。
+        if payload.get('result_pending'):
+            await store.finish_external_poll(
+                task['external_task_id'], epoch, owner=worker_id,
+                state='materializing',
+                error_code='result_pending', last_observed_at=now,
+                next_poll_at=now + backoff_seconds(version), version=version + 1)
+            done += 1
+            continue
         mapped = async_contracts.map_status(
             async_contracts.pointer(payload, contract.status_pointer), contract)
         version = int(task.get('version') or 1)
         if mapped in ('accepted', 'running', 'unknown'):
             await store.finish_external_poll(
-                task['external_task_id'], epoch, state='running',
+                task['external_task_id'], epoch, owner=worker_id,
+                state='running',
                 error_code='' if mapped != 'unknown' else 'unknown_status',
                 last_observed_at=now, next_poll_at=now + backoff_seconds(version),
                 version=version + 1)
@@ -415,29 +410,35 @@ async def poll_due(store, *, worker_id: str, querier=None, limit: int | None = N
             continue
         if mapped == 'succeeded':
             try:
-                ref = _materialize(task, contract, payload)
+                staged = _materialize(task, contract, payload)
             except OSError:
                 logger.warning('外部结果落盘失败 id=%s', task.get('external_task_id'),
                                exc_info=True)
                 # 第八阶段第 7 点：结果获取/存储失败进 materializing（有重试期限），
                 # 不能标记本地完成。
                 await store.finish_external_poll(
-                    task['external_task_id'], epoch, state='materializing',
+                    task['external_task_id'], epoch, owner=worker_id,
+                    state='materializing',
                     error_code='materialize_failed', last_observed_at=now,
                     next_poll_at=now + backoff_seconds(version), version=version + 1)
                 done += 1
                 continue
-            # 先可靠保存文件（上面），再在数据库提交可消费引用 + 同事务唤醒。
-            _register_materialized(store, task, ref)
+            # 第八阶段收口第 8 点：结果已可靠落盘（staged）。在同一事务里完成
+            # 标准结果存储登记 + 终态 + 唤醒。不能仅保存路径就标记 completed。
+            envelope = _envelope_for(task, staged)
+            result_id = str(staged.get('result_id') or
+                            'ext-' + str(task.get('external_task_id') or 'result'))
             written = await store.complete_external_task_and_wake(
-                task['external_task_id'], epoch, state='completed',
-                output_manifest_ref=ref,
-                last_result_id='ext-' + str(task.get('external_task_id') or 'result'))
+                task['external_task_id'], epoch, owner=worker_id,
+                state='completed',
+                output_manifest_ref=str(staged.get('raw_ref') or ''),
+                last_result_id=result_id,
+                staged=staged, envelope=envelope)
             done += 1
             continue
         # failed / cancelled：终态 + 同事务唤醒（或待核实）。
         await store.complete_external_task_and_wake(
-            task['external_task_id'], epoch,
+            task['external_task_id'], epoch, owner=worker_id,
             state='failed' if mapped == 'failed' else 'cancelled',
             error_code=mapped)
         done += 1

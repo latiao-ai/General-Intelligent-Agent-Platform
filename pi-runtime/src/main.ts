@@ -377,6 +377,21 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
 
   controller = new AbortController();
 
+  // 第八阶段收口第 3/4 点：外部任务完成后，宿主把已登记结果读回并交给 Node
+  // 直接注入 toolResult（不重新派发工具），再进入模型循环。必须先注入这些
+  // 结果（补上上一轮「异步受理、结果未定」而缺掉的 toolResult），模型才能在
+  // 下一步看到完整上下文继续推理。
+  if (resume && Array.isArray(resume.deliver_results) && resume.deliver_results.length) {
+    for (const d of resume.deliver_results) {
+      session.pushToolResult(d.call_id, d.tool_name, d.result, !!d.is_error);
+    }
+    // 注入结果后落一次检查点，宿主确认再进入下一轮。
+    if (!(await sendCheckpoint(session.exportContext(), []))) {
+      sendError('外部结果注入检查点未被宿主确认，停止后续推理');
+      return;
+    }
+  }
+
   // 第七阶段收口：恢复模式下，先重派发原待处理调用（resume_admit / resume_deliver），
   // 再进入模型循环。导入消息后**不能**一律立即请求模型——先把上一轮没处理完的
   // 工具调用补上（宿主按账本 replay 或执行），也不重复追加原始用户输入。
