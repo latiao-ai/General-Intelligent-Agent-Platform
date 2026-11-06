@@ -226,7 +226,7 @@ class PiHostToolCallerTests(unittest.IsolatedAsyncioTestCase):
                            'url': 'https://x.com', 'title': '标题',
                            'snippet': '摘要', 'chars': 0, 'status': 'pending'}],
             'errors': [], 'usage': [], 'status': 'searched'}
-        receipt = pi_host_tools._search_receipt(updates)
+        receipt = pi_host_tools._receipt_content(updates, 'web_search')
         self.assertEqual(receipt['tool'], 'web_search')
         self.assertEqual(receipt['status'], 'searched')
         self.assertEqual(len(receipt['sources']), 1)

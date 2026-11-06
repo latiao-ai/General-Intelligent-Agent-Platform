@@ -32,8 +32,15 @@ from webpage_agent.tools import execution_gateway
 
 logger = logging.getLogger(__name__)
 
-# 本阶段 Pi 唯一开放的真实工具（稳定键）。
-ALLOWED_TOOL_KEY = 'local:web:search'
+# 本阶段 Pi 同步开放的真实工具白名单（稳定键）。**显式声明**，不是「自动开放
+# 所有只读工具」——只有列在这里、且能力包声明 effect=read 的工具才会被执行点
+# 解析放行。默认只开放 web_search，保持既有行为；新增只读工具需显式加入并
+# 确认其 effect=read，再经测试验证结果归一。
+SYNC_READ_TOOL_KEYS = ('local:web:search',)
+
+# 异步能力只开放固定合同：协议任务（mcp-task）与显式选中的文件合同。这里不
+# 枚举异步工具——异步受理由 `core.async_contracts` / `integrations.mcp_tasks`
+# 的固定合同机制驱动，Pi 侧不额外放行任何异步写工具。
 
 # 单条来源给模型的正文摘录上限（字符）。正文太长只摘开头，避免撑爆上下文。
 SNIPPET_MAX_CHARS = 400
@@ -77,10 +84,20 @@ class ToolReceipt:
 
 
 def _resolve_web_search():
-    """执行点再次解析并检查工具：只认稳定键 local:web:search。"""
+    """执行点再次解析并检查工具：只认**显式白名单**里的只读工具。
+
+    第九阶段去硬编码：不再写死 `local:web:search` 这一个键，而是从可信目录
+    （能力包 registry）里按 `SYNC_READ_TOOL_KEYS` 白名单查找，并校验其
+    `effect == 'read'`。白名单里声明了但能力包没注册、或 effect 不是 read
+    的工具，一律不放行。
+    """
+    allowed = {key for key in SYNC_READ_TOOL_KEYS}
     for tool in registry.load():
-        if tool.tool_key == ALLOWED_TOOL_KEY:
-            return tool
+        if tool.tool_key not in allowed:
+            continue
+        if str(tool.effect or '') != 'read':
+            continue
+        return tool
     return None
 
 
@@ -97,11 +114,15 @@ def _source_excerpt(doc: dict) -> dict:
     }
 
 
-def _search_receipt(updates: dict) -> dict:
-    """把 web_search 的 state 增量归一成给模型的内容。
+def _receipt_content(updates: dict, tool_name: str) -> dict:
+    """把一次只读工具的 state 增量归一成给模型的内容。
+
+    第九阶段去硬编码：不再写死 `web_search` 的工具名与结构。工具名由调用方
+    传入；增量归一沿用**通用字段**（documents / errors / usage），这些是能力
+    包统一的产物形态（来源登记、错误登记、用量），不是某个工具专属。
 
     不把整份 state 发给 Node：只带来源 ID / 标题 / URL / 限长摘录。
-    `status="searched"` 是阶段小结，这里原样保留为事实，由上层决定终态。
+    `status` 是阶段小结，原样保留为事实，由上层决定终态。
 
     `updates` 可以是真实调用后的增量，也可以是重放时从 receipt 恢复的完整
     内容（含 `documents`）。两者共用同一个 `documents` 字段。
@@ -109,7 +130,7 @@ def _search_receipt(updates: dict) -> dict:
     documents = updates.get('documents') or []
     errors = updates.get('errors') or []
     result = {
-        'tool': 'web_search',
+        'tool': tool_name,
         'status': str(updates.get('status') or 'searched'),
         'sources': [_source_excerpt(d) for d in documents[:MAX_SOURCES]
                     if isinstance(d, dict)],
@@ -292,10 +313,12 @@ class HostToolCaller:
         调用成功、结算前被调用，把本次动作的恢复事实（含已提交工具结果引用）
         写进快照，与 `settle_action` 同一事务提交（第七阶段）。
         """
-        # 执行点再次解析并检查工具：只开放 web_search
+        # 执行点再次解析并检查工具：只开放显式白名单里的只读工具（第九阶段）。
         tool = _resolve_web_search()
         if tool is None:
-            return ToolReceipt(ok=False, error=f'真实工具不可用：{ALLOWED_TOOL_KEY}')
+            return ToolReceipt(
+                ok=False,
+                error=f'真实工具不可用（白名单未放行任何只读工具）')
         if tool.name != tool_name:
             return ToolReceipt(
                 ok=False, error=f'工具未开放：{tool_name}（仅 {tool.name}）')
@@ -333,7 +356,7 @@ class HostToolCaller:
             # 复用已有结果：调用身份标记为 delivered，不再作为 pending 导出。
             self._registry.mark(call_id, 'delivered')
             return ToolReceipt(
-                ok=True, content=_search_receipt(replay),
+                ok=True, content=_receipt_content(replay, tool_name),
                 action_id=result.action_id, attempt_id=result.attempt_id,
                 step_id=step_id, updates=_mergeable_updates(replay))
         if result.kind == 'succeeded':
@@ -346,7 +369,7 @@ class HostToolCaller:
             # 结算成功：标记 delivered，该调用不再作为 pending 导出（第八阶段第 1 点）。
             self._registry.mark(call_id, 'delivered')
             return ToolReceipt(
-                ok=True, content=_search_receipt(result.updates),
+                ok=True, content=_receipt_content(result.updates, tool_name),
                 action_id=result.action_id, attempt_id=result.attempt_id,
                 step_id=step_id, updates=_mergeable_updates(result.updates))
         if result.kind == 'denied':

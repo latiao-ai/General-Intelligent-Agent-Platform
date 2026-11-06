@@ -140,8 +140,13 @@ class AsyncRoundtripE2ETests(unittest.IsolatedAsyncioTestCase):
                     await conn.execute(
                         f"UPDATE runs SET lease_expires_at=0 WHERE run_id='{run_id}'")
                     await conn.commit()
+                # 第九阶段补强：模型替身**必须在上文 toolResult 中看到远端结果标记
+                # 才产出答复**（expect），且答复文本由 Node 派生自真实 toolResult
+                # 内容——不再硬编码与远端结果相同的文本。这证明「模型真的消费了
+                # 注入的结果」，而不是「答复碰巧和远端结果长得一样」。
                 _mock_env([
-                    {'type': 'answer', 'text': '结果：指定远端结果 clip-001'},
+                    {'type': 'answer', 'text': '占位（不应被采用）',
+                     'expect': '指定远端结果 clip-001'},
                 ], async_tool=False)
                 hub2 = Hub(self.store, owner_id='worker-b')
                 claimed2 = await self.store.claim_run('worker-b', 120, run_id=run_id)

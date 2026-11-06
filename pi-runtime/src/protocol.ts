@@ -97,6 +97,9 @@ export interface StartMessage extends BaseMessage {
   mock?: Array<{
     type: 'answer';
     text: string;
+    /** 若设置，受控模型必须在上文 toolResult 中看到该标记才产出答复，
+     *  且答复文本派生自真实 toolResult 内容（验证结果确实被消费）。 */
+    expect?: string;
   } | {
     type: 'tool';
     calls: Array<{ id: string; name: string; arguments: Record<string, unknown> }>;

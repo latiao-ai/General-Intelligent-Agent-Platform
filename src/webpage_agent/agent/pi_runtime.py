@@ -84,16 +84,26 @@ def _tool_decl(tool) -> dict[str, Any]:
 
 
 def default_tool_catalog() -> list[dict[str, Any]]:
-    """Pi 默认可用的真实工具目录：只开放 web_search（稳定键 local:web:search）。
+    """Pi 默认可用的真实工具目录：按**显式只读白名单**从可信目录取工具声明。
 
-    不开放其它工具：本阶段 Pi 只支持单次独立执行里的公开网页检索，不做 MCP
-    写操作。`tools=[]`（显式传入空）表示本轮无工具，**不回退**到任何假工具。
+    第九阶段去硬编码：不再写死 `local:web:search`。白名单定义在
+    `pi_host_tools.SYNC_READ_TOOL_KEYS`，这里从能力包 registry 里按白名单
+    查找，且只取 `effect == 'read'` 的工具。白名单里声明但未注册 / 非只读的
+    工具不进目录。
+
+    `tools=[]`（显式传入空）表示本轮无工具，**不回退**到任何假工具。
     """
+    from webpage_agent.agent import pi_host_tools
     from webpage_agent.capabilities import registry
+    allowed = set(pi_host_tools.SYNC_READ_TOOL_KEYS)
+    declared = []
     for tool in registry.load():
-        if tool.tool_key == "local:web:search":
-            return [_tool_decl(tool)]
-    return []
+        if tool.tool_key not in allowed:
+            continue
+        if str(tool.effect or '') != 'read':
+            continue
+        declared.append(_tool_decl(tool))
+    return declared
 
 
 class PiRuntime:

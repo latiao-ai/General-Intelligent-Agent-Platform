@@ -36,7 +36,7 @@ export interface SessionConfig {
 
 /** 受控模型的一轮产出（对应一次 run() 的返回）。 */
 export type MockTurn =
-  | { type: 'answer'; text: string }
+  | { type: 'answer'; text: string; expect?: string }
   | { type: 'tool'; calls: Array<{ id: string; name: string; arguments: Record<string, unknown> }> };
 
 /**
@@ -471,11 +471,59 @@ export class PiSession {
       return { kind: 'toolUse', message: finalMessage };
     }
 
-    // 答复轮：产出文本答复
-    handlers.onTextDelta(turn.text);
+    // 答复轮：产出文本答复。
+    // `expect` 用于验证「模型替身确实消费了上一轮注入的 toolResult」：
+    // 只有上下文中存在包含该标记的 toolResult 文本时，才允许产出答复，
+    // 且答复文本**派生自真实 toolResult 内容**（而非硬编码的同一段话）。
+    // 这样就能区分「模型真的读了结果」与「答复文本碰巧和结果一样」。
+    let answerText = turn.text;
+    if (typeof turn.expect === 'string' && turn.expect.length > 0) {
+      const toolResults: string[] = [];
+      for (const m of this.context.messages) {
+        const msg = m as { role?: string; content?: Array<{ type?: string; text?: string }> };
+        if (msg.role === 'toolResult' && Array.isArray(msg.content)) {
+          for (const block of msg.content) {
+            if (block && block.type === 'text' && typeof block.text === 'string') {
+              toolResults.push(block.text);
+            }
+          }
+        }
+      }
+      const matched = toolResults.find((t) => t.includes(turn.expect!));
+      if (matched === undefined) {
+        // 模型替身没有在上下文中看到期望的工具结果：判为失败，绝不产出答复。
+        const err = `受控模型未在 toolResult 中看到期望标记：${turn.expect}`;
+        const msg: AssistantMessage = {
+          role: 'assistant',
+          content: [{ type: 'text', text: err }],
+          api: this.model.api,
+          provider: this.model.provider,
+          model: this.model.id,
+          usage: {
+            input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+          },
+          stopReason: 'error',
+          errorMessage: err,
+          timestamp: Date.now(),
+        };
+        this.context.messages.push(msg);
+        const settledErr = await handlers.onModelUsage(requestId, {
+          input_tokens: 1, output_tokens: 1, cache_read_tokens: 0,
+          cache_write_tokens: 0, total_tokens: 2,
+        }, 'failed');
+        if (!settledErr) {
+          return { kind: 'error', error: '模型用量结算失败，停止后续推理', message: msg };
+        }
+        return { kind: 'error', error: err, message: msg };
+      }
+      // 答复文本派生自真实 toolResult 内容，证明结果确实被消费。
+      answerText = `结果：${matched}`;
+    }
+    handlers.onTextDelta(answerText);
     finalMessage = {
       role: 'assistant',
-      content: [{ type: 'text', text: turn.text }],
+      content: [{ type: 'text', text: answerText }],
       api: this.model.api,
       provider: this.model.provider,
       model: this.model.id,
@@ -494,7 +542,7 @@ export class PiSession {
     if (!settled) {
       return { kind: 'error', error: '模型用量结算失败，停止后续推理', message: finalMessage };
     }
-    return { kind: 'answered', answer: answer || turn.text, message: finalMessage };
+    return { kind: 'answered', answer: answer || answerText, message: finalMessage };
   }
 
   /** 销毁：第三阶段是内存 session，无外部资源需释放。 */
