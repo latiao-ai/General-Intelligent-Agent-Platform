@@ -44,12 +44,17 @@ export interface ToolCallMessage extends BaseMessage {
 export interface FinishedMessage extends BaseMessage {
   type: 'finished';
   /** answered | cancelled | failed | waiting —— 只表示本轮结束，不自动代表业务成功。
-   *  waiting：远端已受理、结果未定，宿主确认等待事实落库后结束本轮、释放进程。 */
+   *  waiting：远端已受理（外部任务）或需要批准，宿主确认等待事实落库后结束本轮、释放进程。 */
   outcome: 'answered' | 'cancelled' | 'failed' | 'waiting';
   /** outcome=answered 时的最终答复文本 */
   answer?: string;
   /** outcome=failed 时的错误说明 */
   error?: string;
+  /** outcome=waiting 时的等待原因（第十阶段收口）：
+   *  - 'approval'：工具需要批准，宿主已持久化等待审批事实；
+   *  - 'external'：远端已受理、结果未定。
+   *  宿主据此把 run 停在 waiting_approval 或 waiting_external。 */
+  wait_reason?: 'approval' | 'external';
 }
 
 /** 桥接或引擎错误 */
@@ -133,6 +138,16 @@ export interface StartMessage extends BaseMessage {
       tool_name: string;
       result: unknown;
       is_error: boolean;
+    }>;
+    /**
+     * 新增的补充要求（第十阶段收口第 5 点）：恢复后作为**明确的新消息**进入
+     * context（不是只合并进 user_input 一句话）。Node importContext 后逐条
+     * pushUser，让模型把「新要求」和「旧上下文」分开。每项含 input_seq（序号）
+     * 与 message（原文）。
+     */
+    pending_inputs?: Array<{
+      input_seq: number;
+      message: string;
     }>;
   };
 }

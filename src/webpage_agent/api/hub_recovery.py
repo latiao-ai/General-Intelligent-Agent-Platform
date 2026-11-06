@@ -32,6 +32,27 @@ def _resume_index(steps: list[dict], actions: list[dict]) -> int:
     return len(steps)
 
 
+def _operation_payload_from_run(run_result) -> dict:
+    """把 get_operation 工具的 run 返回规整成 verify_operation 期望的 payload。
+
+    工具 run 返回通常是 `{status, operation, ...}`（MCP runner 把标量提到顶层）。
+    这里兜底几种形状，提取 `status` / `operation` / `code` / `message`。
+    """
+    if not isinstance(run_result, dict):
+        return {}
+    return {
+        'status': run_result.get('status', 'ok'),
+        'operation': run_result.get('operation'),
+        'code': run_result.get('code'),
+        'message': run_result.get('message'),
+    }
+
+
+async def _return(value):
+    """把一个值包成 awaitable（供 verify_operation 的 get_operation_call 用）。"""
+    return value
+
+
 class HubRecoveryMixin:
     """Hub 的恢复、暂停续跑、对账与部署。"""
 
@@ -197,6 +218,29 @@ class HubRecoveryMixin:
 
         decision = pi_recovery.decide(
             snapshot, actions, str(run.get('status') or ''))
+        # 第十阶段收口第 6 点：恢复 unknown 写时，先按原 operation ID 调 get_operation
+        # 核实「远端是否已写」，再决定（applied → 复用 / not_found → 可重试 /
+        # permission_denied、query_failed → 保持待核实）。不能盲目重发、也不能把
+        # 权限错误当成「未执行」。
+        if decision.kind == pi_recovery.RESUME_RECONCILE:
+            try:
+                verify = await self._verify_unknown_writes(run_id, actions)
+            except Exception:                      # noqa: BLE001
+                logger.warning('核实 unknown 写失败 run=%s', run_id, exc_info=True)
+                verify = None
+            if verify is not None and verify.get('applied'):
+                # 远端已写：结果可复用，转 RESUME_DELIVER（回读对象 + 交付结果），
+                # 不生成新写入冒充恢复。
+                decision = pi_recovery.RecoveryDecision(
+                    kind=pi_recovery.RESUME_DELIVER,
+                    reason=f'远端已写（{",".join(verify["applied"])}），复用结果回读对象')
+            elif verify is not None and verify.get('not_found') \
+                    and not verify.get('applied') and not verify.get('unknown'):
+                # 远端明确未写：可重试，但必须显式记录策略（这里保守转待核实，
+                # 由人工确认是否重发，不自动重发避免重复副作用）。
+                decision = pi_recovery.RecoveryDecision(
+                    kind=pi_recovery.RESUME_RECONCILE,
+                    reason='远端确认未写，可显式重试（需记录策略）')
         # 第十阶段第 5 点：等待审批的恢复。快照有 awaiting_approval 事实时，查
         # 审批表决定：已批准 → 恢复原候选（RESUME_ADMIT，重新检查权限/版本/revision/
         # 审批有效性）；仍 pending/已拒绝/过期 → 继续等待或待核实，不盲目重发。
@@ -255,6 +299,9 @@ class HubRecoveryMixin:
         # 第十阶段第 6 点：恢复时把**新增要求内容真正注入 Pi**，不只是更新版本号。
         # 快照里的原始输入 + 尚未纳入计划提交的补充输入，合并成一句完整要求交给
         # Pi 决策；否则「版本号升了但模型没看到新要求」，旧候选仍会按旧要求继续。
+        # 第十阶段收口第 5 点：除合并文本外，另把 pending 补充的**原文 + 序号**作为
+        # 增量输入（pending_inputs）传下去，让 Pi 恢复时把它们当**明确的新消息**进入
+        # 上下文——不是只在合并文本里隐式带上，否则模型分不清「新要求」和「旧上下文」。
         from webpage_agent.agent import run_inputs as run_inputs_module
         base_input = str((snapshot or {}).get('user_input') or '')
         pending_inputs = []
@@ -265,15 +312,23 @@ class HubRecoveryMixin:
             logger.warning('读待处理补充失败 run=%s', run_id, exc_info=True)
         resume['user_input'] = run_inputs_module.merged_requirement(
             base_input, pending_inputs)
+        # 增量输入（原文 + 序号），供 PiRuntime 传进 Node resume.pending_inputs。
+        resume['pending_inputs'] = [
+            {'input_seq': int(item.get('input_seq') or 0),
+             'message': str(item.get('message') or '')}
+            for item in pending_inputs
+            if isinstance(item, dict) and str(item.get('message') or '').strip()
+        ]
         return resume
 
     async def _decide_approval_recovery(self, run_id: str, awaiting: list,
                                         snapshot: dict) -> 'RecoveryDecision':
-        """等待审批的恢复决策（第十阶段第 5 点）。
+        """等待审批的恢复决策（第十阶段第 5 点收口）。
 
         查每个待审批调用的 approval 状态：
-        - 已批准（approved）→ 恢复原候选（RESUME_ADMIT，原 call_id/参数），
-          由执行点重新检查权限、要求版本、对象 revision 与审批有效性；
+        - 已批准（approved）→ 恢复原候选（RESUME_ADMIT，原 call_id + **最终参数**
+          + 参数指纹 + 对象 revision + 要求版本），由执行点重新检查权限、要求版本、
+          对象 revision 与审批有效性；
         - 仍 pending → 继续等待（RESUME_WAIT），不重新推理；
         - 已拒绝/撤销/过期 → 转待核实（RESUME_RECONCILE），不盲目重发。
         """
@@ -297,7 +352,12 @@ class HubRecoveryMixin:
                 approved_calls.append({
                     'call_id': str(item.get('call_id') or ''),
                     'tool_name': str(item.get('tool_name') or ''),
+                    # 恢复原调用的**最终参数**（含幂等键）与参数指纹——不是模型
+                    # 重发的参数。参数已变化时，执行点按 args_hash 拒绝复用。
                     'arguments': dict(item.get('arguments') or {}),
+                    'args_hash': str(item.get('args_hash') or ''),
+                    'expected_revision': item.get('expected_revision'),
+                    'intent_version': int(item.get('intent_version') or 0),
                 })
             elif status == 'pending':
                 any_pending = True
@@ -305,7 +365,8 @@ class HubRecoveryMixin:
                 # rejected / revoked / expired / 未知
                 any_bad = True
         if approved_calls:
-            # 已批准：恢复原候选（原 call_id/参数），执行点重新检查授权有效性。
+            # 已批准：恢复原候选（原 call_id/最终参数），执行点重新检查授权有效性
+            # 与要求版本/revision（变化则拒绝）。
             return pi_recovery.RecoveryDecision(
                 kind=pi_recovery.RESUME_ADMIT, pending_calls=approved_calls,
                 reason='审批已批准，恢复原候选重新检查权限与版本')
@@ -320,6 +381,89 @@ class HubRecoveryMixin:
         return pi_recovery.RecoveryDecision(
             kind=pi_recovery.RESUME_RECONCILE,
             reason='等待审批事实缺失有效关联，需核实')
+
+    async def _verify_unknown_writes(self, run_id: str,
+                                     actions: list[dict]) -> dict | None:
+        """恢复 unknown 写时，按原 operation ID 调 get_operation 核实（第十阶段第 6 点）。
+
+        从 actions 里找 `unknown` 且 effect=write 的动作，提取其最终参数里的幂等键
+        （operation_id），用同一可信主体调用 `get_operation` 核实「远端是否已写」。
+        严格区分四种结局（`platform_verify.verify_operation`）：
+
+        - `applied`：远端已写（可复用结果，回读对象，不重发）；
+        - `not_found`：远端明确未写（可显式重试，但需记录策略）；
+        - `permission_denied`：权限错误——**不能当成未执行**，结果未知；
+        - `query_failed`：查询失败，结果未知。
+
+        返回 `{'applied': [...], 'not_found': [...], 'unknown': [...]}`，分别列出
+        operation_id；找不到任何 unknown 写动作 / 无法提取幂等键时返回 None。
+        """
+        from webpage_agent.core import platform_verify
+        from webpage_agent.tools import core as tools_core
+
+        unknown_writes = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            if str(action.get('status')) != 'unknown':
+                continue
+            effect = str(action.get('effect') or '')
+            receipt = action.get('receipt') or {}
+            if not isinstance(receipt, dict):
+                receipt = {}
+            final_args = receipt.get('final_args') or {}
+            operation_id = str(
+                (final_args or {}).get('operation_id')
+                or (final_args or {}).get('idempotency_key') or '')
+            if effect != 'write' or not operation_id:
+                continue
+            unknown_writes.append({
+                'action_id': str(action.get('action_id') or ''),
+                'operation_id': operation_id,
+                'final_args': final_args,
+            })
+        if not unknown_writes:
+            return None
+
+        # 找 get_operation 工具（同 server 的只读工具），用它核实。
+        get_op_tool = None
+        try:
+            for tool in await tools_core.mcp_tools():
+                if getattr(tool, 'name', '') == 'get_operation' \
+                        and str(getattr(tool, 'effect', '') or 'unknown') == 'read':
+                    get_op_tool = tool
+                    break
+        except Exception:                          # noqa: BLE001
+            logger.warning('发现 get_operation 工具失败', exc_info=True)
+
+        result = {'applied': [], 'not_found': [], 'unknown': []}
+        for item in unknown_writes:
+            operation_id = item['operation_id']
+            if get_op_tool is None:
+                # 没有核实工具：结果未知，转待核实。
+                result['unknown'].append(operation_id)
+                continue
+            try:
+                # 用同一可信主体（当前执行上下文）调用 get_operation。
+                run_result = await get_op_tool.run(
+                    {'operation_id': operation_id}, {'task_id': ''})
+            except Exception as exc:                # noqa: BLE001
+                logger.warning('核实操作失败 op=%s：%s', operation_id, exc)
+                result['unknown'].append(operation_id)
+                continue
+            # 把 run 返回规整成 verify_operation 期望的 payload 形状。
+            payload = _operation_payload_from_run(run_result)
+            verification = await platform_verify.verify_operation(
+                operation_id, server=None,
+                get_operation_call=lambda oid: _return(payload))
+            state = verification.get('state')
+            if state == 'applied':
+                result['applied'].append(operation_id)
+            elif state == 'not_found':
+                result['not_found'].append(operation_id)
+            else:
+                result['unknown'].append(operation_id)
+        return result
 
     async def _assemble_deliver_results(self, refs: list[dict]) -> list[dict] | None:
         """把外部任务的完成结果读回，装配成可注入 Node 的 deliver_results。

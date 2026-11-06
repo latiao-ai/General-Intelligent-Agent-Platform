@@ -100,21 +100,67 @@ def build(state: dict) -> dict:
         kind = 'artifact'
     else:
         kind = 'none'
+    write_evidences = _platform_write_evidences(state)
     return {
         'kind': kind,
         'produced': produced,
         'effects': effects,
         'answered': answered,
         # 有副作用没核实：写请求可能成功了，只是回执看不懂
-        'unverified': any(not item.get('verified') for item in effects),
+        'unverified': (
+            any(not item.get('verified') for item in effects)
+            or (bool(write_evidences) and not _all_writes_verified(write_evidences))
+        ),
+    }
+
+
+def _platform_write_evidences(state: dict) -> list[dict]:
+    """本轮发生的**平台写动作证据**（每项一次写，逐项保存，不合并）。
+
+    写动作证据由宿主在写后回读时逐项追加到 `state['write_evidences']`，每项含
+    对象 ID / 操作 ID / 参数指纹 / 要求版本 / 回读 action / 逐项核验结论。这里
+    只读、只规整，不重算——证据的权威来源是执行链落盘的内容。
+
+    兼容旧的顶层单一 `readback_match` 字段（第十阶段早期实现只留顶层一个）：
+    若没有 `write_evidences` 列表，但有顶层平台写标记（object_id / new_revision
+    / write_result），则退化出一条单证据，避免旧数据被误判成「没有写动作」。
+    """
+    evidences = state.get('write_evidences')
+    if isinstance(evidences, list):
+        out = [e for e in evidences if isinstance(e, dict)]
+        if out:
+            return out
+    # 退化：顶层单一写结果
+    if _looks_like_platform_write(state):
+        return [_single_evidence_from_state(state)]
+    return []
+
+
+def _looks_like_platform_write(state: dict) -> bool:
+    return bool(state.get('object_id') or state.get('new_revision')
+                or state.get('write_result'))
+
+
+def _single_evidence_from_state(state: dict) -> dict:
+    """从顶层单一写结果退化出一条写证据（兼容旧数据）。"""
+    return {
+        'object_id': state.get('object_id'),
+        'operation_id': state.get('operation_id'),
+        'readback_match': bool(state.get('readback_match')),
+        'verified': state.get('readback_match') is True,
     }
 
 
 def final_status(state: dict) -> str:
     """本轮收尾后的**通用**状态。
 
+    第十阶段第 3/9 点修正判定顺序：**存在平台写动作时，先检查完整写动作集合**
+    （逐项核验 + 无未知状态 + 要求版本），再决定成功；`answer` 仅用于展示，
+    **不是**写任务成功的依据——「有答复但回读失败/缺回读」不得成功收尾。
+
     只按"产出了什么 / 副作用是否核实"判定，不认识具体业务：
-    新增能力只要产出 artifact 或 answer，这里一行都不用改。
+    新增能力只要产出 artifact 或 answer，这里一行都不用改（纯只读/闲聊任务
+    保留原有「有答复即成功」语义）。
     """
     state = state or {}
     plan = state.get('plan') or {}
@@ -124,8 +170,15 @@ def final_status(state: dict) -> str:
     if deployment:
         return 'succeeded' if deployment.get('status') == 'success' \
             else 'needs_reconcile'
-    # 有产出（页面或 write_file 写出的文件）就是成功：不能因为"没生成视频"
-    # 就把三个脚本文件说成"没有产出可用结果"。
+
+    # 平台写动作：先看写证据集合，再决定。有写动作但证据不完整/不匹配 →
+    # 不得成功（哪怕有 answer）。
+    write_evidences = _platform_write_evidences(state)
+    if write_evidences:
+        return 'succeeded' if _all_writes_verified(write_evidences) \
+            else 'needs_reconcile'
+
+    # 无平台写动作（纯只读/闲聊/产出文件）：有答复或产物就是成功。
     if state.get('answer') or _produced(state):
         return 'succeeded'
     # 外部状态变更也可以是成果，但部分步骤成功不能代替整份计划完成。
@@ -138,6 +191,29 @@ def final_status(state: dict) -> str:
             and not state.get('failure')):
         return 'succeeded'
     return 'failed'
+
+
+def _all_writes_verified(evidences: list[dict]) -> bool:
+    """完整写动作集合是否**逐项**核验通过。
+
+    任何一项未核实（readback_match 非 True / 显式 verified=False / 未知状态）
+    都判未核实——不能因为「最后一项已核实」就放过「第一项未核实」。逐项保存
+    的意义正在于此：部分成功不能代替全部完成。
+    """
+    if not evidences:
+        return False
+    for evidence in evidences:
+        if evidence.get('status') in ('unknown', 'needs_reconcile'):
+            return False
+        verified = evidence.get('verified')
+        if verified is not None:
+            if not bool(verified):
+                return False
+            continue
+        # 没有显式 verified 字段：看 readback_match
+        if evidence.get('readback_match') is not True:
+            return False
+    return True
 
 
 def label(status, state: dict | None = None) -> str:

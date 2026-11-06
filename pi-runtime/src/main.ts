@@ -372,6 +372,16 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
     if (typeof resume.checkpoint_seq === 'number' && resume.checkpoint_seq > 0) {
       checkpointSeq = resume.checkpoint_seq;
     }
+    // 第十阶段收口第 5 点：新增的补充要求作为**明确的新消息**进入恢复后 context。
+    // importContext 后逐条 pushUser（原文 + 序号），让模型把「新要求」和「旧上下
+    // 文」分开，而不是只合并进 user_input 一句话。
+    if (Array.isArray(resume.pending_inputs) && resume.pending_inputs.length) {
+      for (const p of resume.pending_inputs) {
+        if (p && typeof p.message === 'string' && p.message.trim()) {
+          session.pushUser(p.message);
+        }
+      }
+    }
   } else {
     if (history && history.length) {
       session.pushHistory(history);
@@ -513,13 +523,13 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
       // 第八阶段：远端已受理、结果未定 → 结束本轮、释放进程等待唤醒。
       // 不注入 toolResult、不继续请求模型。
       if (reply.accepted) {
-        sendFinished('waiting');
+        sendFinished('waiting', { wait_reason: 'external' });
         return;
       }
       // 第十阶段：需要批准 → 同 accepted，结束本轮等待唤醒。不把「需要批准」
       // 当错误让模型继续尝试。
       if (reply.needs_approval) {
-        sendFinished('waiting');
+        sendFinished('waiting', { wait_reason: 'approval' });
         return;
       }
       // 失败回执：向模型传 reply.error（保留原始错误正文），不能继续传空的

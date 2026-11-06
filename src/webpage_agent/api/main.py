@@ -65,8 +65,15 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     # 从 resume_plan 里取出放进展平的 state，PiRuntime.run() 只从这里读，
     # 不在顶层与 resume_plan 里同时维护两份。
     pi_resume = resumed.get('pi_resume') if isinstance(resumed, dict) else None
+    # 第十阶段收口第 5 点：Pi 恢复时，`resumed['user_input']` 是「原目标 + 尚未
+    # 纳入计划提交的补充」合并后的完整要求（见 `_pi_resume_plan`）。恢复必须让
+    # Pi 看到**增量输入**，而不是只用原始 `text`——否则「要求版本升了但模型没
+    # 看到新要求」，旧候选仍按旧要求继续。LangGraph 路径 resumed 无此字段，退回
+    # 原始 text。
+    resumed_input = resumed.get('user_input') if isinstance(resumed, dict) else None
+    effective_input = resumed_input if (pi_resume and resumed_input) else text
     state = {
-        'task_id': task_id, 'user_input': text,
+        'task_id': task_id, 'user_input': effective_input,
         # 原目标：运行中补充要求时，"最初要做什么"不能被新要求顶掉——
         # 修订计划要同时看到原目标和按序补充（文档 §5 第八步）。
         'original_goal': text,
@@ -79,7 +86,7 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         'intent_version': int(resumed.get('intent_version') or 0),
         'plan_version': int(resumed.get('plan_version') or 0),
         'processed_intent_version': int(resumed.get('processed_intent_version') or 0),
-        'pending_inputs': [], 'intent_changed': False, 'revision_count': 0,
+        'pending_inputs': list(resumed.get('pending_inputs') or []), 'intent_changed': False, 'revision_count': 0,
         # 已经问过用户的问题：跨轮次带着走，同一组问题不重复弹
         'asked_questions': [str(q) for q in (resumed.get('asked_questions') or [])
                             if str(q).strip()],

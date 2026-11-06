@@ -619,13 +619,18 @@ async def governed_call(
         # 提交结果未知：动作未确认落地，也不能盲目重提（重提 = 再产生副作用）。
         # 结算为 unknown + needs_reconcile，交由人工/恢复核实。不消费批准预留
         # （可能已花掉额度）。
+        # 第十阶段收口第 6 点：unknown 写动作必须把**最终参数（含幂等键
+        # operation_id）**写进 receipt，供恢复时按原 operation ID 调 get_operation
+        # 核实「远端是否已写」——没有它就无法区分「已写」和「未写」，只能盲目待核实。
         if book is not None and action_id:
             await book.settle(
                 step_id=step_id, action_id=action_id, attempt_id=attempt_id,
                 status='unknown',
                 receipt={'error_code': 'E_ASYNC_SUBMIT_UNKNOWN',
                          'phase': 'needs_reconcile',
-                         'certainty': 'unknown', 'effect': effect},
+                         'certainty': 'unknown', 'effect': effect,
+                         'final_args': dict(args or {}),
+                         'tool_key': tool_key},
                 error_type='E_ASYNC_SUBMIT_UNKNOWN',
                 step_status='unknown', state=snapshot_state,
                 next_step_id=next_step_id, snapshot_schema=snapshot_schema)

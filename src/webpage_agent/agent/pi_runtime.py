@@ -125,6 +125,23 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
 
     read_keys = set(pi_host_tools.SYNC_READ_TOOL_KEYS)
     write_keys = set(pi_host_tools.WRITE_TOOL_KEYS)
+    # 第十阶段收口：正式链路测试经环境变量**显式扩展**读/写白名单（受控启用，
+    # 不靠测试注入或临时全局切换——环境变量是显式配置，生产未设置时白名单保持
+    # 默认：只读 web_search、不开放写）。
+    import json as _json
+    import os as _os
+    _extra_read = _os.environ.get('PI_READ_TOOL_KEYS')
+    if _extra_read:
+        try:
+            read_keys |= {str(k) for k in _json.loads(_extra_read)}
+        except ValueError:
+            pass
+    _extra_write = _os.environ.get('PI_WRITE_TOOL_KEYS')
+    if _extra_write:
+        try:
+            write_keys |= {str(k) for k in _json.loads(_extra_write)}
+        except ValueError:
+            pass
     tool_objects: list = []
 
     # 本地只读工具
@@ -243,10 +260,14 @@ class PiRuntime:
                 state['pi_outcome'] = 'answered'
                 state['status'] = 'succeeded'
             elif kind == 'resume_wait':
-                # 第八阶段第 5 点：已受理的外部任务未完成，继续等待。不重新推理、
-                # 不重派发。run 停在 waiting_external，释放执行资源。
+                # 第十阶段收口：区分等待原因。快照有 awaiting_approval（审批仍
+                # pending）→ waiting_approval；否则（已受理外部任务未完成）→
+                # waiting_external。两者都是「持久等待」，不重新推理、不重派发。
                 state['pi_outcome'] = 'waiting'
-                state['status'] = 'waiting_external'
+                if self._snapshot.get('awaiting_approval'):
+                    state['status'] = 'waiting_approval'
+                else:
+                    state['status'] = 'waiting_external'
             else:
                 state['pi_outcome'] = 'failed'
                 state['status'] = 'needs_reconcile'
@@ -256,9 +277,30 @@ class PiRuntime:
             state['_pi_snapshot'] = pi_snapshot.serialize(self._snapshot)
             return state
 
+        # 第十阶段收口：审批已批准（RESUME_ADMIT 恢复原候选）时，清空 awaiting_approval
+        # 事实——这些候选即将重新派发、执行点重查约束，旧等待事实不得残留，否则
+        # 下次恢复又会误判「仍有待审批调用」重复恢复。
+        if isinstance(recovery, dict) and recovery.get('kind') == 'resume_admit' \
+                and self._snapshot.get('awaiting_approval'):
+            self._snapshot['awaiting_approval'] = []
+            self._snapshot['phase'] = 'running'
+
         # 绑定宿主 sink：让 Pi 事件经统一的公共事件出口（emit_async）有序转交，
         # 与 LangGraph 节点内部事件走同一套 answer_delta / stage_start / stage_end 契约。
         token = bind_sink(on_event) if on_event else None
+
+        # 第十阶段收口：惰性发现工具目录。当宿主未显式传入工具目录（tools / 
+        # tool_objects 都是 None），且环境变量显式扩展了读/写白名单（PI_READ_TOOL_KEYS
+        # / PI_WRITE_TOOL_KEYS）时，异步发现完整工具目录（本地只读 + MCP 平台工具），
+        # 让正式链路能真实走 MCP transport 的 update_object / get_object / get_operation。
+        # 未设置环境变量时保持默认（只读 web_search），不改变生产行为。
+        import os as _os
+        if self._tool_objects is None and (
+                _os.environ.get('PI_WRITE_TOOL_KEYS')
+                or _os.environ.get('PI_READ_TOOL_KEYS')):
+            decls, tool_objects = await pi_tool_catalog()
+            self._tools = decls
+            self._tool_objects = tool_objects
 
         try:
             await bridge.start()
@@ -321,6 +363,16 @@ class PiRuntime:
                         ]
 
             resume_field = None
+            # 第十阶段收口第 5 点：新增的补充要求作为**明确的新消息**进入恢复后
+            # context（不只是合并进 user_input 一句话）。pending_inputs 由 Hub 装配
+            # （含原文 + 序号），随 resume 传给 Node，Node importContext 后逐条 push。
+            pending_inputs = list(state.get('pending_inputs') or [])
+            pending_inputs = [
+                {'input_seq': int(p.get('input_seq') or 0),
+                 'message': str(p.get('message') or '')}
+                for p in pending_inputs
+                if isinstance(p, dict) and str(p.get('message') or '').strip()
+            ]
             if resume_messages:
                 resume_field = {'messages': resume_messages,
                                 'checkpoint_seq': resume_seq}
@@ -329,6 +381,8 @@ class PiRuntime:
                     resume_field['pending_calls'] = resume_pending or []
                 if resume_deliver:
                     resume_field['deliver_results'] = resume_deliver
+                if pending_inputs:
+                    resume_field['pending_inputs'] = pending_inputs
 
             start = proto.make_message(
                 bridge.execution_id,
@@ -534,19 +588,31 @@ class PiRuntime:
             build_snapshot=build_snapshot)
         if receipt.needs_approval:
             # 第十阶段第 5 点：需要批准。动作尚未发出（授权层 ApprovalRequired），
-            # 不是失败。把等待审批事实（approval_id + 原调用关联）写进快照，
-            # 结束本轮、释放进程；批准后按快照恢复原候选重新检查权限/版本/revision。
+            # 不是失败。把等待审批事实写进快照，结束本轮、释放进程；批准后按快照
+            # 恢复原候选重新检查权限/版本/revision。
+            # 第十阶段收口：快照保存**完整调用身份 + 最终参数 + 参数指纹 + 对象
+            # revision + 要求版本**——批准后恢复必须复用同一份最终参数（含幂等键），
+            # 不能靠模型重发的参数冒充原调用，也不能在参数变化后继续执行。
             self._host_caller.registry.mark(call_id, 'accepted')
             self._snapshot['phase'] = 'awaiting_approval'
             binding = self._host_caller.registry._bindings.get(call_id) or {}
+            final_args = dict(receipt.final_args or args or {})
+            from webpage_agent.store import ledger as _ledger
+            args_hash = receipt.args_hash or _ledger.args_hash(final_args)
             awaiting = list(self._snapshot.get('awaiting_approval') or [])
             awaiting.append({
                 'call_id': call_id,
                 'logical_call_id': str(binding.get('logical_call_id') or ''),
                 'tool_name': tool_name,
                 'tool_key': str(binding.get('tool_key') or ''),
-                'arguments': dict(args or {}),
+                'arguments': dict(final_args),
+                'args_hash': args_hash,
                 'approval_id': str(receipt.approval_id or ''),
+                # 对象 revision / 要求版本：批准后重查约束的依据（要求变化或
+                # revision 前进都使旧批准失效）。
+                'object_id': str(final_args.get('object_id') or ''),
+                'expected_revision': final_args.get('expected_revision'),
+                'intent_version': int(state.get('intent_version') or 0),
                 'status': 'awaiting_approval',
             })
             self._snapshot['awaiting_approval'] = awaiting
@@ -832,11 +898,18 @@ class PiRuntime:
             # 第七阶段收口：失败同样清除旧 answer，避免 final_status 误判成功。
             state.pop("answer", None)
         elif outcome == "waiting":
-            # 第八阶段第 5 点：远端已受理、结果未定。本轮**不是**失败也不是成功，
-            # 而是「持久等待」——run 停在 waiting_external，等 Worker 从原远端
-            # 任务取得结果后唤醒。不得因残留旧 answer 归一为成功。
+            # 第十阶段收口：区分等待原因（Node 在 finished 里带 wait_reason）。
+            #  - approval：工具需要批准 → run 停在 waiting_approval，等用户批准后
+            #    恢复原候选（不是失败，也不是成功）；
+            #  - external（缺省）：远端已受理、结果未定 → run 停在 waiting_external，
+            #    等 Worker 从原远端任务取得结果后唤醒。
+            # 两种情况本轮都**不是**失败也不是成功，而是「持久等待」；不得因残留
+            # 旧 answer 归一为成功。
             state["pi_outcome"] = "waiting"
-            state["status"] = "waiting_external"
+            if msg.get("wait_reason") == "approval":
+                state["status"] = "waiting_approval"
+            else:
+                state["status"] = "waiting_external"
             state.pop("answer", None)
         else:
             # validate_finished 已保证 outcome 只可能是上述四者，此分支防御性兜底

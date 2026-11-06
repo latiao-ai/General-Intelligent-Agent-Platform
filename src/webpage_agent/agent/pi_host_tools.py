@@ -45,6 +45,34 @@ WRITE_TOOL_KEYS: tuple[str, ...] = ()
 # 第九阶段保留别名（向后兼容旧测试引用）：只读白名单。
 READ_TOOL_KEYS = SYNC_READ_TOOL_KEYS
 
+
+def _effective_read_keys() -> set[str]:
+    """当前生效的读白名单：模块级常量 + 环境变量显式扩展（正式链路测试用）。"""
+    import json as _json
+    import os as _os
+    keys = set(SYNC_READ_TOOL_KEYS)
+    extra = _os.environ.get('PI_READ_TOOL_KEYS')
+    if extra:
+        try:
+            keys |= {str(k) for k in _json.loads(extra)}
+        except ValueError:
+            pass
+    return keys
+
+
+def _effective_write_keys() -> set[str]:
+    """当前生效的写白名单：模块级常量 + 环境变量显式扩展（正式链路测试用）。"""
+    import json as _json
+    import os as _os
+    keys = set(WRITE_TOOL_KEYS)
+    extra = _os.environ.get('PI_WRITE_TOOL_KEYS')
+    if extra:
+        try:
+            keys |= {str(k) for k in _json.loads(extra)}
+        except ValueError:
+            pass
+    return keys
+
 # 单条来源给模型的正文摘录上限（字符）。正文太长只摘开头，避免撑爆上下文。
 SNIPPET_MAX_CHARS = 400
 
@@ -94,6 +122,10 @@ class ToolReceipt:
     # 原候选。不是失败——动作尚未发出，用户确认后继续。
     needs_approval: bool = False
     approval_id: str = ''
+    # 最终发送参数（含幂等键注入）与参数指纹：needs_approval 时随回执带回，
+    # 供批准后恢复原调用、重查约束（不能靠模型重发的参数冒充原调用）。
+    final_args: dict | None = None
+    args_hash: str = ''
 
 
 def _resolve_web_search():
@@ -175,6 +207,58 @@ def _mergeable_updates(updates: dict) -> dict:
     """从工具增量里挑出**认可**、可合并回宿主 state 的字段（白名单）。"""
     return {key: value for key, value in (updates or {}).items()
             if key in _MERGEABLE_KEYS}
+
+
+def _tool_server_prefix(tool_key: str) -> str:
+    """从 MCP 工具键 `mcp:<server>:<name>` 提取 server 前缀 `mcp:<server>:`。
+
+    非 MCP 键（本地能力包 `local:*` 等）返回空串。用于判断写工具与回读工具
+    是否属于同一 server（写后回读必须同 server、同主体）。
+    """
+    key = str(tool_key or '')
+    if not key.startswith('mcp:'):
+        return ''
+    parts = key.split(':', 2)
+    if len(parts) < 3:
+        return ''
+    return f'mcp:{parts[1]}:'
+
+
+def _readback_payload_from_result(read_result) -> dict:
+    """从受治理回读结果（GovernedResult）提取 `get_object` 的对象 payload。
+
+    回读工具经 MCP runner 时，get_object 返回的完整 payload（含 `fields` dict）
+    存在 `updates['mcp_calls'][-1]['payload']` 里（MCP runner 只把标量提到顶层，
+    `fields` 是 dict 不会被提）。这里优先从 mcp_calls 取完整 payload，兜底用
+    updates 顶层的标量字段（object_id / revision）。
+    """
+    updates = (read_result.updates or {}) if read_result is not None else {}
+    # 完整 payload 在 mcp_calls 最后一条里
+    mcp_calls = updates.get('mcp_calls') or []
+    if isinstance(mcp_calls, list) and mcp_calls:
+        last = mcp_calls[-1]
+        if isinstance(last, dict) and isinstance(last.get('payload'), dict):
+            payload = last['payload']
+            return {
+                'status': payload.get('status', 'ok'),
+                'object_id': payload.get('object_id', updates.get('object_id', '')),
+                'owner': payload.get('owner', ''),
+                'revision': payload.get('revision', updates.get('revision')),
+                'fields': payload.get('fields') or {},
+            }
+    # 兜底：updates 顶层标量
+    return {
+        'status': updates.get('status', 'ok'),
+        'object_id': updates.get('object_id', ''),
+        'owner': updates.get('owner', ''),
+        'revision': updates.get('revision'),
+        'fields': updates.get('fields') or {},
+    }
+
+
+async def _return(value):
+    """把一个值包成 awaitable（供 verify_platform_write 的 get_object_call 用）。"""
+    return value
 
 
 class PiCallRegistry:
@@ -336,8 +420,8 @@ class HostToolCaller:
         if catalog is None:
             from webpage_agent.capabilities import registry as _reg
             catalog = list(_reg.load())
-        allowed_read = set(SYNC_READ_TOOL_KEYS)
-        allowed_write = set(WRITE_TOOL_KEYS)
+        allowed_read = _effective_read_keys()
+        allowed_write = _effective_write_keys()
         for tool in catalog:
             if getattr(tool, 'name', '') != tool_name:
                 continue
@@ -350,6 +434,133 @@ class HostToolCaller:
             # 名字匹配但不在白名单 → 拒绝（不返回，交给上层报「未开放」）
             return None
         return None
+
+    def _find_readback_tool(self, write_tool):
+        """找与写工具同 server 的只读回读工具（get_object）。
+
+        第十阶段第 1/7 点：写后回读必须用**同一可信主体**读同一对象，因此回读
+        工具必须与写工具属于同一 MCP server（tool_key 前缀 `mcp:<server>:` 一致）。
+        找不到（未在目录里开放读工具）返回 None——此时不能做回读，写效果判为
+        未核实（缺回读不得成功）。
+
+        按名字 `get_object` 匹配，且校验其 tool_key 与写工具同 server 前缀、
+        effect == 'read'。不能跨 server 回读（那读的是别的平台的对象）。
+        """
+        if self._tools_catalog is None:
+            return None
+        write_key = getattr(write_tool, 'tool_key', '') or ''
+        server_prefix = _tool_server_prefix(write_key)
+        for tool in self._tools_catalog:
+            if getattr(tool, 'name', '') != 'get_object':
+                continue
+            if str(getattr(tool, 'effect', '') or 'unknown') != 'read':
+                continue
+            key = getattr(tool, 'tool_key', '') or ''
+            if server_prefix and _tool_server_prefix(key) != server_prefix:
+                continue
+            return tool
+        return None
+
+    async def _perform_readback(self, write_tool, write_updates: dict,
+                                state: dict, write_step_id: str) -> dict | None:
+        """写成功后，用同一可信主体独立读回对象，返回写证据（第十阶段第 1/7 点）。
+
+        只处理「平台对象写」：写结果带 `object_id` 才需要回读。回读走**同一条
+        受治理链**（governed_call，read effect）——授权、预算、结果记录都不绕过，
+        不是手工调用核验函数。
+
+        返回写证据 dict（含 object_id / operation_id / args_hash / intent_version
+        / read_action_id / readback_match / checks / status），或 None（无需回读 /
+        找不到回读工具 / 回读失败——回读失败也返回证据，只是 readback_match=False，
+        让宿主据此判 needs_reconcile，不能默默跳过）。
+
+        纪律：回读失败、回读工具缺失、字段不符，都**保留证据**而不是吞掉——
+        写效果「未核实」是事实，宿主据此决定不得成功收尾。
+        """
+        from webpage_agent.core import platform_verify
+
+        if not platform_verify.needs_readback(write_updates):
+            return None
+
+        object_id = str(write_updates.get('object_id') or '')
+        operation_id = str(write_updates.get('operation_id') or '')
+        new_revision = write_updates.get('new_revision')
+        modified_fields = write_updates.get('modified_fields') or {}
+
+        # 回读工具：与写工具同 server 的 get_object（读工具）。
+        readback_tool = self._find_readback_tool(write_tool)
+        if readback_tool is None:
+            # 没有可用的回读读工具：写效果无法核实，记录证据（未核实）。
+            return {
+                'object_id': object_id, 'operation_id': operation_id,
+                'new_revision': new_revision, 'modified_fields': modified_fields,
+                'args_hash': ledger_module.args_hash(
+                    (write_updates.get('final_args') or {})),
+                'intent_version': int(state.get('intent_version') or 0),
+                'read_action_id': '', 'readback': None, 'readback_match': False,
+                'checks': {'readback_tool': False}, 'status': 'unverified',
+            }
+
+        # 回读也走受治理链：分配新的逻辑调用身份（与写调用解耦），复用同一
+        # 账本/执行上下文。回读是 read 工具，effect=read，白名单里需已放行。
+        read_call_id = f'{write_step_id}:readback'
+        try:
+            read_step_id = self._registry.logical_id(
+                read_call_id, tool_name='get_object',
+                tool_key=getattr(readback_tool, 'tool_key', '') or 'get_object',
+                args={'object_id': object_id})
+        except RuntimeError:
+            read_step_id = f'{write_step_id}:readback'
+
+        # 最终参数：get_object 只需 object_id，无需幂等键。
+        from webpage_agent.tools import core as tools_core
+        book = ledger_module.current_ledger()
+        read_args = tools_core.execution_arguments(
+            readback_tool, {'object_id': object_id}, read_step_id, book)
+
+        ctx = await execution_gateway.tool_context(
+            step_id=read_step_id, action_id='')
+
+        from webpage_agent.agent import runtime_identity
+        try:
+            read_result = await execution_gateway.governed_call(
+                tool=readback_tool, args=read_args, step_id=read_step_id,
+                state=state, ctx=ctx,
+                snapshot_schema=runtime_identity.PI_STATE_SCHEMA)
+        except Exception as exc:                    # noqa: BLE001
+            logger.warning('写后回读调用失败 object=%s：%s', object_id, exc)
+            return {
+                'object_id': object_id, 'operation_id': operation_id,
+                'new_revision': new_revision, 'modified_fields': modified_fields,
+                'args_hash': ledger_module.args_hash(
+                    (write_updates.get('final_args') or {})),
+                'intent_version': int(state.get('intent_version') or 0),
+                'read_action_id': '', 'readback': None, 'readback_match': False,
+                'checks': {'error': type(exc).__name__}, 'status': 'unverified',
+            }
+
+        read_action_id = read_result.action_id
+        read_payload = _readback_payload_from_result(read_result)
+        # 回读工具经 MCP runner 时，get_object 的 payload 里 object_id/revision/
+        # fields 提到 updates 顶层。这里用 platform_verify 做逐项核验。
+        verification = await platform_verify.verify_platform_write(
+            {'object_id': object_id, 'new_revision': new_revision,
+             'modified_fields': modified_fields},
+            server=None,
+            get_object_call=lambda oid: _return(read_payload))
+
+        return {
+            'object_id': object_id, 'operation_id': operation_id,
+            'new_revision': new_revision, 'modified_fields': modified_fields,
+            'args_hash': ledger_module.args_hash(
+                (write_updates.get('final_args') or {})),
+            'intent_version': int(state.get('intent_version') or 0),
+            'read_action_id': read_action_id,
+            'readback': read_payload or None,
+            'readback_match': bool(verification.get('readback_match')),
+            'checks': verification.get('checks') or {},
+            'status': 'verified' if verification.get('readback_match') else 'unverified',
+        }
 
     async def call(self, *, call_id: str, tool_name: str,
                    args: dict, state: dict, build_snapshot=None) -> ToolReceipt:
@@ -426,6 +637,19 @@ class HostToolCaller:
             import os as _os
             if _os.environ.get('PI_CRASH_AFTER_SETTLE') == '1':
                 _os._exit(0)
+            # 第十阶段第 1/7 点：写工具成功后，用同一可信主体独立回读同一对象，
+            # 逐项保存写证据（对象 ID / 操作 ID / 参数指纹 / 要求版本 / 回读 action
+            # / 核验结论）。证据追加到 state['write_evidences']（不是顶层单个
+            # readback_match），供宿主 final_status 逐项核验。回读失败/缺回读工具
+            # 也保留证据（readback_match=False），让写效果被判「未核实」。
+            write_updates = dict(result.updates or {})
+            write_updates.setdefault('final_args', (result.receipt or {}).get('final_args') or {})
+            write_evidence = await self._perform_readback(
+                tool, write_updates, state, step_id)
+            if write_evidence is not None:
+                existing = list(state.get('write_evidences') or [])
+                existing.append(write_evidence)
+                state['write_evidences'] = existing
             # 结算成功：标记 delivered，该调用不再作为 pending 导出（第八阶段第 1 点）。
             self._registry.mark(call_id, 'delivered')
             return ToolReceipt(
@@ -459,7 +683,9 @@ class HostToolCaller:
             return ToolReceipt(ok=False, needs_approval=True,
                                approval_id=result.approval_id,
                                error=result.error or '需要批准',
-                               step_id=step_id)
+                               step_id=step_id,
+                               final_args=final_args,
+                               args_hash=ledger_module.args_hash(final_args or {}))
         if result.kind == 'blocked':
             return ToolReceipt(ok=False, error=result.error or '结果未定，需核实',
                                step_id=step_id)

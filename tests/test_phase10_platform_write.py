@@ -129,5 +129,68 @@ class WriteCompletionConditionTests(unittest.TestCase):
         self.assertTrue(outcome._verified({'foo': 'bar'}))
 
 
+class FinalStatusWriteOrderingTests(unittest.TestCase):
+    """第十阶段第 3 点：存在平台写动作时，先查写证据集合再判成功，answer 仅展示。"""
+
+    def test_unverified_write_plus_answer_is_not_success(self):
+        # 有 answer + 平台写但无回读匹配 → 不得成功
+        status = outcome.final_status({
+            'answer': '已完成修改',
+            'write_evidences': [
+                {'object_id': 'obj-a', 'operation_id': 'op-1',
+                 'readback_match': False}]})
+        self.assertEqual(status, 'needs_reconcile')
+
+    def test_readback_wrong_object_is_not_success(self):
+        # 回读核验对象不一致 → 不得成功
+        status = outcome.final_status({
+            'write_evidences': [
+                {'object_id': 'obj-a', 'operation_id': 'op-1',
+                 'verified': False,
+                 'checks': {'object_id': False}}]})
+        self.assertEqual(status, 'needs_reconcile')
+
+    def test_missing_revision_is_not_success(self):
+        # 缺 revision 核验 → 不得成功
+        status = outcome.final_status({
+            'write_evidences': [
+                {'object_id': 'obj-a', 'operation_id': 'op-1',
+                 'verified': False, 'checks': {'revision': False}}]})
+        self.assertEqual(status, 'needs_reconcile')
+
+    def test_first_write_unverified_last_verified_is_not_success(self):
+        # 第一次写未核实、最后一次已核实 → 整体不得成功（逐项核验）
+        status = outcome.final_status({
+            'answer': '改好了',
+            'write_evidences': [
+                {'object_id': 'obj-a', 'operation_id': 'op-1',
+                 'readback_match': False},
+                {'object_id': 'obj-b', 'operation_id': 'op-2',
+                 'readback_match': True}]})
+        self.assertEqual(status, 'needs_reconcile')
+
+    def test_all_writes_verified_is_success(self):
+        status = outcome.final_status({
+            'answer': '改好了',
+            'write_evidences': [
+                {'object_id': 'obj-a', 'operation_id': 'op-1',
+                 'readback_match': True},
+                {'object_id': 'obj-b', 'operation_id': 'op-2',
+                 'readback_match': True}]})
+        self.assertEqual(status, 'succeeded')
+
+    def test_unknown_write_evidence_is_not_success(self):
+        status = outcome.final_status({
+            'write_evidences': [
+                {'object_id': 'obj-a', 'operation_id': 'op-1',
+                 'status': 'unknown'}]})
+        self.assertEqual(status, 'needs_reconcile')
+
+    def test_pure_chat_keeps_answer_semantics(self):
+        # 纯闲聊/只读任务（无写证据）：保留「有答复即成功」
+        status = outcome.final_status({'answer': '今天天气不错'})
+        self.assertEqual(status, 'succeeded')
+
+
 if __name__ == '__main__':
     unittest.main()
