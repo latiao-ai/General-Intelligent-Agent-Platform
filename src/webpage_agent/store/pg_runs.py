@@ -55,6 +55,57 @@ class PgRuns:
             row = await self._one(conn, 'SELECT * FROM runs WHERE run_id=%s', (run_id,))
         return _decode_run(dict(row)) if row else None
 
+    async def create_turn_run(self, *, run_id: str, tenant_id: str,
+                              owner_user_id: str, lease_owner: str,
+                              lease_epoch: int, lease_ttl: float,
+                              budget: dict | None = None) -> dict | None:
+        """为会话 turn（chat/query）建一条内部执行记录（run 行）。
+
+        第十二阶段缺口修复（评审点 1）：普通查询没有业务 run，但仍有用户、租户、
+        turn 与费用归属。这里为 turn_id 建一条 `runs` 行作为**内部查询执行记录**，
+        让只读工具经 `governed_call` 走完整治理链（授权 → 预算 → 准入 → 真实调用 →
+        结算），而不是靠关闭网关检查或无条件放行「无 run 调用」。
+
+        租约直接复用 turn 领取时的 `lease_owner`/`lease_epoch`（与 `session_turns`
+        一致），并设成「运行中 + 租约未过期」：
+        - `_owned`（admit_action 的 require_status=('running',)）据此放行；
+        - `claim_run` 的领取条件 `lease_expires_at < now` 保证租约未过期时**不会**
+          被 Worker 业务领取池领走（内部记录不进业务调度）。
+        """
+        stamp = now()
+        expires = time.time() + float(lease_ttl)
+        async with self._lease() as conn:
+            await self._run(conn,
+                'INSERT INTO runs (run_id, task_id, tenant_id, status, '
+                'budget_json, consumed_json, owner_user_id, owner_role, '
+                'lease_owner, lease_expires_at, lease_epoch, '
+                'runtime_kind, runtime_version, runtime_state_schema, '
+                'created_at, updated_at, trace_id) '
+                "VALUES (%s, %s, %s, 'running', %s, '{}', %s, 'member', "
+                "%s, %s, %s, 'pi', 1, 2, %s, %s, %s) "
+                'ON CONFLICT (run_id) DO NOTHING',
+                (run_id, run_id, tenant_id,
+                 json.dumps(budget or {}, ensure_ascii=False), owner_user_id,
+                 lease_owner, expires, int(lease_epoch or 0),
+                 stamp, stamp, uuid.uuid4().hex))
+            await conn.commit()
+        return await self.run(run_id)
+
+    async def settle_turn_run(self, *, run_id: str, status: str,
+                              lease_owner: str, lease_epoch: int) -> bool:
+        """收尾内部查询执行记录：turn 结算后置终态，清租约，不留 running 僵尸行。
+
+        带租约门禁（owner + epoch）：过期执行者不能收尾。返回是否成功。
+        """
+        stamp = now()
+        async with self._lease() as conn:
+            cur = await self._run(conn,
+                'UPDATE runs SET status=%s, lease_expires_at=0, updated_at=%s '
+                'WHERE run_id=%s AND lease_owner=%s AND lease_epoch=%s',
+                (status, stamp, run_id, lease_owner, int(lease_epoch or 0)))
+            await conn.commit()
+        return bool(cur.rowcount)
+
     async def runtime_identity(self, run_id: str) -> dict:
         """读并校验 run 的引擎归属（恢复/分流入口的唯一权威来源）。
 
@@ -303,7 +354,6 @@ class PgRuns:
         写快照，同一事务提交。失租/状态不符返回 False，不抛 LeaseLost——
         调用方（检查点确认）据此回 ok=False 让 Node 停止，而不是炸掉整条桥接。
         """
-        from webpage_agent.governance import execution_control
         async with self._lease() as conn:
             row = await self._one(
                 conn, 'SELECT lease_owner, lease_epoch, lease_expires_at '

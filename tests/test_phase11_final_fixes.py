@@ -9,7 +9,6 @@
 import asyncio
 import json
 import os
-import time
 import unittest
 from types import SimpleNamespace
 
@@ -157,7 +156,6 @@ class WorkerConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         """
         import scripts.run_worker as worker
         from webpage_agent.api.api_hub import Hub
-        from webpage_agent.core.config import settings
         hub = Hub(self.store, owner_id='worker-a')
         p = _principal()
 

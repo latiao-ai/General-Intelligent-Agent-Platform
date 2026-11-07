@@ -277,4 +277,44 @@ class SessionProcessE2ETests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(turn['status'], 'succeeded')
         self.assertIn('后台期间的答复', turn['answer'])
 
+    async def test_create_task_via_http_with_engine_identity_and_dedupe(self):
+        """P9：正式 HTTP 入口创建业务任务，核对引擎身份 + 幂等去重。"""
+        base, _ = await self._start(mock_text=_mock_answer('答复'))
+        async with httpx.AsyncClient(timeout=8) as client:
+            # 正式入口创建任务（POST /api/tasks）
+            r = await client.post(base + '/api/tasks',
+                                  json={'message': '做个红色页面'},
+                                  headers=self.headers)
+            self.assertEqual(r.status_code, 200, r.text)
+            task_id = r.json()['task_id']
+            run_id = r.json()['run_id']
+            # 核对引擎身份已持久化（缺省 default_kind = langgraph）
+            run = await self.store.run(run_id)
+            self.assertIsNotNone(run, 'run 应已落库')
+            self.assertEqual(run['runtime_kind'], 'langgraph',
+                             '缺省引擎身份应为 langgraph')
+            # 幂等：同 Idempotency-Key 重放 → 返回原任务，不重复创建
+            r2 = await client.post(base + '/api/tasks',
+                                   json={'message': '做个红色页面'},
+                                   headers={**self.headers,
+                                            'Idempotency-Key': 'dedupe-key-1'})
+            first_task = r2.json().get('task_id')
+            r3 = await client.post(base + '/api/tasks',
+                                   json={'message': '做个红色页面'},
+                                   headers={**self.headers,
+                                            'Idempotency-Key': 'dedupe-key-1'})
+            self.assertEqual(r3.json().get('task_id'), first_task,
+                             '同幂等键应返回同一任务')
+        # 跨主体拒绝：另一主体访问该任务 → 404
+        now = int(time.time())
+        jwt2 = sign(claims(iat=now, exp=now + 30, jti='e2e-' + uuid.uuid4().hex,
+                           sub='user-other', tenant_id='tenant-a', platform_id='pa'))
+        async with httpx.AsyncClient(timeout=8) as client:
+            exchanged = await client.post(base + '/api/auth/exchange',
+                                          json={'ticket': jwt2})
+            token2 = exchanged.cookies.get('agent_session')
+            other = {'Cookie': 'agent_session=' + token2}
+            res = await client.get(f'{base}/api/tasks/{task_id}', headers=other)
+            self.assertEqual(res.status_code, 404, res.text)
+
 

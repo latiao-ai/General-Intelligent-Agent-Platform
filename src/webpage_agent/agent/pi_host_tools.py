@@ -451,14 +451,19 @@ class HostToolCaller:
         write_key = getattr(write_tool, 'tool_key', '') or ''
         server_prefix = _tool_server_prefix(write_key)
         for tool in self._tools_catalog:
-            if getattr(tool, 'name', '') != 'get_object':
-                continue
-            if str(getattr(tool, 'effect', '') or 'unknown') != 'read':
-                continue
-            key = getattr(tool, 'tool_key', '') or ''
-            if server_prefix and _tool_server_prefix(key) != server_prefix:
-                continue
-            return tool
+            # 第十二阶段缺口修复：自动发现的 MCP 工具名带 `mcp__` 前缀
+            # （单服务端 `mcp__get_object`，多服务端 `mcp__<server>__get_object`），
+            # 而第十阶段测试里手动构造的 Tool 用无前缀 `name='get_object'`。
+            # 因此不能只按裸名 `get_object` 匹配——按 tool_key 的尾缀 `:get_object`
+            # 匹配，兼容两种命名，且仍校验同 server 前缀 + effect=read。
+            name = str(getattr(tool, 'name', '') or '')
+            key = str(getattr(tool, 'tool_key', '') or '')
+            if key.endswith(':get_object') or name == 'get_object':
+                if str(getattr(tool, 'effect', '') or 'unknown') != 'read':
+                    continue
+                if server_prefix and _tool_server_prefix(key) != server_prefix:
+                    continue
+                return tool
         return None
 
     async def _perform_readback(self, write_tool, write_updates: dict,
@@ -478,6 +483,14 @@ class HostToolCaller:
         写效果「未核实」是事实，宿主据此决定不得成功收尾。
         """
         from webpage_agent.core import platform_verify
+
+        # 第十二阶段缺口修复：回读只在**写工具**（effect != read）后做。读工具
+        # （如 get_object）的返回里也有 object_id，若不加 effect 判断会把「读对象」
+        # 误当成「写对象」触发回读，产生一条 readback_match=False 的伪证据，让
+        # 宿主把本已成功的写闭环误判为 needs_reconcile。
+        effect = str(getattr(write_tool, 'effect', '') or 'unknown')
+        if effect == 'read':
+            return None
 
         if not platform_verify.needs_readback(write_updates):
             return None
@@ -615,7 +628,6 @@ class HostToolCaller:
             # 结果。读工具要求有 documents，写工具要求有结果引用（object_id 或
             # write_result 或 mcp_calls），缺内容时明确报错，不重新执行冒充重放。
             replay = result.replay if isinstance(result.replay, dict) else {}
-            effect = str(getattr(tool, 'effect', '') or 'unknown')
             has_content = isinstance(replay.get('documents'), list) or \
                 bool(replay.get('object_id') or replay.get('write_result')
                      or replay.get('mcp_calls') or replay.get('new_revision'))

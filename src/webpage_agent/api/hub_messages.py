@@ -336,8 +336,6 @@ class HubSessionMessageMixin:
         """
         turn_id = str(claimed['turn_id'])
         kind = str(claimed.get('kind') or 'chat')
-        message = str(claimed.get('message') or '')
-        session_id = str(claimed.get('session_id') or '')
         lease_owner = str(claimed.get('lease_owner') or '')
         lease_epoch = int(claimed.get('lease_epoch') or 0)
         execution_generation = int(claimed.get('execution_generation') or 0)
@@ -475,7 +473,6 @@ class HubSessionMessageMixin:
         tools: list = []
         tool_objects = None
         if kind == 'query' and settings.session_query_enabled:
-            from webpage_agent.agent import pi_host_tools
             from webpage_agent.agent.pi_runtime import default_tool_catalog
             tools = default_tool_catalog()
             # 只读工具对象目录（无 run 时工具调用会因无可信主体被拒绝，
@@ -484,20 +481,41 @@ class HubSessionMessageMixin:
 
         runtime = self._build_pi_runtime(tools=tools, tool_objects=tool_objects)
 
-        # 独立 turn 执行身份（A 组第 5 点）：
+        # 独立 turn 执行身份（A 组第 5 点 + 第十二阶段缺口修复）：
         # - billing scope 用 turn_id 作为 run_id 标识（费用结算独立于业务 run）；
         # - 绑定 ExecutionContext（run_id=turn_id），让只读工具经 `tool_context`
         #   的 turn 回退取得**当前用户**的可信主体（tenant_id / owner_user_id 已
         #   在接纳时落库到 session_turns），不依赖业务 run 碰巧提供身份。
+        # - 第十二阶段评审点 1：query 还需要一条**内部查询执行记录**（runs 行）
+        #   并绑定 ActionLedger，让只读工具经 `governed_call` 走完整治理链
+        #   （授权 → 预算 → 准入 → 真实调用 → 结算），而不是被 no_run 拒绝。
         from webpage_agent.governance import core as governance
         from webpage_agent.governance import execution_control
+        from webpage_agent.store import ledger as ledger_module
         owner_user_id = str(claimed.get('owner_user_id') or 'default')
+        lease_owner = str(claimed.get('lease_owner') or '')
+        lease_epoch = int(claimed.get('lease_epoch') or 0)
         exec_ctx = execution_control.ExecutionContext(
             run_id=turn_id,
-            lease_owner=str(claimed.get('lease_owner') or ''),
-            lease_epoch=int(claimed.get('lease_epoch') or 0))
+            lease_owner=lease_owner,
+            lease_epoch=lease_epoch)
         billing_token = governance.bind(self.store, tenant_id, turn_id)
         context_token = execution_control.bind(exec_ctx)
+        ledger_token = None
+        turn_run_created = False
+        if kind == 'query':
+            # 内部查询执行记录：为 turn_id 建 runs 行（复用 turn 租约），并绑定
+            # ActionLedger 走完整治理链。成功与否不硬阻断 turn——建行失败时只读
+            # 工具仍会因 no_run 被拒，退化为诚实的能力边界说明。
+            created = await self.store.create_turn_run(
+                run_id=turn_id, tenant_id=tenant_id, owner_user_id=owner_user_id,
+                lease_owner=lease_owner, lease_epoch=lease_epoch,
+                lease_ttl=float(settings.session_turn_lease_seconds))
+            if created is not None:
+                turn_run_created = True
+                book = ledger_module.ActionLedger(
+                    self.store, turn_id, 1, context=exec_ctx)
+                ledger_token = ledger_module.bind(book)
         try:
             state = {
                 'user_input': message,
@@ -516,6 +534,17 @@ class HubSessionMessageMixin:
                 return '抱歉，我暂时无法回答这个问题。'
             return answer
         finally:
+            if ledger_token is not None:
+                ledger_module.unbind(ledger_token)
+            # 收尾内部查询执行记录（清租约、置终态），不留 running 僵尸行
+            if turn_run_created:
+                try:
+                    await self.store.settle_turn_run(
+                        run_id=turn_id, status='completed',
+                        lease_owner=lease_owner, lease_epoch=lease_epoch)
+                except Exception:                       # noqa: BLE001
+                    logger.warning('收尾内部查询执行记录失败 run=%s', turn_id,
+                                   exc_info=True)
             execution_control.unbind(context_token)
             governance.unbind(billing_token)
 
@@ -611,7 +640,6 @@ class HubSessionMessageMixin:
     async def _create_task_answer(self, session_id: str, message: str,
                                   claimed: dict) -> str:
         """会话内建任务：复用 Hub.start，source_turn_id 避免重复保存用户消息。"""
-        turn_id = str(claimed['turn_id'])
         tenant = str(claimed.get('tenant_id') or 'default')
         owner = str(claimed.get('owner_user_id') or 'default')
         from types import SimpleNamespace
@@ -676,7 +704,6 @@ class HubSessionMessageMixin:
         继续澄清。不能简单退回 accepted 让 Worker 反复领取。
         """
         turn_id = str(claimed['turn_id'])
-        session_id = str(claimed.get('session_id') or '')
         clarification = str(claimed.get('clarification') or '')
         lease_owner = str(claimed.get('lease_owner') or '')
         lease_epoch = int(claimed.get('lease_epoch') or 0)

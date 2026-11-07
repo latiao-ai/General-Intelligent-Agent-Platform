@@ -299,12 +299,19 @@ def _validate_value(key: str, value: Any, sub: dict[str, Any]) -> None:
             raise ProtocolError(f"参数 {key!r} 必须是对象，收到 {type(value).__name__}")
         sub_props = sub.get("properties") or {}
         sub_required = sub.get("required") or []
+        # 开放对象：声明了 additionalProperties=True，或没有声明 properties
+        # （未约束字段集）时，允许任意字段——不能把「空 properties」误判成
+        # 「禁止所有字段」。只有显式声明了 properties 且 additionalProperties
+        # 非 true 时才逐字段收紧。
+        allow_extra = bool(sub.get("additionalProperties", False)) or not sub_props
         for rk in sub_required:
             if rk not in value:
                 raise ProtocolError(f"参数 {key!r} 缺少必填字段 {rk}")
         for sk, sv in value.items():
             sub_node = sub_props.get(sk)
             if sub_node is None:
+                if allow_extra:
+                    continue
                 raise ProtocolError(f"参数 {key!r} 含未声明字段 {sk}")
             _validate_value(f"{key}.{sk}", sv, sub_node)
     elif kind is None:
