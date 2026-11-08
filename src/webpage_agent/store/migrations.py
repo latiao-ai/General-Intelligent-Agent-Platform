@@ -27,7 +27,24 @@ GOVERNANCE = 'v2_production_governance'
 RUN_TRACE = 'v3_run_trace'
 # 用途与估算标记单独一个版本：改 SCHEMA 里的 DO 块不会作用到已经记过基线的库。
 USAGE_DETAIL = 'v4_provider_usage_detail'
-LATEST = USAGE_DETAIL
+# 引擎归属：runs 增加 runtime_kind / runtime_version / runtime_state_schema。
+RUNTIME_OWNERSHIP = 'v5_runtime_ownership'
+# 最终答复去重：messages 增 dedupe_key（部分唯一索引），恢复补收尾幂等。
+FINAL_ANSWER_DEDUPE = 'v6_final_answer_dedupe'
+# 外部任务取消意图：external_tasks 增 cancel_requested（区分本地停止/远端取消请求/
+# 远端已确认取消）。第八阶段第 9 点。
+EXTERNAL_CANCEL_INTENT = 'v7_external_cancel_intent'
+# 会话 turn：独立聊天 turn 记录（第十一阶段）。请求指纹、顺序、状态、引擎身份、
+# 租约、执行代次、关联业务 run。
+SESSION_TURNS = 'v8_session_turns'
+# 会话 turn 追问与歧义：source_turn_id（追问链）、candidates_json（歧义候选）、
+# clarification（追问文案）、execution_generation（执行代次，区分 lease_epoch 的
+# 领取代次——每次重新领取都 +1，用于「过期 running 重领」与「同会话串行」判定）。
+TURN_FOLLOWUP = 'v9_turn_followup'
+# 会话 turn 可信主体：tenant_id / owner_user_id（供只读查询工具从 turn 本身取得
+# 当前用户身份，不依赖业务 run 碰巧提供）。第十一阶段 A 组第 5 点。
+TURN_PRINCIPAL = 'v10_turn_principal'
+LATEST = TURN_PRINCIPAL
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -57,6 +74,56 @@ CREATE INDEX IF NOT EXISTS idx_provider_charges_tenant_day ON provider_charges(t
 ALTER TABLE provider_charges ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT '';
 ALTER TABLE provider_charges ADD COLUMN IF NOT EXISTS tokens_estimated BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS idx_provider_charges_run ON provider_charges(run_id);
+'''), (RUNTIME_OWNERSHIP, '''
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_kind TEXT NOT NULL DEFAULT 'langgraph';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_state_schema INTEGER NOT NULL DEFAULT 1;
+'''), (FINAL_ANSWER_DEDUPE, '''
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS dedupe_key TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_dedupe
+    ON messages(session_id, dedupe_key) WHERE dedupe_key <> '';
+'''), (EXTERNAL_CANCEL_INTENT, '''
+ALTER TABLE external_tasks ADD COLUMN IF NOT EXISTS cancel_requested INTEGER NOT NULL DEFAULT 0;
+'''), (SESSION_TURNS, '''
+CREATE TABLE IF NOT EXISTS session_turns (
+    turn_id            TEXT PRIMARY KEY,
+    session_id         TEXT NOT NULL,
+    turn_seq           INTEGER NOT NULL,
+    request_id         TEXT NOT NULL,
+    request_hash       TEXT NOT NULL DEFAULT '',
+    message            TEXT NOT NULL,
+    target_task_id     TEXT NOT NULL DEFAULT '',
+    target_run_id      TEXT NOT NULL DEFAULT '',
+    kind               TEXT NOT NULL DEFAULT 'chat',
+    status             TEXT NOT NULL DEFAULT 'accepted',
+    engine_kind        TEXT NOT NULL DEFAULT '',
+    engine_version     INTEGER NOT NULL DEFAULT 0,
+    lease_owner        TEXT NOT NULL DEFAULT '',
+    lease_expires_at   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    lease_epoch        INTEGER NOT NULL DEFAULT 0,
+    answer             TEXT NOT NULL DEFAULT '',
+    error              TEXT NOT NULL DEFAULT '',
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_session_turns_request
+    ON session_turns(session_id, request_id);
+CREATE INDEX IF NOT EXISTS idx_session_turns_session
+    ON session_turns(session_id, turn_seq);
+CREATE INDEX IF NOT EXISTS idx_session_turns_claim
+    ON session_turns(status, lease_expires_at);
+'''), (TURN_FOLLOWUP, '''
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS source_turn_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS candidates_json TEXT NOT NULL DEFAULT '';
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS clarification TEXT NOT NULL DEFAULT '';
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS execution_generation INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS idx_session_turns_claim2
+    ON session_turns(session_id, status, lease_expires_at);
+'''), (TURN_PRINCIPAL, '''
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS owner_user_id TEXT NOT NULL DEFAULT 'default';
+CREATE INDEX IF NOT EXISTS idx_session_turns_principal
+    ON session_turns(tenant_id, owner_user_id);
 '''))
 
 

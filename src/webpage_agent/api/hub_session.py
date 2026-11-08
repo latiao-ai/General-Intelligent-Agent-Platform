@@ -3,11 +3,14 @@
 `_artifact_view` 只有时间线在用，所以跟读侧放在一起，不跟恢复计划走。
 方法体与拆分前逐字相同。
 """
+import logging
 import uuid
 from pathlib import Path
 
 from webpage_agent.api.task_record import TaskRecord
 from webpage_agent.core import outcome as outcome_module
+
+logger = logging.getLogger('webpage_agent.api.api_hub')
 
 def _artifact_view(state: dict) -> dict | None:
     """把 state 里的产物压成前端够用的形状（不存在就 None）。"""
@@ -45,10 +48,12 @@ class HubSessionMixin:
             limit, tenant_id=principal.tenant_id, owner_user_id=principal.user_id)
 
     async def session_timeline(self, session_id: str) -> dict:
-        """一个会话的完整回放：聊天气泡 + 每轮的执行过程事件。
+        """一个会话的完整回放：聊天气泡 + 每轮的执行过程事件 + 聊天 turn + 活动 run。
 
         前端切换会话时用它重建"执行步骤"，否则那些步骤会随页面状态一起丢掉。
         草稿与逐字增量同样读取持久事件，历史回放与跨进程订阅使用同一来源。
+        第十一阶段：新增 `chat_turns`（会话聊天 turn）与 `active_runs`（活动/等待/
+        审批/暂停/待核实任务），让前端按 turn 展示聊天、按 run 展示任务卡。
         """
         turns = []
         live_task_id = ''
@@ -89,13 +94,50 @@ class HubSessionMixin:
         if live_task_id:
             meta = await self.store.task_meta(live_task_id) or {}
             live_run_id = str(meta.get('current_run_id') or '')
+
+        # 第十一阶段：会话聊天 turn + 活动 run（等待/审批/暂停/待核实都算活动）。
+        chat_turns = []
+        try:
+            for turn in await self.store.turns_of(session_id):
+                chat_turns.append({
+                    'turn_id': turn.get('turn_id'),
+                    'turn_seq': turn.get('turn_seq'),
+                    'kind': turn.get('kind'),
+                    'status': turn.get('status'),
+                    'message': turn.get('message'),
+                    'answer': turn.get('answer'),
+                    'target_task_id': turn.get('target_task_id'),
+                    'target_run_id': turn.get('target_run_id'),
+                    'created_at': turn.get('created_at'),
+                })
+        except Exception:                          # noqa: BLE001
+            logger.warning('读会话 turn 失败 session=%s', session_id, exc_info=True)
+            chat_turns = []
+
+        active_runs = []
+        for task in await self.store.session_tasks(session_id):
+            run_status = outcome_module.normalize_status(task.get('status') or '')
+            if run_status in outcome_module.TERMINAL_RUN_STATUSES:
+                continue
+            meta = await self.store.task_meta(task['task_id']) or {}
+            active_runs.append({
+                'task_id': task['task_id'],
+                'run_id': str(meta.get('current_run_id') or ''),
+                'message': task['message'],
+                'run_status': run_status,
+                'status': outcome_module.label(run_status, task.get('state') or {}),
+                'created_at': task['created_at'],
+            })
+
         return {'session_id': session_id,
                 'messages': await self.store.messages(session_id),
                 # 这个会话里还在跑的任务：前端切回来时要重新接上事件流
                 'live_task_id': live_task_id,
                 'live_run_id': live_run_id,
                 'live_after_event_id': live_after_event_id,
-                'turns': turns}
+                'turns': turns,
+                'chat_turns': chat_turns,
+                'active_runs': active_runs}
 
     async def prior_context(self, session_id: str) -> dict:
         """上一轮可以接过来用的东西：HTML 产物 + 已取得的正文。

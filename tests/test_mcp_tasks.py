@@ -254,8 +254,27 @@ class _PollStore:
         self.task['poll_epoch'] += 1
         return dict(self.task)
 
-    async def finish_external_poll(self, external_task_id, epoch, **fields):
+    async def finish_external_poll(self, external_task_id, epoch, owner='',
+                                   **fields):
         self.task.update(fields)
+        return dict(self.task)
+
+    async def complete_external_task_and_wake(self, external_task_id, epoch, *,
+                                              owner='', state,
+                                              output_manifest_ref='',
+                                              last_result_id='', error_code='',
+                                              staged=None, envelope=None):
+        # 第八阶段：poller 不直接改写快照，只做「终态 + 唤醒 run」同事务。
+        self.task['state'] = state
+        self.task['error_code'] = error_code
+        if output_manifest_ref:
+            self.task['output_manifest_ref'] = output_manifest_ref
+        if last_result_id:
+            self.task['last_result_id'] = last_result_id
+        if state == 'completed':
+            self.run_row['status'] = 'queued'
+        elif state in ('failed', 'cancelled', 'needs_reconcile'):
+            self.run_row['status'] = 'needs_reconcile'
         return dict(self.task)
 
     async def run(self, run_id):
@@ -310,16 +329,15 @@ class ProtocolPollTests(unittest.IsolatedAsyncioTestCase):
         store = _PollStore(mcp_tasks.PROTOCOL_CONTRACT_ID)
         await self._poll(store, 'completed')
         self.assertEqual(store.task['state'], 'completed')
-        results = store.snapshot['state']['tool_results']
-        self.assertEqual(results[0]['execution_status'], 'succeeded')
+        # 第八阶段：poller 不再直接改快照，改为「完成 + 唤醒 run」。
         self.assertIn('output_manifest_ref', store.task)
+        self.assertEqual(store.run_row['status'], 'queued')
 
     async def test_failed_marks_failed_not_success(self):
         store = _PollStore(mcp_tasks.PROTOCOL_CONTRACT_ID)
         await self._poll(store, 'failed')
         self.assertEqual(store.task['state'], 'failed')
-        results = store.snapshot['state']['tool_results']
-        self.assertEqual(results[0]['execution_status'], 'failed')
+        self.assertEqual(store.run_row['status'], 'needs_reconcile')
 
     async def test_contract_route_is_untouched(self):
         """回归保护：合同路线仍然走状态查询工具，且不会被协议分支顶掉。

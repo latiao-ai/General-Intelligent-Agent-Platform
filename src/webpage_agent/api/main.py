@@ -13,9 +13,9 @@ from webpage_agent.governance import execution_control
 from webpage_agent.store import ledger as ledger_module
 from webpage_agent.core import outcome as outcome_module
 from webpage_agent.capabilities.publishing import deploy_once
-from webpage_agent.agent.graph import build_graph
+from webpage_agent.agent.runtime import get_runtime
+from webpage_agent.core.errors import RecursionBudgetExceeded
 from webpage_agent.core.files import save_json
-from langgraph.errors import GraphRecursionError
 
 logger = logging.getLogger(__name__)
 
@@ -61,19 +61,32 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         # 早点把 task_id 交出去，外部才能在任务被取消后定位已生成的产物。
         await on_start(task_id)
     resumed = resume_plan or {}
+    # 第七阶段收口：Pi 恢复输入用**单一字段** `pi_resume`（快照 + 恢复决策）承载，
+    # 从 resume_plan 里取出放进展平的 state，PiRuntime.run() 只从这里读，
+    # 不在顶层与 resume_plan 里同时维护两份。
+    pi_resume = resumed.get('pi_resume') if isinstance(resumed, dict) else None
+    # 第十阶段收口第 5 点：Pi 恢复时，`resumed['user_input']` 是「原目标 + 尚未
+    # 纳入计划提交的补充」合并后的完整要求（见 `_pi_resume_plan`）。恢复必须让
+    # Pi 看到**增量输入**，而不是只用原始 `text`——否则「要求版本升了但模型没
+    # 看到新要求」，旧候选仍按旧要求继续。LangGraph 路径 resumed 无此字段，退回
+    # 原始 text。
+    resumed_input = resumed.get('user_input') if isinstance(resumed, dict) else None
+    effective_input = resumed_input if (pi_resume and resumed_input) else text
     state = {
-        'task_id': task_id, 'user_input': text,
+        'task_id': task_id, 'user_input': effective_input,
         # 原目标：运行中补充要求时，"最初要做什么"不能被新要求顶掉——
         # 修订计划要同时看到原目标和按序补充（文档 §5 第八步）。
         'original_goal': text,
         'documents': [], 'mcp_calls': [], 'errors': [], 'usage': [],
         'run_id': run_id or '', 'resume_plan': resumed,
+        # Pi 恢复输入（单一字段；LangGraph 路径为 None）
+        'pi_resume': pi_resume,
         # 三个版本分开：intent_version 是"用户要求版本"，plan_version 是"计划版本"；
         # lease_epoch 不在这里（执行权凭证走 ExecutionContext，不进可落盘的状态）。
         'intent_version': int(resumed.get('intent_version') or 0),
         'plan_version': int(resumed.get('plan_version') or 0),
         'processed_intent_version': int(resumed.get('processed_intent_version') or 0),
-        'pending_inputs': [], 'intent_changed': False, 'revision_count': 0,
+        'pending_inputs': list(resumed.get('pending_inputs') or []), 'intent_changed': False, 'revision_count': 0,
         # 已经问过用户的问题：跨轮次带着走，同一组问题不重复弹
         'asked_questions': [str(q) for q in (resumed.get('asked_questions') or [])
                             if str(q).strip()],
@@ -90,53 +103,39 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         'prior_documents': (prior or {}).get('documents') or [],
     }
     started = time.perf_counter()
-    marked = started
     ledger_token = ledger_module.bind(ledger)
     try:
+        # 运行时边界：宿主负责准备状态与收尾，运行时（经工厂取得，默认
+        # LangGraphRuntime）负责驱动图、合并增量、记录耗时并透传节点内部事件。
+        # 控制流异常与取消原样穿过，由下面这段宿主收尾统一处理（§4.3、§7.2）。
+        #
+        # 第七阶段：按 run 的引擎归属分流。有账本时从库里读已存归属（在解释旧
+        # 计划之前），Pi 走 PiRuntime；无账本（CLI 直调）走默认 LangGraph。
+        runtime_kind = ''
+        if ledger is not None and getattr(ledger, 'store', None) is not None \
+                and run_id:
+            from webpage_agent.agent import runtime_identity
+            runtime_kind = await runtime_identity.resolve_kind(ledger.store, run_id)
         async with asyncio.timeout(settings.task_timeout):
-            async for mode, chunk in build_graph().astream(
-                state, config={'recursion_limit': settings.graph_recursion_limit},
-                stream_mode=['updates', 'custom'],
-            ):
-                if mode == 'custom':
-                    # 节点内部发出的动作事件，直接透传给调用方。
-                    if on_event:
-                        await on_event(chunk)
-                    continue
-                for name, update in chunk.items():
-                    now = time.perf_counter()
-                    if isinstance(update, dict):
-                        state.update(update)
-                    # 计划的落库**不再依赖这里**：图里有一个显式的
-                    # `persist_plan` 节点，在第一处工具调用之前用 CAS 提交。
-                    # 以前用 `plan_committed` 布尔值兜在这里，只适合"一次规划"——
-                    # 一旦允许修订，第二份计划就可能没经过持久提交就开始执行。
-                    # stream_mode='updates' 在该节点跑完后才产出事件，
-                    # 所以相邻事件的时间差≈该节点耗时（含少量调度开销）。
-                    # run_step 会自我循环多次，用 step_label 记具体是哪一步，
-                    # 否则耗时表里会出现一排分不清的 "run_step"。
-                    label = (update.get('step_label')
-                             if isinstance(update, dict) else None) or name
-                    state['timings'].append({
-                        'stage': label,
-                        'seconds': round(now - marked, 2),
-                        'status': state.get('status'),
-                    })
-                    marked = now
-                    if progress:
-                        progress(label, state.get('status'), round(now - started, 2))
-                    save_json(folder / 'state.json', state)
+            await get_runtime(runtime_kind).run(
+                state, on_event=on_event, progress=progress)
+            # 第七阶段收口：pi_resume 是**运行时专用**的恢复输入（含不可 JSON 序列化
+            # 的 RecoveryDecision 对象）。runtime 已原地消费完毕，这里 pop 掉，避免
+            # 落盘 state.json 时序列化失败——恢复事实已由 runtime 写进版本化 Pi 快照，
+            # 不在最终 state 里重复一份。
+            state.pop('pi_resume', None)
     except (execution_control.LeaseLost, execution_control.ControlStopped):
         # 控制流异常必须**原样穿过**这一层：把它们包成 RuntimeError 会让
         # "失租"和"暂停"退化成普通失败，中枢再也没法区分该由谁收尾（§4.3、§7.2）。
         raise
-    except GraphRecursionError:
+    except RecursionBudgetExceeded as exc:
         # 保留已执行步骤和真实副作用，预算耗尽按可恢复的中断处理。
-        logger.warning('任务 %s 达到步数上限（%s），按可续跑收尾',
-                       task_id, settings.graph_recursion_limit)
+        # 这是运行时适配层折出的通用结果，宿主不感知底层是 LangGraph 还是 Pi。
+        limit = getattr(exc, 'limit', None) or settings.graph_recursion_limit
+        logger.warning('任务 %s 达到步数上限（%s），按可续跑收尾', task_id, limit)
         state['status'] = 'interrupted'
         state['failure'] = (
-            f'这一轮已经用满 {settings.graph_recursion_limit} 步预算，先停在这里；'
+            f'这一轮已经用满 {limit} 步预算，先停在这里；'
             '已经完成的步骤与产物都保留，可以从断点继续。')
     except Exception as exc:
         state['status'] = 'failed'

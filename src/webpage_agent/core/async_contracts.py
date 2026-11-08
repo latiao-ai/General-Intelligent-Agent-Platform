@@ -25,6 +25,14 @@ class AsyncContract:
     poll_interval_seconds: float = 5.0
     deadline_seconds: float = 1800.0
     recoverable: bool = True
+    # 提交的幂等键提取指针（第八阶段第 2 点）：提交是有副作用的操作，必须
+    # 要么有可查询的 remote id，要么有幂等键/提交结果核实方式；两者都没有时，
+    # 提交结果未知必须转待核实，不能盲目重提。
+    idempotency_key_pointer: str = ''
+    # 用幂等键查任务的工具键（第八阶段收口第 8 点）：首发合同若只返回提交幂等键
+    # 而没有 remote id，必须声明「能用幂等键查任务」的映射能力，否则无法持续
+    # 查询任务进度，不允许进入正常等待（转待核实）。
+    idempotency_lookup_tool_key: str = ''
 
 
 def pointer(document, path: str):
@@ -89,7 +97,10 @@ def load() -> list[AsyncContract]:
             cancel_tool_key=str(row.get('cancel_tool_key') or ''),
             poll_interval_seconds=float(row.get('poll_interval_seconds') or 5),
             deadline_seconds=float(row.get('deadline_seconds') or 1800),
-            recoverable=recoverable))
+            recoverable=recoverable,
+            idempotency_key_pointer=str(row.get('idempotency_key_pointer') or ''),
+            idempotency_lookup_tool_key=str(
+                row.get('idempotency_lookup_tool_key') or '')))
     return found
 
 
@@ -100,8 +111,59 @@ def summary() -> dict:
             'recoverable': sum(1 for row in rows if row.recoverable)}
 
 
+def _enabled_selection() -> dict[str, int]:
+    """读显式选中的合同（`contract_id -> version`）。
+
+    第八阶段第 2 点：配置必须**显式选择**合同及版本，不能自动启用仓库里的
+    示例合同。`ASYNC_CONTRACTS_ENABLED` 形如 `contract_id:version,...`；
+    未配置时**不启用任何文件合同**（协议任务 `mcp-task` 走它自己的保留身份，
+    不在这里）。
+    """
+    raw = str(getattr(settings, 'async_contracts_enabled', '') or '').strip()
+    selection: dict[str, int] = {}
+    if not raw:
+        return selection
+    for part in raw.split(','):
+        item = part.strip()
+        if not item:
+            continue
+        contract_id, _, version = item.partition(':')
+        contract_id = contract_id.strip()
+        if not contract_id:
+            continue
+        try:
+            selection[contract_id] = int(version) if version.strip() else 0
+        except ValueError:
+            selection[contract_id] = 0
+    return selection
+
+
+def selected_contracts() -> list[AsyncContract]:
+    """返回**生效**的文件合同。
+
+    第八阶段第 2 点：不自动启用仓库里的示例合同——出厂 `contracts/async_tools.json`
+    是空清单（示例在 `async_tools.example.json`，不在加载路径上），所以默认
+    `load()` 已经返回空。当配置了 `ASYNC_CONTRACTS_ENABLED`（`contract_id:version`
+    逗号分隔）时，只启用显式选中的合同并按版本过滤；未配置时启用已加载文件里
+    的全部合同（该文件本身已由 `ASYNC_CONTRACTS_FILE` 显式指定）。
+    """
+    selection = _enabled_selection()
+    all_contracts = load()
+    if not selection:
+        return all_contracts
+    out = []
+    for contract in all_contracts:
+        wanted = selection.get(contract.contract_id)
+        if wanted is None:
+            continue
+        if wanted and contract.version != wanted:
+            continue
+        out.append(contract)
+    return out
+
+
 def match_submit(tool_key: str) -> AsyncContract | None:
-    for contract in load():
+    for contract in selected_contracts():
         if contract.submit_tool_key and contract.submit_tool_key == tool_key:
             return contract
     return None
@@ -131,7 +193,7 @@ def match_id(contract_id: str, version: int | None = None) -> AsyncContract | No
         except (TypeError, ValueError):
             same = False
         return protocol_contract() if same else None
-    for contract in load():
+    for contract in selected_contracts():
         if contract.contract_id != contract_id:
             continue
         if version is not None and contract.version != int(version):
@@ -163,19 +225,48 @@ def remote_id_of(payload: dict, contract: AsyncContract) -> str:
 
 
 def acceptance(tool_key: str, payload: dict | None) -> dict:
-    """提交回执如果只是受理，标成 accepted，供观察去等，而不是当成做完了。"""
+    """提交回执如果只是受理，标成 accepted，供观察去等，而不是当成做完了。
+
+    第八阶段第 2 点：提交是有副作用的操作。受理回执必须能**按 remote id 持续
+    查询**；拿不到 remote id 时，若有幂等键（`idempotency_key_pointer`）还能
+    安全核实，否则提交结果未知，返回 `needs_reconcile` 增量——调用方据此转
+    待核实，**不能盲目重提**（重提等于再产生一次副作用）。
+    """
     if not settings.async_tool_runtime_enabled or not isinstance(payload, dict):
         return {}
     contract = match_submit(tool_key)
     if contract is None or not contract.recoverable:
         return {}
     remote = remote_id_of(payload, contract)
-    if not remote:
-        return {}
     mapped = map_status(pointer(payload, contract.status_pointer), contract)
     if mapped in ('succeeded', 'failed', 'cancelled'):
+        # 提交即终态：不登记成等待。
         return {}
-    return {'async_accepted': True, 'remote_task_id': remote,
+    if remote:
+        return {'async_accepted': True, 'remote_task_id': remote,
+                'contract_id': contract.contract_id,
+                'contract_version': contract.version,
+                'execution_status': 'accepted', 'phase': 'accepted'}
+    # 没有可查询的 remote id：看有没有幂等键可核实。
+    idem = pointer(payload, contract.idempotency_key_pointer) \
+        if contract.idempotency_key_pointer else None
+    if isinstance(idem, (str, int, float)) and str(idem).strip():
+        # 第八阶段收口第 8 点：只有幂等键、没有 remote id 时，必须有「用幂等键
+        # 查任务」的映射能力（`idempotency_lookup_tool_key`）才能进入正常等待；
+        # 没有则无法持续查询任务进度，转待核实，不能假装能跟踪。
+        if contract.idempotency_lookup_tool_key:
+            return {'async_accepted': True, 'remote_task_id': '',
+                    'idempotency_key': str(idem).strip(),
+                    'contract_id': contract.contract_id,
+                    'contract_version': contract.version,
+                    'execution_status': 'accepted', 'phase': 'accepted'}
+        return {'async_accepted': False, 'execution_status': 'unknown',
+                'phase': 'needs_reconcile',
+                'idempotency_key': str(idem).strip(),
+                'contract_id': contract.contract_id,
+                'contract_version': contract.version}
+    # 既无 remote id 又无幂等键：提交结果未知，必须转待核实，不能盲目重提。
+    return {'async_accepted': False, 'execution_status': 'unknown',
+            'phase': 'needs_reconcile',
             'contract_id': contract.contract_id,
-            'contract_version': contract.version,
-            'execution_status': 'accepted', 'phase': 'accepted'}
+            'contract_version': contract.version}

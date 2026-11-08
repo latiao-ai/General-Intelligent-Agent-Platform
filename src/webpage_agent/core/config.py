@@ -162,6 +162,26 @@ class Settings:
     # 一次运行最多因补充要求修订几次计划。超过就停下来等用户显式继续——
     # 无限修订等于让一次任务永远不结束，而且每一次都要一次模型调用。
     run_max_revisions: int = max(1, int(os.getenv('RUN_MAX_REVISIONS', '3')))
+
+    # ---------- 会话聊天（第十一阶段：正式会话入口） ----------
+    # 显式能力开关，逐项开放。默认只开「聊天 + 查询」；创建业务任务、修改、
+    # 暂停、取消等控制能力需显式打开并经正式链路验证后启用。
+    session_chat_enabled: bool = (
+        os.getenv('SESSION_CHAT_ENABLED', 'true').strip().lower() == 'true')
+    session_query_enabled: bool = (
+        os.getenv('SESSION_QUERY_ENABLED', 'true').strip().lower() == 'true')
+    # 业务任务创建/控制：写能力未补验前保持关闭。
+    session_task_create_enabled: bool = (
+        os.getenv('SESSION_TASK_CREATE_ENABLED', 'false').strip().lower() == 'true')
+    session_task_control_enabled: bool = (
+        os.getenv('SESSION_TASK_CONTROL_ENABLED', 'false').strip().lower() == 'true')
+    # 聊天 turn 与业务 run 分别预留的并发额度（避免长业务阻塞聊天）。
+    session_chat_concurrency: int = max(1, int(
+        os.getenv('SESSION_CHAT_CONCURRENCY', '2')))
+    # 聊天 turn 的租约时长（秒）。聊天执行会起 Node 子进程 + 模型调用，租约需
+    # 覆盖一次完整答复；过期 running 会被新执行者重新领取（递增执行代次）。
+    session_turn_lease_seconds: float = max(15.0, float(
+        os.getenv('SESSION_TURN_LEASE_SECONDS', '120')))
     # ---------- 结果观察与自主决策（《智能体中台说明书》） ----------
     # 功能开关：关掉时观察节点只做程序事实采集，不调用模型（等价于"按计划跑完"）。
     observe_enabled: bool = (
@@ -188,6 +208,10 @@ class Settings:
     # 连续"没有新进展"的容忍次数：相同指纹重复出现就停，而不是继续烧预算。
     run_max_no_progress: int = max(1, int(
         os.getenv('RUN_MAX_NO_PROGRESS', '2')))
+    # 新建 run 的默认引擎类型（langgraph | pi）。只影响**新建**任务；
+    # 恢复时读库里已存的 runs.runtime_kind，绝不回退到这里。
+    # 第七阶段默认仍为 langgraph，暂不切换生产全局默认。
+    default_runtime_kind: str = os.getenv('DEFAULT_RUNTIME_KIND', 'langgraph').strip().lower()
 
     # ---------- 身份（webpage_agent/api/auth.py / webpage_agent/governance/ticket_auth.py） ----------
     # off      = 不介入，保持单用户行为（默认，本地开发与既有测试不受影响）
@@ -268,6 +292,9 @@ class Settings:
         item.strip() for item in os.getenv('AUTH_ALLOWED_ORIGINS', '').split(',')
         if item.strip())
     async_contracts_file: str = os.getenv('ASYNC_CONTRACTS_FILE', '').strip()
+    # 显式选中的异步合同（`contract_id:version` 逗号分隔）。第八阶段第 2 点：
+    # 不自动启用仓库里的示例合同，只有显式列出的合同才参与提交匹配与轮询。
+    async_contracts_enabled: str = os.getenv('ASYNC_CONTRACTS_ENABLED', '').strip()
     result_gc_grace_seconds: int = max(0, int(
         os.getenv('RESULT_GC_GRACE_SECONDS', '86400')))
 

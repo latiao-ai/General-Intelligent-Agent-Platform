@@ -24,14 +24,25 @@ class PgTasks:
                           message: str, *, tenant_id: str, owner_user_id: str,
                           owner_role: str = 'member', scene: dict | None = None,
                           request_spec: dict | None = None, platform_id: str = '',
-                          platform_subject: str = '') -> dict:
+                          platform_subject: str = '',
+                          runtime_kind: str = '', source_turn_id: str = '') -> dict:
         """会话准入、任务、运行、消息及请求键关联同事务提交。
 
         请求键先锁、会话后锁。事务提交前不会派发任务；崩溃只可能全部回滚或
         留下带 task/run 的可重放请求，不能留下已执行但查不到任务的占位。
+
+        第十一阶段第 7 点：`runtime_kind` 显式写引擎身份（缺省用 `default_kind()`，
+        不依赖 SCHEMA 默认值，保证新库/旧库一致）；`source_turn_id` 关联来源 turn
+        （聊天里的「建任务」控制，避免重复保存用户消息）。
         """
         from webpage_agent.store.idempotency import IdempotencyConflict, IdempotencyInFlight
+        from webpage_agent.agent import runtime_identity
 
+        # 引擎身份：显式给，否则用全局默认（生产默认 LangGraph）。
+        if not runtime_kind:
+            runtime_kind = runtime_identity.default_kind()
+        runtime_version = runtime_identity.version_for_kind(runtime_kind)
+        runtime_state_schema = runtime_identity.schema_for_kind(runtime_kind)
         stamp = now()
         async with self._lease() as conn:
             if request_spec:
@@ -87,12 +98,16 @@ class PgTasks:
                 (task_id, tenant_id, owner_user_id, message, run_id, stamp,
                  json.dumps(scene or {}, ensure_ascii=False)))
             await self._run(conn, 'INSERT INTO runs '
-                '(run_id,task_id,tenant_id,status,owner_user_id,owner_role,platform_id,platform_subject,created_at,updated_at,trace_id) '
-                "VALUES (%s,%s,%s,'queued',%s,%s,%s,%s,%s,%s,%s)",
+                '(run_id,task_id,tenant_id,status,owner_user_id,owner_role,platform_id,platform_subject,created_at,updated_at,trace_id,runtime_kind,runtime_version,runtime_state_schema) '
+                "VALUES (%s,%s,%s,'queued',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (run_id, task_id, tenant_id, owner_user_id, owner_role, platform_id, platform_subject, stamp, stamp,
-                 telemetry.trace_id.get() or uuid.uuid4().hex))
-            await self._run(conn, 'INSERT INTO messages (session_id,role,content,created_at) '
-                "VALUES (%s,'user',%s,%s)", (session_id, message, stamp))
+                 telemetry.trace_id.get() or uuid.uuid4().hex,
+                 runtime_kind, runtime_version, runtime_state_schema))
+            # 用户消息：来源 turn 已经存过用户消息时，避免重复保存（聊天里的「建任务」
+            # 控制，用户那句话已在 turn 里落过一次）。
+            if not source_turn_id:
+                await self._run(conn, 'INSERT INTO messages (session_id,role,content,created_at) '
+                    "VALUES (%s,'user',%s,%s)", (session_id, message, stamp))
             await self._run(conn, 'UPDATE sessions SET updated_at=%s WHERE session_id=%s',
                             (stamp, session_id))
             if request_spec:

@@ -35,6 +35,14 @@ class TicketAlreadyUsed(RuntimeError):
     """同一张票据被第二次兑换（含并发）。调用方应回 409。"""
 
 
+class TurnRequestConflict(RuntimeError):
+    """同一个 session 的 request_id 已用于不同内容（请求指纹不同）。调用方回 409。"""
+
+    def __init__(self, request_id: str) -> None:
+        super().__init__('该 request_id 已用于不同内容的请求')
+        self.request_id = request_id
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 

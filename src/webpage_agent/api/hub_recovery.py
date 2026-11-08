@@ -32,6 +32,27 @@ def _resume_index(steps: list[dict], actions: list[dict]) -> int:
     return len(steps)
 
 
+def _operation_payload_from_run(run_result) -> dict:
+    """把 get_operation 工具的 run 返回规整成 verify_operation 期望的 payload。
+
+    工具 run 返回通常是 `{status, operation, ...}`（MCP runner 把标量提到顶层）。
+    这里兜底几种形状，提取 `status` / `operation` / `code` / `message`。
+    """
+    if not isinstance(run_result, dict):
+        return {}
+    return {
+        'status': run_result.get('status', 'ok'),
+        'operation': run_result.get('operation'),
+        'code': run_result.get('code'),
+        'message': run_result.get('message'),
+    }
+
+
+async def _return(value):
+    """把一个值包成 awaitable（供 verify_operation 的 get_operation_call 用）。"""
+    return value
+
+
 class HubRecoveryMixin:
     """Hub 的恢复、暂停续跑、对账与部署。"""
 
@@ -88,10 +109,17 @@ class HubRecoveryMixin:
         record.status = status
         reply = reply_text(state)
         try:
+            # 传 context：这条 run 是本进程领的，收尾要走带租约的门禁。
+            # **先过门禁**：失租时不得追加最终消息；最终答复与终态同事务提交，
+            # 用稳定去重键保证恢复补收尾不重复（第七阶段）。
+            final_key = f'final:{record.run_id}'
+            committed = await self._finish_run(
+                record, state, status, context=context,
+                final_message=reply, final_message_key=final_key)
+            if not committed:
+                logger.warning('run %s 按快照收尾失租，跳过最终消息', record.run_id)
+                return record
             await record.persist(status=status, state=state)
-            await self.store.append_message(record.session_id, 'assistant', reply)
-            # 传 context：这条 run 是本进程领的，收尾要走带租约的门禁
-            await self._finish_run(record, state, status, context=context)
             await record.publish({'type': 'status', **outcome_module.view(status, state),
                                   'detail': reply})
             logger.info('run %s 按快照收尾（步骤已全部结算）status=%s',
@@ -138,6 +166,347 @@ class HubRecoveryMixin:
                 'asked_questions': asked, 'clarification': clarified,
                 'step_index': _resume_index(steps, actions)}
 
+    async def _pi_resume_plan(self, run_id: str, run: dict) -> dict:
+        """Pi 恢复装配：读版本化 Pi 快照，构造续跑所需的 resume 上下文。
+
+        与 LangGraph 的 `_resume_plan` 不同：Pi 没有「图计划 + 步骤游标」，
+        它的恢复事实来自 `run_snapshots` 里的版本化 Pi 快照（阶段、检查点序号、
+        要求版本、宿主结果状态、完整模型消息、逻辑调用序号、待处理调用、
+        已提交工具结果引用、最终答复候选）。
+
+        快照读取合同（第七阶段收口）——严格区分四种情况：
+
+        - **首次执行**：无快照且无动作 → `pi_snapshot=None`，正常从头开始；
+        - **已有动作却缺快照**：有动作但读不到快照 → 转待核实，**不得退回空
+          状态重新执行**（否则会重复副作用）；
+        - **快照损坏**（state_json 解析失败 / state 为空）→ 抛异常停止；
+        - **版本不兼容**（state_schema 与当前不一致）→ 抛异常停止。
+
+        后三种都不退回空状态重新执行。
+        """
+        from webpage_agent.agent import runtime_identity
+        from webpage_agent.agent import pi_snapshot
+        from webpage_agent.agent import pi_recovery
+
+        actions = await self.store.actions_of(run_id)
+        raw = None
+        try:
+            raw = await self.store.run_snapshot(run_id)
+        except RuntimeError as exc:
+            # 快照损坏：明确停止，不退回空状态
+            raise pi_snapshot.SnapshotError(str(exc)) from exc
+
+        snapshot = None
+        if raw is not None:
+            # 有快照行：严格解析（版本不兼容在这里抛）
+            snapshot = pi_snapshot.parse_row(raw)
+        elif actions:
+            # 已有动作却缺快照：转待核实，不退回空状态重新执行
+            decision = pi_recovery.RecoveryDecision(
+                kind=pi_recovery.RESUME_RECONCILE,
+                reason='有动作但缺失快照，无法确定进度，需核实')
+            return {
+                'runtime_kind': runtime_identity.KIND_PI,
+                'intent_version': int(run.get('intent_version') or 0),
+                'processed_intent_version': int(
+                    run.get('processed_intent_version') or 0),
+                'plan_version': int(run.get('plan_version') or 1),
+                'pi_resume': {'snapshot': None,
+                              'recovery': decision.to_dict()},
+                'user_input': str(run.get('goal') or ''),
+            }
+
+        decision = pi_recovery.decide(
+            snapshot, actions, str(run.get('status') or ''))
+        # 第十阶段收口第 6 点：恢复 unknown 写时，先按原 operation ID 调 get_operation
+        # 核实「远端是否已写」，再决定（applied → 复用 / not_found → 可重试 /
+        # permission_denied、query_failed → 保持待核实）。不能盲目重发、也不能把
+        # 权限错误当成「未执行」。
+        if decision.kind == pi_recovery.RESUME_RECONCILE:
+            try:
+                verify = await self._verify_unknown_writes(run_id, actions)
+            except Exception:                      # noqa: BLE001
+                logger.warning('核实 unknown 写失败 run=%s', run_id, exc_info=True)
+                verify = None
+            if verify is not None and verify.get('applied'):
+                # 远端已写：结果可复用，转 RESUME_DELIVER（回读对象 + 交付结果），
+                # 不生成新写入冒充恢复。
+                decision = pi_recovery.RecoveryDecision(
+                    kind=pi_recovery.RESUME_DELIVER,
+                    reason=f'远端已写（{",".join(verify["applied"])}），复用结果回读对象')
+            elif verify is not None and verify.get('not_found') \
+                    and not verify.get('applied') and not verify.get('unknown'):
+                # 远端明确未写：可重试，但必须显式记录策略（这里保守转待核实，
+                # 由人工确认是否重发，不自动重发避免重复副作用）。
+                decision = pi_recovery.RecoveryDecision(
+                    kind=pi_recovery.RESUME_RECONCILE,
+                    reason='远端确认未写，可显式重试（需记录策略）')
+        # 第十阶段第 5 点：等待审批的恢复。快照有 awaiting_approval 事实时，查
+        # 审批表决定：已批准 → 恢复原候选（RESUME_ADMIT，重新检查权限/版本/revision/
+        # 审批有效性）；仍 pending/已拒绝/过期 → 继续等待或待核实，不盲目重发。
+        if snapshot and snapshot.get('awaiting_approval') \
+                and decision.kind == pi_recovery.RESUME_WAIT:
+            awaiting = list(snapshot.get('awaiting_approval') or [])
+            decision = await self._decide_approval_recovery(
+                run_id, awaiting, snapshot)
+        # 第八阶段第 5 点：恢复时**先判断外部任务**。快照有 awaiting_calls（已受理
+        # 的外部调用）时，按外部任务状态决定等待/交付/待核实，**不套用**普通
+        # pending 重派发规则——否则会把已受理的提交重新执行（重复副作用）。
+        external_tasks = []
+        if snapshot and snapshot.get('awaiting_calls'):
+            try:
+                external_tasks = await self.store.external_tasks_of_run(run_id)
+            except Exception:                      # noqa: BLE001
+                logger.warning('读外部任务失败 run=%s', run_id, exc_info=True)
+            ext_decision = pi_recovery.decide_external(snapshot, external_tasks)
+            # 第八阶段收口第 3 点：已有最终答复（resume_finish）时，**不被**旧的
+            # awaiting 覆盖为「继续等待/交付」。最终答复说明外部结果早已消费、后续
+            # 已推理完成，只需补收尾，不能退回外部等待。
+            if ext_decision is not None and decision.kind != pi_recovery.RESUME_FINISH:
+                decision = ext_decision
+                # 第八阶段收口第 3 点：外部任务已完成 → 读回已登记的结果，装配成
+                # 可直接注入 Node 的 deliver_results（原 toolCallId + 结果内容）。
+                # 结果读回失败（结果没真正可消费）→ 转待核实，不能装成已交付。
+                if ext_decision.kind == pi_recovery.RESUME_DELIVER:
+                    try:
+                        deliver = await self._assemble_deliver_results(
+                            ext_decision.tool_results)
+                        if deliver is None:
+                            decision = pi_recovery.RecoveryDecision(
+                                kind=pi_recovery.RESUME_RECONCILE,
+                                reason='外部任务已完成但结果无法读回，需核实')
+                        else:
+                            ext_decision.deliver_results = deliver
+                    except Exception:              # noqa: BLE001
+                        logger.warning('装配外部结果失败 run=%s', run_id, exc_info=True)
+                        decision = pi_recovery.RecoveryDecision(
+                            kind=pi_recovery.RESUME_RECONCILE,
+                            reason='外部结果装配失败，需核实')
+        # 第七阶段收口：恢复输入用**单一字段** `pi_resume` 承载（快照 + 恢复决策），
+        # 不在顶层与 resume_plan 里同时维护两份。run_task 把它原样放进
+        # state['pi_resume']，PiRuntime.run() 只从这里读。
+        resume = {
+            'runtime_kind': runtime_identity.KIND_PI,
+            'intent_version': int(run.get('intent_version') or 0),
+            'processed_intent_version': int(
+                run.get('processed_intent_version') or 0),
+            'plan_version': int(run.get('plan_version') or 1),
+            'pi_resume': {
+                'snapshot': snapshot,
+                'recovery': decision.to_dict(),
+            },
+        }
+        # 第十阶段第 6 点：恢复时把**新增要求内容真正注入 Pi**，不只是更新版本号。
+        # 快照里的原始输入 + 尚未纳入计划提交的补充输入，合并成一句完整要求交给
+        # Pi 决策；否则「版本号升了但模型没看到新要求」，旧候选仍会按旧要求继续。
+        # 第十阶段收口第 5 点：除合并文本外，另把 pending 补充的**原文 + 序号**作为
+        # 增量输入（pending_inputs）传下去，让 Pi 恢复时把它们当**明确的新消息**进入
+        # 上下文——不是只在合并文本里隐式带上，否则模型分不清「新要求」和「旧上下文」。
+        from webpage_agent.agent import run_inputs as run_inputs_module
+        base_input = str((snapshot or {}).get('user_input') or '')
+        pending_inputs = []
+        try:
+            if hasattr(self.store, 'pending_run_inputs'):
+                pending_inputs = await self.store.pending_run_inputs(run_id)
+        except Exception:                          # noqa: BLE001
+            logger.warning('读待处理补充失败 run=%s', run_id, exc_info=True)
+        resume['user_input'] = run_inputs_module.merged_requirement(
+            base_input, pending_inputs)
+        # 增量输入（原文 + 序号），供 PiRuntime 传进 Node resume.pending_inputs。
+        resume['pending_inputs'] = [
+            {'input_seq': int(item.get('input_seq') or 0),
+             'message': str(item.get('message') or '')}
+            for item in pending_inputs
+            if isinstance(item, dict) and str(item.get('message') or '').strip()
+        ]
+        return resume
+
+    async def _decide_approval_recovery(self, run_id: str, awaiting: list,
+                                        snapshot: dict) -> 'RecoveryDecision':
+        """等待审批的恢复决策（第十阶段第 5 点收口）。
+
+        查每个待审批调用的 approval 状态：
+        - 已批准（approved）→ 恢复原候选（RESUME_ADMIT，原 call_id + **最终参数**
+          + 参数指纹 + 对象 revision + 要求版本），由执行点重新检查权限、要求版本、
+          对象 revision 与审批有效性；
+        - 仍 pending → 继续等待（RESUME_WAIT），不重新推理；
+        - 已拒绝/撤销/过期 → 转待核实（RESUME_RECONCILE），不盲目重发。
+        """
+        from webpage_agent.agent import pi_recovery
+        approved_calls: list[dict] = []
+        any_pending = False
+        any_bad = False
+        for item in awaiting:
+            if not isinstance(item, dict):
+                continue
+            approval_id = str(item.get('approval_id') or '')
+            if not approval_id:
+                any_bad = True
+                continue
+            try:
+                row = await self.store.approval(approval_id)
+            except Exception:                      # noqa: BLE001
+                row = None
+            status = str((row or {}).get('status') or '')
+            if status == 'approved':
+                approved_calls.append({
+                    'call_id': str(item.get('call_id') or ''),
+                    'tool_name': str(item.get('tool_name') or ''),
+                    # 恢复原调用的**最终参数**（含幂等键）与参数指纹——不是模型
+                    # 重发的参数。参数已变化时，执行点按 args_hash 拒绝复用。
+                    'arguments': dict(item.get('arguments') or {}),
+                    'args_hash': str(item.get('args_hash') or ''),
+                    'expected_revision': item.get('expected_revision'),
+                    'intent_version': int(item.get('intent_version') or 0),
+                })
+            elif status == 'pending':
+                any_pending = True
+            else:
+                # rejected / revoked / expired / 未知
+                any_bad = True
+        if approved_calls:
+            # 已批准：恢复原候选（原 call_id/最终参数），执行点重新检查授权有效性
+            # 与要求版本/revision（变化则拒绝）。
+            return pi_recovery.RecoveryDecision(
+                kind=pi_recovery.RESUME_ADMIT, pending_calls=approved_calls,
+                reason='审批已批准，恢复原候选重新检查权限与版本')
+        if any_bad:
+            return pi_recovery.RecoveryDecision(
+                kind=pi_recovery.RESUME_RECONCILE,
+                reason='审批被拒绝/撤销/过期，需核实')
+        if any_pending:
+            return pi_recovery.RecoveryDecision(
+                kind=pi_recovery.RESUME_WAIT, pending_calls=[],
+                reason='审批仍待处理，继续等待')
+        return pi_recovery.RecoveryDecision(
+            kind=pi_recovery.RESUME_RECONCILE,
+            reason='等待审批事实缺失有效关联，需核实')
+
+    async def _verify_unknown_writes(self, run_id: str,
+                                     actions: list[dict]) -> dict | None:
+        """恢复 unknown 写时，按原 operation ID 调 get_operation 核实（第十阶段第 6 点）。
+
+        从 actions 里找 `unknown` 且 effect=write 的动作，提取其最终参数里的幂等键
+        （operation_id），用同一可信主体调用 `get_operation` 核实「远端是否已写」。
+        严格区分四种结局（`platform_verify.verify_operation`）：
+
+        - `applied`：远端已写（可复用结果，回读对象，不重发）；
+        - `not_found`：远端明确未写（可显式重试，但需记录策略）；
+        - `permission_denied`：权限错误——**不能当成未执行**，结果未知；
+        - `query_failed`：查询失败，结果未知。
+
+        返回 `{'applied': [...], 'not_found': [...], 'unknown': [...]}`，分别列出
+        operation_id；找不到任何 unknown 写动作 / 无法提取幂等键时返回 None。
+        """
+        from webpage_agent.core import platform_verify
+        from webpage_agent.tools import core as tools_core
+
+        unknown_writes = []
+        for action in actions:
+            if not isinstance(action, dict):
+                continue
+            if str(action.get('status')) != 'unknown':
+                continue
+            effect = str(action.get('effect') or '')
+            receipt = action.get('receipt') or {}
+            if not isinstance(receipt, dict):
+                receipt = {}
+            final_args = receipt.get('final_args') or {}
+            operation_id = str(
+                (final_args or {}).get('operation_id')
+                or (final_args or {}).get('idempotency_key') or '')
+            if effect != 'write' or not operation_id:
+                continue
+            unknown_writes.append({
+                'action_id': str(action.get('action_id') or ''),
+                'operation_id': operation_id,
+                'final_args': final_args,
+            })
+        if not unknown_writes:
+            return None
+
+        # 找 get_operation 工具（同 server 的只读工具），用它核实。
+        get_op_tool = None
+        try:
+            for tool in await tools_core.mcp_tools():
+                if getattr(tool, 'name', '') == 'get_operation' \
+                        and str(getattr(tool, 'effect', '') or 'unknown') == 'read':
+                    get_op_tool = tool
+                    break
+        except Exception:                          # noqa: BLE001
+            logger.warning('发现 get_operation 工具失败', exc_info=True)
+
+        result = {'applied': [], 'not_found': [], 'unknown': []}
+        for item in unknown_writes:
+            operation_id = item['operation_id']
+            if get_op_tool is None:
+                # 没有核实工具：结果未知，转待核实。
+                result['unknown'].append(operation_id)
+                continue
+            try:
+                # 用同一可信主体（当前执行上下文）调用 get_operation。
+                run_result = await get_op_tool.run(
+                    {'operation_id': operation_id}, {'task_id': ''})
+            except Exception as exc:                # noqa: BLE001
+                logger.warning('核实操作失败 op=%s：%s', operation_id, exc)
+                result['unknown'].append(operation_id)
+                continue
+            # 把 run 返回规整成 verify_operation 期望的 payload 形状。
+            payload = _operation_payload_from_run(run_result)
+            verification = await platform_verify.verify_operation(
+                operation_id, server=None,
+                get_operation_call=lambda oid: _return(payload))
+            state = verification.get('state')
+            if state == 'applied':
+                result['applied'].append(operation_id)
+            elif state == 'not_found':
+                result['not_found'].append(operation_id)
+            else:
+                result['unknown'].append(operation_id)
+        return result
+
+    async def _assemble_deliver_results(self, refs: list[dict]) -> list[dict] | None:
+        """把外部任务的完成结果读回，装配成可注入 Node 的 deliver_results。
+
+        第八阶段收口第 3 点：交付的是**已登记、可消费**的结果内容（经标准结果
+        存储登记），不是 status 包或文件路径。读回失败返回 None（调用方转待核实）。
+
+        返回每项：`{call_id, tool_name, result, is_error}`，Node 据此 pushToolResult。
+        """
+        from webpage_agent.tools import tool_results as tr
+        from webpage_agent.core.config import settings as cfg
+        assembled: list[dict] = []
+        for ref in (refs or []):
+            if not isinstance(ref, dict):
+                continue
+            result_id = str(ref.get('last_result_id') or '')
+            call_id = str(ref.get('call_id') or '')
+            if not result_id or not call_id:
+                # 缺 result 引用或原 toolCallId：无法交付，转待核实。
+                return None
+            manifest = None
+            try:
+                manifest = await self.store.result_manifest(result_id)
+            except Exception:                      # noqa: BLE001
+                manifest = None
+            if manifest is None:
+                # 结果未登记（不是可消费结果）→ 待核实。
+                return None
+            try:
+                content = tr.read_structured(str(cfg.artifact_dir), manifest)
+            except Exception:                      # noqa: BLE001
+                content = None
+            if content is None:
+                # 结构化结果读不回（损坏/缺失）→ 待核实。
+                return None
+            assembled.append({
+                'call_id': call_id,
+                'tool_name': str(ref.get('tool_name') or ''),
+                'result': content,
+                'is_error': False,
+            })
+        return assembled
+
     async def _settle_round(self, record: 'TaskRecord', state: dict, status: str, *,
                             context, close_instruction, close_open_stage) -> None:
         """一轮执行结束的收尾：先过门禁，再落记录与事件。
@@ -158,12 +527,28 @@ class HubRecoveryMixin:
             })
         # 只有"声称做完了"的状态才必须保证没有未处理的补充；停下等人
         # （waiting_input / failed / paused）允许留着，那正是它们在等的东西。
-        await self._finish_run(
+        # 最终答复与终态同事务提交，用稳定去重键（final:<run_id>）保证恢复
+        # 补收尾不重复追加（第七阶段）。
+        # 第八阶段收口第 10 点：waiting_external 是「持久等待」，**不是终态**，
+        # 不能写最终答复——否则「任务结束，状态：waiting_external」这条兜底文案
+        # 会占掉 final:<run_id> 去重键，导致后续真正终态（succeeded）的最终答复
+        # 被去重、用户看到的答复停留在「等待中」。
+        final_key = f'final:{record.run_id}'
+        final_message = None
+        if status != 'waiting_external':
+            final_message = reply
+        committed = await self._finish_run(
             record, state, status, context=context,
             expected_intent_version=state.get('intent_version'),
             require_pending_clear=status in ('succeeded', 'partially_succeeded',
-                                             'needs_reconcile'))
-        await self.store.append_message(record.session_id, 'assistant', reply)
+                                             'needs_reconcile'),
+            final_message=final_message, final_message_key=final_key)
+        if not committed:
+            # 第七阶段：失租（finish_run_owned 落空）后**禁止追加最终消息**。
+            # 终态与最终答复由新执行者按恢复决策补收尾，这里不再写 assistant
+            # 消息或发状态事件，避免恢复后重复答复。
+            logger.warning('run %s 收尾失租，跳过最终消息与状态事件', record.run_id)
+            return
         # 先落记录（内存 + tasks 行），再发事件：两者都写、职责不同。
         await record.persist(status=status, state=state)
         # 状态事件里 `status` 仍是展示标签（前端认这套），另带 run_status

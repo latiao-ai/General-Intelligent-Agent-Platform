@@ -20,8 +20,11 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL,
     role       TEXT NOT NULL,
     content    TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    dedupe_key TEXT NOT NULL DEFAULT ''
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_dedupe
+    ON messages(session_id, dedupe_key) WHERE dedupe_key <> '';
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
 CREATE TABLE IF NOT EXISTS tasks (
     task_id     TEXT PRIMARY KEY,
@@ -78,7 +81,10 @@ CREATE TABLE IF NOT EXISTS runs (
     error               TEXT,
     compensated_at      TEXT,
     created_at          TEXT NOT NULL,
-    updated_at          TEXT NOT NULL
+    updated_at          TEXT NOT NULL,
+    runtime_kind        TEXT NOT NULL DEFAULT 'langgraph',
+    runtime_version     INTEGER NOT NULL DEFAULT 1,
+    runtime_state_schema INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, lease_expires_at);
@@ -585,6 +591,7 @@ CREATE TABLE IF NOT EXISTS external_tasks (
     poll_owner        TEXT NOT NULL DEFAULT '',
     poll_epoch        INTEGER NOT NULL DEFAULT 0,
     poll_lease_expires_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    cancel_requested  INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL
 );
@@ -623,6 +630,18 @@ ALTER TABLE actions ADD COLUMN IF NOT EXISTS external_task_id TEXT NOT NULL DEFA
 -- 已验证的现场上下文（当前项目 / 选中对象）。浏览器自报的 JSON 不能直接当它用。
 ALTER TABLE tasks_meta ADD COLUMN IF NOT EXISTS scene_context_json TEXT NOT NULL DEFAULT '';
 
+-- run 的引擎归属：由哪个引擎驱动（langgraph | pi）、运行时实现版本、状态格式版本。
+-- 恢复入口据此分流；存量 run 默认回填 langgraph，新 run 创建时确定归属。
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_kind TEXT NOT NULL DEFAULT 'langgraph';
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_version INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_state_schema INTEGER NOT NULL DEFAULT 1;
+
+-- 最终答复的去重键：恢复补收尾时按 (session_id, dedupe_key) 幂等，
+-- 避免「进程在终态与最终消息之间崩溃」后恢复重复追加最终答复。
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS dedupe_key TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_dedupe
+    ON messages(session_id, dedupe_key) WHERE dedupe_key <> '';
+
 -- 费用明细的完整快照。v2 里那张表是给「已经记过基线、还没有这张表」的存量库建的，
 -- 而且建完就不再执行。用途和估算标记必须写在这里，verify_schema 才认得出
 -- 「只改了升级脚本、快照没跟上」。全新库先建这张完整的表，v2 用 IF NOT EXISTS
@@ -646,6 +665,42 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     migration_id  TEXT PRIMARY KEY,
     applied_at    TEXT NOT NULL
 );
+
+-- ---------- 会话 turn（第十一阶段：独立聊天 turn，不把每句话建成业务任务） ----------
+-- 一次聊天/查询/控制是一轮 turn；业务任务通过 turn 关联（target_task_id/run_id）。
+CREATE TABLE IF NOT EXISTS session_turns (
+    turn_id            TEXT PRIMARY KEY,
+    session_id         TEXT NOT NULL,
+    turn_seq           INTEGER NOT NULL,
+    request_id         TEXT NOT NULL,
+    request_hash       TEXT NOT NULL DEFAULT '',
+    message            TEXT NOT NULL,
+    target_task_id     TEXT NOT NULL DEFAULT '',
+    target_run_id      TEXT NOT NULL DEFAULT '',
+    kind               TEXT NOT NULL DEFAULT 'chat',
+    status             TEXT NOT NULL DEFAULT 'accepted',
+    engine_kind        TEXT NOT NULL DEFAULT '',
+    engine_version     INTEGER NOT NULL DEFAULT 0,
+    lease_owner        TEXT NOT NULL DEFAULT '',
+    lease_expires_at   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    lease_epoch        INTEGER NOT NULL DEFAULT 0,
+    source_turn_id     TEXT NOT NULL DEFAULT '',
+    candidates_json    TEXT NOT NULL DEFAULT '',
+    clarification      TEXT NOT NULL DEFAULT '',
+    execution_generation INTEGER NOT NULL DEFAULT 0,
+    tenant_id          TEXT NOT NULL DEFAULT 'default',
+    owner_user_id      TEXT NOT NULL DEFAULT 'default',
+    answer             TEXT NOT NULL DEFAULT '',
+    error              TEXT NOT NULL DEFAULT '',
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_session_turns_request
+    ON session_turns(session_id, request_id);
+CREATE INDEX IF NOT EXISTS idx_session_turns_session
+    ON session_turns(session_id, turn_seq);
+CREATE INDEX IF NOT EXISTS idx_session_turns_claim
+    ON session_turns(status, lease_expires_at);
 """
 # 时间单位约定：
 # `background_jobs.due_at` / `lease_expires_at` 与 `external_tasks.*_at` 一律用

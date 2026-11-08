@@ -37,7 +37,10 @@ TEST_TABLES = ('memory_tombstones', 'memories', 'background_jobs', 'artifacts',
                'action_attempts', 'actions', 'steps', 'plans', 'run_snapshots',
                'run_inputs', 'run_input_processing', 'run_decisions',
                'runs', 'tasks_meta', 'events', 'tasks', 'session_memory',
-               'session_summaries', 'messages', 'sessions', 'request_keys')
+               'session_summaries', 'messages', 'sessions', 'request_keys',
+               'external_tasks', 'tool_result_manifests', 'tool_result_parts',
+               'tool_authorizations', 'approvals', 'approval_reservations',
+               'run_decisions', 'provider_charges', 'session_turns')
 
 
 def valid_test_dsn(dsn):
@@ -212,7 +215,7 @@ def override_settings(**changes):
     from webpage_agent.core.config import settings as real_settings
 
     fake = replace(real_settings, **changes)
-    modules = ('webpage_agent.api.routes', 'webpage_agent.api.api_hub', 'webpage_agent.api.main', 'webpage_agent.agent.nodes', 'webpage_agent.agent.decide', 'webpage_agent.agent.plan_validate', 'webpage_agent.agent.refs', 'webpage_agent.core.services',
+    modules = ('webpage_agent.api.routes', 'webpage_agent.api.api_hub', 'webpage_agent.api.main', 'webpage_agent.agent.nodes', 'webpage_agent.agent.decide', 'webpage_agent.agent.plan_validate', 'webpage_agent.agent.refs', 'webpage_agent.agent.langgraph_runtime', 'webpage_agent.core.services',
                'webpage_agent.tools.core', 'webpage_agent.agent.context', 'webpage_agent.core.memory', 'webpage_agent.capabilities.base',
                'webpage_agent.capabilities.web', 'webpage_agent.capabilities.export',
                'webpage_agent.capabilities.answers', 'webpage_agent.capabilities.publishing',

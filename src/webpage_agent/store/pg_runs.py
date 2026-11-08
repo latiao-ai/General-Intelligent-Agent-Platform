@@ -17,20 +17,34 @@ class PgRuns:
     async def create_run(self, run_id: str, task_id: str, *, budget: dict | None = None,
                    tenant_id: str = 'default', status: str = 'queued',
                    owner_user_id: str = 'default', owner_role: str = 'member',
-                   platform_id: str | None = None) -> None:
+                   platform_id: str | None = None,
+                   runtime_kind: str | None = None) -> None:
+        # 引擎归属在**创建时**确定：默认走全局 default_runtime_kind（只影响新建），
+        # 显式传入则用传入值。恢复时不走这里，读库里已存的归属。
+        from webpage_agent.agent import runtime_identity
+        kind = runtime_identity.normalize_kind(
+            runtime_kind or runtime_identity.default_kind())
+        if not kind:
+            raise runtime_identity.UnknownRuntimeKind(
+                run_id, runtime_kind or '')
+        version = runtime_identity.version_for_kind(kind)
+        schema = runtime_identity.schema_for_kind(kind)
         stamp = now()
         async with self._lease() as conn:
             await conn.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', ('retention:'+task_id,))
             await self._run(conn, 'INSERT INTO runs (run_id, task_id, tenant_id, status, '
                 'budget_json, consumed_json, owner_user_id, owner_role, platform_id, platform_subject, '
+                'runtime_kind, runtime_version, runtime_state_schema, '
                 'created_at, updated_at, trace_id) '
                 'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '
                 "COALESCE(%s, (SELECT platform_id FROM runs WHERE task_id=%s ORDER BY created_at LIMIT 1), ''), "
-                "COALESCE((SELECT platform_subject FROM runs WHERE task_id=%s ORDER BY created_at LIMIT 1), ''), %s, %s, %s)",
+                "COALESCE((SELECT platform_subject FROM runs WHERE task_id=%s ORDER BY created_at LIMIT 1), ''), "
+                '%s, %s, %s, %s, %s, %s)',
                 (run_id, task_id, tenant_id, status,
                  json.dumps(budget or {}, ensure_ascii=False), '{}',
                  str(owner_user_id or 'default'), str(owner_role or 'member'),
                  platform_id, task_id, task_id,
+                 kind, int(version), int(schema),
                  stamp, stamp, telemetry.trace_id.get() or uuid.uuid4().hex))
             await self._run(conn, 'UPDATE tasks_meta SET current_run_id=%s WHERE task_id=%s',
                 (run_id, task_id))
@@ -40,6 +54,88 @@ class PgRuns:
         async with self._lease() as conn:
             row = await self._one(conn, 'SELECT * FROM runs WHERE run_id=%s', (run_id,))
         return _decode_run(dict(row)) if row else None
+
+    async def create_turn_run(self, *, run_id: str, tenant_id: str,
+                              owner_user_id: str, lease_owner: str,
+                              lease_epoch: int, lease_ttl: float,
+                              budget: dict | None = None) -> dict | None:
+        """为会话 turn（chat/query）建一条内部执行记录（run 行）。
+
+        第十二阶段缺口修复（评审点 1）：普通查询没有业务 run，但仍有用户、租户、
+        turn 与费用归属。这里为 turn_id 建一条 `runs` 行作为**内部查询执行记录**，
+        让只读工具经 `governed_call` 走完整治理链（授权 → 预算 → 准入 → 真实调用 →
+        结算），而不是靠关闭网关检查或无条件放行「无 run 调用」。
+
+        租约直接复用 turn 领取时的 `lease_owner`/`lease_epoch`（与 `session_turns`
+        一致），并设成「运行中 + 租约未过期」：
+        - `_owned`（admit_action 的 require_status=('running',)）据此放行；
+        - `claim_run` 的领取条件 `lease_expires_at < now` 保证租约未过期时**不会**
+          被 Worker 业务领取池领走（内部记录不进业务调度）。
+        """
+        stamp = now()
+        expires = time.time() + float(lease_ttl)
+        async with self._lease() as conn:
+            await self._run(conn,
+                'INSERT INTO runs (run_id, task_id, tenant_id, status, '
+                'budget_json, consumed_json, owner_user_id, owner_role, '
+                'lease_owner, lease_expires_at, lease_epoch, '
+                'runtime_kind, runtime_version, runtime_state_schema, '
+                'created_at, updated_at, trace_id) '
+                "VALUES (%s, %s, %s, 'running', %s, '{}', %s, 'member', "
+                "%s, %s, %s, 'pi', 1, 2, %s, %s, %s) "
+                'ON CONFLICT (run_id) DO NOTHING',
+                (run_id, run_id, tenant_id,
+                 json.dumps(budget or {}, ensure_ascii=False), owner_user_id,
+                 lease_owner, expires, int(lease_epoch or 0),
+                 stamp, stamp, uuid.uuid4().hex))
+            await conn.commit()
+        return await self.run(run_id)
+
+    async def settle_turn_run(self, *, run_id: str, status: str,
+                              lease_owner: str, lease_epoch: int) -> bool:
+        """收尾内部查询执行记录：turn 结算后置终态，清租约，不留 running 僵尸行。
+
+        带租约门禁（owner + epoch）：过期执行者不能收尾。返回是否成功。
+        """
+        stamp = now()
+        async with self._lease() as conn:
+            cur = await self._run(conn,
+                'UPDATE runs SET status=%s, lease_expires_at=0, updated_at=%s '
+                'WHERE run_id=%s AND lease_owner=%s AND lease_epoch=%s',
+                (status, stamp, run_id, lease_owner, int(lease_epoch or 0)))
+            await conn.commit()
+        return bool(cur.rowcount)
+
+    async def runtime_identity(self, run_id: str) -> dict:
+        """读并校验 run 的引擎归属（恢复/分流入口的唯一权威来源）。
+
+        返回 `{kind, version, state_schema}`；未知引擎抛 `UnknownRuntimeKind`，
+        不兼容版本抛 `IncompatibleRuntimeVersion`。**不回退默认引擎**。
+        """
+        from webpage_agent.agent import runtime_identity
+        row = await self.run(run_id)
+        if row is None:
+            raise runtime_identity.UnknownRuntimeKind(run_id, '<missing>')
+        kind = runtime_identity.normalize_kind(str(row.get('runtime_kind') or ''))
+        if not kind:
+            # 存量 run 没有这列（旧库迁移前）或值未知：按默认回填 LangGraph 属存量，
+            # 但「写了一个不认识的值」必须阻断，不能静默退回。
+            stored = str(row.get('runtime_kind') or '')
+            if stored in ('', None):
+                kind = runtime_identity.KIND_LANGGRAPH
+            else:
+                raise runtime_identity.UnknownRuntimeKind(run_id, stored)
+        version = int(row.get('runtime_version') or 0)
+        schema = int(row.get('runtime_state_schema') or 0)
+        expected_version = runtime_identity.version_for_kind(kind)
+        expected_schema = runtime_identity.schema_for_kind(kind)
+        if version and version != expected_version:
+            raise runtime_identity.IncompatibleRuntimeVersion(
+                run_id, kind, 'runtime_version', version, expected_version)
+        if schema and schema != expected_schema:
+            raise runtime_identity.IncompatibleRuntimeVersion(
+                run_id, kind, 'runtime_state_schema', schema, expected_schema)
+        return {'kind': kind, 'version': version, 'state_schema': schema}
 
     async def update_run(self, run_id: str, **fields) -> None:
         allowed = {'status', 'plan_version', 'intent_version',
@@ -172,24 +268,54 @@ class PgRuns:
                 (run_id,))
         return dict(row) if row else {}
 
+    async def verify_lease(self, run_id: str, *, lease_owner: str,
+                           lease_epoch: int) -> None:
+        '''校验当前执行者仍持有租约（owner + epoch 一致且未过期）。
+
+        第七阶段收口：检查点/快照等**非动作**写入也要过租约门禁，否则过期执行者
+        仍能覆盖新执行者的快照。失租/代次不符抛 `LeaseLost`。
+        '''
+        from webpage_agent.governance import execution_control
+        async with self._lease() as conn:
+            row = await self._one(
+                conn, 'SELECT lease_owner, lease_epoch, lease_expires_at '
+                'FROM runs WHERE run_id=%s', (run_id,))
+        if row is None:
+            raise execution_control.LeaseLost(run_id, '运行不存在')
+        if str(row.get('lease_owner') or '') != str(lease_owner) \
+                or int(row.get('lease_epoch') or 0) != int(lease_epoch):
+            raise execution_control.LeaseLost(
+                run_id, f'持有者/代次已变更（库中 {row.get("lease_owner") or "空"}'
+                        f'#{row.get("lease_epoch") or 0}）')
+        expires = float(row.get('lease_expires_at') or 0)
+        if expires and expires < time.time():
+            raise execution_control.LeaseLost(run_id, '租约已过期')
+
     async def save_snapshot(self, run_id: str, *, plan_version: int, state: dict,
                             next_step_id: str = '', artifact_namespace: str = '',
                             conn=None, intent_version: int | None = None,
                             processed_intent_version: int | None = None,
                             observation_seq: int | None = None,
-                            next_route: str = '') -> None:
+                            next_route: str = '',
+                            snapshot_schema: int | None = None) -> None:
         '''写运行快照（恢复所需的最小完整状态）。
 
         长正文与文件不进快照：它们走产物引用，快照里只留引用与索引。
         快照里的版本字段只用于**排障与核对**：恢复时以 `runs` 的版本为准，
         因为补充输入会改变 `runs.intent_version`，而快照可能还没来得及更新。
+
+        `snapshot_schema` 是快照状态格式的代次：LangGraph 用 1，Pi 用自己的
+        schema 代次（第七阶段）。之前写死 1，导致 Pi 快照无法标注版本；
+        现在显式传入，UPSERT 也同步更新，避免旧 schema 值残留。
         '''
+        schema = int(snapshot_schema if snapshot_schema is not None else 1)
         payload = json.dumps(state, ensure_ascii=False, default=str)
         sql = ('INSERT INTO run_snapshots (run_id, plan_version, snapshot_schema, '
                'state_json, next_step_id, artifact_namespace, updated_at, '
                'intent_version, processed_intent_version, observation_seq, next_route) '
                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) '
                'ON CONFLICT (run_id) DO UPDATE SET plan_version=EXCLUDED.plan_version, '
+               'snapshot_schema=EXCLUDED.snapshot_schema, '
                'state_json=EXCLUDED.state_json, next_step_id=EXCLUDED.next_step_id, '
                'artifact_namespace=EXCLUDED.artifact_namespace, '
                'updated_at=EXCLUDED.updated_at, '
@@ -197,7 +323,7 @@ class PgRuns:
                'processed_intent_version=EXCLUDED.processed_intent_version, '
                'observation_seq=EXCLUDED.observation_seq, '
                'next_route=EXCLUDED.next_route')
-        args = (run_id, int(plan_version or 1), 1, payload, next_step_id,
+        args = (run_id, int(plan_version or 1), schema, payload, next_step_id,
                 artifact_namespace, now(), int(intent_version or 0),
                 int(processed_intent_version or 0), int(observation_seq or 0),
                 str(next_route or ''))
@@ -206,6 +332,48 @@ class PgRuns:
             return
         async with self._lease() as own:
             await self._run(own, sql, args)
+
+    async def save_snapshot_owned(self, run_id: str, *, plan_version: int,
+                                  state: dict, lease_owner: str,
+                                  lease_epoch: int,
+                                  next_step_id: str = '',
+                                  artifact_namespace: str = '',
+                                  intent_version: int | None = None,
+                                  processed_intent_version: int | None = None,
+                                  observation_seq: int | None = None,
+                                  next_route: str = '',
+                                  snapshot_schema: int | None = None) -> bool:
+        """把快照写入与租约校验放进**同一事务**，返回 False = 已失租（不写）。
+
+        第七阶段 `_persist_snapshot` 之前是「先 `verify_lease` 再独立
+        `save_snapshot`」两步：两步之间租约可能被接管，过期执行者仍能把快照
+        写进库里覆盖新执行者的进度。这里把「校验 owner + epoch + 未过期」与
+        「UPSERT 快照」合进一个事务，条件不满足就一行都不写、返回 False。
+
+        实现：锁住 run 行（`FOR UPDATE`）读 owner/epoch/expires，校验通过再
+        写快照，同一事务提交。失租/状态不符返回 False，不抛 LeaseLost——
+        调用方（检查点确认）据此回 ok=False 让 Node 停止，而不是炸掉整条桥接。
+        """
+        async with self._lease() as conn:
+            row = await self._one(
+                conn, 'SELECT lease_owner, lease_epoch, lease_expires_at '
+                'FROM runs WHERE run_id=%s FOR UPDATE', (run_id,))
+            if row is None:
+                return False
+            if str(row.get('lease_owner') or '') != str(lease_owner) \
+                    or int(row.get('lease_epoch') or 0) != int(lease_epoch):
+                return False
+            expires = float(row.get('lease_expires_at') or 0)
+            if expires and expires < time.time():
+                return False
+            await self.save_snapshot(
+                run_id, plan_version=plan_version, state=state,
+                next_step_id=next_step_id, artifact_namespace=artifact_namespace,
+                conn=conn, intent_version=intent_version,
+                processed_intent_version=processed_intent_version,
+                observation_seq=observation_seq, next_route=next_route,
+                snapshot_schema=snapshot_schema)
+            return True
 
     async def run_snapshot(self, run_id: str) -> dict | None:
         async with self._lease() as conn:
@@ -216,8 +384,11 @@ class PgRuns:
         data = dict(row)
         try:
             data['state'] = json.loads(data.get('state_json') or '{}')
-        except ValueError:
-            data['state'] = {}
+        except ValueError as exc:
+            # 第七阶段收口：损坏的 state_json 必须可被识别，不能吞成 {} 冒充空快照。
+            raise RuntimeError(
+                f'run {run_id} 的快照 state_json 损坏：{exc}') from exc
+        data['schema'] = int(data.get('snapshot_schema') or 0)
         return data
 
     # ---------- 运行中补充输入 ----------

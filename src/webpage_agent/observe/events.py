@@ -2,10 +2,31 @@
 
 节点级进度（`stream_mode='updates'`）只告诉你"某个节点跑完了"；这里发的是节点
 **内部**的动作与阶段起止，前者用来呈现思考过程，后者用来做实时计时。
+
+事件出口（第四阶段统一）：
+
+    事件有两个出口，按优先级：
+
+    1. **作用域绑定的宿主 sink**（`bind_sink` / `emit` 优先使用）：图外的运行时
+       （如 PiRuntime）在没有 LangGraph writer 的上下文里，也能把事件有序转交给
+       宿主的异步回调。sink 用 `contextvars` 绑定到当前异步作用域，正常结束、异常
+       或取消路径都必须可靠解绑，避免跨请求串流。
+    2. **LangGraph stream writer**（无 sink 绑定时的原图行为）：在节点内部通过
+       `get_stream_writer()` 发出 custom 事件，由 `LangGraphRuntime` 透传。
+
+    没有绑定 sink 且不在 LangGraph 流式上下文里时（单元测试直接调用节点、或调用
+    方没开 custom 流），静默跳过——节点代码不必关心自己被谁、以何种方式调用。
 """
+from __future__ import annotations
+
+import logging
 import time
+from contextvars import ContextVar
+from typing import Awaitable, Callable, Optional
 
 from langgraph.config import get_stream_writer
+
+logger = logging.getLogger(__name__)
 
 # 各阶段的中文名，CLI / Streamlit / API 三处共用。
 STAGE_LABELS = {
@@ -39,12 +60,108 @@ def label_of(stage: str) -> str:
     return STAGE_LABELS.get(stage, stage)
 
 
-def emit(event: dict) -> None:
-    """在节点内部发出自定义事件。
+# 宿主 sink：接收一个事件 dict，可以是同步函数或协程。绑定到当前异步作用域，
+# 供图外运行时（PiRuntime 等）复用 emit() 把事件交回宿主回调。
+# 用 ContextVar 而非全局变量，保证不同请求/执行之间相互隔离、不会串流。
+Sink = Callable[[dict], Optional[Awaitable[None]]]
+_sink: ContextVar[Optional[Sink]] = ContextVar('pi_event_sink', default=None)
 
-    不在 LangGraph 流式上下文里时（单元测试直接调用节点函数、或调用方没开
-    custom 流）静默跳过，因此节点代码不必关心自己被谁、以何种方式调用。
+# 待排空的异步事件：sink 返回协程时，不 ensure_future（那会产生未被跟踪、可能在
+# 执行终结前还没跑完的任务），而是收进这个按作用域隔离的队列，由调用方在终结前
+# 调 `drain_events()` 严格 await 完。保证「工具事件在终结前处理完」。
+_pending: ContextVar[list[Awaitable[None]]] = ContextVar('pi_event_pending',
+                                                        default=None)
+
+
+def bind_sink(sink: Optional[Sink]):
+    """在当前异步作用域内绑定宿主 sink，返回一个用于解绑的 token。
+
+    用法（异步上下文里）：
+
+        token = bind_sink(on_event)
+        try:
+            ... 驱动执行 ...
+            await drain_events()   # 终结前把未等待的异步事件排空
+        finally:
+            unbind_sink(token)
+
+    正常结束、异常或取消路径都必须解绑，避免事件串到别的请求。
     """
+    if sink is not None:
+        _pending.set([])
+    return _sink.set(sink)
+
+
+def unbind_sink(token) -> None:
+    """解除 sink 绑定，恢复之前的作用域值。幂等。"""
+    _sink.reset(token)
+    if _pending.get() is not None:
+        _pending.set(None)
+
+
+def _enqueue(coro: Awaitable[None]) -> None:
+    """把 sink 返回的协程收进当前作用域的待排空队列（不 ensure_future）。"""
+    queue = _pending.get()
+    if queue is not None:
+        queue.append(coro)
+
+
+async def drain_events() -> None:
+    """排空当前作用域内所有未等待的异步事件（按入队顺序严格 await）。
+
+    真实搜索里 `emit()` 是同步的，sink 若返回协程会先被收进队列，这里在
+    run() 终结前把它们全部 await 完，确保工具事件在终结前处理完、顺序不乱。
+    """
+    queue = _pending.get()
+    if not queue:
+        return
+    pending = list(queue)
+    queue.clear()
+    for coro in pending:
+        try:
+            await coro
+        except Exception:                              # noqa: BLE001
+            logger.warning('排空事件失败', exc_info=True)
+
+
+def emit(event: dict) -> None:
+    """发出一个细粒度事件。
+
+    优先走**作用域绑定的宿主 sink**（图外运行时也能交回宿主）；没有 sink 时
+    回退到 LangGraph stream writer（原图行为）。两者都没有则静默跳过。
+
+    注意：`emit` 是**同步**函数，sink 若返回协程会被收进作用域的待排空队列
+    （不 ensure_future），由调用方在终结前 `await drain_events()` 排空——保证
+    异步事件不被丢失、不被乱序。节点内部的事件量很小，这一约定与原 LangGraph
+    writer 的同步调用保持一致。
+    """
+    sink = _sink.get()
+    if sink is not None:
+        result = sink(event)
+        if result is not None and hasattr(result, '__await__'):
+            _enqueue(result)
+        return
+    try:
+        writer = get_stream_writer()
+    except RuntimeError:
+        return
+    if writer is None:
+        return
+    writer(event)
+
+
+async def emit_async(event: dict) -> None:
+    """异步发出事件：sink 为协程时严格 await，保证有序转交。
+
+    运行时若要求事件严格按序到达宿主（例如 PiRuntime 的 text_delta），应使用
+    这个版本而非 emit()。
+    """
+    sink = _sink.get()
+    if sink is not None:
+        result = sink(event)
+        if result is not None and hasattr(result, '__await__'):
+            await result
+        return
     try:
         writer = get_stream_writer()
     except RuntimeError:
@@ -62,7 +179,6 @@ def action(label: str, detail: str = '', icon: str = '') -> dict:
 def thought(text: str) -> dict:
     """智能体的计划陈述，如「我先帮你查找…」。"""
     return {'type': 'thought', 'text': text}
-
 
 
 def draft(report: dict | None) -> dict:

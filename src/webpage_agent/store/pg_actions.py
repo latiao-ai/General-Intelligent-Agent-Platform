@@ -296,7 +296,8 @@ class PgActions:
                             error_type: str | None = None,
                             step_status: str | None = None,
                             state: dict | None = None,
-                            next_step_id: str = '') -> dict:
+                            next_step_id: str = '',
+                            snapshot_schema: int | None = None) -> dict:
         """原子结算：动作 + attempt + 步骤 + 快照一次提交。
 
         "工具已返回但提交失败"时**不能推进内存游标继续下一步**：调用方会收到
@@ -336,9 +337,224 @@ class PgActions:
             if state is not None:
                 await self.save_snapshot(run_id, plan_version=plan_version, state=state,
                                          next_step_id=next_step_id, conn=conn,
-                                         observation_seq=int((water or {}).get('observation_seq') or 0))
+                                         observation_seq=int((water or {}).get('observation_seq') or 0),
+                                         snapshot_schema=snapshot_schema)
             return {'action_id': action_id, 'status': status,
                     'observation_seq': int((water or {}).get('observation_seq') or 0)}
+
+    async def settle_action_accepted(self, context, *, run_id: str,
+                                     plan_version: int, step_id: str,
+                                     action_id: str, attempt_id: str | None,
+                                     receipt: dict,
+                                     external: dict,
+                                     state: dict | None = None,
+                                     next_step_id: str = '',
+                                     snapshot_schema: int | None = None) -> dict:
+        """原子结算「已受理」：动作回执 + external task + 等待检查点一次提交。
+
+        第八阶段第 4 点：accepted 结算与任务登记必须在**同一数据库事务**里
+        保存（提交动作回执、external task、调用关联、等待检查点、`waiting_external`）。
+        任何提交断点后，accepted 与外部任务登记要么同时存在、要么同时回滚；
+        恢复不会因漏登记而重新提交（重复副作用）。
+
+        动作状态写 `accepted`（不是 succeeded——提交成功但远端业务未完成），
+        `phase='accepted'`；attempt 结束但不标错误；runs 置 `waiting_external=1`。
+        `external` 是登记所需的字段（remote_task_id / contract_id / version /
+        submission_key / item_key / deadline_at / next_poll_at / …）。
+        """
+        stamp = now()
+        async with self._lease() as conn:
+            await self._owned(conn, context, run_id=run_id,
+                              require_status=('running', 'paused'))
+            await self._run(
+                conn, "UPDATE actions SET status='accepted', receipt_json=%s, "
+                "phase='accepted', updated_at=%s WHERE action_id=%s",
+                (json.dumps(receipt or {}, ensure_ascii=False, default=str),
+                 stamp, action_id))
+            if attempt_id:
+                await self._run(
+                    conn, 'UPDATE action_attempts SET ended_at=%s, error_type=NULL '
+                    'WHERE attempt_id=%s', (stamp, attempt_id))
+            # 步骤停在受理阶段，不标 succeeded/ended。
+            await self._run(
+                conn, "UPDATE steps SET status='accepted', phase='accepted', "
+                'output_json=COALESCE(%s, output_json) '
+                'WHERE run_id=%s AND plan_version=%s AND step_id=%s',
+                (json.dumps(receipt, ensure_ascii=False, default=str),
+                 run_id, int(plan_version), step_id))
+            # 结果水位 +1（受理也是一次相关结果落库）。
+            water = await self._one(
+                conn, 'UPDATE runs SET observation_seq=COALESCE(observation_seq,0)+1, '
+                'waiting_external=1 '
+                'WHERE run_id=%s RETURNING observation_seq', (run_id,))
+            # external task 在同一事务登记（复用 conn，不 commit）。
+            await self.register_external_task(
+                external_task_id=str(external.get('external_task_id') or ''),
+                remote_task_id=str(external.get('remote_task_id') or ''),
+                tenant_id=str(external.get('tenant_id') or 'default'),
+                owner_user_id=str(external.get('owner_user_id') or 'default'),
+                server_binding_id=str(external.get('server_binding_id') or ''),
+                credential_binding=str(external.get('credential_binding') or ''),
+                credential_subject=str(external.get('credential_subject') or ''),
+                tool_key=str(external.get('tool_key') or ''),
+                contract_id=str(external.get('contract_id') or ''),
+                contract_version=int(external.get('contract_version') or 1),
+                run_id=run_id, step_id=step_id, action_id=action_id,
+                accepted_result_id=str(external.get('accepted_result_id') or ''),
+                submission_key=str(external.get('submission_key') or ''),
+                item_key=str(external.get('item_key') or ''),
+                deadline_at=float(external.get('deadline_at') or 0),
+                next_poll_at=float(external.get('next_poll_at') or 0),
+                conn=conn)
+            if state is not None:
+                await self.save_snapshot(run_id, plan_version=plan_version,
+                                         state=state, next_step_id=next_step_id,
+                                         conn=conn,
+                                         observation_seq=int(
+                                             (water or {}).get('observation_seq') or 0),
+                                         snapshot_schema=snapshot_schema)
+            return {'action_id': action_id, 'status': 'accepted',
+                    'observation_seq': int((water or {}).get('observation_seq') or 0)}
+
+    async def complete_external_task_and_wake(self, external_task_id: str,
+                                             epoch: int, *,
+                                             owner: str = '',
+                                             state: str,
+                                             output_manifest_ref: str = '',
+                                             last_result_id: str = '',
+                                             error_code: str = '',
+                                             staged: dict | None = None,
+                                             envelope: dict | None = None) -> dict | None:
+        """把外部任务推进到终态，并在**同一事务**里唤醒 run。
+
+        第八阶段第 8 点：外部结果与待唤醒记录同事务提交。poller 不直接改写 Pi
+        messages——这里只做两件事：① 条件更新 external_tasks 到终态（带 owner/
+        epoch/租约门禁）；② 条件更新 runs（requeue 或 needs_reconcile），让获得
+        执行权的宿主吸收结果。旧 poller / 重复完成 / 失租分支返回 None，调用方
+        不得继续更新快照或唤醒。
+
+        第八阶段收口第 8 点：completed 时若传 `staged`（`stage_result` 产出）与
+        `envelope`，则在**同一事务**里走 `commit_result_in_tx` 完成标准结果存储
+        登记——不能仅保存状态包/文件路径就标记 completed，否则读回时拿不到可
+        消费结果。登记失败（抛异常）整笔回滚，任务不进入 completed。
+
+        第八阶段收口第 6 点：终态写回同样检查 owner、epoch、租约有效期及开放
+        状态。迟到查询（owner/epoch 不符或租约已过期）不得把已终态的任务改状态。
+
+        唤醒使用**状态条件更新**：不能复活 cancelled、不能覆盖 paused、不能抢占
+        正在运行的新执行者（只有 waiting_external 且无有效租约的 run 才会被
+        requeue）。
+        """
+        stamp = now()
+        async with self._lease() as conn:
+            task = await self._one(
+                conn,
+                "UPDATE external_tasks SET state=%s, output_manifest_ref=%s, "
+                'last_result_id=%s, error_code=%s, last_observed_at=%s, '
+                'poll_owner=%s, poll_lease_expires_at=%s, version=version+1, '
+                'updated_at=%s '
+                'WHERE external_task_id=%s AND poll_epoch=%s AND poll_owner=%s '
+                'AND poll_lease_expires_at > %s '
+                'AND state IN (%s, %s, %s) RETURNING *',
+                (state, output_manifest_ref, last_result_id, error_code,
+                 time.time(), '', 0, stamp, external_task_id, int(epoch), owner,
+                 time.time(), 'accepted', 'running', 'materializing'))
+            if task is None:
+                # 旧 poller / 重复完成 / 失租 / 状态不符：不写、不唤醒。
+                return None
+            task = dict(task)
+            # 第八阶段收口第 8 点：completed 时在同一事务完成标准结果登记。
+            if state == 'completed' and staged is not None:
+                from webpage_agent.tools import tool_results as tr
+                context = {
+                    'tenant_id': str(task.get('tenant_id') or 'default'),
+                    'owner_user_id': str(task.get('owner_user_id') or 'default'),
+                    'run_id': str(task.get('run_id') or ''),
+                    'step_id': str(task.get('step_id') or ''),
+                    'action_id': str(task.get('action_id') or ''),
+                    'attempt_id': '',
+                }
+                await tr.commit_result_in_tx(
+                    conn, context, staged, envelope or {})
+            run_id = str(task.get('run_id') or '')
+            if run_id:
+                if state == 'completed':
+                    # 结果已可靠保存：把 run 放回队列，等宿主吸收结果。只在
+                    # waiting_external，或「running 但租约已过期/释放」（完成先于
+                    # 等待收尾的竞态）时唤醒，避免抢占正在运行的新执行者、覆盖
+                    # paused、复活 cancelled。第八阶段收口第 5 点：完成先于等待收尾
+                    # 时 run 可能仍是 running（宿主还没 finish 成 waiting_external），
+                    # 此时也必须可靠唤醒，否则外部任务已终态、run 永久等待。
+                    # 第八阶段收口第 7 点：已登记取消意图（cancel_requested_at）
+                    # 的 run 不被 completed 唤醒复活——完成与取消竞争时，取消意图
+                    # 优先，run 交给取消/核实路径，不因远端先完成就盖过用户取消。
+                    await self._run(
+                        conn,
+                        "UPDATE runs SET status='queued', waiting_external=0, "
+                        'error=NULL, lease_owner=NULL, lease_expires_at=NULL, '
+                        'updated_at=%s WHERE run_id=%s '
+                        "AND cancel_requested_at IS NULL "
+                        "AND (status='waiting_external' "
+                        "     OR (status='running' AND (lease_owner IS NULL "
+                        "         OR lease_expires_at IS NULL OR lease_expires_at < %s)))",
+                        (stamp, run_id, time.time()))
+                elif state in ('failed', 'cancelled', 'needs_reconcile'):
+                    # 失败/取消/结果未知：run 交给人工核实。取消已确认与失败同属
+                    # 「结果不可交付」，不能把 run 放回队列假装成功。
+                    label = {'failed': '失败', 'cancelled': '已取消',
+                             'needs_reconcile': '结果未知'}.get(state, state)
+                    await self._run(
+                        conn,
+                        "UPDATE runs SET status='needs_reconcile', "
+                        'waiting_external=0, error=%s, lease_owner=NULL, '
+                        'lease_expires_at=NULL, updated_at=%s '
+                        "WHERE run_id=%s AND (status='waiting_external' "
+                        " OR (status='running' AND (lease_owner IS NULL "
+                        "     OR lease_expires_at IS NULL OR lease_expires_at < %s)))",
+                        (f'外部任务 {external_task_id} {label}', stamp, run_id,
+                         time.time()))
+            return task
+
+    async def request_external_cancel(self, external_task_id: str) -> dict | None:
+        """持久化远端取消**意图**（第八阶段第 9 点）。
+
+        只登记意图，不声称已取消——远端是否真的取消要经合同取消能力查询确认。
+        幂等：已请求过返回既有行。对已完成/已失败/已取消的任务不再登记。
+        """
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                "UPDATE external_tasks SET cancel_requested=1, updated_at=%s "
+                "WHERE external_task_id=%s AND state IN "
+                "('accepted','running','materializing') RETURNING *",
+                (now(), external_task_id))
+            await conn.commit()
+            return dict(row) if row else None
+
+    async def confirm_external_cancel(self, external_task_id: str,
+                                      epoch: int, *, owner: str = '',
+                                      confirmed: bool) -> dict | None:
+        """按查询结果确认远端已取消（第八阶段第 9 点）。
+
+        只有持当前轮询代次、且任务仍开放时才写 `cancelled`；远端未确认取消则
+        保持 `running`（如实保留状态，不声称已取消）。取消与完成的竞争由代次
+        门禁裁决：完成已提交则这里写不进（state 不在开放集合）。
+
+        第八阶段收口第 6 点：取消确认写回同样检查 owner、epoch、租约有效期及
+        开放状态。迟到查询（owner/epoch 不符或租约已过期）不得把已终态的任务
+        改回 running。
+        """
+        target = 'cancelled' if confirmed else 'running'
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                "UPDATE external_tasks SET state=%s, updated_at=%s "
+                "WHERE external_task_id=%s AND poll_epoch=%s AND poll_owner=%s "
+                'AND poll_lease_expires_at > %s '
+                "AND state IN ('accepted','running','materializing') RETURNING *",
+                (target, now(), external_task_id, int(epoch), owner, time.time()))
+            await conn.commit()
+            return dict(row) if row else None
 
     async def finish_run_owned(self, context, *, run_id: str, status: str,
                                error: str | None = None,
@@ -348,18 +564,30 @@ class PgActions:
                                compensated_at: str | None = None,
                                observation_seq: int | None = None,
                                next_route: str = '',
-                               require_no_pending_inputs: bool = False) -> bool:
+                               require_no_pending_inputs: bool = False,
+                               final_message: str | None = None,
+                               final_message_key: str = '',
+                               session_id: str = '',
+                               snapshot_schema: int | None = None) -> bool:
         """带租约与**要求版本**条件地写 run 终态。返回 False = 已失去执行权(不写)。
 
         收尾也必须过版本门禁（文档 §5 第十一步）：旧版本跑出来的"完成"不能
         盖在新要求上面。若用户在收尾前补了一句要求，这里抛 `IntentChanged`——
         调用方应当回到消费循环，而不是把这个 run 标成结束。
+
+        第七阶段：可选的 `final_message` / `final_message_key` / `session_id` 让
+        最终答复在**同一事务**里提交，并用稳定去重键（`(session_id, dedupe_key)`
+        唯一索引）保证恢复补收尾不会重复追加最终消息。
         """
         from webpage_agent.governance import execution_control
 
         async with self._lease() as conn:
             try:
-                row = await self._owned(conn, context, run_id=run_id)
+                # 第七阶段收口：终态只允许从 running/paused 进入。已持久化终态
+                # （succeeded/failed/cancelled/needs_reconcile 等）不得被迟到
+                # 消息覆盖——require_status 让重复收尾抛 LeaseLost。
+                row = await self._owned(conn, context, run_id=run_id,
+                                        require_status=('running', 'paused'))
             except execution_control.LeaseLost:
                 return False
             if row is None:
@@ -381,6 +609,29 @@ class PgActions:
             sets = ['status=%s', 'error=%s', 'updated_at=%s',
                     'lease_owner=NULL', 'lease_expires_at=NULL']
             args: list = [status, error, now()]
+            # 第八阶段收口第 5 点：宿主「进入等待」收尾时，**同事务重新检查外部
+            # 结果**。若外部任务在收尾前已被 poller 抢先推进到终态（完成先于等待
+            # 收尾的竞态），则不能把 run 写成 waiting_external——否则外部任务已
+            # 终态、run 却永久等待（没人再触发唤醒）。此时按终态改写：completed
+            # → queued（宿主吸收结果），failed/cancelled/needs_reconcile →
+            # needs_reconcile。
+            if status == 'waiting_external':
+                ext_states = await self._all(
+                    conn, 'SELECT state FROM external_tasks WHERE run_id=%s',
+                    (run_id,))
+                states = {str(r.get('state') or '') for r in ext_states}
+                if states:
+                    if states & {'failed', 'cancelled', 'needs_reconcile'}:
+                        status = 'needs_reconcile'
+                        error = '外部任务已结束但结果不可交付，需核实'
+                    elif not (states & {'accepted', 'running', 'materializing'}):
+                        # 全部 completed（或已终态但无失败）：放回队列吸收结果。
+                        status = 'queued'
+                        error = ''
+                sets[0] = 'status=%s'
+                sets[1] = 'error=%s'
+                args[0] = status
+                args[1] = error
             if compensated_at is not None:
                 sets.append('compensated_at=%s')
                 args.append(compensated_at)
@@ -398,7 +649,15 @@ class PgActions:
                     state=state, conn=conn, intent_version=current_intent,
                     processed_intent_version=int(
                         row.get('processed_intent_version') or 0),
-                    observation_seq=observation_seq, next_route=next_route)
+                    observation_seq=observation_seq, next_route=next_route,
+                    snapshot_schema=snapshot_schema)
+            # 最终答复与终态同事务提交，按稳定去重键幂等（第七阶段）。
+            if final_message is not None and session_id:
+                await self._run(
+                    conn, 'INSERT INTO messages '
+                    '(session_id, role, content, created_at, dedupe_key) '
+                    "VALUES (%s, 'assistant', %s, %s, %s) ON CONFLICT DO NOTHING",
+                    (session_id, final_message, now(), final_message_key or ''))
             return True
 
     async def pause_at_boundary(self, context, *, run_id: str, plan_version: int,
@@ -501,30 +760,44 @@ class PgActions:
                                      step_id: str, action_id: str,
                                      accepted_result_id: str, submission_key: str,
                                      item_key: str = '', deadline_at: float = 0.0,
-                                     next_poll_at: float = 0.0) -> dict:
+                                     next_poll_at: float = 0.0,
+                                     conn=None) -> dict:
         """登记一个已受理的外部任务。
 
         唯一约束 `(run_id, action_id, item_key)` 保证**同一个动作只登记一次**：
         重复提交不会变成两个任务（那意味着两份费用）。
+
+        第八阶段第 4 点：`conn` 允许复用外部事务连接（在 `settle_action` 同一
+        事务里登记），**不能自行 commit**——事务边界由调用方持有。传入 `conn`
+        时只在事务里执行语句；不传时走 `self._lease()` 自己开事务。
         """
         stamp = now()
+        sql = ('INSERT INTO external_tasks '
+               '(external_task_id, remote_task_id, tenant_id, owner_user_id, '
+               ' server_binding_id, credential_binding, credential_subject, '
+               ' tool_key, contract_id, contract_version, run_id, step_id, action_id, '
+               ' accepted_result_id, submission_key, item_key, state, version, '
+               ' next_poll_at, deadline_at, last_observed_at, created_at, updated_at) '
+               'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) '
+               'ON CONFLICT (run_id, action_id, item_key) DO NOTHING RETURNING *')
+        params = (external_task_id, remote_task_id, tenant_id, owner_user_id,
+                  server_binding_id, credential_binding, credential_subject,
+                  tool_key, contract_id, int(contract_version), run_id, step_id,
+                  action_id, accepted_result_id, submission_key, item_key,
+                  'accepted', 1, float(next_poll_at), float(deadline_at),
+                  time.time(), stamp, stamp)
+        if conn is not None:
+            row = await self._one(conn, sql, params)
+            if row is None:
+                # 已登记过：返回既有行（不新建）
+                existing = await self._one(
+                    conn,
+                    'SELECT * FROM external_tasks WHERE run_id=%s AND action_id=%s '
+                    'AND item_key=%s', (run_id, action_id, item_key))
+                return dict(existing) if existing else {}
+            return dict(row)
         async with self._lease() as conn:
-            row = await self._one(
-                conn,
-                'INSERT INTO external_tasks '
-                '(external_task_id, remote_task_id, tenant_id, owner_user_id, '
-                ' server_binding_id, credential_binding, credential_subject, '
-                ' tool_key, contract_id, contract_version, run_id, step_id, action_id, '
-                ' accepted_result_id, submission_key, item_key, state, version, '
-                ' next_poll_at, deadline_at, last_observed_at, created_at, updated_at) '
-                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) '
-                'ON CONFLICT (run_id, action_id, item_key) DO NOTHING RETURNING *',
-                (external_task_id, remote_task_id, tenant_id, owner_user_id,
-                 server_binding_id, credential_binding, credential_subject,
-                 tool_key, contract_id, int(contract_version), run_id, step_id,
-                 action_id, accepted_result_id, submission_key, item_key,
-                 'accepted', 1, float(next_poll_at), float(deadline_at),
-                 time.time(), stamp, stamp))
+            row = await self._one(conn, sql, params)
             if row is None:
                 # 已经登记过：返回既有行（不新建）
                 existing = await self._one(
@@ -566,23 +839,37 @@ class PgActions:
 
     async def claim_external_task_poll(self, external_task_id: str, owner: str,
                                        lease_seconds: float = 60.0) -> dict | None:
-        """领取一次轮询（带代次）。旧 Worker 不能覆盖新结果。"""
+        """领取一次轮询（带代次）。旧 Worker 不能覆盖新结果。
+
+        第八阶段第 6 点：领取时**重新检查开放状态**（accepted/running/
+        materializing）与**到期时间**（next_poll_at 已到、deadline 未超），
+        并做租约可用性检查。只有仍开放、且上一轮租约已释放/过期才可领取。
+        """
         current = time.time()
         async with self._lease() as conn:
             row = await self._one(
                 conn,
-                'UPDATE external_tasks SET poll_owner=%s, poll_epoch=poll_epoch+1, '
+                "UPDATE external_tasks SET poll_owner=%s, poll_epoch=poll_epoch+1, "
                 'poll_lease_expires_at=%s, updated_at=%s '
-                "WHERE external_task_id=%s AND (poll_owner IS NULL "
-                " OR poll_owner='' OR poll_lease_expires_at < %s) RETURNING *",
+                "WHERE external_task_id=%s "
+                "AND state IN ('accepted','running','materializing') "
+                'AND next_poll_at <= %s '
+                "AND (poll_owner IS NULL OR poll_owner='' "
+                '    OR poll_lease_expires_at < %s) RETURNING *',
                 (owner, current + float(lease_seconds), now(), external_task_id,
-                 current))
+                 current, current))
             await conn.commit()
             return dict(row) if row else None
 
     async def finish_external_poll(self, external_task_id: str, epoch: int,
-                                   **fields) -> dict | None:
-        """结束这一轮查询。代次对不上就什么都不写，避免旧轮询覆盖新结果。"""
+                                   owner: str = '', **fields) -> dict | None:
+        """结束这一轮查询。代次对不上就什么都不写，避免旧轮询覆盖新结果。
+
+        第八阶段收口第 6 点：写回时检查 **owner、epoch、有效期
+        （poll_lease_expires_at）及允许的状态迁移**。旧 poller（epoch 不符 /
+        owner 不符 / 租约已过期）、重复完成、失租分支都不得写回——条件不满足
+        返回 None，调用方据此**不得**继续更新快照或唤醒 run。
+        """
         allowed = ('state', 'version', 'next_poll_at', 'deadline_at',
                    'last_observed_at', 'last_result_id', 'output_manifest_ref',
                    'error_code', 'remote_task_id')
@@ -593,12 +880,14 @@ class PgActions:
                 continue
             sets.append(f'{key}=%s')
             params.append(value)
-        params.extend([now(), external_task_id, int(epoch)])
+        params.extend([now(), external_task_id, int(epoch), owner, time.time()])
         async with self._lease() as conn:
             row = await self._one(
                 conn,
                 f"UPDATE external_tasks SET {', '.join(sets)}, updated_at=%s "
-                'WHERE external_task_id=%s AND poll_epoch=%s RETURNING *',
+                'WHERE external_task_id=%s AND poll_epoch=%s '
+                'AND poll_owner=%s '
+                'AND poll_lease_expires_at > %s RETURNING *',
                 tuple(params))
             await conn.commit()
             return dict(row) if row else None

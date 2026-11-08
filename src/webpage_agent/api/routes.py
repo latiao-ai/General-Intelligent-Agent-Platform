@@ -193,6 +193,20 @@ class RunInputRequest(StrictBody):
     task_id: str | None = Field(default=None, max_length=64)
 
 
+class SessionMessageRequest(StrictBody):
+    """会话消息（第十一阶段正式会话入口）：一句话，路由成聊天/查询/控制。
+
+    `request_id` 由客户端生成并持久保存：响应丢失时用同一个 ID 重发，返回原 turn
+    （不重复建 turn）；同一 ID 不同载荷返回 409。
+    `target_task_id` 是**显式目标**：给了才视为「明确目标」，否则由服务端按
+    活动任务数判断（单个活动任务 + 控制动词 → 明确；多个 → 追问）。
+    """
+    request_id: str = Field(min_length=1, max_length=64,
+                            pattern=r'^[A-Za-z0-9_.:-]+$')
+    message: str = Field(min_length=1, max_length=10000)
+    target_task_id: str | None = Field(default=None, max_length=64)
+
+
 class PlatformContextRequest(StrictBody):
     """Any registered platform can preview its signed scene without starting work."""
     context: dict | None = None
@@ -956,6 +970,30 @@ async def delete_memory(session_id: str,
 async def list_sessions(principal=Depends(policies.current_principal)):
     """会话列表（侧边栏用）：按最近活跃排序，含标题与消息数。"""
     return {'sessions': await hub.list_sessions(principal=principal)}
+
+
+@app.post('/api/sessions/{session_id}/messages', status_code=202)
+async def post_session_message(session_id: str, payload: SessionMessageRequest,
+                               principal=Depends(policies.current_principal)):
+    """会话消息入口：接纳后立即返回 202，不等待模型完成。
+
+    同一 request_id + 同一载荷返回原 turn（replayed）；同一 request_id 不同载荷
+    返回 409。路由成聊天/查询/控制，闲聊不建任务、不更新任何 intent_version。
+    """
+    from webpage_agent.store.pg_store import TurnRequestConflict
+    from webpage_agent.api.hub_messages import CapabilityDisabled
+    try:
+        result = await hub.accept_session_message(
+            session_id, request_id=payload.request_id, message=payload.message,
+            target_task_id=payload.target_task_id or '', principal=principal)
+    except TurnRequestConflict:
+        raise HTTPException(status_code=409,
+                            detail='该 request_id 已用于不同内容的请求') from None
+    except PermissionError:
+        raise HTTPException(status_code=404, detail='会话不存在') from None
+    except CapabilityDisabled as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from None
+    return result
 
 
 @app.get('/api/sessions/{session_id}/messages')

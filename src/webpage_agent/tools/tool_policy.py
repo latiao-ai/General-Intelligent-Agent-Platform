@@ -214,20 +214,42 @@ def filter_catalog(tools, policies, *, tenant_id: str, role: str = '',
 # ---------- 准入判定（P4） ----------
 
 def scope_satisfied(scope: str, args: dict | None) -> bool:
-    """资源范围是逗号分隔的字段名时，这些字段必须出现在最终参数里。
+    """资源范围与**最终参数**做值比较（第十阶段第 3 点）。
 
-    空范围表示不额外限制。写成句子的范围只是说明，不在这里当表达式执行。
+    支持两种约束（逗号分隔）：
+
+    - `field`：该字段必须出现在最终参数里且非空（旧语义，保留兼容）；
+    - `field=value`：该字段必须等于指定值（**对象级隔离**）——可信约束由
+      政策表声明，模型参数里的实际值必须与之一致，不能用「字段非空」冒充
+      已授权对象。
+
+    空范围、`*`、`any` 表示不额外限制。写成句子的范围只是说明，不在这里当
+    表达式执行（旧语义保持不变）。
     """
     import re
     text = (scope or '').strip()
     if not text or text in ('*', 'any'):
         return True
-    if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*(,[A-Za-z_][A-Za-z0-9_]*)*', text):
-        return True
     values = args or {}
-    for name in text.split(','):
-        if values.get(name) in (None, ''):
-            return False
+    for clause in text.split(','):
+        clause = clause.strip()
+        if not clause:
+            continue
+        if '=' in clause:
+            # 值约束：字段值必须等于约束值（对象级隔离）
+            name, _, expected = clause.partition('=')
+            name = name.strip()
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', name):
+                return False
+            actual = values.get(name)
+            if actual is None or str(actual) != str(expected):
+                return False
+        else:
+            # 字段存在约束：字段必须出现在参数里且非空（旧语义）
+            if not re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', clause):
+                return False
+            if values.get(clause) in (None, ''):
+                return False
     return True
 
 

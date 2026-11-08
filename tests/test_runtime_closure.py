@@ -259,10 +259,28 @@ class _MemoryStore:
         self.task['poll_epoch'] = int(self.task['poll_epoch']) + 1
         return dict(self.task)
 
-    async def finish_external_poll(self, external_task_id, epoch, **fields):
+    async def finish_external_poll(self, external_task_id, epoch, owner='',
+                                   **fields):
         if int(epoch) != int(self.task['poll_epoch']):
             return None
         self.task.update(fields)
+        return dict(self.task)
+
+    async def complete_external_task_and_wake(self, external_task_id, epoch, *,
+                                              owner='', state,
+                                              output_manifest_ref='',
+                                              last_result_id='', error_code='',
+                                              staged=None, envelope=None):
+        # 第八阶段：poller 不直接改写快照，只做「终态 + 唤醒 run」同事务。
+        self.task['state'] = state
+        self.task['error_code'] = error_code
+        # 与真实仓储一致：无条件写 output_manifest_ref / last_result_id。
+        self.task['output_manifest_ref'] = output_manifest_ref
+        self.task['last_result_id'] = last_result_id
+        if state == 'completed':
+            self.run_row['status'] = 'queued'
+        elif state in ('failed', 'cancelled', 'needs_reconcile'):
+            self.run_row['status'] = 'needs_reconcile'
         return dict(self.task)
 
     async def run(self, run_id):
@@ -327,8 +345,8 @@ class PollTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submits['n'], 1)
         self.assertEqual(store.task['state'], 'completed')
         self.assertEqual(store.run_row['status'], 'queued')
-        self.assertEqual(store.snapshot['state']['tool_results'][0]['phase'],
-                         'completed')
+        # 第八阶段：poller 不再直接改写快照，结果由宿主吸收后再注入 toolResult。
+        self.assertIn('output_manifest_ref', store.task)
 
 
 class ContractFileTests(unittest.TestCase):

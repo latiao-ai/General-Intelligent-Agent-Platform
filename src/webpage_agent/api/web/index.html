@@ -950,6 +950,61 @@ async function postTask(text, key) {
   }
 }
 
+// 会话消息入口（第十一阶段）：普通输入统一提交到这里，服务端路由成聊天/查询/
+// 控制。requestId 复用原 ID 重试，服务端返回原 turn 而不是重复接纳。
+async function postSessionMessage(text, requestId, targetTaskId) {
+  const options = {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({request_id: requestId, message: text,
+                          ...(targetTaskId ? {target_task_id: targetTaskId} : {})}),
+  };
+  const url = `${API_PREFIX}/sessions/${S.sessionId}/messages`;
+  try {
+    return await checkAuth(await fetch(url, options));
+  } catch (err) {
+    // 网络层失败：请求可能已到服务端，复用原 requestId 重试一次
+    return await checkAuth(await fetch(url, options));
+  }
+}
+
+// 聊天 turn 终态：这些状态下 Worker 已经执行完、答复已落库，可以停止轮询。
+function chatTurnDone(status) {
+  return ['succeeded', 'failed', 'waiting_clarification', 'cancelled']
+    .includes(status);
+}
+
+// 轮询 timeline，直到该 turn 执行出终态（第十一阶段第 7 点 / A 组第 4 点）。
+// 消息 POST 只持久接纳，答复由 Worker 后台生成；只在发送后拉一次时间线会看不到
+// 后台生成的答复。这里按 turn_id 轮询，终态后刷新会话，刷新/重试复用原 request ID。
+//
+// A 组第 4 点：多 turn 并存——用 `S.sessionId` 判断是否切走，**不用 sessionEpoch**。
+// 否则第一个 turn 完成触发 openSession 会递增 epoch，把其他 pending turn 的轮询
+// 全部误杀（"一个 turn 完成使其他轮询失效"）。
+async function pollChatReply(turnId, sessionId) {
+  const deadline = Date.now() + 120000;   // 最多轮询 120s
+  while (Date.now() < deadline) {
+    if (S.sessionId !== sessionId) return;  // 用户已切走，放弃本次轮询
+    await new Promise(r => setTimeout(r, 800));
+    try {
+      const res = checkAuth(await fetch(
+        `${API_PREFIX}/sessions/${sessionId}/timeline`));
+      if (!res.ok) continue;
+      const data = await res.json();
+      const turn = (data.chat_turns || []).find(t => t.turn_id === turnId);
+      if (turn && chatTurnDone(turn.status)) {
+        // 终态：幂等全量刷新（openSession 是幂等的，重复调用安全）
+        if (S.sessionId === sessionId) {
+          openSession(sessionId, {keepWorkspace: true});
+        }
+        return;
+      }
+    } catch { /* 网络抖动，下一轮继续 */ }
+  }
+  // 超时兜底：最后再拉一次，至少不丢已经落库的答复
+  if (S.sessionId === sessionId) openSession(sessionId, {keepWorkspace: true});
+}
+
 // 给**当前任务**补一句要求。
 // 关键：不打断、不新建任务、不换 EventSource——原任务继续跑，只是下个边界改计划。
 // requestId 会跟着这一条消息走到最后：网络失败重试时必须复用同一个 ID，
@@ -966,8 +1021,9 @@ async function postRunInput(text, requestId) {
   try {
     return await checkAuth(await fetch(url, options));
   } catch (err) {
-    // 网络层失败：请求可能已经到了服务端，用同一个 requestId 再试一次
-    return await fetch(url, options);
+    // 网络层失败：请求可能已经到了服务端，用同一个 requestId 再试一次。
+    // 重试也必须过 checkAuth，否则 401 时不会触发登录失效处理（A 组第 4 点）。
+    return await checkAuth(await fetch(url, options));
   }
 }
 
@@ -1061,34 +1117,52 @@ async function send() {
   const text = $('msg').value.trim();
   if (!text) return;
   $('msg').value = '';
-  // 目标还没结束（在跑，或停在等人/等批准/暂停/待核实）：这句话是补充。
-  // 只有目标已经结束，发送才会在当前会话里开一轮新任务。
-  if (goalOpen()) {
-    const requestId = addInputBubble(text);
-    const resumeWait = !S.running && S.runStatus === 'waiting_input';
-    $('send').disabled = true;
-    W.sending = true;
-    workspaceControls();
-    try {
-      if (resumeWait) {
-        setRunning(true);
-        startNewTurn();
-        openStream(S.taskId);
+  // 第十一阶段：普通输入统一走会话消息入口（服务端路由成聊天/查询/控制），
+  // **不再**因「存在开放任务」就把输入自动当成补充投递——那会把闲聊也塞进
+  // 正在跑的业务任务。明确目标的补充/控制保留独立入口（run 卡片上的按钮）。
+  await sendSessionMessage(text);
+}
+
+async function sendSessionMessage(text) {
+  W.sending = true;
+  workspaceControls();
+  addMessage('user', text);
+  $('send').disabled = true;
+  const requestId = newIdempotencyKey();
+  try {
+    const res = await postSessionMessage(text, requestId, null);
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      if (res.status === 409) {
+        // 同一 requestId 已用于不同内容（理论上不会：requestId 每次新生成）。
+        addMessage('assistant', '请求冲突，请重新发送。');
+      } else {
+        const detail = typeof data.detail === 'string' ? data.detail : '';
+        throw new Error(res.status === 401
+          ? '请先通过平台登录，再进入智能体。'
+          : (detail || ('HTTP ' + res.status)));
       }
-      const ok = await sendRunInput(text, requestId);
-      if (!ok) {
-        $('msg').value = text;      // 没提交成功就把草稿还回去
-        if (resumeWait) setRunning(false);
+    } else {
+      // 接纳成功：kind 是 chat/query/control/ambiguous，turn 已在后台处理。
+      if (data.kind === 'ambiguous') {
+        addMessage('assistant', '你说的目标有多个任务，请指明要操作哪一个。');
       }
-    } finally {
-      W.sending = false;
-      $('send').disabled = false;
-      workspaceControls();
-      $('msg').focus();
+      // Worker 在后台异步执行 turn、生成答复。这里**不能只拉一次时间线**——
+      // 否则后台生成的答复对用户不可见。按 turn_id 轮询直到终态再刷新。
+      if (data.turn_id && S.sessionId) {
+        pollChatReply(data.turn_id, S.sessionId);
+      } else if (S.sessionId) {
+        openSession(S.sessionId, {keepWorkspace: true});
+      }
     }
-    return;
+  } catch (err) {
+    addMessage('assistant', '提交失败：' + err.message);
+    if (!$('msg').value) $('msg').value = text;
+  } finally {
+    W.sending = false;
+    $('send').disabled = false;
+    workspaceControls();
   }
-  await startNewTask(text);
 }
 
 async function startNewTask(text) {
@@ -1111,13 +1185,8 @@ async function startNewTask(text) {
     const res = checkAuth(await postTask(text, idempotencyKey));
     if (!res.ok) {
       const error = await res.json().catch(() => ({}));
-      if (res.status === 409 && error.detail?.code === 'session_goal_open') {
-        await openSession(S.sessionId, {keepWorkspace: true});
-        S.taskId = error.detail.task_id; S.runId = error.detail.run_id;
-        const requestId = addInputBubble(text);
-        if (!await sendRunInput(text, requestId) && !$('msg').value) $('msg').value = text;
-        return;
-      }
+      // 第十一阶段：**不再**在 409 session_goal_open 时自动把输入改投成对旧任务
+      // 的补充。明确目标的补充/控制走独立入口；普通输入统一走 messages 入口。
       const detail = typeof error.detail === 'string' ? error.detail : '';
       throw new Error(res.status === 401
         ? '请先通过平台登录，再进入智能体。'

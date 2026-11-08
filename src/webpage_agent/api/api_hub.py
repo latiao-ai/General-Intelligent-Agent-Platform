@@ -53,9 +53,11 @@ from webpage_agent.api.hub_session import HubSessionMixin
 from webpage_agent.api.hub_inputs import HubInputsMixin
 from webpage_agent.api.hub_compensation import HubCompensationMixin
 from webpage_agent.api.hub_recovery import HubRecoveryMixin, _resume_index
+from webpage_agent.api.hub_messages import HubSessionMessageMixin
 
 
-class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixin):
+class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
+          HubCompensationMixin, HubRecoveryMixin):
     """会话与任务注册表。持久部分在 PostgreSQL，实时队列通过数据库通知跨进程补读。"""
 
     # 内存里最多留多少个任务记录（查过的历史任务不必永久驻留）
@@ -244,6 +246,11 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
         epoch = int(run.get('lease_epoch') or 0)
         owner = str(run.get('lease_owner') or '')
 
+        # 第七阶段：在读取/解释旧计划之前先确定运行时。未知引擎或版本不兼容
+        # 在这里抛异常（不回退默认引擎），由上层收尾。
+        from webpage_agent.agent import runtime_identity
+        runtime_kind = await runtime_identity.resolve_kind(self.store, run_id)
+
         task = await self.store.task(task_id)
         if task is None:
             # 执行者收尾：带上领取时的 owner + epoch。若此刻已被别人接手，
@@ -279,46 +286,54 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
 
         # 计划：有就恢复，没有才规划。**空计划不等于"没有计划"**——
         # `{'steps': []} or None` 会得到一个非空字典，正是旧代码的坑。
-        plan = await self.store.plan(run_id) or {}
-        steps = plan.get('steps') or []
-        actions = await self.store.actions_of(run_id)
-        snapshot_state = await self._recovery_state(run_id)
-        waiting = {
-            'asked_questions': [str(q) for q in (snapshot_state.get('asked_questions') or [])
-                                if str(q).strip()],
-            'clarification': str(snapshot_state.get('clarification') or ''),
-            'intent_version': int(run.get('intent_version') or 0),
-            'processed_intent_version': int(run.get('processed_intent_version') or 0),
-        }
-        if steps:
-            plan_version = int(plan.get('version') or 1)
-            context = context.with_plan_version(plan_version)
-            resume_plan = {'steps': steps, 'summary': plan.get('goal') or '续跑',
-                           'plan_version': plan_version,
-                           'step_index': _resume_index(steps, actions),
-                           **waiting}
-            if actions:
-                # 落库 + 投递都要 await：这里本来就在协程里，"同步投递"只会
-                # 得到一个没被 await 的协程（事件静默丢失）。
-                await record.publish(action(
-                    '沿用已提交的计划',
-                    f'{len(steps)} 步 · 第 {resume_plan["step_index"] + 1} 步继续',
-                    '↩️'))
-        elif actions:
-            # 有动作却没有计划：这不该发生。**不能拿新规划冒充恢复**——那会绕开
-            # 原有动作身份，可能重复副作用。
-            logger.error('run %s 有 %s 个动作但没有计划，转待核实',
-                         run_id, len(actions))
-            # 执行者收尾：这是我们领到的 run，写结论必须带上自己的租约
-            await self.store.update_run_owned(
-                run_id, lease_owner=owner, lease_epoch=epoch,
-                status='needs_reconcile', error='有动作但缺失计划，需人工核实')
-            record.status = 'needs_reconcile'
-            await record.persist(status='needs_reconcile', state=record.state)
-            return record
+        # 第七阶段：这段「图计划 + 步骤游标」的恢复解释**只属于 LangGraph**。
+        # Pi 有动作却没有「图计划」是**正常状态**——它有自己的版本化快照装配，
+        # 不套用「有动作但没有图计划就异常」这条 LangGraph 规则。
+        if runtime_kind == runtime_identity.KIND_LANGGRAPH:
+            plan = await self.store.plan(run_id) or {}
+            steps = plan.get('steps') or []
+            actions = await self.store.actions_of(run_id)
+            snapshot_state = await self._recovery_state(run_id)
+            waiting = {
+                'asked_questions': [str(q) for q in (snapshot_state.get('asked_questions') or [])
+                                    if str(q).strip()],
+                'clarification': str(snapshot_state.get('clarification') or ''),
+                'intent_version': int(run.get('intent_version') or 0),
+                'processed_intent_version': int(run.get('processed_intent_version') or 0),
+            }
+            if steps:
+                plan_version = int(plan.get('version') or 1)
+                context = context.with_plan_version(plan_version)
+                resume_plan = {'steps': steps, 'summary': plan.get('goal') or '续跑',
+                               'plan_version': plan_version,
+                               'step_index': _resume_index(steps, actions),
+                               **waiting}
+                if actions:
+                    # 落库 + 投递都要 await：这里本来就在协程里，"同步投递"只会
+                    # 得到一个没被 await 的协程（事件静默丢失）。
+                    await record.publish(action(
+                        '沿用已提交的计划',
+                        f'{len(steps)} 步 · 第 {resume_plan["step_index"] + 1} 步继续',
+                        '↩️'))
+            elif actions:
+                # 有动作却没有计划：这不该发生。**不能拿新规划冒充恢复**——那会绕开
+                # 原有动作身份，可能重复副作用。
+                logger.error('run %s 有 %s 个动作但没有计划，转待核实',
+                             run_id, len(actions))
+                # 执行者收尾：这是我们领到的 run，写结论必须带上自己的租约
+                await self.store.update_run_owned(
+                    run_id, lease_owner=owner, lease_epoch=epoch,
+                    status='needs_reconcile', error='有动作但缺失计划，需人工核实')
+                record.status = 'needs_reconcile'
+                await record.persist(status='needs_reconcile', state=record.state)
+                return record
+            else:
+                # 停在追问、计划还没提交：下一轮仍要带着问过的问题和版本，不能从零规划
+                resume_plan = waiting
         else:
-            # 停在追问、计划还没提交：下一轮仍要带着问过的问题和版本，不能从零规划
-            resume_plan = waiting
+            # Pi：用自己的版本化快照装配恢复（第七阶段）。不读 plans/steps，
+            # 不套 LangGraph 的「有动作但没图计划就异常」。
+            resume_plan = await self._pi_resume_plan(run_id, run)
 
         history = await self.history(record.session_id)
         prior = await self.prior_context(record.session_id)
@@ -330,7 +345,11 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
         # 所有步骤都已结算、但 run 没来得及收尾（进程在"最后一次结算"与
         # "写终态"之间消失）：这里只剩收尾，**不能**再跑一遍图——图拿不到
         # 上一次的 step_outputs，只会得出"什么都没有产出"（文档 §5.4）。
-        if resume_plan and resume_plan.get('steps') and resume_plan['step_index'] >= len(resume_plan['steps']) \
+        # 这条「看快照收尾」的捷径也只属于 LangGraph 的步骤游标；Pi 的
+        # 收尾决策走它自己的快照与恢复决策表。
+        if runtime_kind == runtime_identity.KIND_LANGGRAPH \
+                and resume_plan and resume_plan.get('steps') \
+                and resume_plan['step_index'] >= len(resume_plan['steps']) \
                 and not self._needs_observation():
             snapshot = await self._recovery_state(run_id)
             if not snapshot.get('step_outputs'):
@@ -665,8 +684,13 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
     async def _finish_run(self, record: TaskRecord, state: dict, status: str, *,
                           context=None,
                           expected_intent_version: int | None = None,
-                          require_pending_clear: bool = True) -> None:
+                          require_pending_clear: bool = True,
+                          final_message: str | None = None,
+                          final_message_key: str = '') -> bool:
         """把 run 收尾，并把计划与步骤落库，供续跑与界面查询。
+
+        返回 True 表示终态已提交；返回 False 表示**失租**（finish_run_owned 落空），
+        调用方据此**禁止追加最终消息**（第七阶段）。
 
         `status` 必须是**通用**状态：run 层不认识 `local_ready` 这类展示词。
         以前这里用 `RUN_STATUS_OF.get(status, status)` 折算，兜底会让新业务词
@@ -733,19 +757,51 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
             fields['error'] = state['failure']
         if context is not None and context.lease_owner:
             # 有执行权就走带门禁的收尾：版本 + 待处理补充一起校验，一次事务。
+            # 第七阶段收口：Pi run 的终态快照必须标注版本化 Pi 快照 schema，
+            # 否则 finish_run_owned 会把 Pi 快照覆盖成普通 state（schema=1）。
+            # 第八阶段第 1 点：Pi 收尾提交**真正的版本化 Pi 快照**（来自
+            # runtime 序列化到 state['_pi_snapshot'] 的结构），而不是给普通宿主
+            # state 打 Pi schema 标签——普通 state 没有 messages/pending_calls/
+            # checkpoint_seq 等恢复事实，恢复会拿它当 Pi 快照解析失败或错乱。
+            from webpage_agent.agent import runtime_identity
+            from webpage_agent.agent import pi_snapshot
+            is_pi = bool(state.get('_pi_snapshot')) or bool(state.get('pi_resume'))
+            snapshot_state = state
+            if is_pi:
+                raw_snapshot = state.get('_pi_snapshot')
+                if isinstance(raw_snapshot, dict):
+                    # 真正的版本化 Pi 快照：再规整一次（剥离任何混入的宿主字段），
+                    # 保证落库的是最小完整的 Pi 快照，而不是普通 state。
+                    try:
+                        snapshot_state = pi_snapshot.serialize(raw_snapshot)
+                    except Exception:      # noqa: BLE001
+                        snapshot_state = raw_snapshot
             try:
-                await self.store.finish_run_owned(
+                committed = await self.store.finish_run_owned(
                     context, run_id=record.run_id, status=run_status,
-                    error=fields.get('error'), state=state,
+                    error=fields.get('error'), state=snapshot_state,
                     observation_seq=int(state.get('observation_seq') or 0),
                     next_route=str(state.get('next_route') or ''),
                     expected_intent_version=expected_intent_version,
                     plan_version=fields['plan_version'],
                     compensated_at=fields.get('compensated_at'),
-                    require_no_pending_inputs=require_pending_clear)
+                    require_no_pending_inputs=require_pending_clear,
+                    final_message=final_message,
+                    final_message_key=final_message_key,
+                    session_id=record.session_id,
+                    snapshot_schema=(runtime_identity.PI_STATE_SCHEMA
+                                     if is_pi else None))
             except execution_control.LeaseLost:
                 logger.warning('run %s 收尾时已失租，不写终态', record.run_id)
-                return
+                return False
+            if not committed:
+                # 第七阶段：finish_run_owned 返回 False = 已失租（内部吞了
+                # LeaseLost）。失租后**禁止继续追加最终消息**——这一笔落空，
+                # 最终答复/消息由新执行者按恢复决策补收尾，这里直接返回。
+                logger.warning('run %s 收尾时已失租（finish_run_owned=False），'
+                               '禁止追加最终消息', record.run_id)
+                record._lease_lost = True
+                return False
             # 这里**只动 runs 行**，不动 record.status：`tasks` 行要等调用方的
             # persist() 才写。提前把内存置成终态会开一个窗口——record.done 已经
             # 为真、库里 tasks.status 还是 queued，回放接口按库读就显示"已完成
@@ -756,11 +812,17 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
             # 所以这段不是"绕过 fencing 的后门"，而是"本来就没有租约可校验"。
             # 若将来出现新的无上下文生产调用点，那是设计错误，应当补 claim 而不是加到这里。
             await self.store.update_run(record.run_id, **fields)
+            # 无上下文路径的最终答复也按稳定去重键幂等落库（第七阶段）。
+            if final_message is not None:
+                await self.store.append_message(
+                    record.session_id, 'assistant', final_message,
+                    dedupe_key=final_message_key)
         # outbox：业务事件与派生作业在同一处写入，消费者按 dedupe_key 幂等
         await self.store.enqueue_job(
             uuid.uuid4().hex[:12], 'session_summary',
             f"{record.session_id}:{record.run_id}",
             {'session_id': record.session_id})
+        return True
 
     async def get(self, task_id: str) -> TaskRecord | None:
         """Refresh passive records from PostgreSQL; another worker may have changed them."""
@@ -813,12 +875,20 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
         跨进程不能直接 cancel 一个 asyncio.Task，只能往库里写标记，由持有租约
         的执行者在自己那一侧轮询到再停（见 `_guard`）。以前这里只看内存、却
         无条件把 run 标成 cancelled —— 进程外的任务其实还在跑，界面说停了。
+
+        第八阶段收口第 7 点：也接受 `waiting_external`（持久等待中的 run）。等待
+        中的 run 没有活跃执行者，取消要**持久化取消意图**，再对每个开放的外部
+        任务发远端取消请求并查询确认（区分本地停止 / 远端取消请求 / 远端确认
+        取消）。远端不支持取消时如实保留状态，不声称已取消。
         """
         run = await self.store.run(run_id)
-        if run is None or run['status'] not in {'queued', 'running', 'reconciling'}:
+        if run is None or run['status'] not in {'queued', 'running', 'reconciling',
+                                                 'waiting_external'}:
             return False
         if run.get('cancel_requested_at'):
             return True
+        if run['status'] == 'waiting_external':
+            return await self._cancel_waiting_run(run_id, run)
         record = self.tasks.get(run['task_id'])
         if record is not None and record.live and record.run_id == run_id:
             record._task.cancel()
@@ -827,6 +897,42 @@ class Hub(HubSessionMixin, HubInputsMixin, HubCompensationMixin, HubRecoveryMixi
         # 由持有租约的一方在自己那一侧读到再停。
         await self.store.update_run(run_id, cancel_requested_at=now())
         logger.info('run %s 已写入取消请求（执行者在其他进程）', run_id)
+        return True
+
+    async def _cancel_waiting_run(self, run_id: str, run: dict) -> bool:
+        """取消一个持久等待中的 run：持久化取消意图 + 远端取消请求 + 查询确认。
+
+        第八阶段收口第 7 点：区分三种情况——
+        - **本地停止**：run 侧标 cancel_requested_at，不再被唤醒；
+        - **远端取消请求**：对每个开放外部任务调合同取消能力（请求可能失败）；
+        - **远端确认取消**：查询确认后 external task 标 cancelled，run 进
+          cancelled/needs_reconcile。远端不支持取消时如实保留 waiting_external，
+          **不声称任务已取消**。
+        """
+        from webpage_agent.core import external_tasks as ext
+        # 先本地登记取消意图（run 侧）：不再被 complete 唤醒。
+        await self.store.update_run(run_id, cancel_requested_at=now())
+        tasks = await self.store.external_tasks_of_run(run_id)
+        open_tasks = [t for t in tasks
+                      if str(t.get('state') or '') in ('accepted', 'running',
+                                                       'materializing')]
+        confirmed_cancel = 0
+        for task in open_tasks:
+            result = await ext.request_external_cancel(
+                self.store, external_task_id=str(task.get('external_task_id') or ''),
+                worker_id=f'cancel-{run_id}')
+            if result.get('confirmed'):
+                confirmed_cancel += 1
+        if confirmed_cancel:
+            # 所有开放任务都已确认取消 → run 标记 cancelled（不复活、不误报）。
+            await self.store.update_run(run_id, status='cancelled',
+                                        waiting_external=0,
+                                        cancel_requested_at=now())
+            logger.info('run %s 等待中的外部任务已确认取消', run_id)
+            return True
+        # 远端未确认取消 / 不支持取消：如实保留状态（仍是 waiting_external），
+        # 不声称已取消——由后续轮询或人工核实决定结局。
+        logger.info('run %s 取消意图已登记，远端取消未确认（保留等待状态）', run_id)
         return True
 
     async def close(self) -> None:

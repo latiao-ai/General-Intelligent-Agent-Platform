@@ -28,3 +28,18 @@ class BudgetExceeded(RuntimeError):
     def __init__(self, message: str = '运行预算用尽') -> None:
         super().__init__(message)
         self.safe_message = message
+
+
+class RecursionBudgetExceeded(RuntimeError):
+    """推理编排的递归预算（步数）用尽。
+
+    这是运行时适配层把底层引擎（当前是 LangGraph 的 `GraphRecursionError`）折成的
+    **通用结果**：宿主（`run_task`）不应当感知底层是 LangGraph 还是 Pi。语义上
+    **不是失败**——已完成步骤与真实副作用都保留，按可恢复的中断（interrupted）
+    收尾，从断点继续。`limit` 记录触发时的递归上限，供收尾文案引用。
+    """
+
+    def __init__(self, message: str = '递归预算用尽', limit: int | None = None) -> None:
+        super().__init__(message)
+        self.safe_message = message
+        self.limit = limit
