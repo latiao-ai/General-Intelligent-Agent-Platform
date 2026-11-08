@@ -65,8 +65,50 @@ test('schemaFromJson 支持 object + required + 嵌套', () => {
   assert.ok(s);
 });
 
-test('schemaFromJson 拒绝不支持的 anyOf', () => {
-  assert.throws(() => schemaFromJson({ type: 'object', anyOf: [] }), /不支持的 JSON Schema 关键字/);
+test('schemaFromJson 把「类型或 null」的 anyOf 降级为可空字段', () => {
+  // FastAPI/Pydantic 与 LibTV 惯用写法：Optional[str] → anyOf: [string, null]
+  const s = schemaFromJson({ type: 'object', properties: {
+    name: { anyOf: [{ type: 'string' }, { type: 'null' }], default: null },
+  } });
+  assert.ok(s);
+});
+
+test('schemaFromJson 支持真正的联合类型 anyOf（两个非 null 分支）', () => {
+  const s = schemaFromJson({ anyOf: [{ type: 'string' }, { type: 'integer' }] });
+  assert.ok(s);
+});
+
+test('schemaFromJson 支持 $defs + $ref 内联', () => {
+  const s = schemaFromJson({
+    type: 'object',
+    $defs: { Clip: { type: 'object', properties: { id: { type: 'string' } } } },
+    properties: { clip: { $ref: '#/$defs/Clip' } },
+  });
+  assert.ok(s);
+});
+
+test('schemaFromJson 支持 enum 约束', () => {
+  const s = schemaFromJson({ type: 'string', enum: ['generate', 'edit', 'extend'] });
+  assert.ok(s);
+});
+
+test('schemaFromJson 支持 pattern/minLength 等约束', () => {
+  const s = schemaFromJson({
+    type: 'object',
+    properties: {
+      key: { type: 'string', pattern: '^[A-Za-z0-9._:-]{8,255}$', minLength: 8 },
+    },
+  });
+  assert.ok(s);
+});
+
+test('schemaFromJson 支持 additionalProperties', () => {
+  const s = schemaFromJson({
+    type: 'object',
+    additionalProperties: true,
+    properties: { a: { type: 'string' } },
+  });
+  assert.ok(s);
 });
 
 test('schemaFromJson 拒绝未知类型', () => {
