@@ -151,7 +151,9 @@ MAX_SOURCES = 8
 _MERGEABLE_KEYS = ('documents', 'usage', 'errors',
                    'mcp_calls', 'object_id', 'operation_id', 'revision',
                    'new_revision', 'modified_fields', 'write_result',
-                   'readback', 'readback_match')
+                   'readback', 'readback_match',
+                   # 脚本化部署的业务回执。身份、租约、status 仍不在这份白名单里。
+                   'deployment')
 
 
 @dataclass
@@ -189,6 +191,8 @@ class ToolReceipt:
     # 供批准后恢复原调用、重查约束（不能靠模型重发的参数冒充原调用）。
     final_args: dict | None = None
     args_hash: str = ''
+    # 结果未定（in_flight / unknown）：脚本化恢复要停在待核实，不能当普通失败重试。
+    blocked: bool = False
 
 
 def _resolve_web_search():
@@ -657,15 +661,36 @@ class HostToolCaller:
             return ToolReceipt(
                 ok=False,
                 error=f'工具未开放或不在白名单：{tool_name}')
+        return await self._call_resolved(
+            call_id=call_id, tool=tool, tool_name=tool_name, args=args,
+            state=state, build_snapshot=build_snapshot, step_id=None)
 
+    async def call_declared(self, *, step_id: str, tool, args: dict,
+                            state: dict, build_snapshot=None) -> ToolReceipt:
+        """执行宿主已经点名的工具（脚本化补偿 / 部署）。
+
+        不经过模型白名单：步骤是事先定好的，不是模型从目录里挑的。治理链与
+        `call` 相同，仍然是 `governed_call`。账本身份用脚本里的 `step_id`，
+        不用 `pi:call:N`——中断后续跑必须对上同一步，不能换成新幂等键再写一次。
+        """
+        name = str(getattr(tool, 'name', '') or step_id)
+        return await self._call_resolved(
+            call_id=step_id, tool=tool, tool_name=name, args=args,
+            state=state, build_snapshot=build_snapshot, step_id=step_id)
+
+    async def _call_resolved(self, *, call_id: str, tool, tool_name: str,
+                             args: dict, state: dict, build_snapshot=None,
+                             step_id: str | None) -> ToolReceipt:
+        """`call` / `call_declared` 共用的治理调用。`step_id` 为空时才分配逻辑序号。"""
         tool_key = tool.tool_key or tool.name
-        # 逻辑调用身份：宿主分配并持久化的 run 内序号，与参数哈希解耦。
-        # 第七阶段收口：按桥接 call_id 直接绑定（ToolCall.id），不再拼 node_call_key。
-        try:
-            step_id = self._registry.logical_id(
-                call_id, tool_name=tool_name, tool_key=tool_key, args=args)
-        except RuntimeError as exc:
-            return ToolReceipt(ok=False, error=str(exc), step_id='')
+        if not step_id:
+            # 逻辑调用身份：宿主分配并持久化的 run 内序号，与参数哈希解耦。
+            # 第七阶段收口：按桥接 call_id 直接绑定（ToolCall.id），不再拼 node_call_key。
+            try:
+                step_id = self._registry.logical_id(
+                    call_id, tool_name=tool_name, tool_key=tool_key, args=args)
+            except RuntimeError as exc:
+                return ToolReceipt(ok=False, error=str(exc), step_id='')
 
         # 第十阶段第 4 点：宿主分配逻辑调用身份后，复用 execution_arguments 生成
         # **最终发送参数**（含幂等键注入）。授权、审批指纹、账本准入、远端发送
@@ -693,7 +718,8 @@ class HostToolCaller:
             replay = result.replay if isinstance(result.replay, dict) else {}
             has_content = isinstance(replay.get('documents'), list) or \
                 bool(replay.get('object_id') or replay.get('write_result')
-                     or replay.get('mcp_calls') or replay.get('new_revision'))
+                     or replay.get('mcp_calls') or replay.get('new_revision')
+                     or replay.get('deployment'))
             if not has_content:
                 return ToolReceipt(
                     ok=False, action_id=result.action_id,
@@ -763,7 +789,7 @@ class HostToolCaller:
                                args_hash=ledger_module.args_hash(final_args or {}))
         if result.kind == 'blocked':
             return ToolReceipt(ok=False, error=result.error or '结果未定，需核实',
-                               step_id=step_id)
+                               step_id=step_id, blocked=True)
         # failed
         return ToolReceipt(ok=False, error=result.error or '工具执行失败',
                            action_id=result.action_id,

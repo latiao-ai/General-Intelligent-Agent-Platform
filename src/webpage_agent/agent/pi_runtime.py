@@ -36,6 +36,12 @@
     - 模型 usage 结算失败不阻断 ack（模型已跑完，usage 是事后记账），但「全零
       或缺失 usage」在 `core.services.end_model_request` 里走保守估算、不填零。
 
+脚本化补偿 / 部署（仍是本类，不另开运行时）：
+
+    - `resume_plan.scripted` 或快照 `host_result_state.script` 为真时，不启动
+      Node，按步骤顺序走 `HostToolCaller.call_declared`。没有这个标记时，
+      `resume_plan.steps` 仍然被忽略——那是只改引擎、不执行步骤的空转。
+
 第六阶段（共享网关）修正：
 
     - `HostToolCaller.call()` 传入**真实 state**（含 task_id / artifact_dir /
@@ -249,6 +255,24 @@ class PiRuntime:
         resume_snapshot = (pi_resume or {}).get('snapshot') if pi_resume else None
         self._snapshot = dict(resume_snapshot) if resume_snapshot else \
             pi_snapshot.new_snapshot(user_input=str(state.get('user_input') or ''))
+
+        # 脚本化补偿 / 部署：步骤是宿主定好的，不能交给模型，也不能把「已结算但
+        # 没有模型消息」理解成要把结果送回 Node。这条路径在恢复决策之前返回。
+        from webpage_agent.agent import pi_script
+        script = pi_script.script_of(state, self._snapshot)
+        if script is not None:
+            token = bind_sink(on_event) if on_event else None
+            try:
+                await pi_script.execute(self, state, script)
+            finally:
+                if token is not None:
+                    try:
+                        await drain_events()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("排空事件失败：%s", exc)
+                    unbind_sink(token)
+            state['_pi_snapshot'] = pi_snapshot.serialize(self._snapshot)
+            return state
 
         # 恢复决策。resume_finish / resume_reconcile / resume_block / resume_wait
         # 属于「不重新推理」的结局，在进入桥接前直接写回 state 收尾。

@@ -687,6 +687,10 @@ async def governed_call(
     # 读回「同一次调用」的真实参数，而不是用模型重发的参数冒充原调用。授权、
     # 审批指纹、账本准入、远端发送针对的正是这份最终参数。
     receipt['final_args'] = dict(args or {})
+    # 有副作用的工具若声明了 compensate，把解析后的撤销参数冻进回执。
+    # Pi 原 run 没有图计划，手工补偿之后只读这份元数据，不让模型现决定撤什么。
+    from webpage_agent.tools.compensation import attach_compensate
+    attach_compensate(receipt, tool, updates)
     # 第八阶段收口第 2 点：accepted 时**先**装配 external（含 external_task_id），
     # 再把 external 交给 build_snapshot，让 awaiting_calls 在结算的同一事务里
     # 随快照写入。不能依赖结算返回后的第二次快照写补齐关键关联——否则崩溃在

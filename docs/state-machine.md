@@ -218,7 +218,7 @@ Pi 不是图。它不实现 `plan` / `revise_plan` / `verify_completion` 这些�
 | `waiting_external` | 工具回执 `accepted` | 外部任务完成后 `resume_deliver` 注入结果。Pi 崩溃不自动重放未定调用 |
 | `succeeded` / `needs_reconcile` | 有答复，或平台写经 `platform_verify` 回读 | 写证据不齐是 `needs_reconcile`，不能靠模型解释文本收成成功 |
 
-Pi **不做**多步 `compensate`，也**不做**「点一下部署」那条一步图计划。这两条都显式新建 `runtime_kind=langgraph` 的 run：补偿把已成功且声明了 `compensate` 的步骤翻成撤销计划；部署把上一次产物收成单步 `deploy`。不要在 Pi 上留同名空接口。原 run 的引擎不变。
+补偿和「部署上一份产物」也是 Pi run（`runtime_kind=pi`），但不是模型自由挑工具。两条都新建脚本化 Pi run：`resume_plan.scripted=true`，步骤按既定顺序经 `HostToolCaller.call_declared` → `governed_call` 执行，不启动模型桥接。补偿步骤来自图计划里已成功且声明了 `compensate` 的步骤；Pi 原 run 没有计划时，来自账本成功回执里结算时冻住的 `compensate`。部署是单步 `deploy`。脚本记在 Pi 快照的 `host_result_state.script`，恢复走 `_pi_resume_plan`，不走图的 `_resume_plan`。原 run 的引擎不变。没有 `scripted` 标记时，Pi 仍忽略 `resume_plan.steps`——那是只改引擎、不执行步骤的空转。
 
 补充要求若在收尾时才进来，下一轮必须走 `_resume_for_engine`。Pi 不能改读图的 `plans/steps`，否则快照被丢掉，已执行的工具会再跑一遍。显式 `resume` 同样不把「有动作、没有图计划」当成异常：那是 Pi 的正常形态。图路径仍拒绝这种组合。
 

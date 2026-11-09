@@ -717,22 +717,28 @@ class HubRecoveryMixin:
         if not tool_name:
             raise RuntimeError('没有声明部署动作的能力包')
         run_id = uuid.uuid4().hex[:12]
-        # 部署仍是「一步图计划」，不是 Pi 工具循环。显式固定 LangGraph，
-        # 避免默认引擎改成 pi 之后这条 run 丢掉步骤、改去自由工具循环。
+        # 部署仍是事先定好的一步，不是模型自由挑工具。引擎用 Pi，执行走脚本，
+        # 与补偿同一条治理链（governed_call / 账本 / 事件 / 取消与租约）。
+        from webpage_agent.agent import runtime_identity
+        from webpage_agent.agent.pi_script import scripted_resume
         await self.store.create_run(run_id, record.task_id, status='queued',
                               tenant_id=tenant,
                               owner_user_id=str(getattr(principal, 'user_id', '')
                                                 or record.owner_user_id or 'default'),
-                              runtime_kind='langgraph')
+                              runtime_kind=runtime_identity.KIND_PI)
+        created = await self.store.run(run_id) or {}
         step = {'tool': tool_name, 'step_id': 's1', 'args': {},
                 'depends_on': [], 'why': '用户点击部署'}
         keep_artifact_id = record.artifact_id
         record.run_id = run_id
+        resume_plan = scripted_resume(
+            [step], kind='deployment', summary='部署上一轮产物',
+            intent_version=int(created.get('intent_version') or 1))
         outcome = await self._claim_and_arm(
             record, run_id,
             lambda claimed: self._run(
                 record, [], {'artifact': prior_artifact},
-                resume_plan={'steps': [step], 'summary': '部署上一轮产物'}),
+                resume_plan=resume_plan),
             wait=True)
         if outcome != 'started':
             raise RuntimeError('无法领取部署运行，请稍后重试')

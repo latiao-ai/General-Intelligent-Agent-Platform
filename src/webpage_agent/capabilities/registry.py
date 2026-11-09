@@ -76,6 +76,9 @@ class Tool:
     output_schema: dict | None = None
     # Adapter-declared transport identity, supplied by the execution ledger.
     idempotency_arg: str = ''
+    # 可选的撤销声明。写动作结算成功时冻进账本回执，供没有图计划的 Pi run
+    # 做手工补偿。形状见 `webpage_agent.tools.compensation`。不交给模型现编。
+    compensate: dict | None = None
 
 
 _DECLARATIONS: dict[str, dict] = {}
@@ -88,7 +91,8 @@ _LOADED = False
 def tool(*, name: str, label: str, description: str, args: dict,
          effect: str = 'unknown', key: str = '', capability: str = '',
          scope: str = '', local_output: bool = False,
-         file_output: bool = False, deployment_output: bool = False):
+         file_output: bool = False, deployment_output: bool = False,
+         compensate: dict | None = None):
     """把一个 async 函数登记成工具。
 
     只记录声明，真正的 `Tool` 在 `registered()` 里构建——这样能力包文件里
@@ -103,6 +107,7 @@ def tool(*, name: str, label: str, description: str, args: dict,
                               'local_output': bool(local_output),
                               'file_output': bool(file_output),
                               'deployment_output': bool(deployment_output),
+                              'compensate': compensate,
                               'run': fn}
         _VERSION += 1
         return fn
@@ -245,6 +250,8 @@ def _build(declaration: dict) -> Tool:
         local_output=bool(declaration.get('local_output')),
         file_output=bool(declaration.get('file_output')),
         deployment_output=bool(declaration.get('deployment_output')),
+        compensate=(declaration.get('compensate')
+                    if isinstance(declaration.get('compensate'), dict) else None),
     )
     _check(spec)
     return spec
