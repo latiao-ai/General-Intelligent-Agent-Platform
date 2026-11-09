@@ -15,6 +15,7 @@
 """
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -30,7 +31,7 @@ from tests.exec_env import PG_DSN, new_store, reset_db, valid_test_dsn
 def _platform_server(state_file: Path) -> mcp_servers.Server:
     return mcp_servers.Server(
         id='platform', transport='stdio',
-        stdio_command='.venv-pi-test/bin/python',
+        stdio_command=sys.executable,
         stdio_args=('-m', 'tests.mcp_platform_server',
                     '--state-file', str(state_file)),
         idempotency_arg='operation_id')

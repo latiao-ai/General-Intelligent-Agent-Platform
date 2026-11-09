@@ -691,6 +691,7 @@ CREATE TABLE IF NOT EXISTS session_turns (
     execution_generation INTEGER NOT NULL DEFAULT 0,
     tenant_id          TEXT NOT NULL DEFAULT 'default',
     owner_user_id      TEXT NOT NULL DEFAULT 'default',
+    owner_role         TEXT NOT NULL DEFAULT 'member',
     answer             TEXT NOT NULL DEFAULT '',
     error              TEXT NOT NULL DEFAULT '',
     created_at         TEXT NOT NULL,

@@ -52,6 +52,19 @@ _STDERR_TAIL_LINES = 200
 _SENTINEL = object()
 
 
+async def _close_subprocess_transport(proc: asyncio.subprocess.Process) -> None:
+    """关掉 asyncio 子进程传输，并让 close 回调在当前循环里跑完。"""
+    transport = getattr(proc, '_transport', None)
+    if transport is None or transport.is_closing():
+        return
+    try:
+        transport.close()
+    except Exception:  # noqa: BLE001 — 清理失败不能盖住原来的结束原因
+        logger.debug('关闭子进程传输失败', exc_info=True)
+        return
+    await asyncio.sleep(0)
+
+
 class PiBridgeError(Exception):
     """桥接层错误：启动失败、子进程崩溃、超时等，可被宿主识别。"""
 
@@ -332,10 +345,18 @@ class PiBridge:
                     await asyncio.wait_for(proc.wait(), timeout=self._kill_timeout)
                 except asyncio.TimeoutError:
                     logger.warning("子进程 kill 后仍未退出")
-        for task in (self._reader_task, self._stderr_task, self._monitor_task):
-            if task and not task.done():
-                task.cancel()
+        pending = [task for task in
+                   (self._reader_task, self._stderr_task, self._monitor_task)
+                   if task is not None and not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         self._terminate(f"子进程已退出（code={proc.returncode}）")
+        # 管道传输必须在事件循环还活着时关掉。否则对象拖到循环关闭后才析构，
+        # BaseSubprocessTransport.__del__ 会在已关闭的循环上 call_soon，
+        # 打出 Event loop is closed（-W error 下会把整套测试打红）。
+        await _close_subprocess_transport(proc)
 
     async def close(self) -> None:
         """正常清理：发 shutdown，等待退出，回收后台任务。幂等，可重复调用。"""

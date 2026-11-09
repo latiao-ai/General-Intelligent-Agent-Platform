@@ -19,7 +19,7 @@ MCP 平台**（`tests/mcp_platform_server.py`，stdio transport + JSON 持久化
 - answer 轮用 `expect` 验证 Pi 真的消费了写结果（Node 侧校验 toolResult 含该标记）。
 
 依赖：真实 PostgreSQL（`PG_TEST_DSN`）、已构建的 Node 桥接（`pi-runtime/dist`）、
-受控 MCP 平台（`.venv-pi-test/bin/python -m tests.mcp_platform_server`）。
+受控 MCP 平台（当前解释器 `-m tests.mcp_platform_server`）。
 """
 from __future__ import annotations
 
@@ -115,7 +115,7 @@ class PiWriteLoopProcessTests(unittest.IsolatedAsyncioTestCase):
         folder = tempfile.mkdtemp()
         mcp_servers = [{
             'id': 'platform', 'transport': 'stdio',
-            'stdio_command': str(ROOT / '.venv-pi-test/bin/python'),
+            'stdio_command': sys.executable,
             'stdio_args': ['-m', 'tests.mcp_platform_server',
                            '--state-file', state_file],
             'idempotency_arg': 'operation_id',

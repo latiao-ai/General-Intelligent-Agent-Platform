@@ -377,6 +377,10 @@ def missing_runtime_keys() -> list:
 
 
 def check_runtime_keys():
+    # 受控模型脚本不访问供应商。测试和崩溃恢复子进程是在导入之后才写
+    # PI_MOCK_SCRIPT，所以看当前环境变量，不看导入时冻进 settings 的空值。
+    if os.getenv('PI_MOCK_SCRIPT', '').strip():
+        return
     missing = missing_runtime_keys()
     if missing:
         raise RuntimeError('请在 .env 设置：' + ', '.join(missing))

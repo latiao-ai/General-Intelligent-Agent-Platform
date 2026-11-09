@@ -58,6 +58,7 @@ class PgRuns:
     async def create_turn_run(self, *, run_id: str, tenant_id: str,
                               owner_user_id: str, lease_owner: str,
                               lease_epoch: int, lease_ttl: float,
+                              owner_role: str = 'member',
                               budget: dict | None = None) -> dict | None:
         """为会话 turn（chat/query）建一条内部执行记录（run 行）。
 
@@ -81,11 +82,12 @@ class PgRuns:
                 'lease_owner, lease_expires_at, lease_epoch, '
                 'runtime_kind, runtime_version, runtime_state_schema, '
                 'created_at, updated_at, trace_id) '
-                "VALUES (%s, %s, %s, 'running', %s, '{}', %s, 'member', "
+                "VALUES (%s, %s, %s, 'running', %s, '{}', %s, %s, "
                 "%s, %s, %s, 'pi', 1, 2, %s, %s, %s) "
                 'ON CONFLICT (run_id) DO NOTHING',
                 (run_id, run_id, tenant_id,
                  json.dumps(budget or {}, ensure_ascii=False), owner_user_id,
+                 str(owner_role or 'member'),
                  lease_owner, expires, int(lease_epoch or 0),
                  stamp, stamp, uuid.uuid4().hex))
             await conn.commit()

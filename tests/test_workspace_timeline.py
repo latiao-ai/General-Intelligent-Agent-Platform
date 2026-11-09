@@ -28,6 +28,7 @@ class WorkspaceTimelineTests(unittest.IsolatedAsyncioTestCase):
         store = SimpleNamespace(
             run=AsyncMock(return_value={'run_id': 'r', 'task_id': 't', 'status': 'interrupted'}),
             plan=AsyncMock(return_value={}), actions_of=AsyncMock(return_value=[]),
+            runtime_identity=AsyncMock(return_value={'kind': 'langgraph'}),
             update_run=AsyncMock(), events=AsyncMock(return_value=[(9, {'type': 'status'})]))
         hub = Hub(store=store)
         record = SimpleNamespace(live=False, task_id='t', publish=AsyncMock())
