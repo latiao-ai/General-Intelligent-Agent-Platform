@@ -639,7 +639,7 @@ python -m scripts.mock_identity_platform --port 8090 --hub http://127.0.0.1:8010
 
 | 层 | 存在哪 | 词汇 | 会不会随能力增长 |
 |---|---|---|---|
-| 状态机 | `tasks.status` / `runs.status` | 12 个通用值：`queued` `running` `reconciling` `waiting_input` `waiting_approval` `paused` `succeeded` `partially_succeeded` `needs_reconcile` `failed` `cancelled` `interrupted` | **不会**。接第 N 个 MCP Server 只让 `tool_key` 的行数变多 |
+| 状态机 | `tasks.status` / `runs.status` | 13 个通用值：`queued` `running` `reconciling` `waiting_input` `waiting_approval` `waiting_external` `paused` `succeeded` `partially_succeeded` `needs_reconcile` `failed` `cancelled` `interrupted` | **不会**。接第 N 个 MCP Server 只让 `tool_key` 的行数变多 |
 | outcome | `state.outcome`（随任务持久化、随接口返回） | `{kind, produced[], effects[], answered, unverified}` | 会。它是数据，可以有无穷多种组合 |
 | 展示标签 | 接口字段 `status` / 前端文案表 | `answered` `local_ready` `deployed` `deploy_needs_check` `compensated` … | 会，而且随便加——它不进状态机、不写库 |
 

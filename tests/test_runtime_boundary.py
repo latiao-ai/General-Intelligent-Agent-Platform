@@ -263,10 +263,12 @@ class RunTaskRuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
                                tool_key='local:web:search', effect='read'),
         }
 
+        from tests.exec_env import override_settings
         with tempfile.TemporaryDirectory() as folder:
             with install_main(folder), install_tools(table), \
                     install_plan([{'tool': 'answer_directly', 'step_id': 's1',
-                                   'args': {}}])[0]:
+                                   'args': {}}])[0], \
+                    override_settings(default_runtime_kind='langgraph'):
                 state = await run_task('你好')
         self.assertEqual(state['status'], 'succeeded')
         self.assertIn('timings', state)
@@ -295,8 +297,10 @@ class RunTaskRuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
         patch_plan, plan_calls = install_plan(
             [{'tool': 'answer_directly', 'step_id': 's1', 'args': {}}])
 
+        from tests.exec_env import override_settings
         with tempfile.TemporaryDirectory() as folder:
-            with install_main(folder), install_tools(table), patch_plan:
+            with install_main(folder), install_tools(table), patch_plan, \
+                    override_settings(default_runtime_kind='langgraph'):
                 state = await run_task(
                     '继续', resume_plan={
                         'steps': [{'tool': 'answer_directly', 'step_id': 's1',
@@ -313,11 +317,21 @@ class RuntimeFactoryAndContractTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await reset_db()
 
-    async def test_get_runtime_returns_langgraph_by_default(self):
-        """生产默认运行时是 LangGraphRuntime。"""
+    async def test_get_runtime_follows_default_kind(self):
+        """空 kind 跟 settings.default_runtime_kind。未设置环境变量时源码默认是 pi。"""
         from webpage_agent.agent.runtime import get_runtime
         from webpage_agent.agent.langgraph_runtime import LangGraphRuntime
-        self.assertIsInstance(get_runtime(), LangGraphRuntime)
+        from webpage_agent.agent.pi_runtime import PiRuntime
+        from tests.exec_env import override_settings
+        with override_settings(default_runtime_kind='pi',
+                               pi_system_prompt='停手规则'):
+            runtime = get_runtime()
+            self.assertIsInstance(runtime, PiRuntime)
+            self.assertEqual(runtime._system_prompt, '停手规则')
+        with override_settings(default_runtime_kind='langgraph'):
+            self.assertIsInstance(get_runtime(), LangGraphRuntime)
+        self.assertIsInstance(get_runtime('langgraph'), LangGraphRuntime)
+        self.assertIsInstance(get_runtime('pi'), PiRuntime)
 
     async def test_run_task_uses_factory_not_hardcoded_impl(self):
         """run_task 通过工厂取运行时，测试可注入替代实现。

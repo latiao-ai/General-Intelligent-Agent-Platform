@@ -11,6 +11,16 @@
       下一轮模型收到来源摘录后给出答复」，而非只打印一个固定数字；
     - 缺少凭据时明确报错并返回非零退出码。
 
+**重要限制（第六阶段起）**：正式路径 `governed_call(require_ledger=True)` 在没有
+执行账本时一律拒绝真实工具调用（返回 E_NO_LEDGER），不再有"无账本走兼容路径"
+的旁路。本脚本不建账本，因此**工具用例在这里必然是失败的**——这是门禁生效的
+正确表现，不是链路故障。要验证真实执行，请用带账本的入口：
+
+    tests/test_governed_pi_integration.py（PG + 租约 + 账本）
+    或起 API + Worker 走 HTTP 链路（runtime_kind='pi' 的 run）
+
+直答用例（不调工具）不受此限制，仍可在本脚本内独立验证桥接与模型往返。
+
 用法（在 main_branch/ 下）：
 
     PYTHONPATH=src python scripts/pi_smoke.py "你好"
@@ -68,14 +78,26 @@ async def run_tool_answer() -> int:
     tool_calls = []
 
     # 真实受治理调用对象：只开放 web_search，执行真正的网页检索。
-    # 无治理 scope（CLI 直调）时 governed_call 走兼容路径，直接真实调用不落账。
+    # 注意：本脚本无执行账本，governed_call 会按正式路径拒绝真实调用
+    # （E_NO_LEDGER）。这里的价值是**验证门禁生效**，不是验证工具真的跑通。
     from webpage_agent.agent.pi_host_tools import HostToolCaller
 
     class _SpyCaller(HostToolCaller):
-        async def call(self, *, call_id, tool_name, args, state):
-            tool_calls.append((tool_name, args))
-            return await super().call(
-                call_id=call_id, tool_name=tool_name, args=args, state=state)
+        # 用 **kwargs 透传：宿主侧调用签名会随阶段演进新增参数（如第七阶段的
+        # build_snapshot），Spy 只负责记录，不该跟着逐个改签名——否则脚本会
+        # 在每一次宿主接口演进而非链路本身出问题时崩掉。
+        #
+        # 记录回执的 ok：**只记录「发起过调用」会制造假阳性**。无账本时
+        # governed_call 一律返回 E_NO_LEDGER，工具根本没执行，模型拿到的是
+        # 错误回执；旧断言在这种情况下仍判 PASS，等于把「被门禁拒绝」当成
+        # 「链路打通」。
+        async def call(self, *, call_id, tool_name, args, state, **kwargs):
+            receipt = await super().call(
+                call_id=call_id, tool_name=tool_name, args=args, state=state,
+                **kwargs)
+            tool_calls.append((tool_name, args, bool(getattr(receipt, 'ok', False)),
+                               str(getattr(receipt, 'error', '') or '')))
+            return receipt
 
     runtime = PiRuntime(
         model={
@@ -96,20 +118,32 @@ async def run_tool_answer() -> int:
     result = await runtime.run(state)
     print("pi_outcome:", result.get("pi_outcome"))
     print("答复:", result.get("answer"))
-    print("Python 侧收到的工具调用:", tool_calls)
+    print("Python 侧收到的工具调用:", [(n, ok) for n, _a, ok, _e in tool_calls])
 
     if result.get("pi_outcome") != "answered":
         return _fail(f"工具用例未成功，pi_outcome={result.get('pi_outcome')}")
     # 核实确实经过真实 web_search 工具（而非 echo/add 假工具）
     if not tool_calls:
         return _fail("未收到任何工具调用，Pi 没有发起 web_search")
-    names = [n for n, _ in tool_calls]
+    names = [n for n, _a, _ok, _e in tool_calls]
     if "web_search" not in names:
         return _fail(f"工具调用不是 web_search：{names}")
-    ws_args = [a for n, a in tool_calls if n == "web_search"]
+    ws = [(a, ok, err) for n, a, ok, err in tool_calls if n == "web_search"]
     if not any(isinstance(a.get("query"), str) and a["query"].strip()
-               for a in ws_args):
-        return _fail(f"web_search 缺少非空 query：{ws_args}")
+               for a, _ok, _e in ws):
+        return _fail(f"web_search 缺少非空 query：{[a for a, _o, _e in ws]}")
+    # 核心断言：至少一次**真正执行成功**。
+    # 无执行账本时 governed_call 对所有写实调用返回 E_NO_LEDGER，工具一次都不会
+    # 执行，模型只能拿到错误回执并如实说"工具不可用"。这种结果不能算通过——
+    # 那验证的是门禁，不是链路。
+    if not any(ok for _a, ok, _e in ws):
+        errs = sorted({e for _a, _o, e in ws if e})
+        hint = '；'.join(errs[:2]) or '（回执未给出原因）'
+        return _fail(
+            'web_search 全部被拒绝，链路未真正执行：' + hint
+            + '。本脚本没有执行账本，而正式路径（require_ledger=True）在没有账本时'
+              '一律拒绝真实工具调用。要验证真实执行，请走带账本的入口：'
+              'tests/test_governed_pi_integration.py，或起 API + Worker 走 HTTP 链路。')
     # 核实最终答复消费了搜索结果（非空、且不是空泛的失败兜底）
     answer = str(result.get("answer", "")).strip()
     if not answer:

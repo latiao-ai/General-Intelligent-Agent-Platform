@@ -41,3 +41,9 @@ class StateMachineDocTests(unittest.TestCase):
     def test_every_decision_appears(self):
         missing = [kind for kind in ObservationDecision.DECISIONS if kind not in self.doc]
         self.assertEqual(missing, [], f'文档缺少决定：{missing}')
+
+    def test_waiting_external_is_a_status_not_only_a_flag(self):
+        self.assertIn('waiting_external', outcome_module.RUN_STATUSES)
+        self.assertIn('waiting_external', outcome_module.STOPPED_RUN_STATUSES)
+        self.assertIn("runs.status = 'waiting_external'", self.doc)
+        self.assertNotIn('不是第 13 个状态', self.doc)

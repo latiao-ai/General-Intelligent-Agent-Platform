@@ -1,0 +1,393 @@
+{
+ "result": {
+  "plain-string": {
+   "additionalProperties": false,
+   "properties": {
+    "limit": {
+     "type": "integer"
+    },
+    "query": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "query"
+   ],
+   "type": "object"
+  },
+  "all-scalar-kinds": {
+   "additionalProperties": false,
+   "properties": {
+    "b": {
+     "type": "boolean"
+    },
+    "i": {
+     "type": "integer"
+    },
+    "n": {
+     "type": "number"
+    },
+    "s": {
+     "type": "string"
+    },
+    "z": {
+     "type": "null"
+    }
+   },
+   "required": [
+    "s",
+    "n",
+    "i",
+    "b",
+    "z"
+   ],
+   "type": "object"
+  },
+  "string-constraints": {
+   "additionalProperties": false,
+   "properties": {
+    "num": {
+     "exclusiveMaximum": 11,
+     "exclusiveMinimum": -1,
+     "maximum": 10,
+     "minimum": 0,
+     "type": "number"
+    },
+    "q": {
+     "format": "uri",
+     "maxLength": 20,
+     "minLength": 2,
+     "pattern": "^[a-z]+$",
+     "type": "string"
+    }
+   },
+   "required": [
+    "q",
+    "num"
+   ],
+   "type": "object"
+  },
+  "array-constraints": {
+   "additionalProperties": false,
+   "properties": {
+    "tags": {
+     "items": {
+      "type": "string"
+     },
+     "maxItems": 5,
+     "minItems": 1,
+     "type": "array",
+     "uniqueItems": true
+    }
+   },
+   "required": [
+    "tags"
+   ],
+   "type": "object"
+  },
+  "nested-object": {
+   "additionalProperties": false,
+   "properties": {
+    "outer": {
+     "additionalProperties": true,
+     "properties": {
+      "inner": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "inner"
+     ],
+     "type": "object"
+    }
+   },
+   "required": [
+    "outer"
+   ],
+   "type": "object"
+  },
+  "enum-without-null": {
+   "additionalProperties": false,
+   "properties": {
+    "kind": {
+     "anyOf": [
+      {
+       "const": "a",
+       "type": "string"
+      },
+      {
+       "const": "b",
+       "type": "string"
+      },
+      {
+       "const": 3,
+       "type": "number"
+      },
+      {
+       "const": true,
+       "type": "boolean"
+      }
+     ]
+    }
+   },
+   "required": [
+    "kind"
+   ],
+   "type": "object"
+  },
+  "enum-with-null": {
+   "additionalProperties": false,
+   "properties": {
+    "kind": {
+     "anyOf": [
+      {
+       "const": "a",
+       "type": "string"
+      },
+      {
+       "const": "b",
+       "type": "string"
+      }
+     ]
+    }
+   },
+   "required": [
+    "kind"
+   ],
+   "type": "object"
+  },
+  "const-values": {
+   "additionalProperties": false,
+   "properties": {
+    "k": {
+     "const": "fixed",
+     "type": "string"
+    },
+    "nz": {
+     "type": "null"
+    }
+   },
+   "required": [
+    "k",
+    "nz"
+   ],
+   "type": "object"
+  },
+  "anyof-nullable": {
+   "additionalProperties": false,
+   "properties": {
+    "maybe": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "maybe"
+   ],
+   "type": "object"
+  },
+  "anyof-union-no-null": {
+   "additionalProperties": false,
+   "properties": {
+    "v": {
+     "anyOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "number"
+      }
+     ]
+    }
+   },
+   "required": [
+    "v"
+   ],
+   "type": "object"
+  },
+  "oneof-union": {
+   "additionalProperties": false,
+   "properties": {
+    "v": {
+     "anyOf": [
+      {
+       "type": "boolean"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    }
+   },
+   "required": [
+    "v"
+   ],
+   "type": "object"
+  },
+  "object-with-oneof-variants": {
+   "additionalProperties": false,
+   "properties": {
+    "assetId": {
+     "type": "null"
+    },
+    "fileRef": {
+     "type": "string"
+    },
+    "projectId": {
+     "type": "null"
+    }
+   },
+   "required": [],
+   "type": "object"
+  },
+  "defs-ref": {
+   "additionalProperties": false,
+   "properties": {
+    "item": {
+     "additionalProperties": false,
+     "properties": {
+      "id": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "id"
+     ],
+     "type": "object"
+    }
+   },
+   "required": [
+    "item"
+   ],
+   "type": "object"
+  },
+  "implicit-object": {
+   "additionalProperties": false,
+   "properties": {
+    "wrap": {
+     "additionalProperties": false,
+     "properties": {
+      "a": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "a"
+     ],
+     "type": "object"
+    }
+   },
+   "required": [
+    "wrap"
+   ],
+   "type": "object"
+  },
+  "implicit-array": {
+   "additionalProperties": false,
+   "properties": {
+    "list": {
+     "items": {
+      "type": "integer"
+     },
+     "type": "array"
+    }
+   },
+   "required": [
+    "list"
+   ],
+   "type": "object"
+  },
+  "then-branch-merge": {
+   "additionalProperties": false,
+   "properties": {
+    "extra": {
+     "type": "string"
+    },
+    "mode": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "mode",
+    "extra"
+   ],
+   "type": "object"
+  },
+  "allof-intersect": {
+   "additionalProperties": false,
+   "properties": {
+    "v": {
+     "allOf": [
+      {
+       "type": "string"
+      },
+      {
+       "type": "string"
+      }
+     ]
+    }
+   },
+   "required": [
+    "v"
+   ],
+   "type": "object"
+  },
+  "deep-nesting": {
+   "additionalProperties": false,
+   "properties": {
+    "l1": {
+     "additionalProperties": false,
+     "properties": {
+      "l2": {
+       "items": {
+        "additionalProperties": false,
+        "properties": {
+         "l3": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "l3"
+        ],
+        "type": "object"
+       },
+       "type": "array"
+      }
+     },
+     "required": [
+      "l2"
+     ],
+     "type": "object"
+    }
+   },
+   "required": [
+    "l1"
+   ],
+   "type": "object"
+  },
+  "null-required-field": {
+   "additionalProperties": false,
+   "properties": {
+    "x": {
+     "type": "null"
+    }
+   },
+   "required": [
+    "x"
+   ],
+   "type": "object"
+  },
+  "additional-props-default": {
+   "additionalProperties": false,
+   "properties": {
+    "a": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "a"
+   ],
+   "type": "object"
+  }
+ },
+ "failures": {}
+}

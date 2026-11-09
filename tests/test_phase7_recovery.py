@@ -507,14 +507,23 @@ class FormalHubPiRecoveryTests(unittest.IsolatedAsyncioTestCase):
         finally:
             self._clear_mock_env()
 
-        # 恢复后：工具仍只有一次（不重复执行），run 收尾，最终消息唯一
+        # 恢复后：工具仍只有一次（不重复执行），run 收尾，最终消息唯一。
+        #
+        # 这里必须断言**具体结局**，不能写成 status in ('succeeded',
+        # 'needs_reconcile')：崩溃点在「工具已结算、Node 未吸收」，正确的恢复决策
+        # 是 resume_deliver——把已提交的结果补交给 Node，继续由模型收尾。一旦它
+        # 退化成 resume_reconcile（不补交、直接判结果未定），run 照样能到
+        # needs_reconcile 且工具次数也不变，宽断言完全抓不到。
+        # 所以改为：终态必须是 succeeded，且最终消息必须是崩溃后模型新产出的答复
+        # （reconcile 路径不会启动 Node，也就不可能产生这句）。
         actions = await self.store.actions_of(run_id)
         self.assertEqual(len(actions), 1)
         run = await self.store.run(run_id)
-        self.assertIn(run['status'], ('succeeded', 'needs_reconcile'))
+        self.assertEqual(run['status'], 'succeeded')
         msgs = await self.store.messages(session_id)
         assistant = [m for m in msgs if m['role'] == 'assistant']
-        self.assertLessEqual(len(assistant), 1)
+        self.assertEqual(len(assistant), 1)
+        self.assertIn('恢复后答复', assistant[0]['content'])
 
 
 if __name__ == '__main__':

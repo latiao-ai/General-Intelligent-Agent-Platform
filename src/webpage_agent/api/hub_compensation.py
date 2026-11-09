@@ -64,9 +64,13 @@ class HubCompensationMixin:
 
         before = dict(record.state or {})
         new_run_id = uuid.uuid4().hex[:12]
+        # 多步 compensate 是图语义：把已成功步骤翻成撤销计划再跑。
+        # Pi 工具循环不做这件事。补偿 run 显式固定 LangGraph，不跟默认引擎走 pi，
+        # 否则会建一条不执行撤销步骤的空转。原 run 的引擎不变。
         await self.store.create_run(new_run_id, record.task_id, status='queued',
                               tenant_id=run.get('tenant_id') or 'default',
-                              owner_user_id=str(run.get('owner_user_id') or 'default'))
+                              owner_user_id=str(run.get('owner_user_id') or 'default'),
+                              runtime_kind='langgraph')
         record.run_id = new_run_id
         outcome = await self._claim_and_arm(
             record, new_run_id,

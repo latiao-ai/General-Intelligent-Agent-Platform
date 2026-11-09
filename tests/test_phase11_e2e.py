@@ -231,7 +231,6 @@ class SessionMessageE2ETests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cross_principal_rejected_task_unchanged(self):
         """跨主体请求：拒绝，目标任务零变化。"""
-        from webpage_agent.agent import runtime_identity
         hub = self._hub()
         p1 = _principal(user='u')
         p2 = _principal(user='other')

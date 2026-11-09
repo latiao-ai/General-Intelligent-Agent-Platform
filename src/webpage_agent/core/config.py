@@ -26,6 +26,27 @@ def _env_flag(name: str, default: str = 'false') -> bool:
     return os.getenv(name, default).strip().lower() == 'true'
 
 
+# 画布任务的默认系统提示。Pi 生产入口必须带上，否则模型不知道何时停手，
+# 同一检索会换关键词反复调用。PI_SYSTEM_PROMPT 未设置时用这段；设为空字符串则关闭。
+DEFAULT_PI_SYSTEM_PROMPT = (
+    '你是画布任务执行助手。执行规则：'
+    '1) 每个检索意图只调用一次搜索工具，禁止对同一问题换关键词重复搜索；'
+    '2) 已有信息足以回答或完成当前要求时立即给出最终答复，不要为了再确认而继续调用工具；'
+    '3) 工具失败时最多重试一次，仍失败就说明原因并停止；'
+    '4) 缺少对象、字段或用户必须做的选择时，调用 request_input 停下来问人，'
+    '不要猜测、不要空转重试；'
+    '5) 写操作只使用宿主给出的对象标识，写完后等待回读核验，不要自行重复写入。'
+)
+
+
+def pi_system_prompt_from_env() -> str:
+    """未设置环境变量时用画布默认规则；显式设为空字符串表示不注入。"""
+    raw = os.environ.get('PI_SYSTEM_PROMPT')
+    if raw is None:
+        return DEFAULT_PI_SYSTEM_PROMPT
+    return raw
+
+
 def governance_enabled(auth_mode: str, dev_compat: bool, explicit: bool) -> bool:
     """票模式且没有开发兼容时，政策、结果信封、异步查询一起打开。
 
@@ -63,6 +84,13 @@ class Settings:
     llm_output_price_micros_per_million: int = int(os.getenv('LLM_OUTPUT_PRICE_MICROS_PER_MILLION', '0'))
     search_request_cost_micros: int = int(os.getenv('SEARCH_REQUEST_COST_MICROS', '0'))
     maintenance_interval_seconds: float = max(10.0, float(os.getenv('MAINTENANCE_INTERVAL_SECONDS', '3600')))
+    prompt_timezone: str = os.getenv('PROMPT_TIMEZONE', 'Asia/Shanghai').strip() or 'Asia/Shanghai'
+    # Pi 系统提示。默认是画布停手/少重复检索规则；PI_SYSTEM_PROMPT 可覆盖。
+    pi_system_prompt: str = pi_system_prompt_from_env()
+    # 写工具扩展开关。默认关闭。仅 PI_WRITE_TOOLS_ENABLED=true 时，
+    # PI_WRITE_TOOL_KEYS 才会并入写白名单，并打审计日志。
+    # 只配了键、没开这道门：键被忽略并告警，不会静默扩权。
+    pi_write_tools_enabled: bool = _env_flag('PI_WRITE_TOOLS_ENABLED', 'false')
     llm_key: str = os.getenv('LLM_API_KEY', '')
     llm_model: str = os.getenv('LLM_MODEL', '')
     # 解析阶段关闭模型推理。实测多轮场景 4.4s → 2.3s（约 2 倍），
@@ -208,10 +236,11 @@ class Settings:
     # 连续"没有新进展"的容忍次数：相同指纹重复出现就停，而不是继续烧预算。
     run_max_no_progress: int = max(1, int(
         os.getenv('RUN_MAX_NO_PROGRESS', '2')))
-    # 新建 run 的默认引擎类型（langgraph | pi）。只影响**新建**任务；
+    # 新建 run 的默认引擎（langgraph | pi）。只影响**新建**任务；
     # 恢复时读库里已存的 runs.runtime_kind，绝不回退到这里。
-    # 第七阶段默认仍为 langgraph，暂不切换生产全局默认。
-    default_runtime_kind: str = os.getenv('DEFAULT_RUNTIME_KIND', 'langgraph').strip().lower()
+    # 未设置环境变量时默认 pi：画布业务 run 走 Pi 工具循环。
+    # 存量 run 仍按行上的 runtime_kind 恢复，LangGraph 分支保留到排空。
+    default_runtime_kind: str = os.getenv('DEFAULT_RUNTIME_KIND', 'pi').strip().lower() or 'pi'
 
     # ---------- 身份（webpage_agent/api/auth.py / webpage_agent/governance/ticket_auth.py） ----------
     # off      = 不介入，保持单用户行为（默认，本地开发与既有测试不受影响）

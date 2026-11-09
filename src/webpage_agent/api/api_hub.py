@@ -551,8 +551,10 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
             max_rounds = max(1, int(settings.run_max_revisions or 1)) + 1
             for round_index in range(max_rounds):
                 if round_index:
-                    # 新一轮要读数据库里最新的计划与补充，而不是拿着旧的提示
-                    resume_plan = await self._resume_plan(record.run_id)
+                    # 新一轮要读数据库里最新的进度与补充，而不是拿着旧的提示。
+                    # Pi 走自己的快照装配；这里若误用图的 `_resume_plan`，
+                    # 有动作、没计划的 Pi run 会丢掉快照并从头再执行。
+                    resume_plan = await self._resume_for_engine(record.run_id)
                 state = await execute_round(resume_plan)
                 status_now = outcome_module.check_run_status(
                     state.get('status') or 'failed')

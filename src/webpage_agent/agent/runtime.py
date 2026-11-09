@@ -11,7 +11,9 @@
         - 运行时只负责「驱动一次执行」——消费准备好的状态、把节点级进度与
           内部细粒度事件交回给回调，最后返回最终状态。
 
-    生产默认只有 `LangGraphRuntime` 一个实现，外部行为与改造前完全一致。
+    新建业务 run 的默认引擎是 Pi（`DEFAULT_RUNTIME_KIND`，未设置时为 pi）。
+    无 run 身份的调用仍按 `default_kind()` 取引擎。已落库的 LangGraph run
+    按行上的 `runtime_kind` 恢复，不因默认切换被重跑。
 
 契约约定（状态归属是关键）：
 
@@ -93,8 +95,9 @@ def get_runtime(kind: str = '') -> Runtime:
 
     第七阶段起按**引擎归属**分流：
 
-    - `kind` 为空（CLI 直调 / 无账本单测）→ 返回 `LangGraphRuntime`（生产默认）；
-    - `kind == 'pi'` → 返回 `PiRuntime`；
+    - `kind` 为空 → 用 `runtime_identity.default_kind()`（未设置环境变量时是 pi）；
+    - `kind == 'pi'` → 返回 `PiRuntime`，系统提示来自 `settings.pi_system_prompt`；
+    - `kind == 'langgraph'` → 返回 `LangGraphRuntime`；
     - 未知 `kind` → 抛 `UnknownRuntimeKind`，**不回退默认引擎**。
 
     调用方（`run_task` / Hub）负责从 `store.runtime_identity(run_id)` 读已存归属
@@ -104,7 +107,7 @@ def get_runtime(kind: str = '') -> Runtime:
 
     normalized = runtime_identity.normalize_kind(kind) if kind else ''
     if not kind:
-        normalized = runtime_identity.KIND_LANGGRAPH
+        normalized = runtime_identity.default_kind()
     if normalized == runtime_identity.KIND_LANGGRAPH:
         from webpage_agent.agent.langgraph_runtime import LangGraphRuntime
         return LangGraphRuntime()
@@ -147,5 +150,21 @@ def get_runtime(kind: str = '') -> Runtime:
                         'url': 'https://mock.example', 'chars': 3,
                     }],
                 }
-        return PiRuntime(mock_script=mock_script, tool_runner=tool_runner)
+        # 凭据缺失会让真实链路直接 401：PiRuntime 的默认模型配置里没有 key，
+        # 必须由宿主从 settings 注入，否则正式入口只能跑受控模型（PI_MOCK_SCRIPT）。
+        from webpage_agent.core.config import settings
+        return PiRuntime(
+            mock_script=mock_script, tool_runner=tool_runner,
+            model={
+                'id': settings.llm_model,
+                'base_url': settings.llm_base_url,
+                'provider': 'deepseek',
+                'api': 'openai-completions',
+            },
+            api_key=settings.llm_key or None,
+            # 系统提示是配置，不是临时环境变量说明。
+            # settings.pi_system_prompt 默认带画布停手规则；PI_SYSTEM_PROMPT
+            # 可覆盖，显式空字符串则不注入。
+            system_prompt=settings.pi_system_prompt or None,
+        )
     raise runtime_identity.UnknownRuntimeKind('<new-run>', kind)

@@ -279,7 +279,7 @@ async def request_external_cancel(store, *, external_task_id: str,
             # 远端不支持取消：如实保留状态，不声称已取消。
             return {'requested': True, 'confirmed': False,
                     'state': str(task.get('state') or 'running')}
-    except Exception as exc:                       # noqa: BLE001
+    except Exception:                               # noqa: BLE001
         logger.warning('请求远端取消失败 id=%s', external_task_id, exc_info=True)
         return {'requested': True, 'confirmed': False,
                 'state': str(task.get('state') or 'running')}
@@ -349,8 +349,7 @@ async def poll_due(store, *, worker_id: str, querier=None, limit: int | None = N
                 error_code='no_contract')
             done += 1
             continue
-        # 合同自己的轮询间隔与截止时间真正参与调度。
-        poll_interval = float(getattr(contract, 'poll_interval_seconds', 5) or 5)
+        # 截止时间在这里判断。轮询间隔在登记时写进 next_poll_at，领取时已经用过。
         deadline = float(task.get('deadline_at') or 0)
         if deadline and now > deadline and str(task.get('state')) != 'materializing':
             await store.complete_external_task_and_wake(
@@ -428,7 +427,7 @@ async def poll_due(store, *, worker_id: str, querier=None, limit: int | None = N
             envelope = _envelope_for(task, staged)
             result_id = str(staged.get('result_id') or
                             'ext-' + str(task.get('external_task_id') or 'result'))
-            written = await store.complete_external_task_and_wake(
+            await store.complete_external_task_and_wake(
                 task['external_task_id'], epoch, owner=worker_id,
                 state='completed',
                 output_manifest_ref=str(staged.get('raw_ref') or ''),

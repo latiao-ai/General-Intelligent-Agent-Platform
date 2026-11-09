@@ -15,11 +15,8 @@
 """
 from __future__ import annotations
 
-import asyncio
-import json
 import tempfile
 import unittest
-from contextlib import contextmanager
 from pathlib import Path
 
 from webpage_agent.integrations import mcp_adapter, mcp_servers
@@ -169,7 +166,7 @@ class GovernedPlatformWriteTests(unittest.IsolatedAsyncioTestCase):
             sf = Path(folder) / 'platform.json'
             seed_state(sf, {'obj-a': {'object_id': 'obj-a', 'owner': 'subject-A',
                                       'revision': 1, 'fields': {'title': '旧'}}})
-            server = _platform_server(sf)
+            _server = _platform_server(sf)
             calls = []
 
             async def fake_run(args, state):
