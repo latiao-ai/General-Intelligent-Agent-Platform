@@ -30,8 +30,8 @@ webpage-agent-main/
 
 | 引擎 | 何时用 | 做什么 |
 |---|---|---|
-| Pi（`PiRuntime` + `pi-runtime/`） | **新建**业务 run 的默认。`DEFAULT_RUNTIME_KIND` 未设置时就是 `pi` | 工具循环：governed_call、检查点、审批 / 外部等待 / 缺参 `waiting_input`、写后 `platform_verify` |
-| LangGraph（`LangGraphRuntime`） | 该 run 行上的 `runtime_kind=langgraph`，以及补偿 run | 计划、修订、观察、核对、多步补偿。排空前保留，不因默认切换删除 |
+| Pi（`PiRuntime` + `pi-runtime/`） | **新建**业务 run 的默认。`DEFAULT_RUNTIME_KIND` 未设置时就是 `pi`。补偿 run 和「部署上一份产物」也是 Pi | 工具循环：governed_call、检查点、审批 / 外部等待 / 缺参 `waiting_input`、写后 `platform_verify`。补偿和部署另走脚本模式（`pi_script.py`）：不启动模型，按既定步骤调用 |
+| LangGraph（`LangGraphRuntime`） | 该 run 行上的 `runtime_kind=langgraph` | 计划、修订、观察、核对。排空前保留，不因默认切换删除。补偿和「部署上一份产物」不再新建图 run |
 
 恢复读库里的 `runtime_kind` / `runtime_version` / `runtime_state_schema`，不认识的引擎直接拒绝，不退回另一个引擎再跑一遍。系统提示是 `settings.pi_system_prompt`（可用 `PI_SYSTEM_PROMPT` 覆盖），不是只写在文档里的环境变量。
 
@@ -42,7 +42,7 @@ webpage-agent-main/
 | 包 | 职责 | 关键模块 |
 |---|---|---|
 | `api/` | HTTP 层：路由、鉴权、应用装配 | `routes.py`（对外接口与页面）、`api_hub.py`（任务编排入口）、`main.py`（执行流程与阶段标签）、`auth.py`、`auth_connections.py` |
-| `agent/` | 两套执行内核。Pi 是新建 run 的默认；LangGraph 图留给存量 run 与补偿 | `runtime.py`、`pi_runtime.py`、`graph.py`、`nodes.py`（规划/续跑/执行/观察/核对/补偿）、`context.py`、`run_inputs.py`、`scene_context.py` |
+| `agent/` | 两套执行内核。Pi 是新建 run 的默认，补偿和部署走 Pi 的脚本模式；LangGraph 图留给存量 run | `runtime.py`、`pi_runtime.py`、`pi_script.py`、`graph.py`、`nodes.py`（规划/续跑/执行/观察/核对/补偿）、`context.py`、`run_inputs.py`、`scene_context.py` |
 | `tools/` | 工具汇总、调用上下文、权限策略、结果整形 | `core.py`（内核工具汇总，不 import 任何业务包）、`tool_context.py`、`tool_policy.py`、`tool_authorization.py`、`tool_results.py` |
 | `store/` | 持久化仓储，唯一实现是 PostgreSQL | `pg_store.py`、`persistence.py`（`Repository` 协议）、`migrations.py`、`ledger.py`、`idempotency.py`、`artifact_store.py` |
 | `governance/` | 治理：策略、审批、票据、执行控制、复核 | `policies.py`、`core.py`、`approvals.py`、`ticket_auth.py`、`request_review.py`、`execution_control.py` |
