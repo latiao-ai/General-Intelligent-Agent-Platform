@@ -109,8 +109,8 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         # LangGraphRuntime）负责驱动图、合并增量、记录耗时并透传节点内部事件。
         # 控制流异常与取消原样穿过，由下面这段宿主收尾统一处理（§4.3、§7.2）。
         #
-        # 第七阶段：按 run 的引擎归属分流。有账本时从库里读已存归属（在解释旧
-        # 计划之前），Pi 走 PiRuntime；无账本（CLI 直调）走默认 LangGraph。
+        # 按 run 的引擎归属分流。有账本时从库里读已存归属（在解释旧计划之前）。
+        # 无账本的 CLI 直调走 default_kind()：未设置环境变量时是 Pi。
         runtime_kind = ''
         if ledger is not None and getattr(ledger, 'store', None) is not None \
                 and run_id:

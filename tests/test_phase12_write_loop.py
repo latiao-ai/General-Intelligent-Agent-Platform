@@ -144,6 +144,7 @@ class PiWriteLoopProcessTests(unittest.IsolatedAsyncioTestCase):
             'TENANT_BUDGET_ENABLED': 'false',
             # 写闭环：显式扩展读/写白名单（受控 MCP 平台工具）
             'PI_READ_TOOL_KEYS': json.dumps(['mcp:platform:get_object']),
+            'PI_WRITE_TOOLS_ENABLED': 'true',
             'PI_WRITE_TOOL_KEYS': json.dumps(['mcp:platform:update_object']),
             # 受控模型脚本：驱动 Pi 自主读→写→答复
             'PI_MOCK_SCRIPT': _mock_script(),

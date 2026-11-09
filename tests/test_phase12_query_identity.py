@@ -26,6 +26,33 @@ def _require_pg(testcase):
         testcase.skipTest('需要 PG_TEST_DSN（指向一次性测试库，库名含 test）')
 
 
+class QueryRoleAcceptanceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_only_authenticated_principal_supplies_role(self):
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        from webpage_agent.api.hub_messages import HubSessionMessageMixin
+        from tests.exec_env import override_settings
+
+        hub = HubSessionMessageMixin()
+        hub.store = SimpleNamespace(session_tasks=AsyncMock(return_value=[]),
+                                    turns_of=AsyncMock(return_value=[]),
+                                    create_turn=AsyncMock(return_value={
+                                        'turn_id': 't', 'status': 'accepted',
+                                        'kind': 'query'}))
+        hub._assert_session_owner = AsyncMock()
+        with override_settings(session_query_enabled=True):
+            for authenticated, role, expected in [(True, 'operator', 'operator'),
+                                                   (True, 'admin', 'admin'),
+                                                   (True, 'member', 'member'),
+                                                   (False, 'operator', 'member')]:
+                principal = SimpleNamespace(tenant_id='t', user_id='u',
+                                            role=role, authenticated=authenticated)
+                await hub.accept_session_message('s', request_id='r',
+                                                 message='天气', principal=principal)
+                self.assertEqual(hub.store.create_turn.await_args.kwargs['owner_role'],
+                                 expected)
+
+
 class QueryIdentityGovernanceTests(unittest.IsolatedAsyncioTestCase):
     """内部查询执行记录 + 账本：只读工具走通治理 + 拒绝路径仍有效。"""
 
@@ -52,6 +79,59 @@ class QueryIdentityGovernanceTests(unittest.IsolatedAsyncioTestCase):
         book = ledger_module.ActionLedger(
             self.store, turn_id, 1, context=context)
         return created, context, book
+
+    async def test_query_roles_follow_persisted_principal_and_policy(self):
+        from webpage_agent.api.api_hub import Hub
+        from webpage_agent.capabilities.registry import Tool
+        from webpage_agent.governance.policies import Principal
+        from webpage_agent.tools import execution_gateway, tool_authorization, tool_policy
+        from tests.exec_env import override_settings
+
+        calls = []
+        observations = []
+
+        async def invoke(args, state):
+            calls.append(args)
+            return {'status': 'searched'}
+
+        tool = Tool('restricted', '受限查询', 'd', {'type': 'object'}, invoke,
+                    tool_key='local:test:restricted', effect='read')
+        await self.store.upsert_tool_policy(tenant_id='tenant-a', tool_key=tool.tool_key,
+                                            role='operator', effect='read')
+        hub = Hub(self.store, owner_id='worker-a')
+
+        class Runtime:
+            async def run(inner, state):
+                ctx = await execution_gateway.tool_context(step_id='s', action_id='')
+                row = await hub.store.run(state['run_id'])
+                policies = await tool_authorization.load_policies(hub.store, ctx.tenant_id)
+                visible, _ = tool_policy.filter_catalog(
+                    [tool], policies, tenant_id=ctx.tenant_id,
+                    user_id=ctx.user_id, role=ctx.role)
+                result = await execution_gateway.governed_call(
+                    tool=tool, args={'query': 'x', 'role': 'operator'},
+                    step_id='s', state={}, ctx=ctx)
+                observations.append((row['owner_role'], ctx.role, bool(visible),
+                                     result.kind, result.error_code))
+                return {'answer': 'done'}
+
+        hub._build_pi_runtime = lambda **kwargs: Runtime()
+        with override_settings(session_query_enabled=True), \
+                patch('webpage_agent.tools.tool_policy.enforcement_enabled', return_value=True):
+            for role in ('operator', 'member'):
+                p = Principal(tenant_id='tenant-a', user_id='user-' + role,
+                              role=role, authenticated=True)
+                accepted = await hub.accept_session_message(
+                    'session-' + role, request_id='r', message='天气', principal=p)
+                claimed = await self.store.claim_turn('worker-a', 120,
+                                                      session_id='session-' + role)
+                self.assertEqual(claimed['turn_id'], accepted['turn_id'])
+                self.assertEqual(claimed['owner_role'], role)
+                self.assertEqual(await hub._run_pi_chat(claimed), 'done')
+        self.assertEqual(observations[0][:4], ('operator', 'operator', True, 'succeeded'))
+        self.assertEqual(observations[1][:4], ('member', 'member', False, 'denied'))
+        self.assertEqual(observations[1][4], 'E_NO_POLICY')
+        self.assertEqual(len(calls), 1)
 
     async def test_create_turn_run_creates_internal_execution_record(self):
         """内部查询执行记录：runs 行存在，running + 租约 + pi 引擎，非业务 run。"""

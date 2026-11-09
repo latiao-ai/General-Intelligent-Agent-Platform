@@ -31,15 +31,31 @@ class RuntimeOwnershipTests(unittest.IsolatedAsyncioTestCase):
         await self.store.create_task(task_id, 's1', '测试')
 
     async def test_default_kind_is_langgraph(self):
+        """显式 langgraph 仍按图的版本落库（排空前的恢复身份）。"""
         from webpage_agent.agent import runtime_identity
         await self._seed_task()
-        await self.store.create_run('r1', 't1', status='queued')
+        await self.store.create_run('r1', 't1', status='queued',
+                                    runtime_kind='langgraph')
         run = await self.store.run('r1')
         self.assertEqual(run['runtime_kind'], 'langgraph')
         self.assertEqual(run['runtime_version'],
                          runtime_identity.LANGGRAPH_RUNTIME_VERSION)
         self.assertEqual(run['runtime_state_schema'],
                          runtime_identity.LANGGRAPH_STATE_SCHEMA)
+
+    async def test_configured_pi_default_persists_pi_identity(self):
+        """DEFAULT_RUNTIME_KIND=pi 时，新建 run 的引擎身份是 pi，而不是图。"""
+        from webpage_agent.agent import runtime_identity
+        from tests.exec_env import override_settings
+        await self._seed_task('t-pi')
+        with override_settings(default_runtime_kind='pi'):
+            self.assertEqual(runtime_identity.default_kind(), 'pi')
+            await self.store.create_run('r-pi', 't-pi', status='queued')
+        run = await self.store.run('r-pi')
+        self.assertEqual(run['runtime_kind'], 'pi')
+        self.assertEqual(run['runtime_version'], runtime_identity.PI_RUNTIME_VERSION)
+        self.assertEqual(run['runtime_state_schema'],
+                         runtime_identity.PI_STATE_SCHEMA)
 
     async def test_explicit_pi_kind(self):
         from webpage_agent.agent import runtime_identity

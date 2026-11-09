@@ -50,11 +50,12 @@ export interface FinishedMessage extends BaseMessage {
   answer?: string;
   /** outcome=failed 时的错误说明 */
   error?: string;
-  /** outcome=waiting 时的等待原因（第十阶段收口）：
+  /** outcome=waiting 时的等待原因：
    *  - 'approval'：工具需要批准，宿主已持久化等待审批事实；
-   *  - 'external'：远端已受理、结果未定。
-   *  宿主据此把 run 停在 waiting_approval 或 waiting_external。 */
-  wait_reason?: 'approval' | 'external';
+   *  - 'external'：远端已受理、结果未定；
+   *  - 'input'：缺参或需要用户补充，宿主停在 waiting_input。
+   *  宿主据此把 run 停在 waiting_approval / waiting_external / waiting_input。 */
+  wait_reason?: 'approval' | 'external' | 'input';
 }
 
 /** 桥接或引擎错误 */
@@ -183,6 +184,7 @@ export interface ModelAdmitMessage extends BaseMessage {
   request_id: string;
   /** allow=1 才可真正请求模型；否则 Node 不得 stream。 */
   allow: boolean;
+  current_time_prompt?: string;
   /** deny 时的原因。 */
   reason?: string;
 }
@@ -227,6 +229,8 @@ export interface ToolResultMessage extends BaseMessage {
   needs_approval?: boolean;
   /** 批准 ID（needs_approval 时随回执带回，供批准后恢复原候选）。 */
   approval_id?: string;
+  /** 缺参/需要用户补充：Node 结束本轮，不把这则回执当工具错误继续推理。 */
+  needs_input?: boolean;
 }
 
 /** 停止执行 / 关闭进程 */

@@ -10,6 +10,10 @@ import asyncio
 import logging
 import time
 import uuid
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from webpage_agent.agent.pi_recovery import RecoveryDecision
 
 from webpage_agent.api.task_record import TaskRecord
 from webpage_agent.capabilities import registry as capability_registry
@@ -166,6 +170,19 @@ class HubRecoveryMixin:
                 'asked_questions': asked, 'clarification': clarified,
                 'step_index': _resume_index(steps, actions)}
 
+    async def _resume_for_engine(self, run_id: str) -> dict | None:
+        """按这条 run 已存的引擎装配续跑输入。
+
+        Pi 没有图计划。补充要求触发的下一轮如果仍走 `_resume_plan`，
+        会丢掉 `pi_resume`，PiRuntime 会当成首次执行再跑一遍工具。
+        """
+        from webpage_agent.agent import runtime_identity
+        ident = await self.store.runtime_identity(run_id)
+        if ident['kind'] == runtime_identity.KIND_PI:
+            run = await self.store.run(run_id) or {}
+            return await self._pi_resume_plan(run_id, run)
+        return await self._resume_plan(run_id)
+
     async def _pi_resume_plan(self, run_id: str, run: dict) -> dict:
         """Pi 恢复装配：读版本化 Pi 快照，构造续跑所需的 resume 上下文。
 
@@ -319,6 +336,12 @@ class HubRecoveryMixin:
             for item in pending_inputs
             if isinstance(item, dict) and str(item.get('message') or '').strip()
         ]
+        # 缺参停在 waiting_input：有新补充就把停靠的工具结果交付回去再继续；
+        # 没有补充则保持等待，不重新推理。
+        decision, snapshot = pi_recovery.apply_pending_input(
+            decision, snapshot, resume['pending_inputs'])
+        resume['pi_resume']['snapshot'] = snapshot
+        resume['pi_resume']['recovery'] = decision.to_dict()
         return resume
 
     async def _decide_approval_recovery(self, run_id: str, awaiting: list,
@@ -640,11 +663,15 @@ class HubRecoveryMixin:
             return None
         if record.live:
             return record
-        plan = await self.store.plan(run_id) or {}
-        steps = plan.get('steps') or []
-        if not steps and await self.store.actions_of(run_id):
-            # 有动作却没有计划必须核实；首次规划尚未成功且没有动作时可以重试规划。
-            return None
+        from webpage_agent.agent import runtime_identity
+        ident = await self.store.runtime_identity(run_id)
+        if ident['kind'] != runtime_identity.KIND_PI:
+            # 只属于图：有动作却没有计划必须核实。Pi 没有步骤计划，
+            # 工具动作落在 actions / 快照里，不能用这条规则把续跑判死。
+            plan = await self.store.plan(run_id) or {}
+            steps = plan.get('steps') or []
+            if not steps and await self.store.actions_of(run_id):
+                return None
         # 续跑也要先占租约：否则同一份计划可能被 Worker 与本次 resume 同时执行。
         # 但已被别人持有租约时不能动它的状态——先把 running 改成 queued 就等于
         # 替正在执行的进程改账。
@@ -690,10 +717,13 @@ class HubRecoveryMixin:
         if not tool_name:
             raise RuntimeError('没有声明部署动作的能力包')
         run_id = uuid.uuid4().hex[:12]
+        # 部署仍是「一步图计划」，不是 Pi 工具循环。显式固定 LangGraph，
+        # 避免默认引擎改成 pi 之后这条 run 丢掉步骤、改去自由工具循环。
         await self.store.create_run(run_id, record.task_id, status='queued',
                               tenant_id=tenant,
                               owner_user_id=str(getattr(principal, 'user_id', '')
-                                                or record.owner_user_id or 'default'))
+                                                or record.owner_user_id or 'default'),
+                              runtime_kind='langgraph')
         step = {'tool': tool_name, 'step_id': 's1', 'args': {},
                 'depends_on': [], 'why': '用户点击部署'}
         keep_artifact_id = record.artifact_id

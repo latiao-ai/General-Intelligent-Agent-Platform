@@ -15,9 +15,54 @@
  * 工具执行**交回 Python**：Node 侧发 tool_call，用 call_id → Promise 等待回执。
  * 同一轮内允许 Pi 一次产生多个 tool_call，但**逐个串行回执**（一次只等一个）。
  */
-import { Type, type TSchema, type Tool, type ToolCall } from '@mariozechner/pi-ai';
+import type { Tool, ToolCall } from '@mariozechner/pi-ai';
 
 import type { HostToolDecl, ToolCallMessage } from './protocol.js';
+
+/**
+ * 本模块产出的 schema 一律是**普通 JSON Schema 对象**。
+ *
+ * 历史实现用 TypeBox 的 `Type.*` 构造这些对象，但 TypeBox 只为拼出一个
+ * `{type, properties, required, ...}` 字面量，却要在进程启动时加载 6MB / 288 个
+ * 导出，实测单次 import 约 3.7s——而 Pi 是「一 run 一进程」，这笔开销每次都付。
+ * 这里用等价的最小构造器替代，产出 JSON 逐字节一致（见 schema-cases.mjs 对拍）。
+ *
+ * `TSchema` 因此退化为「键值对象」别名，仅用于内部流转；交给 SDK 时在
+ * `buildToolsFromHost` 里断言成 SDK 的 schema 类型——运行时不做任何校验，
+ * 真正的约束校验发生在模型端点与 MCP 服务端。
+ */
+type TSchema = Record<string, unknown>;
+
+type Opts = Record<string, unknown> | undefined;
+
+const spread = (o: Opts): Record<string, unknown> => (o ? { ...o } : {});
+
+const T = {
+  String: (o?: Opts) => ({ type: 'string', ...spread(o) }),
+  Number: (o?: Opts) => ({ type: 'number', ...spread(o) }),
+  Integer: (o?: Opts) => ({ type: 'integer', ...spread(o) }),
+  Boolean: () => ({ type: 'boolean' }),
+  Null: () => ({ type: 'null' }),
+  /** 字面量：`{type: <typeof v>, const: v}`，与 TypeBox 的 Type.Literal 一致。 */
+  Literal: (v: string | number | boolean) => ({ type: typeof v, const: v }),
+  /** 联合：输出 anyOf；单元素**不**降级（与 TypeBox 行为一致）。 */
+  Union: (variants: TSchema[]) => ({ anyOf: variants }),
+  Intersect: (variants: TSchema[]) => ({ allOf: variants }),
+  Array: (items: TSchema, o?: Opts) => ({ type: 'array', ...spread(o), items }),
+  Object: (properties: Record<string, TSchema>, o?: Opts) => ({
+    type: 'object',
+    ...spread(o),
+    properties,
+  }),
+  /**
+   * 可选标记：**no-op**。
+   *
+   * 是否必填由 `Type.Object` 的 `required` 显式数组决定（本模块的所有调用点
+   * 都传了 required），TypeBox 的 Optional symbol 在 JSON 层面不产生任何字段，
+   * 因此这里保持原样返回即可，语义完全等价。
+   */
+  Optional: (s: TSchema) => s,
+};
 
 /** 把一个宿主 JSON Schema 节点转成 TypeBox schema。
  *
@@ -60,7 +105,7 @@ const arrayOpts = ['minItems', 'maxItems', 'uniqueItems'] as const;
 /** 把 unknown 字面量收窄成 TypeBox 可接受的字面量类型，其余抛错。 */
 function literalSchema(v: unknown): TSchema {
   if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
-    return Type.Literal(v);
+    return T.Literal(v);
   }
   throw new Error(`不支持的字面量类型：${typeof v}`);
 }
@@ -100,6 +145,22 @@ function compile(node: unknown, defs: SchemaNode, depth: number): TSchema {
     return compile(target, defs, depth + 1);
   }
 
+  // 顶层是 object、但同时带 oneOf/anyOf：必须**保留 object 外壳**。
+  //
+  // Pydantic 表达「互斥必填」时输出这种形状，例如 LibTV 的 inspect_media：
+  //   {"type":"object","properties":{...},"oneOf":[{required:["fileRef"]},
+  //                                            {anyOf:[{required:["projectId"]},...]}]}
+  // 模型端点要求 tools[].function.parameters 顶层 `type` 必须是 object；
+  // 若这里直接交给 compileCombinator，顶层 object 会被整个丢掉、只剩 anyOf，
+  // 请求被 400 拒绝（"parameters must be a JSON Schema of type object"）。
+  // 互斥语义无法用单一 object 表达，取各变体 required 的交集（通常为空），
+  // 具体必填约束交给 MCP 服务端在调用时校验。
+  const implicitObject = schema.type === undefined && 'properties' in schema;
+  if ((schema.type === 'object' || implicitObject)
+      && ('anyOf' in schema || 'oneOf' in schema)) {
+    return compileObjectWithVariants(schema, defs, depth);
+  }
+
   // 组合关键字：优先处理（Pydantic 的 anyOf 常带 null 分支，表示可空）。
   if ('anyOf' in schema || 'oneOf' in schema || 'allOf' in schema) {
     // allOf 里若是 if/then/else 条件约束，把它并入当前 object（见下），
@@ -115,12 +176,12 @@ function compile(node: unknown, defs: SchemaNode, depth: number): TSchema {
     }
     // 过滤 null：enum 里混 null 表示可空。
     const nonNull = values.filter((v) => v !== null);
-    const built = Type.Union(nonNull.map((v) => literalSchema(v)));
-    return nonNull.length === values.length ? built : Type.Optional(built);
+    const built = T.Union(nonNull.map((v) => literalSchema(v)));
+    return nonNull.length === values.length ? built : T.Optional(built);
   }
   if ('const' in schema) {
     const v = schema.const;
-    return v === null ? Type.Optional(Type.Null()) : literalSchema(v);
+    return v === null ? T.Optional(T.Null()) : literalSchema(v);
   }
 
   // if/then/else 条件分支：pi-ai 无法表达运行时条件，宽松处理为「合并 then 分支
@@ -165,7 +226,7 @@ function compile(node: unknown, defs: SchemaNode, depth: number): TSchema {
     }
     // additionalProperties：缺省 false（Pydantic 默认拒绝额外字段），显式 true 时开放。
     const ap = schema.additionalProperties;
-    return Type.Object(built, {
+    return T.Object(built, {
       additionalProperties: ap === true ? true : false,
       required: required as string[],
     });
@@ -176,22 +237,102 @@ function compile(node: unknown, defs: SchemaNode, depth: number): TSchema {
     if (items === undefined || items === null) {
       throw new Error('array 参数缺少 items');
     }
-    return Type.Array(compile(items, defs, depth + 1), opts);
+    return T.Array(compile(items, defs, depth + 1), opts);
   }
   switch (kind) {
     case 'string':
-      return Type.String(pickOptions(schema, stringOpts));
+      return T.String(pickOptions(schema, stringOpts));
     case 'number':
-      return Type.Number(pickOptions(schema, numberOpts));
+      return T.Number(pickOptions(schema, numberOpts));
     case 'integer':
-      return Type.Integer(pickOptions(schema, numberOpts));
+      return T.Integer(pickOptions(schema, numberOpts));
     case 'boolean':
-      return Type.Boolean();
+      return T.Boolean();
     case 'null':
-      return Type.Null();
+      return T.Null();
     default:
       throw new Error(`不支持的参数类型：${String(kind)}`);
   }
+}
+
+/** 编译「顶层 object + oneOf/anyOf 变体」的 schema，始终产出顶层 object。
+ *
+ * 变体是「互斥必填」的约束补丁（只带 required，字段定义在顶层 properties 里）。
+ * 合并规则：
+ *   - properties 取并集；变体里给出**具体类型**的字段覆盖顶层同名的 null 占位
+ *     （Pydantic 用 `{"type":"null"}` 表示「本变体里该字段不允许出现」）；
+ *   - required 取各变体的**交集**：互斥变体不能强制任何一个字段，
+ *     具体必填由服务端在调用时校验，不在参数 schema 里假装是必填；
+ *   - 嵌套的 anyOf/oneOf 递归展开，循环引用由 depth 上限兜住。
+ */
+function compileObjectWithVariants(
+  schema: SchemaNode,
+  defs: SchemaNode,
+  depth: number,
+): TSchema {
+  const properties: Record<string, unknown> = {
+    ...(schema.properties as Record<string, unknown> ?? {}),
+  };
+  const requiredSets: string[][] = [];
+  const collected: string[] = [];
+
+  const collect = (node: unknown): void => {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return;
+    const n = node as SchemaNode;
+    if (Array.isArray(n.required)) {
+      const keys = n.required.map((r) => String(r));
+      if (keys.length > 0) {
+        requiredSets.push(keys);
+        for (const k of keys) {
+          if (!collected.includes(k)) collected.push(k);
+        }
+      }
+    }
+    if (n.properties && typeof n.properties === 'object'
+        && !Array.isArray(n.properties)) {
+      for (const [key, value] of Object.entries(n.properties as Record<string, unknown>)) {
+        const existing = properties[key];
+        const existingIsNull = Boolean(
+          existing && typeof existing === 'object'
+          && (existing as SchemaNode).type === 'null',
+        );
+        const incoming = value as SchemaNode | null;
+        const incomingIsNull = Boolean(incoming && incoming.type === 'null');
+        if (existing === undefined || (existingIsNull && !incomingIsNull)) {
+          properties[key] = value;
+        }
+      }
+    }
+    const nested = n.oneOf ?? n.anyOf;
+    if (Array.isArray(nested)) nested.forEach(collect);
+  };
+
+  const variants = (schema.oneOf ?? schema.anyOf) as unknown;
+  if (!Array.isArray(variants) || variants.length === 0) {
+    throw new Error('oneOf/anyOf 必须是数组');
+  }
+  variants.forEach(collect);
+
+  const built: Record<string, TSchema> = {};
+  for (const [key, sub] of Object.entries(properties)) {
+    built[key] = compile(sub, defs, depth + 1);
+  }
+
+  // required 取交集；变体里要求的字段若被合并掉，也不在这里强制。
+  let required: string[] = Array.isArray(schema.required)
+    ? (schema.required as unknown[]).map((x) => String(x))
+    : [];
+  if (requiredSets.length > 0) {
+    const shared = collected.filter((key) => requiredSets.every((s) => s.includes(key)));
+    // 顶层自己显式要求的字段必须保留（它与变体约束是「与」的关系）。
+    required = Array.from(new Set([...required, ...shared]));
+  }
+
+  const ap = schema.additionalProperties;
+  return T.Object(built, {
+    additionalProperties: ap === true ? true : false,
+    required,
+  });
 }
 
 function compileCombinator(schema: SchemaNode, defs: SchemaNode, depth: number): TSchema {
@@ -244,7 +385,7 @@ function compileCombinator(schema: SchemaNode, defs: SchemaNode, depth: number):
       return compile(merged, defs, depth + 1);
     }
     const compiled = branches.map((b) => compile(b, defs, depth + 1));
-    return compiled.length === 1 ? compiled[0] : Type.Intersect(compiled);
+    return compiled.length === 1 ? compiled[0] : T.Intersect(compiled);
   }
 
   const key = ('anyOf' in schema ? 'anyOf' : 'oneOf') as 'anyOf' | 'oneOf';
@@ -256,14 +397,14 @@ function compileCombinator(schema: SchemaNode, defs: SchemaNode, depth: number):
   const nonNull = nonNullBranches(variants);
   if (nonNull !== null) {
     if (nonNull.length === 1) {
-      return Type.Optional(compile(nonNull[0], defs, depth + 1));
+      return T.Optional(compile(nonNull[0], defs, depth + 1));
     }
-    return Type.Optional(
-      Type.Union(nonNull.map((b) => compile(b, defs, depth + 1))),
+    return T.Optional(
+      T.Union(nonNull.map((b) => compile(b, defs, depth + 1))),
     );
   }
   // 真正的联合类型（无 null 分支）。
-  return Type.Union(variants.map((b) => compile(b, defs, depth + 1)));
+  return T.Union(variants.map((b) => compile(b, defs, depth + 1)));
 }
 
 export function schemaFromJson(node: unknown): TSchema {
@@ -274,30 +415,60 @@ export function schemaFromJson(node: unknown): TSchema {
   return compile(node, defs as SchemaNode, 0);
 }
 
+export interface DroppedTool {
+  name: string;
+  reason: string;
+}
+
 /**
- * 把宿主传入的工具声明转成 Pi SDK 的 Tool[]。
+ * 把宿主传入的工具声明转成 Pi SDK 的 Tool[]，并列出被丢掉的工具。
  *
- * 只在参数为「object + 受支持字段」时支持；其他形状直接抛错，让 start 明确
- * 失败，而非静默丢失约束。空数组返回空数组（本轮无工具）。
+ * 参数根编译后不是 object 的工具**跳过并告警**，不抛错拖垮整份目录——
+ * 供应商对这种 schema 的反应是整次请求 400，一个工具都调不了。
+ * 缺 name、目录不是数组，仍是宿主协议错误，直接抛。
  */
-export function buildToolsFromHost(decls: HostToolDecl[]): Tool[] {
+export function assembleToolsFromHost(decls: HostToolDecl[]): {
+  tools: Tool[];
+  dropped: DroppedTool[];
+} {
   if (!Array.isArray(decls)) {
     throw new Error('工具目录必须是数组');
   }
-  return decls.map((decl) => {
+  const tools: Tool[] = [];
+  const dropped: DroppedTool[] = [];
+  for (const decl of decls) {
     if (!decl || typeof decl.name !== 'string' || !decl.name) {
       throw new Error('工具缺少合法 name');
     }
-    const params = decl.parameters ?? {};
-    if (typeof params !== 'object' || Array.isArray(params) || params === null) {
-      throw new Error(`工具 ${decl.name} 的参数 schema 必须是对象`);
+    try {
+      const params = decl.parameters ?? {};
+      if (typeof params !== 'object' || Array.isArray(params) || params === null) {
+        throw new Error('参数 schema 必须是对象');
+      }
+      const compiled = schemaFromJson(params);
+      const plain = JSON.parse(JSON.stringify(compiled)) as SchemaNode;
+      if (plain.type !== 'object') {
+        throw new Error(
+          `编译后顶层不是 object（type=${JSON.stringify(plain.type)}）`,
+        );
+      }
+      tools.push({
+        name: decl.name,
+        description: typeof decl.description === 'string' ? decl.description : '',
+        parameters: compiled,
+      });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      dropped.push({ name: decl.name, reason });
+      console.warn(`跳过工具 ${decl.name}：${reason}`);
     }
-    return {
-      name: decl.name,
-      description: typeof decl.description === 'string' ? decl.description : '',
-      parameters: schemaFromJson(params),
-    };
-  });
+  }
+  return { tools, dropped };
+}
+
+/** 只要可用工具。坏 schema 已在 assembleToolsFromHost 里丢掉。 */
+export function buildToolsFromHost(decls: HostToolDecl[]): Tool[] {
+  return assembleToolsFromHost(decls).tools;
 }
 
 /** 把 Pi 的 toolcall_end 事件转成发给宿主的 tool_call 消息。 */

@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS runs (
     compensated_at      TEXT,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
-    runtime_kind        TEXT NOT NULL DEFAULT 'langgraph',
+    runtime_kind        TEXT NOT NULL DEFAULT 'pi',
     runtime_version     INTEGER NOT NULL DEFAULT 1,
     runtime_state_schema INTEGER NOT NULL DEFAULT 1
 );
@@ -631,8 +631,9 @@ ALTER TABLE actions ADD COLUMN IF NOT EXISTS external_task_id TEXT NOT NULL DEFA
 ALTER TABLE tasks_meta ADD COLUMN IF NOT EXISTS scene_context_json TEXT NOT NULL DEFAULT '';
 
 -- run 的引擎归属：由哪个引擎驱动（langgraph | pi）、运行时实现版本、状态格式版本。
--- 恢复入口据此分流；存量 run 默认回填 langgraph，新 run 创建时确定归属。
-ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_kind TEXT NOT NULL DEFAULT 'langgraph';
+-- 恢复入口据此分流。v5 给存量行回填 langgraph；v11 把列默认改成 pi，
+-- 与应用层 DEFAULT_RUNTIME_KIND 一致。已存在的行不会被改写。
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_kind TEXT NOT NULL DEFAULT 'pi';
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_state_schema INTEGER NOT NULL DEFAULT 1;
 

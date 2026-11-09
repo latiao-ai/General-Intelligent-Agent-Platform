@@ -17,5 +17,10 @@ os.environ.setdefault('AUTH_MODE', 'off')
 os.environ.setdefault('API_RATE_LIMIT_ENABLED', 'false')
 os.environ.setdefault('TENANT_BUDGET_ENABLED', 'false')
 os.environ.setdefault('MCP_SERVERS', '[]')
+# 生产未设置 DEFAULT_RUNTIME_KIND 时，新建业务 run 走 Pi。
+# 这套用例里的图路径（规划、修订、补偿、观察）仍在排空，进程内钉回 langgraph，
+# 避免整库测试突然改去拉 Node。验证「默认是 pi」的用例用 override_settings，
+# 或在子进程环境里显式写 DEFAULT_RUNTIME_KIND=pi（不要继承这个钉）。
+os.environ.setdefault('DEFAULT_RUNTIME_KIND', 'langgraph')
 # PG_TEST_DSN 故意不设默认值：`reset_db()` 会 TRUNCATE，指错库就是数据事故。
 # 必须由调用方显式给出（库名含 test），否则用例按 SkipTest 跳过。

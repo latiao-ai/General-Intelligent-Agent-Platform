@@ -1,9 +1,11 @@
 """Pi 宿主工具调用对象：把「模型发起的工具调用」接到受治理的真实执行。
 
-第五阶段：Pi 不再用假工具（echo/add），而是通过这里调用**唯一开放的真实工具**
-`local:web:search`（web_search）。每一次调用都走 `tools/execution_gateway.py` 的
-同一条治理链（授权 → 准入 → 撤权复查 → 真实调用 → 结算），并把搜索结果转成
-模型可用的回执。
+第五阶段：Pi 不再用假工具（echo/add），而是通过这里调用**白名单内的真实工具**。
+默认只开放 `local:web:search`（web_search）；第十/十二阶段起，读/写白名单可经
+`PI_READ_TOOL_KEYS` / `PI_WRITE_TOOL_KEYS` 环境变量**显式扩展**（读工具要求
+`effect=read`，写工具必须逐个点名，默认空）。每一次调用都走
+`tools/execution_gateway.py` 的同一条治理链
+（授权 → 准入 → 撤权复查 → 真实调用 → 结算），并把结果转成模型可用的回执。
 
 关键纪律：
 
@@ -11,7 +13,9 @@
   库里已提交的 run 行，**不**从 Node 或模型输出取；桥接 `call_id` 只用于
   往返关联，Python 分配稳定执行身份（step_id / action_id / attempt_id），
   不假定模型生成的 ID 能用于重启恢复；
-- **只开放 local:web:search**：执行点再次解析并检查工具，其它工具一律拒绝；
+- **只执行白名单内的工具**：执行点按请求名再次解析并检查工具，白名单外一律拒绝；
+- **必须有执行账本**：`governed_call(require_ledger=True)` 是正式路径，没有账本时
+  返回 `E_NO_LEDGER`、绝不落到真实调用。不存在"无账本直接执行"的兼容旁路——
 - **成功结算前不向 Pi 发成功回执**：结算失败就停止后续模型执行；
 - **结果归一**：工具内部返回的 `status="searched"` 是阶段小结，不是业务终态；
   回执保留来源 ID / 标题 / URL / 限长正文摘录，正文经 sources 存储读取，
@@ -38,9 +42,14 @@ logger = logging.getLogger(__name__)
 SYNC_READ_TOOL_KEYS = ('local:web:search',)
 
 # 本阶段 Pi 同步开放的**写**工具白名单（稳定键）。**默认空**——写工具绝不默认
-# 开放。第十阶段仅启用受控平台的 update_object（经显式配置注入，见
-# `pi_tool_catalog()`），生产不开放通用写工具。
+# 开放。扩展必须同时满足两道门：`PI_WRITE_TOOLS_ENABLED=true`，以及
+# `PI_WRITE_TOOL_KEYS` 里逐个点名。只配了键、没开开关，会被忽略并告警，
+# 不能靠误配静默扩权。
 WRITE_TOOL_KEYS: tuple[str, ...] = ()
+
+# 宿主控制工具：缺参时模型调用它，本轮结束并进入 waiting_input。
+# 不是业务工具，不走 governed_call，也不占用写白名单。
+REQUEST_INPUT_NAME = 'request_input'
 
 # 第九阶段保留别名（向后兼容旧测试引用）：只读白名单。
 READ_TOOL_KEYS = SYNC_READ_TOOL_KEYS
@@ -48,30 +57,84 @@ READ_TOOL_KEYS = SYNC_READ_TOOL_KEYS
 
 def _effective_read_keys() -> set[str]:
     """当前生效的读白名单：模块级常量 + 环境变量显式扩展（正式链路测试用）。"""
-    import json as _json
     import os as _os
     keys = set(SYNC_READ_TOOL_KEYS)
     extra = _os.environ.get('PI_READ_TOOL_KEYS')
     if extra:
-        try:
-            keys |= {str(k) for k in _json.loads(extra)}
-        except ValueError:
-            pass
+        parsed = _parse_key_list(extra, 'PI_READ_TOOL_KEYS')
+        if parsed:
+            keys |= parsed
     return keys
+
+
+def write_tools_gate_open() -> bool:
+    """写白名单扩展门禁。环境变量优先（进程启动与测试改 env 都认），否则看 settings。"""
+    import os as _os
+    raw = _os.environ.get('PI_WRITE_TOOLS_ENABLED')
+    if raw is not None:
+        return raw.strip().lower() == 'true'
+    from webpage_agent.core.config import settings
+    return bool(settings.pi_write_tools_enabled)
+
+
+def _parse_key_list(raw: str, name: str) -> set[str] | None:
+    import json as _json
+    try:
+        parsed = _json.loads(raw)
+    except ValueError:
+        logger.warning('%s 不是合法 JSON，已忽略', name)
+        return None
+    if not isinstance(parsed, list):
+        logger.warning('%s 必须是 JSON 数组，已忽略', name)
+        return None
+    return {str(key) for key in parsed}
 
 
 def _effective_write_keys() -> set[str]:
-    """当前生效的写白名单：模块级常量 + 环境变量显式扩展（正式链路测试用）。"""
-    import json as _json
+    """当前生效的写白名单。
+
+    模块级常量（默认空）之外的键，必须打开 `PI_WRITE_TOOLS_ENABLED` 才会并入。
+    门开时打审计日志；门关时丢弃环境变量里的键并告警。
+    """
     import os as _os
     keys = set(WRITE_TOOL_KEYS)
     extra = _os.environ.get('PI_WRITE_TOOL_KEYS')
-    if extra:
-        try:
-            keys |= {str(k) for k in _json.loads(extra)}
-        except ValueError:
-            pass
-    return keys
+    if not extra:
+        return keys
+    parsed = _parse_key_list(extra, 'PI_WRITE_TOOL_KEYS')
+    if not parsed:
+        return keys
+    if not write_tools_gate_open():
+        logger.warning(
+            '拒绝静默扩权：PI_WRITE_TOOL_KEYS=%s 已忽略。'
+            '要开放这些写工具，必须同时设置 PI_WRITE_TOOLS_ENABLED=true',
+            sorted(parsed))
+        return keys
+    enabled = keys | parsed
+    logger.info('审计：Pi 写白名单经显式门禁扩展为 %s', sorted(enabled))
+    return enabled
+
+
+def request_input_decl() -> dict:
+    """缺参时让模型停下来问人的宿主工具声明。"""
+    return {
+        'name': REQUEST_INPUT_NAME,
+        'description': (
+            '向用户索取继续执行所缺的信息（选中对象、字段或必须由人做的选择）。'
+            '调用后本轮立即停止，进入 waiting_input。不要猜测缺的值，也不要改用别的工具空转。'
+        ),
+        'parameters': {
+            'type': 'object',
+            'additionalProperties': False,
+            'properties': {
+                'question': {
+                    'type': 'string',
+                    'description': '需要用户补充的具体问题，一句话',
+                },
+            },
+            'required': ['question'],
+        },
+    }
 
 # 单条来源给模型的正文摘录上限（字符）。正文太长只摘开头，避免撑爆上下文。
 SNIPPET_MAX_CHARS = 400

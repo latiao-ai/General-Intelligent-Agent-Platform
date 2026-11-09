@@ -270,7 +270,6 @@ async def _external_registration(book, ctx, *, tool_key: str,
     tenant_id = 'default'
     owner_user_id = 'default'
     credential_subject = ''
-    platform_id = ''
     if ctx is not None:
         tenant_id = str(getattr(ctx, 'tenant_id', None) or 'default')
         owner_user_id = str(getattr(ctx, 'user_id', None) or 'default')
@@ -283,7 +282,6 @@ async def _external_registration(book, ctx, *, tool_key: str,
                 tenant_id = str(run.get('tenant_id') or tenant_id)
                 owner_user_id = str(run.get('owner_user_id') or owner_user_id)
                 credential_subject = str(run.get('platform_subject') or '')
-                platform_id = str(run.get('platform_id') or '')
         except Exception:                                # noqa: BLE001
             logger.warning('读取 run 归属失败 run=%s', run_id, exc_info=True)
     submission_key = remote_task_id or idempotency_key or step_id

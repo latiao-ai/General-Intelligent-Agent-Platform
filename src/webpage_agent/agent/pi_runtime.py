@@ -1,8 +1,7 @@
 """PiRuntime：通过 Node 桥接驱动 Pi 推理，实现 `agent.runtime.Runtime` 契约。
 
 第三阶段目标：打通「Python → Node 中的 Pi → Python 假工具 → Pi 答复」这一条
-最小链路。生产入口 `get_runtime()` 仍然默认 `LangGraphRuntime`，本实现只通过
-测试注入和独立 smoke 入口验证，不开放全局切换、不新增数据库字段。
+最小链路。新建业务 run 的默认引擎是 Pi；已落库的 LangGraph run 仍走原恢复分支。
 
 契约遵守（与 Runtime 接口一致）：
 
@@ -103,7 +102,10 @@ def default_tool_catalog() -> list[dict[str, Any]]:
         if str(tool.effect or '') != 'read':
             continue
         declared.append(_tool_decl(tool))
-    return declared
+    declared.append(pi_host_tools.request_input_decl())
+    from webpage_agent.agent.pi_tool_schema import prepare_declarations
+    kept, _dropped = prepare_declarations(declared)
+    return kept
 
 
 async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
@@ -123,25 +125,10 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
     from webpage_agent.tools import core as tools_core
     from webpage_agent.capabilities import registry as cap_registry
 
-    read_keys = set(pi_host_tools.SYNC_READ_TOOL_KEYS)
-    write_keys = set(pi_host_tools.WRITE_TOOL_KEYS)
-    # 第十阶段收口：正式链路测试经环境变量**显式扩展**读/写白名单（受控启用，
-    # 不靠测试注入或临时全局切换——环境变量是显式配置，生产未设置时白名单保持
-    # 默认：只读 web_search、不开放写）。
-    import json as _json
-    import os as _os
-    _extra_read = _os.environ.get('PI_READ_TOOL_KEYS')
-    if _extra_read:
-        try:
-            read_keys |= {str(k) for k in _json.loads(_extra_read)}
-        except ValueError:
-            pass
-    _extra_write = _os.environ.get('PI_WRITE_TOOL_KEYS')
-    if _extra_write:
-        try:
-            write_keys |= {str(k) for k in _json.loads(_extra_write)}
-        except ValueError:
-            pass
+    # 读白名单可经 PI_READ_TOOL_KEYS 扩展。写白名单默认空，且必须再开
+    # PI_WRITE_TOOLS_ENABLED 才会并入 PI_WRITE_TOOL_KEYS（见 pi_host_tools）。
+    read_keys = pi_host_tools._effective_read_keys()
+    write_keys = pi_host_tools._effective_write_keys()
     tool_objects: list = []
 
     # 本地只读工具
@@ -163,7 +150,15 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
             tool_objects.append(tool)
 
     decls = [_tool_decl(t) for t in tool_objects]
-    return decls, tool_objects
+    decls.append(pi_host_tools.request_input_decl())
+    from webpage_agent.agent.pi_tool_schema import prepare_declarations
+    kept, dropped = prepare_declarations(decls)
+    if dropped:
+        logger.warning('Pi 工具目录丢弃 %s 个参数 schema 不合格的工具', len(dropped))
+        dropped_names = {item.get('name') for item in dropped}
+        tool_objects = [tool for tool in tool_objects
+                        if getattr(tool, 'name', '') not in dropped_names]
+    return kept, tool_objects
 
 
 class PiRuntime:
@@ -196,6 +191,11 @@ class PiRuntime:
         # tools=None 表示用默认目录（web_search）；tools=[] 表示本轮无工具。
         # 不再回退到 echo/add。
         self._tools = tools if tools is not None else default_tool_catalog()
+        # 是否由调用方**显式**给出工具目录。显式目录优先于 run() 里的惰性发现：
+        # 发现逻辑只看环境变量（PI_READ/WRITE_TOOL_KEYS），不加这个标记的话，
+        # 只要环境里配了白名单，任何显式传入的目录都会在 run() 里被悄悄覆盖成
+        # 真实工具目录——调用方的意图被环境变量劫持，且失败时表现为"工具不对"。
+        self._tools_explicit = tools is not None
         # 第十阶段：Tool 对象目录（含执行器），供 HostToolCaller 按请求工具名
         # 唯一匹配（读/写白名单）。None 时 HostToolCaller 回退到本地能力 registry。
         self._tool_objects = tool_objects
@@ -213,6 +213,9 @@ class PiRuntime:
         # 受控工具执行器（测试）：覆盖真实 web_search 的 tool.run，但仍走完整
         # 受治理结算链路（产生 action/attempt），用于无网络下验证恢复不变量。
         self._tool_runner = tool_runner
+        # 同一工具参数校验连续失败的次数。达到上限就停在 waiting_input，
+        # 不再把错误回给模型空转。
+        self._schema_rejects: dict[str, int] = {}
         # 模型请求握手：request_id → reservation，准入时存、结算时取。
         self._model_reservations: dict[str, Any] = {}
         # 第七阶段：版本化 Pi 快照（检查点/恢复用），run() 里初始化。
@@ -253,7 +256,7 @@ class PiRuntime:
         recovery = (pi_resume or {}).get('recovery') if pi_resume else None
         if isinstance(recovery, dict) and recovery.get('kind') in (
                 'resume_finish', 'resume_reconcile', 'resume_block',
-                'resume_wait'):
+                'resume_wait', 'resume_wait_input'):
             kind = recovery['kind']
             if kind == 'resume_finish':
                 state['answer'] = recovery.get('final_answer') or ''
@@ -268,12 +271,28 @@ class PiRuntime:
                     state['status'] = 'waiting_approval'
                 else:
                     state['status'] = 'waiting_external'
+            elif kind == 'resume_wait_input':
+                fact = recovery.get('input_request') if isinstance(
+                    recovery.get('input_request'), dict) else {}
+                question = str(fact.get('question') or recovery.get('reason')
+                               or '需要补充信息后才能继续')
+                self._mark_waiting_input(state, question)
             else:
+                # resume_reconcile / resume_block：结果未定，既不重试也不当成功。
+                # 两个字段分工不同，别混用：
+                # - errors[].detail 留恢复决策的原始说明（含内部 action_id 与英文
+                #   状态），排障要看这个；
+                # - state['failure'] 是给用户的回执正文，由 core/messages.py 直接
+                #   拼进句子，不能塞内部标识，也不能缺——缺了会退化成默认那句
+                #   "有写操作的结果没能确认"，而这里可能只是一次只读检索，等于
+                #   凭空告诉用户产生了副作用、要去核对线上数据。
+                detail = recovery.get('reason') or '结果未定，需核实后再继续'
                 state['pi_outcome'] = 'failed'
                 state['status'] = 'needs_reconcile'
+                state['failure'] = ('有一步操作执行到一半，没能确认是否已经生效'
+                                    '（未重试，避免重复执行）')
                 state.setdefault('errors', []).append({
-                    'stage': 'pi', 'type': 'RecoveryBlocked',
-                    'detail': recovery.get('reason') or '结果未定，需核实后再继续'})
+                    'stage': 'pi', 'type': 'RecoveryBlocked', 'detail': detail})
             state['_pi_snapshot'] = pi_snapshot.serialize(self._snapshot)
             return state
 
@@ -295,7 +314,7 @@ class PiRuntime:
         # 让正式链路能真实走 MCP transport 的 update_object / get_object / get_operation。
         # 未设置环境变量时保持默认（只读 web_search），不改变生产行为。
         import os as _os
-        if self._tool_objects is None and (
+        if not self._tools_explicit and self._tool_objects is None and (
                 _os.environ.get('PI_WRITE_TOOL_KEYS')
                 or _os.environ.get('PI_READ_TOOL_KEYS')):
             decls, tool_objects = await pi_tool_catalog()
@@ -316,7 +335,10 @@ class PiRuntime:
                     content = str(item.get("content", "") or "")[:max_input]
                     history.append({"role": item["role"], "content": content})
 
-            # 工具目录发送前校验：完整 JSON Schema，非法则明确报错
+            # 白名单装配的最后一道：坏 schema 在这里丢掉，不让它进 start。
+            # validate_tool_catalog 仍然要求留下的每一条根都是 type:object。
+            from webpage_agent.agent.pi_tool_schema import prepare_declarations
+            self._tools, _dropped = prepare_declarations(self._tools)
             proto.validate_tool_catalog(self._tools)
 
             # 恢复上下文：有已提交的完整消息就带上，Node 据此重建、不重复追加
@@ -492,7 +514,25 @@ class PiRuntime:
         try:
             proto.validate_args_against_schema(args, allowed["parameters"])
         except ProtocolError as exc:
+            strikes = self._schema_rejects.get(tool_name, 0) + 1
+            self._schema_rejects[tool_name] = strikes
+            # 同一工具参数反复不合格：停下来问人，不再把错误喂回模型空转。
+            if strikes >= 2:
+                await self._park_for_input(
+                    bridge, state, call_id, tool_name,
+                    f'调用 {tool_name} 的参数仍不完整：{exc}。请补充后继续。')
+                return
             await self._send_tool_error(bridge, call_id, f"参数不符合 schema：{exc}")
+            return
+
+        from webpage_agent.agent import pi_host_tools
+        if tool_name == pi_host_tools.REQUEST_INPUT_NAME:
+            question = str((args or {}).get('question') or '').strip()
+            if not question:
+                await self._send_tool_error(bridge, call_id, 'question 不能为空')
+                return
+            await self._park_for_input(
+                bridge, state, call_id, tool_name, question)
             return
 
         if self._tool_executor is not None:
@@ -677,6 +717,9 @@ class PiRuntime:
                 f"非法 model_request：{exc}", stderr_tail=bridge.stderr_tail()
             ) from exc
         request_id = msg["request_id"]
+        from webpage_agent.agent.context import current_time_prompt
+        from webpage_agent.core.config import settings
+        time_prompt = current_time_prompt(settings.prompt_timezone)
         try:
             reservation = await self._begin_model(request_id)
         except Exception as exc:  # noqa: BLE001 预算耗尽/无 scope 都按拒绝处理
@@ -687,7 +730,8 @@ class PiRuntime:
             return
         self._model_reservations[request_id] = reservation
         await bridge.send(proto.make_message(
-            bridge.execution_id, "model_admit", request_id=request_id, allow=True))
+            bridge.execution_id, "model_admit", request_id=request_id, allow=True,
+            current_time_prompt=time_prompt))
 
     async def _handle_model_usage(self, bridge: PiBridge, msg: dict) -> None:
         """模型用量结算握手：Node 上报 usage，宿主结算后回 ack。
@@ -841,6 +885,45 @@ class PiRuntime:
         )
         await bridge.send(reply)
 
+    def _mark_waiting_input(self, state: dict, question: str) -> None:
+        """缺参/需要补充：写宿主状态，清掉旧答复，避免被收成成功。"""
+        text = str(question or '').strip() or '需要补充信息后才能继续'
+        state['pi_outcome'] = 'waiting'
+        state['status'] = 'waiting_input'
+        state['failure'] = text
+        # clarification 留空：reply_text 在两者相同时会藏起问题正文。
+        # 问题放在 failure 里，收尾回执会原样带给用户。
+        state['clarification'] = ''
+        asked = [str(item) for item in (state.get('asked_questions') or []) if str(item).strip()]
+        if text not in asked:
+            asked.append(text)
+        state['asked_questions'] = asked
+        state.pop('answer', None)
+
+    async def _park_for_input(self, bridge: PiBridge, state: dict, call_id: str,
+                              tool_name: str, question: str) -> None:
+        """把当前工具调用停成 waiting_input，并让 Node 结束本轮。"""
+        from webpage_agent.agent import pi_snapshot
+        text = str(question or '').strip() or '需要补充信息后才能继续'
+        host = dict(self._snapshot.get('host_result_state') or {})
+        host['awaiting_input'] = {
+            'call_id': call_id,
+            'tool_name': tool_name,
+            'question': text,
+        }
+        self._snapshot['host_result_state'] = host
+        self._snapshot['phase'] = 'awaiting_input'
+        pending = [item for item in (self._snapshot.get('pending_calls') or [])
+                   if not (isinstance(item, dict) and item.get('call_id') == call_id)]
+        self._snapshot['pending_calls'] = pending
+        self._mark_waiting_input(state, text)
+        state['_pi_snapshot'] = pi_snapshot.serialize(self._snapshot)
+        await self._persist_snapshot()
+        reply = proto.make_message(
+            bridge.execution_id, 'tool_result', call_id=call_id,
+            ok=False, result=None, error='', needs_input=True)
+        await bridge.send(reply)
+
     def _allowed_tool(self, name: str) -> dict[str, Any] | None:
         for tool in self._tools:
             if tool.get("name") == name:
@@ -908,9 +991,15 @@ class PiRuntime:
             state["pi_outcome"] = "waiting"
             if msg.get("wait_reason") == "approval":
                 state["status"] = "waiting_approval"
+                state.pop("answer", None)
+            elif msg.get("wait_reason") == "input":
+                question = str(
+                    ((self._snapshot.get('host_result_state') or {}).get('awaiting_input')
+                     or {}).get('question') or '需要补充信息后才能继续')
+                self._mark_waiting_input(state, question)
             else:
                 state["status"] = "waiting_external"
-            state.pop("answer", None)
+                state.pop("answer", None)
         else:
             # validate_finished 已保证 outcome 只可能是上述四者，此分支防御性兜底
             state["pi_outcome"] = "failed"

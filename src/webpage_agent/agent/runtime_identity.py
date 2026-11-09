@@ -31,7 +31,7 @@ PI_STATE_SCHEMA = 2
 
 
 def default_kind() -> str:
-    """全局默认引擎（只作用于**新建** run）。生产默认 LangGraph。"""
+    """全局默认引擎（只作用于**新建** run）。未配置时是 pi。"""
     from webpage_agent.core.config import settings
     value = str(getattr(settings, 'default_runtime_kind', '') or '').strip().lower()
     if value in KNOWN_KINDS:

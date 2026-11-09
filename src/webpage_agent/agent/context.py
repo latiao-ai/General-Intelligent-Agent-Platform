@@ -15,6 +15,14 @@
 import copy
 import json
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+
+def current_time_prompt(timezone_name: str) -> str:
+    now = datetime.now(ZoneInfo(timezone_name))
+    return (f'[服务端时间] 当前日期和时间：{now.isoformat(timespec="seconds")}；'
+            f'时区：{timezone_name}。这是生成本次模型请求时的时间。')
 
 
 def platform_scene_text(scene: dict | None, max_chars: int | None = None) -> str:
@@ -213,7 +221,10 @@ def prepare_request(system: str, messages: list, *, schema=None,
     UTF-8 字节数是常见 byte-level tokenizer 的保守上界；另计消息和工具调用
     包装，并预留输出和安全余量。报告不含原文、对象编号或密钥。
     """
-    conversation = [{'role': 'system', 'content': system}]
+    zone = getattr(settings, 'prompt_timezone', None) or 'Asia/Shanghai'
+    clock = current_time_prompt(zone)
+    system_text = '\n\n'.join(part for part in (str(system or ''), clock) if part)
+    conversation = [{'role': 'system', 'content': system_text}]
     for item in messages:
         conversation.append({'role': item[0], 'content': item[1]}
                             if isinstance(item, tuple) else copy.deepcopy(item))

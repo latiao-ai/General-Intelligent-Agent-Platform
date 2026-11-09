@@ -14,7 +14,7 @@
 | Node | v22.22.2 |
 | 依赖锁 | `pi-runtime/package-lock.json`（@mariozechner/pi-ai 0.73.1）、`requirements.lock.txt` |
 | Schema | `LATEST = v10_turn_principal`（`v1_baseline_20261029` … `v10_turn_principal`） |
-| 默认引擎 | `DEFAULT_RUNTIME_KIND = langgraph`（未切换生产默认） |
+| 默认引擎 | 验收当时是 `langgraph`。**当前代码默认已改为 `pi`**（见 `docs/architecture.md`）。本表其余行仍是当时的验收记录 |
 
 ## 二、能力矩阵
 
@@ -52,11 +52,11 @@
 | `SESSION_QUERY_ENABLED` | `true` | 会话查询开放 |
 | `SESSION_TASK_CREATE_ENABLED` | `false` | 会话内建任务**关闭**（正式建任务走 `POST /api/tasks`） |
 | `SESSION_TASK_CONTROL_ENABLED` | `false` | 会话内暂停/恢复/取消**关闭**（正式控制走 `/runs/{id}/...`） |
-| `WRITE_TOOL_KEYS` | `()` 空 | Pi 写工具默认不开放（受控经 `PI_WRITE_TOOL_KEYS`） |
+| `WRITE_TOOL_KEYS` | `()` 空 | Pi 写工具默认不开放。`PI_WRITE_TOOL_KEYS` 必须再开 `PI_WRITE_TOOLS_ENABLED=true` 才生效，并写审计日志 |
 | `SYNC_READ_TOOL_KEYS` | `('local:web:search',)` | Pi 只读工具白名单 |
 | `SESSION_CHAT_CONCURRENCY` | `2` | 聊天并发额度 |
 | `SESSION_TURN_LEASE_SECONDS` | `120` | 聊天 turn 租约 |
-| `DEFAULT_RUNTIME_KIND` | `langgraph` | 生产默认引擎（未切换） |
+| `DEFAULT_RUNTIME_KIND` | 验收当时 `langgraph`；当前源码默认 `pi` | 只影响新建 run。写工具仍默认关闭，扩展开关是 `PI_WRITE_TOOLS_ENABLED` |
 
 ## 三、隔离验收环境
 

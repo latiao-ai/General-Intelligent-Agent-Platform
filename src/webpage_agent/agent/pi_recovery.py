@@ -33,6 +33,7 @@ RESUME_DELIVER = 'resume_deliver'      # 结果已提交、Node 未吸收：补 
 RESUME_FINISH = 'resume_finish'        # 最终答复已提交、run 未收尾：只补收尾
 RESUME_BLOCK = 'resume_block'          # 结果未知的只读调用：保守阻断
 RESUME_WAIT = 'resume_wait'            # 已受理的外部任务未完成：继续等待，不重新推理
+RESUME_WAIT_INPUT = 'resume_wait_input'  # 缺参停在等人补充：没有新输入就不重跑
 
 
 @dataclass
@@ -51,6 +52,8 @@ class RecoveryDecision:
     deliver_results: list[dict] = None
     # 说明（排障用）
     reason: str = ''
+    # waiting_input 的停靠事实：{call_id, tool_name, question}
+    input_request: dict | None = None
 
     def __post_init__(self) -> None:
         if self.tool_results is None:
@@ -69,6 +72,7 @@ class RecoveryDecision:
             'pending_calls': list(self.pending_calls),
             'deliver_results': list(self.deliver_results),
             'reason': self.reason,
+            'input_request': dict(self.input_request) if self.input_request else None,
         }
 
 
@@ -123,6 +127,14 @@ def decide(snapshot: dict | None, actions: list[dict], run_status: str) -> Recov
             return RecoveryDecision(kind=RESUME_DELIVER, tool_results=to_deliver,
                                     reason='工具结果已提交但 Node 未吸收，补 toolResult 再继续')
 
+    # 3.6 缺参停在等人。必须先于「待处理调用重派发」：request_input 的候选
+    # 还在 pending_calls 里，当成普通 admit 会再问一遍，或者空转。
+    waiting = awaiting_input_fact(snapshot)
+    if waiting:
+        return RecoveryDecision(
+            kind=RESUME_WAIT_INPUT, input_request=waiting,
+            reason=str(waiting.get('question') or '需要用户补充'))
+
     # 3.5 等待审批（第十阶段第 5 点）：快照记录了 awaiting_approval 事实。审批
     # 是否已批准需要查 approvals 表（宿主 `_pi_resume_plan` 负责），这里保守
     # 返回 RESUME_WAIT，把「是否已批准」留给宿主按审批状态决定转 RESUME_ADMIT。
@@ -141,6 +153,65 @@ def decide(snapshot: dict | None, actions: list[dict], run_status: str) -> Recov
     # 没有未完成事实：正常继续（或已收尾）。
     return RecoveryDecision(kind=RESUME_ADMIT, pending_calls=[],
                             reason='无未完成的恢复事实，继续执行')
+
+
+def awaiting_input_fact(snapshot: dict | None) -> dict | None:
+    """快照里的「等人补充」事实。没有则返回 None。"""
+    if not isinstance(snapshot, dict):
+        return None
+    host = snapshot.get('host_result_state') or {}
+    fact = host.get('awaiting_input') if isinstance(host, dict) else None
+    phase = str(snapshot.get('phase') or '')
+    if phase != 'awaiting_input' and not (
+            isinstance(fact, dict) and fact.get('call_id')):
+        return None
+    if not isinstance(fact, dict):
+        fact = {}
+    return {
+        'call_id': str(fact.get('call_id') or ''),
+        'tool_name': str(fact.get('tool_name') or 'request_input'),
+        'question': str(fact.get('question') or '需要补充信息后才能继续'),
+    }
+
+
+def apply_pending_input(decision: RecoveryDecision, snapshot: dict | None,
+                        pending_inputs: list | None) -> tuple[RecoveryDecision, dict | None]:
+    """等人补充之后：有新输入就交付停靠的工具结果并清掉等待，否则保持原决策。
+
+    没有可配对的 call_id 时不假装已经交付，改成按新消息继续（RESUME_ADMIT），
+    避免永远停在 waiting_input。
+    """
+    if decision.kind != RESUME_WAIT_INPUT:
+        return decision, snapshot
+    texts = [str(item.get('message') or '').strip()
+             for item in (pending_inputs or []) if isinstance(item, dict)]
+    texts = [text for text in texts if text]
+    if not texts:
+        return decision, snapshot
+    fact = decision.input_request or {}
+    call_id = str(fact.get('call_id') or '')
+    if not isinstance(snapshot, dict):
+        return RecoveryDecision(
+            kind=RESUME_ADMIT, pending_calls=[],
+            reason='有补充但没有可恢复的快照，按新消息继续'), snapshot
+    snap = dict(snapshot)
+    host = dict(snap.get('host_result_state') or {})
+    host.pop('awaiting_input', None)
+    snap['host_result_state'] = host
+    snap['phase'] = 'running'
+    if not call_id:
+        return RecoveryDecision(
+            kind=RESUME_ADMIT, pending_calls=[],
+            reason='有补充但缺少可配对的工具调用，按新消息继续'), snap
+    return RecoveryDecision(
+        kind=RESUME_DELIVER,
+        deliver_results=[{
+            'call_id': call_id,
+            'tool_name': str(fact.get('tool_name') or 'request_input'),
+            'result': {'status': 'supplemented', 'messages': texts},
+            'is_error': False,
+        }],
+        reason='用户已补充，注入后继续'), snap
 
 
 def _absorbed(ref: dict, messages: list, call_id_by_logical: dict) -> bool:

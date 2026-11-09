@@ -4,8 +4,10 @@ Pi 与 LangGraph 不同——它没有「图计划 + 步骤游标」，恢复靠
 轮次里的对话事实与调用进度**。快照必须保存足以「既不漏结果、也不重复已完成
 动作」的最少完整状态：
 
-- `phase`：运行阶段（started / running / awaiting_tools / answered / failed /
-  cancelled）；
+- `phase`：运行阶段（started / running / awaiting_tools / awaiting_input /
+  awaiting_approval / awaiting_external / answered / failed / cancelled）。
+  `awaiting_input` 的问题与 call_id 放在 `host_result_state.awaiting_input`，
+  不新增顶层字段，因此不递增 `PI_STATE_SCHEMA`；
 - `checkpoint_seq`：检查点序号（单调递增，Node 每发一次检查点 +1）；
 - `intent_version` / `processed_intent_version`：最新及已处理的要求版本；
 - `host_result_state`：宿主结果状态（已结算工具结果引用的游标/水位）；
