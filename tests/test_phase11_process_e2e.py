@@ -288,11 +288,11 @@ class SessionProcessE2ETests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r.status_code, 200, r.text)
             task_id = r.json()['task_id']
             run_id = r.json()['run_id']
-            # 核对引擎身份已持久化（缺省 default_kind = langgraph）
+            # 核对引擎身份已持久化（缺省 default_kind = pi）
             run = await self.store.run(run_id)
             self.assertIsNotNone(run, 'run 应已落库')
-            self.assertEqual(run['runtime_kind'], 'langgraph',
-                             '缺省引擎身份应为 langgraph')
+            self.assertEqual(run['runtime_kind'], 'pi',
+                             '缺省引擎身份应为 pi')
             # 幂等：同 Idempotency-Key 重放 → 返回原任务，不重复创建
             r2 = await client.post(base + '/api/tasks',
                                    json={'message': '做个红色页面'},

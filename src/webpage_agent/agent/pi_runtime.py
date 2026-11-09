@@ -490,8 +490,12 @@ class PiRuntime:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("排空事件失败：%s", exc)
                 unbind_sink(token)
-            if own_bridge:
+            # 注入的桥接也要在循环还活着时关掉。测试常把真实 PiBridge 交进来
+            # 却不自己 close，管道会拖到循环关闭后才析构。
+            try:
                 await bridge.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("关闭桥接失败：%s", exc)
 
         # 第八阶段第 1 点：把**真正的版本化 Pi 快照**序列化后交给宿主，供收尾时
         # 落库。宿主的 `_finish_run` 据此提交版本化 Pi 快照（经 `pi_snapshot.

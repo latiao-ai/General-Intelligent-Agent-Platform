@@ -46,7 +46,9 @@ TURN_FOLLOWUP = 'v9_turn_followup'
 TURN_PRINCIPAL = 'v10_turn_principal'
 # 新建 run 的列默认改为 pi。已有行保持原 runtime_kind（存量仍是 langgraph）。
 RUNTIME_DEFAULT_PI = 'v11_runtime_default_pi'
-LATEST = RUNTIME_DEFAULT_PI
+# 会话 turn 上的角色。接纳时已经传入 owner_role，领取后要原样交给查询执行记录。
+TURN_OWNER_ROLE = 'v12_turn_owner_role'
+LATEST = TURN_OWNER_ROLE
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -128,6 +130,8 @@ CREATE INDEX IF NOT EXISTS idx_session_turns_principal
     ON session_turns(tenant_id, owner_user_id);
 '''), (RUNTIME_DEFAULT_PI, '''
 ALTER TABLE runs ALTER COLUMN runtime_kind SET DEFAULT 'pi';
+'''), (TURN_OWNER_ROLE, '''
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS owner_role TEXT NOT NULL DEFAULT 'member';
 '''))
 
 

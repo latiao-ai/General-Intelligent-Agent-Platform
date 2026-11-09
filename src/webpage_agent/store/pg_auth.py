@@ -262,6 +262,7 @@ class PgAuth:
                           target_task_id: str = '', target_run_id: str = '',
                           kind: str = 'chat', tenant_id: str = 'default',
                           owner_user_id: str = 'default',
+                          owner_role: str = 'member',
                           source_turn_id: str = '',
                           candidates: list | None = None,
                           clarification: str = '') -> dict:
@@ -307,13 +308,14 @@ class PgAuth:
                 '(turn_id, session_id, turn_seq, request_id, request_hash, message, '
                 ' target_task_id, target_run_id, kind, status, source_turn_id, '
                 ' candidates_json, clarification, execution_generation, '
-                ' tenant_id, owner_user_id, created_at, updated_at) '
-                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                ' tenant_id, owner_user_id, owner_role, created_at, updated_at) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
                 (turn_id, session_id, turn_seq, request_id, request_hash, message,
                  target_task_id, target_run_id, kind, 'accepted',
                  source_turn_id or '',
                  json.dumps(candidates or [], ensure_ascii=False),
-                 clarification or '', 0, tenant_id, owner_user_id, stamp, stamp))
+                 clarification or '', 0, tenant_id, owner_user_id,
+                 str(owner_role or 'member'), stamp, stamp))
             # 用户消息（同事务）
             await self._run(conn, 'INSERT INTO messages (session_id, role, content, created_at, dedupe_key) '
                 'VALUES (%s,%s,%s,%s,%s)',
