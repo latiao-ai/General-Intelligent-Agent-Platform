@@ -6,17 +6,19 @@
   "description": "Pi 运行时桥接子进程：Python 通过逐行 JSON 协议驱动 Pi SDK 推理，工具执行交回 Python。",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "bundle": "esbuild src/main.ts --bundle --platform=node --format=esm --outfile=dist/main.js",
     "start": "node dist/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --test dist/session.test.js",
     "check:schema": "node scripts/schema-golden.mjs",
-    "check": "npm run typecheck && npm run build && npm run test && npm run check:schema"
+    "check": "npm run typecheck && npm run build && npm run test && npm run check:schema && npm run bundle"
   },
   "dependencies": {
     "@mariozechner/pi-ai": "0.73.1"
   },
   "devDependencies": {
-    "typescript": "^5.6.0",
-    "@types/node": "^22.0.0"
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.25.12",
+    "typescript": "^5.6.0"
   }
 }

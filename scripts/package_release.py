@@ -1,4 +1,9 @@
-"""Create a source-only release with a fixed allowlist and secret checks."""
+"""Create a source release with a fixed allowlist and secret checks.
+
+`pi-runtime` 要带上源码、锁文件和已经打好的 `dist/main.js`。`dist/main.js`
+必须是 esbuild 打出来的单文件，这样解包后的测试不用 `node_modules` 也能拉起
+Node 桥接。`node_modules` 和密钥仍然排除。
+"""
 import argparse
 import hashlib
 import io
@@ -9,11 +14,37 @@ import re
 import tarfile
 
 ROOT = Path(__file__).resolve().parents[1]
-DIRECTORIES = ('src', 'scripts', 'contracts', 'docs', 'deploy', 'tests', '.github')
+DIRECTORIES = ('src', 'scripts', 'contracts', 'docs', 'deploy', 'tests', '.github',
+               'pi-runtime')
 FILES = ('.env.example', '.gitignore', 'THIRD-PARTY-NOTICES.md', 'requirements.txt',
          'requirements.lock.txt', 'requirements-dev.txt', 'pyproject.toml',
          '智能体中台运行机制说明.md')
 SECRET = re.compile(rb'(?:-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|sk-[A-Za-z0-9_-]{24,})')
+
+
+def _excluded(rel: Path) -> bool:
+    """node_modules、缓存和点目录不进发布包，遍历时直接跳过。
+
+    `node_modules/.bin` 里全是符号链接。若先做符号链接检查再排除，
+    打包会在还没被排除的依赖目录上失败。
+    """
+    return any(
+        (part.startswith('.') and part not in ('.github', '.env.example', '.gitignore'))
+        or part in ('__pycache__', 'node_modules', 'secrets', 'profile', 'artifacts')
+        for part in rel.parts)
+
+
+def _walk(directory: Path, root: Path):
+    for path in directory.iterdir():
+        rel = path.relative_to(root)
+        if _excluded(rel):
+            continue
+        if path.is_symlink():
+            raise ValueError('Symlink is not allowed: ' + str(rel))
+        if path.is_dir():
+            yield from _walk(path, root)
+        elif path.is_file():
+            yield path
 
 
 def source_files(root: Path) -> list[Path]:
@@ -22,8 +53,8 @@ def source_files(root: Path) -> list[Path]:
         directory = root / name
         if directory.is_symlink():
             raise ValueError('Symlink is not allowed: ' + name)
-        if directory.exists():
-            paths.extend(directory.rglob('*'))
+        if directory.is_dir():
+            paths.extend(_walk(directory, root))
     out = []
     for path in sorted(set(paths)):
         if path.is_symlink():
@@ -33,8 +64,7 @@ def source_files(root: Path) -> list[Path]:
         rel = path.relative_to(root)
         if rel.parts[0] == 'deploy' and (len(rel.parts) != 2 or not path.name.endswith('.example')):
             continue
-        if any(part.startswith('.') and part not in ('.github', '.env.example', '.gitignore')
-               or part in ('__pycache__', 'node_modules', 'secrets', 'profile', 'artifacts') for part in rel.parts):
+        if _excluded(rel):
             continue
         if path.suffix in ('.pyc', '.pyo', '.pem', '.key', '.sqlite', '.db') or path.name.startswith('.env.') and path.name != '.env.example':
             continue
@@ -81,8 +111,29 @@ def local_secrets(root: Path) -> set[bytes]:
     return {value for value in values if not value.lower().startswith((b'replace-', b'your-', b'changeme'))}
 
 
+def _require_bundled_bridge(root: Path) -> None:
+    """解包后的 unittest 会直接 `node pi-runtime/dist/main.js`。
+
+    tsc 产物还在 `import '@mariozechner/pi-ai'`，没有 node_modules 就会
+    PiBridgeError。发布前必须已经跑过 `npm run bundle`。没有 `pi-runtime`
+    目录的树（打包逻辑自己的夹具）跳过这道检查。
+    """
+    if not (root / 'pi-runtime').is_dir():
+        return
+    main = root / 'pi-runtime' / 'dist' / 'main.js'
+    if not main.is_file():
+        raise ValueError(
+            'pi-runtime/dist/main.js 缺失：先在 pi-runtime 执行 npm run check')
+    text = main.read_text(encoding='utf-8', errors='replace')
+    if re.search(r'''from\s+['"]@mariozechner/pi-ai''', text):
+        raise ValueError(
+            'pi-runtime/dist/main.js 仍依赖 node_modules：'
+            '先在 pi-runtime 执行 npm run bundle')
+
+
 def package(root: Path, output: Path) -> str:
     root = root.resolve()
+    _require_bundled_bridge(root)
     paths = source_files(root)
     # Complete validation before creating the output; never leave a partial release.
     bodies = {str(p.relative_to(root)): p.read_bytes() for p in paths}
