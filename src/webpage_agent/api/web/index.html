@@ -355,6 +355,12 @@ a{color:var(--brand);text-decoration:none}
 .cbtn[hidden]{display:none}
 .cbtn .ic{width:14px;height:14px}
 .cbtn .ic.live{color:var(--ok)}
+.connector-chips{display:flex;align-items:center;gap:4px;max-width:34vw;overflow:hidden}
+.connector-chip{display:inline-flex;align-items:center;gap:1px;height:30px;padding:0 6px;
+  border:1px solid var(--line);border-radius:9px;background:#fff;cursor:pointer;color:var(--ink-2)}
+.connector-chip:hover{background:var(--soft);border-color:#d9dfe5}
+.connector-chip .cc-x{font-size:13px;line-height:1;color:var(--muted-2)}
+.connector-chip .cc-ico{font-size:15px;line-height:1}
 .send-btn{width:32px;height:32px;border:0;border-radius:50%;background:var(--soft-2);color:var(--muted);
   display:grid;place-items:center;cursor:pointer;transition:background .15s,color .15s,transform .1s}
 .send-btn .ic{width:15px;height:15px}
@@ -1370,12 +1376,7 @@ body {
             <button class="cbtn" id="plusBtn" title="添加文件、技能、专家或连接器" aria-haspopup="menu">
               <svg class="ic"><use href="#i-plus"/></svg>
             </button>
-            <button class="cbtn" id="attachBtn" title="添加附件（当前版本由服务端决定是否支持）">
-              <svg class="ic"><use href="#i-paperclip"/></svg>
-            </button>
-            <button class="cbtn" id="toolsBtn" title="工具与指令">
-              <svg class="ic"><use href="#i-slash"/></svg>
-            </button>
+            <div class="connector-chips" id="connectorChips" aria-label="已连接连接器"></div>
             <button class="cbtn pill" id="wsPill" aria-expanded="false" aria-controls="workspace">
               <svg class="ic"><use href="#i-grid"/></svg>
               <span id="wsPillLabel">选择工作空间</span>
@@ -4531,21 +4532,7 @@ setInterval(async () => {
       '<p class="hint" style="margin-top:12px">输入框里可以直接写目标，例如「把这个链接整理成报告」「把报告部署到服务器」；' +
       '任务进行中再发一句，会被服务端当成补充要求，而不是重开一轮。</p>');
   };
-  $('toolsBtn').onclick = () => {
-    ta.focus();
-    showInfo('可以这样说', 
-      '<div class="kbd-list">' +
-      '<div class="kbd-row"><span>深度研究某个行业问题，要求多来源互证</span></div>' +
-      '<div class="kbd-row"><span>把这个链接 / 这批资料整理成可分享的 HTML 页面</span></div>' +
-      '<div class="kbd-row"><span>把报告部署上线，给我访问链接</span></div>' +
-      '<div class="kbd-row"><span>任务跑到一半改要求：换成表格，只要 5 条</span></div>' +
-      '</div>');
-  };
-
-  /* ---------- 15. 附件 / 语音 ---------- */
-  $('attachBtn').onclick = () => {
-    toast('附件上传由部署方决定：当前后端未提供上传接口，可直接粘贴链接');
-  };
+  /* ---------- 15. 语音 ---------- */
   $('micBtn').onclick = () => {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SR) { toast('当前浏览器不支持语音输入'); return; }
@@ -5079,11 +5066,87 @@ setInterval(async () => {
   });
 
   /* ---------- 输入框「+」菜单 / 连接器 ---------- */
-  const CONNECTOR_ICONS = {publishing: '🌐', beeftv: '🖼', libtv: '🎬'};
+  const CONNECTOR_ICONS = {
+    publishing: '🌐', beeftv: '🖼', libtv: '🎬', github: '🐙',
+    feishu: '🕊', lark: '🕊', qqmail: '📮', tencent: '📈',
+    ima: '🪄', lexshare: '📚', bilibili: '📺',
+  };
   let connectorItems = [];
 
+  function connectorIcon(item) {
+    const byId = CONNECTOR_ICONS[item.id];
+    if (byId) return byId;
+    const name = String(item.name || '').toLowerCase();
+    for (const [key, icon] of Object.entries(CONNECTOR_ICONS)) {
+      if (name.includes(key)) return icon;
+    }
+    return item.icon || '🔗';
+  }
+
+  function renderConnectorChips() {
+    const box = $id('connectorChips');
+    if (!box) return;
+    const enabled = connectorItems.filter(item => item.enabled);
+    box.replaceChildren(...enabled.map(item => {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'connector-chip';
+      chip.title = `${item.name}（已连接，点击断开）`;
+      chip.innerHTML = `<span class="cc-x">×</span><span class="cc-ico">${esc(connectorIcon(item))}</span>`;
+      chip.onclick = e => { e.stopPropagation(); disconnectConnector(item); };
+      return chip;
+    }));
+  }
+
+  async function disconnectConnector(item) {
+    try {
+      const res = await fetch(`${PREFIX}/connectors/${encodeURIComponent(item.id)}/disconnect`, {method: 'POST'});
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+      item.enabled = false;
+      item.tools = 0;
+      renderConnectors($id('cpSearch').value);
+      renderConnectorChips();
+      toast(`已断开「${item.name}」`);
+    } catch (err) {
+      toast('断开失败：' + (err.message || '网络错误'));
+    }
+  }
+
   function closePlusMenu() { $id('plusMenu').hidden = true; }
-  function closeConnectorPanel() { $id('connectorPop').hidden = true; }
+  let connectorHoverOpen = false;
+  let connectorCloseTimer = null;
+
+  function closeConnectorPanel() {
+    $id('connectorPop').hidden = true;
+    connectorHoverOpen = false;
+    clearTimeout(connectorCloseTimer);
+    const pop = $id('connectorPop');
+    pop.style.position = '';
+    pop.style.left = '';
+    pop.style.top = '';
+    pop.style.bottom = '';
+  }
+
+  function positionConnectorPanel(anchor, rect) {
+    if (!anchor || innerWidth <= 760) return;
+    const box = rect || anchor.getBoundingClientRect();
+    const pop = $id('connectorPop');
+    pop.style.position = 'fixed';
+    pop.style.bottom = 'auto';
+    const width = pop.offsetWidth || 328;
+    const height = pop.offsetHeight || 420;
+    pop.style.left = Math.max(12, Math.min(box.right + 8, innerWidth - width - 12)) + 'px';
+    pop.style.top = Math.max(12, Math.min(box.bottom - height, innerHeight - height - 12)) + 'px';
+  }
+
+  function scheduleConnectorClose() {
+    if (!connectorHoverOpen) return;
+    clearTimeout(connectorCloseTimer);
+    connectorCloseTimer = setTimeout(() => {
+      if (connectorHoverOpen) closeConnectorPanel();
+    }, 300);
+  }
 
   $id('plusBtn').addEventListener('click', e => {
     e.stopPropagation();
@@ -5098,16 +5161,39 @@ setInterval(async () => {
     if (!btn) return;
     const act = btn.dataset.act;
     closePlusMenu();
-    if (act === 'file') $id('attachBtn').click();
-    else if (act === 'connector') openConnectorPanel();
+    if (act === 'file') toast('附件上传暂未开放，可直接粘贴链接');
+    else if (act === 'connector') openConnectorPanel(false, $id('plusMenu'));
     else if (act === 'expert') openHub('expert');
     else if (act === 'skill') openHub('skill');
     else toast('这个入口暂未接入，可以先看「技能」或「连接器」。');
   });
 
-  function openConnectorPanel() {
-    closePlusMenu();
+  const connectorEntry = $id('plusMenu').querySelector('[data-act="connector"]');
+  let connectorHoverTimer = null;
+  if (connectorEntry) {
+    connectorEntry.addEventListener('mouseenter', () => {
+      clearTimeout(connectorHoverTimer);
+      connectorHoverTimer = setTimeout(() => {
+        connectorHoverOpen = true;
+        openConnectorPanel(true, $id('plusMenu'));
+      }, 160);
+    });
+    connectorEntry.addEventListener('mouseleave', () => clearTimeout(connectorHoverTimer));
+  }
+  $id('plusMenu').addEventListener('mouseleave', scheduleConnectorClose);
+  $id('plusMenu').addEventListener('mouseenter', () => clearTimeout(connectorCloseTimer));
+  $id('connectorPop').addEventListener('mouseenter', () => clearTimeout(connectorCloseTimer));
+  $id('connectorPop').addEventListener('mouseleave', scheduleConnectorClose);
+
+  function openConnectorPanel(keepPlus = false, anchor = null) {
+    const rect = anchor ? anchor.getBoundingClientRect() : null;
+    if (!keepPlus) {
+      connectorHoverOpen = false;
+      closePlusMenu();
+    }
     $id('connectorPop').hidden = false;
+    if (rect) positionConnectorPanel(anchor, rect);
+    else if (!$id('plusMenu').hidden) positionConnectorPanel($id('plusMenu'));
     $id('cpSearch').value = '';
     loadConnectors();
   }
@@ -5121,6 +5207,7 @@ setInterval(async () => {
       const data = await res.json();
       connectorItems = data.items || [];
       renderConnectors('');
+      renderConnectorChips();
     } catch (err) {
       list.innerHTML = `<div class="cp-note" style="padding:14px 8px">读取失败：${esc(err.message || '网络错误')}</div>`;
     }
@@ -5139,7 +5226,7 @@ setInterval(async () => {
       row.className = 'cp-row';
       const icon = document.createElement('div');
       icon.className = 'cp-icon';
-      icon.textContent = CONNECTOR_ICONS[item.id] || item.icon || '🔗';
+      icon.textContent = connectorIcon(item);
       const name = document.createElement('div');
       name.className = 'cp-name';
       name.textContent = item.name;
@@ -5187,6 +5274,7 @@ setInterval(async () => {
         ? `已连接「${item.name}」${item.tools ? `，发现 ${item.tools} 个工具` : ''}`
         : `已断开「${item.name}」`);
       renderConnectors($id('cpSearch').value);
+      renderConnectorChips();
     } catch (err) {
       item.enabled = before;
       btn.classList.toggle('on', before);
@@ -5267,6 +5355,7 @@ setInterval(async () => {
     if (!$id('modelMenu').hidden) loadModels();
   });
   loadModels();
+  loadConnectors();
 
   document.addEventListener('click', e => {
     if (!$id('plusMenu').hidden && !e.target.closest('#plusMenu') && !e.target.closest('#plusBtn')) closePlusMenu();
