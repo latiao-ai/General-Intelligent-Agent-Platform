@@ -563,9 +563,10 @@ class HubSessionMessageMixin:
         # - 绑定 ExecutionContext（run_id=turn_id），让只读工具经 `tool_context`
         #   的 turn 回退取得**当前用户**的可信主体（tenant_id / owner_user_id 已
         #   在接纳时落库到 session_turns），不依赖业务 run 碰巧提供身份。
-        # - 第十二阶段评审点 1：query 还需要一条**内部查询执行记录**（runs 行）
+        # - 第十二阶段评审点 1：chat/query 都需要一条**内部执行记录**（runs 行）
         #   并绑定 ActionLedger，让只读工具经 `governed_call` 走完整治理链
         #   （授权 → 预算 → 准入 → 真实调用 → 结算），而不是被 no_run 拒绝。
+        #   两者共用同一套工具目录（含 web_search），执行身份不能只发给 query。
         from webpage_agent.governance import core as governance
         from webpage_agent.governance import execution_control
         from webpage_agent.store import ledger as ledger_module
@@ -580,15 +581,26 @@ class HubSessionMessageMixin:
         ledger_token = None
         turn_run_created = False
         try:
-            if kind == 'query':
-                # 内部查询执行记录：为 turn_id 建 runs 行（复用 turn 租约），并绑定
-                # ActionLedger 走完整治理链。成功与否不硬阻断 turn——建行失败时只读
-                # 工具仍会因 no_run 被拒，退化为诚实的能力边界说明。
-                created = await self.store.create_turn_run(
-                    run_id=turn_id, tenant_id=tenant_id, owner_user_id=owner_user_id,
-                    owner_role=str(claimed.get('owner_role') or 'member'),
-                    lease_owner=lease_owner, lease_epoch=lease_epoch,
-                    lease_ttl=float(settings.session_turn_lease_seconds))
+            if kind in ('chat', 'query'):
+                # 内部执行记录：为 turn_id 建 runs 行（复用 turn 租约），并绑定
+                # ActionLedger 走完整治理链。chat 与 query 都会注入需治理的只读
+                # 工具（web_search / list_dir / read_file），执行身份必须一视同仁：
+                # 补充类短句（如「主要是在朱雀星上的相关事情」）不含 _QUERY_HINTS，
+                # 会被 route_message 判成 chat；若只有 query 绑账本，模型依据会话
+                # 历史继续调用 web_search 时必然拿到 E_NO_LEDGER。
+                # 建行失败不硬阻断 turn：账本缺失时工具会被 no_run 拒绝，由模型
+                # 如实说明能力边界；异常也不该让一次普通闲聊直接失败。
+                try:
+                    created = await self.store.create_turn_run(
+                        run_id=turn_id, tenant_id=tenant_id,
+                        owner_user_id=owner_user_id,
+                        owner_role=str(claimed.get('owner_role') or 'member'),
+                        lease_owner=lease_owner, lease_epoch=lease_epoch,
+                        lease_ttl=float(settings.session_turn_lease_seconds))
+                except Exception:                       # noqa: BLE001
+                    logger.warning('建立内部执行记录失败 turn=%s', turn_id,
+                                   exc_info=True)
+                    created = None
                 if created is not None:
                     turn_run_created = True
                     book = ledger_module.ActionLedger(
@@ -620,7 +632,7 @@ class HubSessionMessageMixin:
             model_choice.reset(model_token)
             if ledger_token is not None:
                 ledger_module.unbind(ledger_token)
-            # 收尾内部查询执行记录（清租约、置终态），不留 running 僵尸行
+            # 收尾内部执行记录（清租约、置终态），不留 running 僵尸行
             if turn_run_created:
                 try:
                     await self.store.settle_turn_run(
