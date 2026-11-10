@@ -147,13 +147,47 @@ def install_tools(tools_by_name: dict):
     return stack
 
 
+class _InstalledPlan:
+    """同时换掉规划节点，并把这次执行的运行时指到进程内节点循环。
+
+    生产 `get_runtime` 只返回 Pi。这些用例要的是「计划提交、暂停、租约」而不是
+    Node 里的模型，所以只在这个 with 块里把 `run_task` 用的工厂换成测试驱动。
+    """
+
+    def __init__(self, fake, calls):
+        self._fake = fake
+        self.calls = calls
+        self._stack = None
+
+    def __enter__(self):
+        from webpage_agent.agent import nodes
+        from webpage_agent.api import main as main_module
+        from tests.host_loop import HostLoopRuntime
+        self._stack = ExitStack()
+        self._stack.enter_context(patch.object(nodes, 'plan', self._fake))
+        self._stack.enter_context(patch.object(
+            main_module, 'get_runtime', lambda kind='': HostLoopRuntime()))
+        return self
+
+    def __exit__(self, *exc):
+        if self._stack is not None:
+            return self._stack.__exit__(*exc)
+        return False
+
+
+def install_host_loop():
+    """让 `run_task` 走进程内规划节点，而不是启动 Pi。"""
+    from webpage_agent.api import main as main_module
+    from tests.host_loop import HostLoopRuntime
+    return patch.object(main_module, 'get_runtime', lambda kind='': HostLoopRuntime())
+
+
 def install_plan(steps: list[dict], summary: str = '测试计划'):
     """替换规划节点：计划内容由用例决定，不调模型。
 
     返回 (patch, 记录表)。记录表里每次调用追加一条执行前的输入，用来断言
-    "续跑不该重新规划"。
+    "续跑不该重新规划"。with 块内 `run_task` 走进程内节点循环，不启动 Pi。
     """
-    from webpage_agent.agent import nodes
     calls: list[str] = []
 
     async def fake_plan(state):
@@ -171,7 +205,7 @@ def install_plan(steps: list[dict], summary: str = '测试计划'):
                          'intent_version': int(state.get('intent_version') or 0)},
                 'step_index': 0, 'status': 'planned'}
 
-    return patch.object(nodes, 'plan', fake_plan), calls
+    return _InstalledPlan(fake_plan, calls), calls
 
 
 def install_main(artifact_dir):
@@ -215,7 +249,7 @@ def override_settings(**changes):
     from webpage_agent.core.config import settings as real_settings
 
     fake = replace(real_settings, **changes)
-    modules = ('webpage_agent.api.routes', 'webpage_agent.api.api_hub', 'webpage_agent.api.main', 'webpage_agent.agent.nodes', 'webpage_agent.agent.decide', 'webpage_agent.agent.plan_validate', 'webpage_agent.agent.refs', 'webpage_agent.agent.langgraph_runtime', 'webpage_agent.core.services',
+    modules = ('webpage_agent.api.routes', 'webpage_agent.api.api_hub', 'webpage_agent.api.main', 'webpage_agent.agent.nodes', 'webpage_agent.agent.decide', 'webpage_agent.agent.plan_validate', 'webpage_agent.agent.refs', 'webpage_agent.agent.pi_runtime', 'webpage_agent.core.services',
                'webpage_agent.tools.core', 'webpage_agent.agent.context', 'webpage_agent.core.memory', 'webpage_agent.capabilities.base',
                'webpage_agent.capabilities.web', 'webpage_agent.capabilities.export',
                'webpage_agent.capabilities.answers', 'webpage_agent.capabilities.publishing',

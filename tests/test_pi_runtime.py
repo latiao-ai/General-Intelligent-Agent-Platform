@@ -40,7 +40,7 @@ class CurrentTimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item['allow'] for item in sent))
         self.assertEqual(runtime._system_prompt, '自定义规则')
 
-    def test_langgraph_request_uses_shanghai_time_and_keeps_system(self):
+    def test_prepare_uses_shanghai_time_and_keeps_system(self):
         from datetime import datetime, timezone
         from unittest.mock import patch
         from webpage_agent.agent import context
@@ -604,7 +604,7 @@ class EventSinkIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["text"] for e in received_b], ["b1"])
 
     async def test_no_sink_falls_back_to_writer(self):
-        # 无 sink 绑定：emit 回退到 LangGraph writer（此处无 writer，静默跳过，不抛错）
+        # 没有绑定 sink 时静默跳过，不抛错。
         from webpage_agent.observe.events import emit_async
         await emit_async({"type": "answer_delta", "text": "x"})  # 不抛错
 

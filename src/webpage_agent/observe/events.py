@@ -3,19 +3,13 @@
 节点级进度（`stream_mode='updates'`）只告诉你"某个节点跑完了"；这里发的是节点
 **内部**的动作与阶段起止，前者用来呈现思考过程，后者用来做实时计时。
 
-事件出口（第四阶段统一）：
+事件出口：
 
-    事件有两个出口，按优先级：
+    事件走**作用域绑定的宿主 sink**（`bind_sink`）。PiRuntime 在 `run()` 里
+    把宿主回调绑到当前异步作用域，正常结束、异常或取消路径都必须解绑，
+    避免跨请求串流。
 
-    1. **作用域绑定的宿主 sink**（`bind_sink` / `emit` 优先使用）：图外的运行时
-       （如 PiRuntime）在没有 LangGraph writer 的上下文里，也能把事件有序转交给
-       宿主的异步回调。sink 用 `contextvars` 绑定到当前异步作用域，正常结束、异常
-       或取消路径都必须可靠解绑，避免跨请求串流。
-    2. **LangGraph stream writer**（无 sink 绑定时的原图行为）：在节点内部通过
-       `get_stream_writer()` 发出 custom 事件，由 `LangGraphRuntime` 透传。
-
-    没有绑定 sink 且不在 LangGraph 流式上下文里时（单元测试直接调用节点、或调用
-    方没开 custom 流），静默跳过——节点代码不必关心自己被谁、以何种方式调用。
+    没有绑定 sink 时静默跳过——直接调用节点的单元测试不必先准备一条流。
 """
 from __future__ import annotations
 
@@ -24,9 +18,15 @@ import time
 from contextvars import ContextVar
 from typing import Awaitable, Callable, Optional
 
-from langgraph.config import get_stream_writer
-
 logger = logging.getLogger(__name__)
+
+# 编排阶段名。Pi 工具循环不再逐个跑这些节点，但阶段标签仍用这份清单，
+# 前端耗时表和历史事件才能对上中文名。
+ORCHESTRATION_STAGES = (
+    'intake', 'plan', 'persist_plan', 'revise_plan', 'run_step',
+    'observe_result', 'decide_next', 'wait_async', 'verify_completion',
+    'finalize',
+)
 
 # 各阶段的中文名，CLI / Streamlit / API 三处共用。
 STAGE_LABELS = {
@@ -127,27 +127,17 @@ async def drain_events() -> None:
 def emit(event: dict) -> None:
     """发出一个细粒度事件。
 
-    优先走**作用域绑定的宿主 sink**（图外运行时也能交回宿主）；没有 sink 时
-    回退到 LangGraph stream writer（原图行为）。两者都没有则静默跳过。
+    走作用域绑定的宿主 sink。没有 sink 则静默跳过。
 
-    注意：`emit` 是**同步**函数，sink 若返回协程会被收进作用域的待排空队列
-    （不 ensure_future），由调用方在终结前 `await drain_events()` 排空——保证
-    异步事件不被丢失、不被乱序。节点内部的事件量很小，这一约定与原 LangGraph
-    writer 的同步调用保持一致。
+    `emit` 是同步函数。sink 若返回协程，收进作用域的待排空队列
+    （不 ensure_future），由调用方在终结前 `await drain_events()` 排空。
     """
     sink = _sink.get()
-    if sink is not None:
-        result = sink(event)
-        if result is not None and hasattr(result, '__await__'):
-            _enqueue(result)
+    if sink is None:
         return
-    try:
-        writer = get_stream_writer()
-    except RuntimeError:
-        return
-    if writer is None:
-        return
-    writer(event)
+    result = sink(event)
+    if result is not None and hasattr(result, '__await__'):
+        _enqueue(result)
 
 
 async def emit_async(event: dict) -> None:
@@ -157,18 +147,11 @@ async def emit_async(event: dict) -> None:
     这个版本而非 emit()。
     """
     sink = _sink.get()
-    if sink is not None:
-        result = sink(event)
-        if result is not None and hasattr(result, '__await__'):
-            await result
+    if sink is None:
         return
-    try:
-        writer = get_stream_writer()
-    except RuntimeError:
-        return
-    if writer is None:
-        return
-    writer(event)
+    result = sink(event)
+    if result is not None and hasattr(result, '__await__'):
+        await result
 
 
 def action(label: str, detail: str = '', icon: str = '') -> dict:

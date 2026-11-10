@@ -43,7 +43,8 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[1]
 
 # 本项目的常驻进程模块名：--force 只认这些（配合工作目录判断，不误伤别人的服务）。
-_MODULES = ('scripts.serve_api', 'scripts.serve_frontend', 'scripts.serve_dev', 'scripts.run_worker')
+_MODULES = ('scripts.serve_api', 'scripts.serve_frontend', 'scripts.serve_dev',
+            'scripts.serve_skillhub', 'scripts.run_worker')
 
 
 def lan_address():
@@ -226,18 +227,20 @@ def resolve_ports(wanted, auto_port: bool):
     return resolved
 
 
-def spawn(label, argv):
+def spawn(label, argv, env=None):
     print(f'[serve_dev] 启动 {label}: {" ".join(argv[2:])}', flush=True)
-    return subprocess.Popen(argv, cwd=str(_ROOT))
+    return subprocess.Popen(argv, cwd=str(_ROOT), env=env)
 
 
 def main():
     parser = argparse.ArgumentParser(description='一键启动中台（后端 + Worker + 可选前端）')
     parser.add_argument('--port', type=int, default=8002, help='后端端口，默认 8002')
     parser.add_argument('--frontend-port', type=int, default=8001, help='前端代理端口，默认 8001')
+    parser.add_argument('--skillhub-port', type=int, default=8010, help='SkillHub 端口，默认 8010')
     parser.add_argument('--with-frontend', action='store_true',
                         help='同时启动 8001 前端联调代理（需要 BeeFTV 在 8003/8004）')
     parser.add_argument('--no-worker', action='store_true', help='不启动 Worker')
+    parser.add_argument('--no-skillhub', action='store_true', help='不启动 SkillHub')
     parser.add_argument('--migrate', action='store_true', help='启动前先执行数据库迁移')
     parser.add_argument('--local', action='store_true', help='只绑 127.0.0.1，不对局域网开放')
     parser.add_argument('--reload', action='store_true', help='后端改代码自动重启（开发用）')
@@ -260,7 +263,11 @@ def main():
     if args.force:
         stop_leftovers(exclude={os.getpid(), os.getppid()})
 
-    wanted = [(api_port, '后端')] + ([(fe_port, '前端代理')] if args.with_frontend else [])
+    wanted = [(api_port, '后端')]
+    if not args.no_skillhub:
+        wanted.append((args.skillhub_port, 'SkillHub'))
+    if args.with_frontend:
+        wanted.append((fe_port, '前端代理'))
     if args.force:
         for port, what in wanted:
             if port_in_use(port) and not free_port(port, what, args.force_any):
@@ -270,20 +277,36 @@ def main():
     if resolved is None:
         return 2
     api_port = resolved[0][0]
+    index = 1
+    skillhub_port = args.skillhub_port
+    if not args.no_skillhub:
+        skillhub_port = resolved[index][0]
+        index += 1
     if args.with_frontend:
-        fe_port = resolved[1][0]
+        fe_port = resolved[index][0]
 
     busy = [f'{port}（{what}）' for port, what in resolved if port_in_use(port)]
     if busy:
         print(f'[serve_dev] 端口已被占用：{"、".join(busy)}\n'
               f'           加 --force 结束本项目残留进程后重启，--auto-port 自动换端口，\n'
-              f'           或直接指定 --port / --frontend-port。',
+              f'           或直接指定 --port / --skillhub-port / --frontend-port。',
               file=sys.stderr)
         return 2
 
     api_cmd = [sys.executable, '-m', 'scripts.serve_api', '--port', str(api_port)]
     api_cmd += ['--lan'] if lan else []
     api_cmd += ['--reload'] if args.reload else []
+
+    api_env = os.environ.copy()
+    configured_url = os.getenv('SKILLHUB_URL', '').strip()
+    if not configured_url:
+        try:
+            from dotenv import dotenv_values
+            configured_url = str(dotenv_values(_ROOT / '.env').get('SKILLHUB_URL') or '').strip()
+        except Exception:                              # noqa: BLE001
+            configured_url = ''
+    if not configured_url and not args.no_skillhub:
+        api_env['SKILLHUB_URL'] = f'http://127.0.0.1:{skillhub_port}/v1/skills'
 
     if args.migrate:
         print('[serve_dev] 执行数据库迁移 …', flush=True)
@@ -294,7 +317,11 @@ def main():
 
     children = []
     try:
-        children.append(('后端', spawn('后端', api_cmd)))
+        if not args.no_skillhub:
+            children.append(('SkillHub', spawn('SkillHub',
+                                               [sys.executable, '-m', 'scripts.serve_skillhub',
+                                                '--port', str(skillhub_port)])))
+        children.append(('后端', spawn('后端', api_cmd, env=api_env)))
         if not args.no_worker:
             children.append(('Worker', spawn('Worker',
                                              [sys.executable, '-m', 'scripts.run_worker'])))
@@ -308,6 +335,8 @@ def main():
         address = lan_address() if lan else None
         print('\n[serve_dev] 启动完成，按 Ctrl+C 一起停止：', flush=True)
         print(f'  中台界面/接口    http://127.0.0.1:{api_port}/', flush=True)
+        if not args.no_skillhub:
+            print(f'  SkillHub         http://127.0.0.1:{skillhub_port}/v1/health', flush=True)
         if lan and address:
             print(f'  局域网访问       http://{address}:{api_port}/', flush=True)
         elif lan:

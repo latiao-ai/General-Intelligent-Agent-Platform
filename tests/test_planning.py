@@ -756,7 +756,7 @@ class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_small_talk_answers_without_searching(self):
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.agent.graph import build_graph
+        from tests.host_loop import HostLoopRuntime
         from webpage_agent.tools.core import Tool
         touched = {'searched': False}
 
@@ -776,7 +776,7 @@ class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(tool_module.BUILTIN_BY_NAME, table), \
                 patch.object(tool_module, 'catalog', fake_catalog):
-            result = await build_graph().ainvoke({
+            result = await HostLoopRuntime().run({
                 'task_id': 'x', 'user_input': '你好', 'documents': [],
                 'errors': [], 'usage': [], 'step_index': 0, 'mcp_calls': []})
         from webpage_agent.core import outcome
@@ -788,7 +788,7 @@ class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
     async def test_plan_steps_run_in_order(self):
         from webpage_agent.agent import nodes
         from webpage_agent.tools import core as tool_module
-        from webpage_agent.agent.graph import build_graph
+        from tests.host_loop import HostLoopRuntime
         from webpage_agent.tools.core import Tool
         order = []
 
@@ -812,7 +812,7 @@ class GraphShapeTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(tool_module.BUILTIN_BY_NAME, table), \
                 patch.object(tool_module, 'catalog', fake_catalog), \
                 patch.object(nodes, 'plan', fake_plan):
-            await build_graph().ainvoke({
+            await HostLoopRuntime().run({
                 'task_id': 'x', 'user_input': 'q', 'documents': [],
                 'errors': [], 'usage': [], 'step_index': 0, 'mcp_calls': []})
         self.assertEqual(order, ['web_search', 'render_html'])

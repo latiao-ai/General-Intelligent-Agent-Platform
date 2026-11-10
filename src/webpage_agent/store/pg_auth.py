@@ -32,6 +32,8 @@ class PgAuth:
         # 身份源的稳定编号是隔离键：两个平台各自有个 user-123，必须落到两个账号
         idp = (identity_provider_id or provider).strip()
         async with self._lease() as conn:
+            await self._run(conn, 'SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))',
+                            (json.dumps(['identity', tenant_id, idp, subject]),))
             row = await self._one(
                 conn,
                 'SELECT user_id, tenant_id, role FROM identities '
@@ -69,6 +71,104 @@ class PgAuth:
             await conn.commit()
             return dict(row)
 
+    async def login_platform_identity(self, *, platform_id: str, provider: str,
+                                      subject: str, display_name: str = '',
+                                      email: str = '', role: str = 'member',
+                                      tenant_id: str = 'default',
+                                      session_id: str, session_digest: str,
+                                      session_expires_at: float,
+                                      user_agent: str = '',
+                                      remote_addr: str = '') -> dict:
+        """平台账号（密码已由平台校验）→ 中台会话；首次登录顺带建号与绑定。
+
+        与 `redeem_ticket` 只差"谁证明身份"：那边信平台后端签的票据，这边信平台
+        登录接口的校验结果。落库形态完全一致——身份仍然写 `identities`，会话仍然
+        只存凭证摘要，**密码不进这个库**。
+
+        身份复用规则：同一租户下 subject 相同就复用已有中台账号（哪怕它最早是
+        OIDC 绑进来的），否则才建新号。这条保证"一个平台用户 = 一个中台账号"，
+        不会因为换登录方式把历史会话和权限拆成两个账号。
+        """
+        stamp = now()
+        async with self._lease() as conn:
+            # 首登并发靠 advisory lock 串行化，避免两个请求各建一个账号
+            await self._run(conn, 'SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))',
+                            (json.dumps(['identity', tenant_id, provider, subject]),))
+            row = await self._one(
+                conn,
+                'SELECT user_id, tenant_id, role, identity_provider_id FROM identities '
+                'WHERE tenant_id=%s AND subject=%s ORDER BY created_at LIMIT 1',
+                (tenant_id, subject))
+            created = False
+            if row is None:
+                created = True
+                user_id = 'u_' + uuid.uuid4().hex[:16]
+                await self._run(
+                    conn,
+                    'INSERT INTO app_users '
+                    '(user_id, display_name, email, status, created_at, updated_at) '
+                    'VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (user_id) DO NOTHING',
+                    (user_id, display_name, email, 'active', stamp, stamp))
+                await self._run(
+                    conn,
+                    'INSERT INTO identities '
+                    '(provider, subject, user_id, tenant_id, identity_provider_id, '
+                    ' email, role, created_at, last_seen_at) '
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (tenant_id, identity_provider_id, subject) "
+                    "  WHERE identity_provider_id <> '' "
+                    '  DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at '
+                    'RETURNING user_id, tenant_id, role',
+                    (provider, subject, user_id, tenant_id, provider, email, role,
+                     stamp, stamp))
+                row = {'user_id': user_id, 'tenant_id': tenant_id,
+                       'role': role, 'identity_provider_id': provider}
+            else:
+                await self._run(
+                    conn,
+                    'UPDATE identities SET last_seen_at=%s '
+                    'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
+                    (stamp, tenant_id, row['identity_provider_id'], subject))
+                # 只同步"平台自己绑的身份"；联合身份（OIDC 等）的角色不在这里改，
+                # 否则平台侧改个角色就能提权到中台 operator。
+                if (row.get('identity_provider_id') or '') == provider:
+                    await self._run(
+                        conn,
+                        'UPDATE identities SET role=%s, email=%s '
+                        'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
+                        (role, email, tenant_id, provider, subject))
+                    row = dict(row, role=role)
+            user = await self._one(
+                conn, 'SELECT status, display_name FROM app_users WHERE user_id=%s FOR UPDATE',
+                (row['user_id'],))
+            if not user or user['status'] != 'active':
+                await conn.rollback()
+                raise PermissionError('账号已停用')
+            # 老账号是票据/SSO 建的可能没有显示名，这里用平台用户名补上，
+            # 否则侧栏只能看到一个 u_xxx 的账号 ID。
+            if display_name and not (user.get('display_name') or '').strip():
+                await self._run(
+                    conn,
+                    'UPDATE app_users SET display_name=%s, updated_at=%s WHERE user_id=%s',
+                    (display_name, stamp, row['user_id']))
+
+            identity_provider_id = row.get('identity_provider_id') or provider
+            await self._run(
+                conn,
+                'INSERT INTO auth_sessions '
+                '(auth_session_id, token_digest, user_id, tenant_id, platform_id, '
+                ' connection_id, identity_provider_id, subject, issued_at, '
+                ' expires_at, last_seen_at, user_agent, remote_addr) '
+                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)',
+                (session_id, session_digest, row['user_id'], tenant_id,
+                 platform_id, identity_provider_id, identity_provider_id, subject,
+                 stamp, float(session_expires_at), stamp, user_agent[:200],
+                 remote_addr[:64]))
+            await conn.commit()
+            return {'user_id': row['user_id'], 'tenant_id': row['tenant_id'],
+                    'role': row.get('role') or 'member',
+                    'auth_session_id': session_id, 'created': created}
+
     async def redeem_ticket(self, *, issuer: str, jti: str, expires_at: int,
                             connection_id: str, platform_id: str,
                             tenant_id: str, identity_provider_id: str,
@@ -102,6 +202,8 @@ class PgAuth:
                 raise TicketAlreadyUsed(f'票据 {jti} 已被兑换过') from exc
 
             idp = (identity_provider_id or connection_id).strip()
+            await self._run(conn, 'SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))',
+                            (json.dumps(['identity', tenant_id, idp, subject]),))
             row = await self._one(
                 conn,
                 'SELECT user_id, tenant_id, role FROM identities '
@@ -128,12 +230,16 @@ class PgAuth:
                     'RETURNING user_id, tenant_id, role',
                     (idp, subject, user_id, tenant_id, idp, email, 'member',
                      stamp, stamp))
-            else:
-                await self._run(
-                    conn,
-                    'UPDATE identities SET last_seen_at=%s '
-                    'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
-                    (stamp, tenant_id, idp, subject))
+            user = await self._one(conn,
+                'SELECT status FROM app_users WHERE user_id=%s FOR UPDATE',
+                (row['user_id'],))
+            if not user or user['status'] != 'active':
+                raise PermissionError('账号已停用')
+            await self._run(
+                conn,
+                'UPDATE identities SET last_seen_at=%s '
+                'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
+                (stamp, tenant_id, idp, subject))
 
             await self._run(
                 conn,
@@ -205,6 +311,74 @@ class PgAuth:
                 conn,
                 'SELECT user_id, display_name, email, status, created_at '
                 'FROM app_users WHERE user_id=%s', (user_id,))
+
+    async def list_tenant_users(self, tenant_id: str) -> list[dict]:
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn,
+                'SELECT u.user_id, u.display_name, u.email, u.status FROM app_users u '
+                'WHERE EXISTS (SELECT 1 FROM identities i '
+                'WHERE i.user_id=u.user_id AND i.tenant_id=%s) '
+                'ORDER BY u.user_id', (tenant_id,))
+        return [dict(row) for row in rows]
+
+    async def set_tenant_user_status(self, *, tenant_id: str, user_id: str,
+                                     operator_id: str, session_id: str,
+                                     status: str) -> dict:
+        async with self._lease() as conn:
+            await self._run(conn, 'SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))',
+                            (json.dumps(['admin-user-status', tenant_id]),))
+            # 与兑换事务保持用户 → 身份 → 会话的锁顺序；多个用户按 ID 排序。
+            users = await self._all(conn,
+                'SELECT user_id, status FROM app_users WHERE user_id IN (%s,%s) '
+                'ORDER BY user_id FOR UPDATE', (user_id, operator_id))
+            user = next((row for row in users if row['user_id'] == user_id), None)
+            await self._all(conn,
+                'SELECT i.user_id FROM identities i JOIN auth_sessions s '
+                'ON i.user_id=s.user_id AND i.tenant_id=s.tenant_id '
+                'AND i.identity_provider_id=s.identity_provider_id AND i.subject=s.subject '
+                'WHERE s.auth_session_id=%s AND s.user_id=%s AND s.tenant_id=%s '
+                'FOR UPDATE OF i', (session_id, operator_id, tenant_id))
+            await self._one(conn,
+                'SELECT auth_session_id FROM auth_sessions WHERE auth_session_id=%s FOR UPDATE',
+                (session_id,))
+            operator = await self._one(conn,
+                'SELECT 1 FROM auth_sessions s JOIN app_users u ON u.user_id=s.user_id '
+                'JOIN identities i ON i.user_id=s.user_id AND i.tenant_id=s.tenant_id '
+                'AND i.identity_provider_id=s.identity_provider_id AND i.subject=s.subject '
+                "WHERE s.auth_session_id=%s AND s.user_id=%s AND s.tenant_id=%s "
+                "AND s.revoked_at IS NULL AND s.expires_at>%s AND u.status='active' "
+                "AND i.role='operator'", (session_id, operator_id, tenant_id, time.time()))
+            if not operator:
+                raise PermissionError('操作人会话或权限已失效')
+            belongs = await self._one(conn,
+                'SELECT 1 FROM identities WHERE user_id=%s AND tenant_id=%s LIMIT 1',
+                (user_id, tenant_id))
+            if not user or not belongs:
+                raise LookupError('用户不存在')
+            other = await self._one(conn,
+                'SELECT 1 FROM identities WHERE user_id=%s AND tenant_id<>%s '
+                'UNION ALL SELECT 1 FROM auth_sessions WHERE user_id=%s AND tenant_id<>%s LIMIT 1',
+                (user_id, tenant_id, user_id, tenant_id))
+            if other:
+                raise ValueError('用户关联其他租户，不能修改全局状态')
+            if status == 'disabled' and user_id == operator_id:
+                raise ValueError('不能停用自己')
+            stamp = now()
+            await self._run(conn, 'UPDATE app_users SET status=%s, updated_at=%s WHERE user_id=%s',
+                            (status, stamp, user_id))
+            if status == 'disabled':
+                await self._run(conn,
+                    'UPDATE auth_sessions SET revoked_at=%s WHERE user_id=%s AND revoked_at IS NULL',
+                    (stamp, user_id))
+            await self._run(conn,
+                'INSERT INTO events (task_id, seq, payload, created_at) VALUES (%s, %s, %s, %s)',
+                ('audit_' + uuid.uuid4().hex, 1, json.dumps({
+                    'type': 'admin_user_status', 'tenant_id': tenant_id,
+                    'operator_id': operator_id, 'user_id': user_id,
+                    'previous_status': user['status'], 'status': status,
+                    'auth_session_id': session_id}, ensure_ascii=False), stamp))
+            return {'user_id': user_id, 'status': status}
 
     # ---------- 会话与消息 ----------
 
@@ -560,19 +734,52 @@ class PgAuth:
                                (session_id,))
             await conn.commit()
 
+    async def get_workspace(self, *, tenant_id: str, owner_user_id: str) -> str:
+        """用户级工作目录（前端「选择工作空间」选中的本地目录）。没设过返回空串。"""
+        async with self._lease() as conn:
+            row = await self._one(
+                conn, 'SELECT path FROM user_workspaces WHERE tenant_id=%s AND owner_user_id=%s',
+                (tenant_id, owner_user_id))
+        return str((row or {}).get('path') or '')
+
+    async def set_workspace(self, *, tenant_id: str, owner_user_id: str, path: str) -> None:
+        async with self._lease() as conn:
+            await self._run(
+                conn,
+                'INSERT INTO user_workspaces (tenant_id, owner_user_id, path, updated_at) '
+                'VALUES (%s,%s,%s,%s) ON CONFLICT (tenant_id, owner_user_id) DO UPDATE '
+                'SET path=EXCLUDED.path, updated_at=EXCLUDED.updated_at',
+                (tenant_id, owner_user_id, path, now()))
+            await conn.commit()
+
+    async def clear_workspace(self, *, tenant_id: str, owner_user_id: str) -> None:
+        async with self._lease() as conn:
+            await self._run(
+                conn, 'DELETE FROM user_workspaces WHERE tenant_id=%s AND owner_user_id=%s',
+                (tenant_id, owner_user_id))
+            await conn.commit()
+
     async def list_sessions(self, limit: int = 50, *, tenant_id: str | None = None,
-                      owner_user_id: str | None = None) -> list[dict]:
+                      owner_user_id: str | None = None,
+                      include_legacy: bool = False) -> list[dict]:
         """会话列表（按最近活跃排序），供前端侧边栏展示。
 
         title 取该会话第一条用户消息（截断），没有就回退到「新会话」。
         传入 tenant_id / owner_user_id 时只返回该主体名下的会话。
+
+        `include_legacy` 决定要不要把 ``owner_user_id='default'`` 的存量会话
+        也算进来——调用方必须传 ``policy_legacy_visible``，**不能在这里默认放行**：
+        列表一旦放行、详情（`ensure_owner`）不放行，就会变成"看得见、点开 404"。
         """
         where, params = [], []
         if tenant_id:
             where.append('s.tenant_id=%s')
             params.append(tenant_id)
         if owner_user_id:
-            where.append("(s.owner_user_id=%s OR s.owner_user_id='default')")
+            if include_legacy:
+                where.append("(s.owner_user_id=%s OR s.owner_user_id='default')")
+            else:
+                where.append('s.owner_user_id=%s')
             params.append(owner_user_id)
         clause = (' WHERE ' + ' AND '.join(where)) if where else ''
         async with self._lease() as conn:

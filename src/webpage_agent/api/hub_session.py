@@ -9,6 +9,7 @@ from pathlib import Path
 
 from webpage_agent.api.task_record import TaskRecord
 from webpage_agent.core import outcome as outcome_module
+from webpage_agent.core.config import settings
 
 logger = logging.getLogger('webpage_agent.api.api_hub')
 
@@ -44,8 +45,14 @@ class HubSessionMixin:
     async def list_sessions(self, limit: int = 50, principal=None) -> list[dict]:
         if principal is None:
             return await self.store.list_sessions(limit)
+        # 列表与详情必须用同一条归属规则，否则会出现"侧边栏看得见、点开 404"。
+        # 存量 default 数据只在 `ensure_owner` 也会放行的场景（未认证 + 开关打开）
+        # 才列出来。
+        include_legacy = (settings.policy_legacy_visible
+                          and not getattr(principal, 'authenticated', False))
         return await self.store.list_sessions(
-            limit, tenant_id=principal.tenant_id, owner_user_id=principal.user_id)
+            limit, tenant_id=principal.tenant_id, owner_user_id=principal.user_id,
+            include_legacy=include_legacy)
 
     async def session_timeline(self, session_id: str) -> dict:
         """一个会话的完整回放：聊天气泡 + 每轮的执行过程事件 + 聊天 turn + 活动 run。

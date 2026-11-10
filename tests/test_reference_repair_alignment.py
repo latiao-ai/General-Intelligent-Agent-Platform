@@ -23,7 +23,7 @@ from unittest.mock import patch
 from webpage_agent.agent import nodes
 from webpage_agent.core.schemas import ExecutionPlan, ObservationDecision
 
-from tests.exec_env import (Remote, install_main, install_tools, new_store,
+from tests.exec_env import (Remote, install_host_loop, install_main, install_tools, new_store,
                             override_settings, reset_db, seed_run)
 
 
@@ -195,7 +195,7 @@ class ReferenceRepairGraphTests(unittest.IsolatedAsyncioTestCase):
         await seed_run(store, status='queued', message='创建桂林节点')
         hub = Hub(store, owner_id='w1')
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
-                install_tools(tools), \
+                install_tools(tools), install_host_loop(), \
                 patch.object(nodes, 'structured_call', model), \
                 override_settings(observe_enabled=True):
             await worker.run_once(hub, 'w1', run_id='run1')

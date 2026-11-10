@@ -1,7 +1,8 @@
 """PiRuntime：通过 Node 桥接驱动 Pi 推理，实现 `agent.runtime.Runtime` 契约。
 
 第三阶段目标：打通「Python → Node 中的 Pi → Python 假工具 → Pi 答复」这一条
-最小链路。新建业务 run 的默认引擎是 Pi；已落库的 LangGraph run 仍走原恢复分支。
+最小链路。生产执行引擎只有 Pi。存量 langgraph 行在进入这里之前
+已经改挂，或被宿主停在待核实。
 
 契约遵守（与 Runtime 接口一致）：
 
@@ -57,16 +58,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
+from dataclasses import replace as dataclass_replace
 from typing import Any, Awaitable, Callable
 
 from webpage_agent.agent import pi_protocol as proto
 from webpage_agent.agent.pi_bridge import PiBridge, PiBridgeError
 from webpage_agent.agent.pi_protocol import ProtocolError
+from webpage_agent.core.errors import RecursionBudgetExceeded
 from webpage_agent.observe.events import (
     answer_delta,
     bind_sink,
     drain_events,
     emit_async,
+    stage_end,
     stage_start,
     unbind_sink,
 )
@@ -86,6 +92,35 @@ def _tool_decl(tool) -> dict[str, Any]:
         "description": tool.description,
         "parameters": tool.args,
     }
+
+
+# 模型端点对函数名的要求：1~128 个 ASCII 字母/数字/下划线/连字符。MCP 工具名
+# 常带点（如 BeeFTV 的 canvas.get），原样下发会让**整次请求** 400，一个工具都
+# 调不了。这里只改「对模型暴露的名字」，Tool 的 run 闭包仍绑定真实 MCP 工具。
+_UNSAFE_TOOL_NAME = re.compile(r'[^A-Za-z0-9_-]+')
+
+
+def _safe_tool_name(name: str) -> str:
+    base = _UNSAFE_TOOL_NAME.sub('_', str(name or '')).strip('_')
+    return (base or 'tool')[:64]
+
+
+def sanitize_tool_names(tools: list) -> list:
+    """把工具名收成供应商允许的字符集；改名后重名的保留第一个并告警。"""
+    seen: set[str] = set()
+    result: list = []
+    for tool in tools:
+        original = getattr(tool, 'name', '')
+        safe = _safe_tool_name(original)
+        if safe in seen:
+            logger.warning('Pi 工具改名后重名，已丢弃：%s', original)
+            continue
+        seen.add(safe)
+        if safe != original:
+            logger.info('Pi 工具改名：%s -> %s（仅对模型暴露名）', original, safe)
+            tool = dataclass_replace(tool, name=safe)
+        result.append(tool)
+    return result
 
 
 def default_tool_catalog() -> list[dict[str, Any]]:
@@ -155,6 +190,8 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
         elif key in write_keys:
             tool_objects.append(tool)
 
+    # 名字先收成供应商允许的字符集，声明与执行目录用同一份名字。
+    tool_objects = sanitize_tool_names(tool_objects)
     decls = [_tool_decl(t) for t in tool_objects]
     decls.append(pi_host_tools.request_input_decl())
     from webpage_agent.agent.pi_tool_schema import prepare_declarations
@@ -226,6 +263,16 @@ class PiRuntime:
         self._model_reservations: dict[str, Any] = {}
         # 第七阶段：版本化 Pi 快照（检查点/恢复用），run() 里初始化。
         self._snapshot: dict[str, Any] = {}
+        # 产品循环：步数、重复指纹、确认边界用的已调用工具。每次 run() 清零。
+        self._tool_calls = 0
+        self._repeat_counts: dict[str, int] = {}
+        self._call_trace: list[dict] = []
+        self._progress = None
+        self._live_state: dict | None = None
+        self._progress_started = 0.0
+        self._progress_marked = 0.0
+        self._open_stage = ''
+        self._stage_opened = 0.0
 
     async def run(
         self,
@@ -246,6 +293,14 @@ class PiRuntime:
         bridge = self._bridge or PiBridge()
         own_bridge = self._bridge is None
         answer_parts: list[str] = []
+        self._tool_calls = 0
+        self._repeat_counts = {}
+        self._call_trace = []
+        self._progress = progress
+        self._live_state = state
+        self._progress_started = time.perf_counter()
+        self._progress_marked = self._progress_started
+        self._open_stage = ''
 
         # 第七阶段收口：恢复输入用**单一字段** `pi_resume`（快照 + 恢复决策）承载，
         # 由 Hub 的 _pi_resume_plan 装配、run_task 展平进 state。这里只从这一处读，
@@ -461,6 +516,8 @@ class PiRuntime:
                     await self._handle_checkpoint(bridge, msg)
                 elif mtype == "finished":
                     self._apply_finished(state, msg, bridge.execution_id)
+                    await self._close_stage('done')
+                    self._note_progress('pi', str(state.get('status') or ''))
                     break
                 elif mtype == "error":
                     raise PiBridgeError(
@@ -504,6 +561,42 @@ class PiRuntime:
         state['_pi_snapshot'] = _snap.serialize(self._snapshot)
         return state
 
+    def _note_progress(self, stage: str, status: str) -> None:
+        """节点级进度：写入 timings，并调用宿主的同步 progress 回调。"""
+        now = time.perf_counter()
+        state = self._live_state
+        if isinstance(state, dict):
+            state.setdefault('timings', []).append({
+                'stage': stage,
+                'seconds': round(now - self._progress_marked, 2),
+                'status': state.get('status') or status,
+            })
+        self._progress_marked = now
+        if self._progress is not None:
+            elapsed = round(now - self._progress_started, 2)
+            shown = ''
+            if isinstance(state, dict):
+                shown = str(state.get('status') or status)
+            self._progress(stage, shown, elapsed)
+
+    async def _close_stage(self, status: str) -> None:
+        if not self._open_stage:
+            return
+        elapsed = time.perf_counter() - self._stage_opened
+        stage = self._open_stage
+        self._open_stage = ''
+        await emit_async(stage_end(stage, elapsed, status or 'done'))
+
+    async def _open_named_stage(self, stage: str) -> None:
+        if self._open_stage and self._open_stage != stage:
+            await self._close_stage('done')
+        if self._open_stage == stage:
+            return
+        self._open_stage = stage
+        self._stage_opened = time.perf_counter()
+        await emit_async(stage_start(stage))
+        self._note_progress(stage, '')
+
     async def _handle_event(self, msg: dict, answer_parts: list[str]) -> None:
         """转发事件：text_delta 走 answer_delta（text 字段），阶段走 stage 契约。"""
         kind = msg.get("kind")
@@ -513,8 +606,7 @@ class PiRuntime:
             # 公共事件契约：answer_delta 使用 text 字段
             await emit_async(answer_delta(delta))
         elif kind == "progress" or kind == "stage":
-            stage = str(msg.get("label", ""))
-            await emit_async(stage_start(stage))
+            await self._open_named_stage(str(msg.get("label", "") or "pi"))
 
     async def _handle_tool_call(self, bridge: PiBridge, msg: dict, state: dict) -> None:
         """校验并执行工具，回执（保留错误正文）。
@@ -554,6 +646,8 @@ class PiRuntime:
             return
 
         from webpage_agent.agent import pi_host_tools
+        from webpage_agent.agent import pi_product
+        from webpage_agent.core.config import settings
         if tool_name == pi_host_tools.REQUEST_INPUT_NAME:
             question = str((args or {}).get('question') or '').strip()
             if not question:
@@ -562,6 +656,22 @@ class PiRuntime:
             await self._park_for_input(
                 bridge, state, call_id, tool_name, question)
             return
+
+        limit = max(1, int(getattr(settings, 'run_max_tool_calls', 40) or 40))
+        if self._tool_calls >= limit:
+            raise RecursionBudgetExceeded('这一轮已经用满步数预算', limit=limit)
+        fingerprint = pi_product.repeat_key(tool_name, args if isinstance(args, dict) else {})
+        stalled = pi_product.repeat_block(
+            self._repeat_counts, fingerprint,
+            int(getattr(settings, 'run_max_no_progress', 2) or 2))
+        if stalled:
+            raise RecursionBudgetExceeded(stalled)
+        blocked = pi_product.confirmation_block(
+            self._call_trace, self._tool_for_guard(tool_name), self._guard_catalog())
+        if blocked:
+            await self._park_for_input(bridge, state, call_id, tool_name, blocked)
+            return
+        self._tool_calls += 1
 
         if self._tool_executor is not None:
             # 测试注入的假工具替身
@@ -575,6 +685,9 @@ class PiRuntime:
                 error=None if ok else str(result),
             )
             await bridge.send(reply)
+            if ok:
+                pi_product.note_repeat(self._repeat_counts, fingerprint)
+                self._call_trace.append({'tool': tool_name, 'step_id': call_id, 'args': {}})
             return
 
         # 真实受治理调用：走 HostToolCaller（授权 → 准入 → 撤权复查 → 真实调用 → 结算）
@@ -710,6 +823,8 @@ class PiRuntime:
             await bridge.send(reply)
             return
         if receipt.ok:
+            pi_product.note_repeat(self._repeat_counts, fingerprint)
+            self._call_trace.append({'tool': tool_name, 'step_id': call_id, 'args': {}})
             # 成功结算后合并认可增量回宿主 state（documents/usage/errors）
             if receipt.updates:
                 for key, value in receipt.updates.items():
@@ -952,6 +1067,19 @@ class PiRuntime:
             ok=False, result=None, error='', needs_input=True)
         await bridge.send(reply)
 
+    def _guard_catalog(self) -> list:
+        if self._tool_objects:
+            return list(self._tool_objects)
+        caller = self._host_caller
+        catalog = getattr(caller, '_tools_catalog', None) if caller is not None else None
+        return list(catalog or [])
+
+    def _tool_for_guard(self, name: str):
+        for tool in self._guard_catalog():
+            if getattr(tool, 'name', '') == name:
+                return tool
+        return None
+
     def _allowed_tool(self, name: str) -> dict[str, Any] | None:
         for tool in self._tools:
             if tool.get("name") == name:
@@ -995,6 +1123,15 @@ class PiRuntime:
                 return
             state["answer"] = answer
             state["pi_outcome"] = "answered"
+            from webpage_agent.agent import pi_product
+            gap = pi_product.completion_block(state)
+            if gap:
+                # 有答复不等于做完：产物缺失或部署回执未确认时不能当成功。
+                state["pi_outcome"] = "failed"
+                state.pop("answer", None)
+                state["failure"] = gap
+                state.setdefault("errors", []).append(
+                    {"stage": "verify_completion", "type": "UnmetCriteria", "detail": gap})
         elif outcome == "cancelled":
             state["pi_outcome"] = "cancelled"
             # 第七阶段收口：取消**不得**因残留旧 answer 被归一为成功。清除旧答复，

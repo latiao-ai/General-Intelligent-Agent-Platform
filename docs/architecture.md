@@ -8,7 +8,7 @@
 webpage-agent-main/
 ├── src/webpage_agent/        # 唯一的可导入包
 │   ├── api/                  # 对外接口层
-│   ├── agent/                # Pi（默认）与 LangGraph 执行内核
+│   ├── agent/                # Pi 执行内核
 │   ├── tools/                # 工具调用与权限策略
 │   ├── store/                # 持久化
 │   ├── governance/           # 治理、审批、身份
@@ -26,14 +26,13 @@ webpage-agent-main/
 
 ## 执行引擎
 
-`agent/` 里有两套运行时，宿主经 `get_runtime(kind)` 取，不在业务代码里写死：
+宿主经 `get_runtime()` 取运行时，生产只有 Pi（`PiRuntime` + `pi-runtime/`）。
 
-| 引擎 | 何时用 | 做什么 |
-|---|---|---|
-| Pi（`PiRuntime` + `pi-runtime/`） | **新建**业务 run 的默认。`DEFAULT_RUNTIME_KIND` 未设置时就是 `pi`。补偿 run 和「部署上一份产物」也是 Pi | 工具循环：governed_call、检查点、审批 / 外部等待 / 缺参 `waiting_input`、写后 `platform_verify`。补偿和部署另走脚本模式（`pi_script.py`）：不启动模型，按既定步骤调用 |
-| LangGraph（`LangGraphRuntime`） | 该 run 行上的 `runtime_kind=langgraph` | 计划、修订、观察、核对。排空前保留，不因默认切换删除。补偿和「部署上一份产物」不再新建图 run |
+新建业务 run、补偿 run 和「部署上一份产物」都走 Pi。工具循环包含 governed_call、检查点、审批 / 外部等待 / 缺参 `waiting_input`、写后 `platform_verify`。补偿和部署另走脚本模式（`pi_script.py`）：不启动模型，按既定步骤调用。画布上的确认边界、重复调用停手、产物与部署回执核对挂在这条循环上。
 
-恢复读库里的 `runtime_kind` / `runtime_version` / `runtime_state_schema`，不认识的引擎直接拒绝，不退回另一个引擎再跑一遍。系统提示是 `settings.pi_system_prompt`（可用 `PI_SYSTEM_PROMPT` 覆盖），不是只写在文档里的环境变量。
+库里 `runtime_kind=langgraph` 的存量行不再启动旧引擎。没有动作、没有已执行步骤、没有未完成外部任务时，执行前改挂成 Pi 再跑。已经产生副作用的，停在 `needs_reconcile` 并写明原因，避免把旧步骤重放一遍。
+
+恢复读库里的 `runtime_kind` / `runtime_version` / `runtime_state_schema`。不认识的引擎直接拒绝。系统提示是 `settings.pi_system_prompt`（可用 `PI_SYSTEM_PROMPT` 覆盖）。
 
 各阶段关闭说明（`docs/phase8` 至 `phase12`）记录的是当时「尚未切换默认引擎」。以本节和 `core/config.py` 的当前默认值为准。
 
@@ -42,12 +41,12 @@ webpage-agent-main/
 | 包 | 职责 | 关键模块 |
 |---|---|---|
 | `api/` | HTTP 层：路由、鉴权、应用装配 | `routes.py`（对外接口与页面）、`api_hub.py`（任务编排入口）、`main.py`（执行流程与阶段标签）、`auth.py`、`auth_connections.py` |
-| `agent/` | 两套执行内核。Pi 是新建 run 的默认，补偿和部署走 Pi 的脚本模式；LangGraph 图留给存量 run | `runtime.py`、`pi_runtime.py`、`pi_script.py`、`graph.py`、`nodes.py`（规划/续跑/执行/观察/核对/补偿）、`context.py`、`run_inputs.py`、`scene_context.py` |
+| `agent/` | Pi 执行内核。补偿和部署走脚本模式。规划节点仍在 `nodes.py`，生产入口不靠它们驱动 | `runtime.py`、`pi_runtime.py`、`pi_script.py`、`pi_product.py`、`nodes.py`、`context.py`、`run_inputs.py`、`scene_context.py` |
 | `tools/` | 工具汇总、调用上下文、权限策略、结果整形 | `core.py`（内核工具汇总，不 import 任何业务包）、`tool_context.py`、`tool_policy.py`、`tool_authorization.py`、`tool_results.py` |
 | `store/` | 持久化仓储，唯一实现是 PostgreSQL | `pg_store.py`、`persistence.py`（`Repository` 协议）、`migrations.py`、`ledger.py`、`idempotency.py`、`artifact_store.py` |
 | `governance/` | 治理：策略、审批、票据、执行控制、复核 | `policies.py`、`core.py`、`approvals.py`、`ticket_auth.py`、`request_review.py`、`execution_control.py` |
 | `observe/` | 可观测性：事件、观测、健康检查、日志、遥测 | `events.py`、`observation.py`、`runtime_check.py`、`logging_setup.py`、`telemetry.py`、`maintenance.py`、`task_notify.py`、`errors.py` |
-| `core/` | 领域模型与共享设施 | `schemas.py`（LangGraph 状态定义）、`config.py`（设置与项目根）、`services.py`、`messages.py`、`outcome.py`、`memory.py`、`credentials.py`、`external_tasks.py`、`async_contracts.py`、`profile.py`、`mcp_connections.py`、`md.py`、`files.py`、`sources.py` |
+| `core/` | 领域模型与共享设施 | `schemas.py`（运行状态）、`config.py`（设置与项目根）、`services.py`、`messages.py`、`outcome.py`、`memory.py`、`credentials.py`、`external_tasks.py`、`async_contracts.py`、`profile.py`、`mcp_connections.py`、`md.py`、`files.py`、`sources.py` |
 | `capabilities/` | 本地能力插件，`@tool` 声明，import 即注册 | `registry.py`、`base.py`、`web.py`、`answers.py`、`export.py`、`publishing.py` |
 | `integrations/` | 外部平台集成 | `mcp_adapter.py`、`mcp_servers.py`、`mcp_subject.py`、`mcp_tasks.py`、`search.py` |
 

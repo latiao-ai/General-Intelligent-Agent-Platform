@@ -1,7 +1,7 @@
 """一次受治理的工具调用：授权、准入、撤权复查、真实调用、结果归一、结算。
 
 这是从 `agent/nodes.py` 的 `run_step` 里**抽取**出来的「单次执行边界」，供
-LangGraph 图（`run_step`）与 Pi 运行时（`pi_runtime`）**共同复用**。两者都必须
+规划节点（`run_step`）与 Pi 运行时（`pi_runtime`）**共同复用**。两者都必须
 走同一条治理链：控制检查 → 授权 → 调用预算 → 准入（`ActionLedger.admit`）→
 撤权复查 → 真实调用 → 结果归一 → 结算（`ActionLedger.settle`）。
 

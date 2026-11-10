@@ -301,12 +301,12 @@ class DualEngineRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('steps', plan)
         self.assertEqual(plan['pi_resume']['recovery']['kind'], 'resume_reconcile')
 
-    async def test_second_round_langgraph_stays_on_the_graph_shape(self):
+    async def test_legacy_graph_run_with_actions_refuses_replay(self):
         hub, _store = await self._hub('langgraph')
         plan = await hub._resume_for_engine('r1')
-        self.assertNotIn('pi_resume', plan or {})
-        self.assertNotIn('steps', plan or {})
-        self.assertIn('intent_version', plan)
+        self.assertTrue(plan.get('refused'))
+        self.assertEqual(plan['pi_resume']['recovery']['kind'], 'resume_reconcile')
+        self.assertNotIn('steps', plan)
 
     def test_protocol_version_matches_node(self):
         from webpage_agent.agent.pi_protocol import PROTOCOL_VERSION

@@ -98,6 +98,8 @@ async def exchange(ticket: str, store, *, user_agent: str = '',
             session_expires_at=expires_at,
             email=identity.email, display_name=identity.display_name,
             user_agent=user_agent, remote_addr=remote_addr)
+    except PermissionError as exc:
+        raise ExchangeError('账号已停用', status=403) from exc
     except Exception as exc:                                  # noqa: BLE001
         if type(exc).__name__ == 'TicketAlreadyUsed':
             logger.info('票据重复兑换：iss=%s jti=%s', identity.issuer,
@@ -148,8 +150,7 @@ async def principal_from_session(request: Request, store):
         raise HTTPException(status_code=401, detail='登录已过期')
     user = await store.user(row['user_id'])
     if user and str(user.get('status') or 'active') != 'active':
-        # 用户被停用：会话立刻失效，不等它自己过期
-        await store.revoke_user_sessions(row['user_id'])
+        # 停用事务负责撤销当时的会话；此处只拒绝，避免影响重新启用后的新会话。
         raise HTTPException(status_code=401, detail='账号已停用')
 
     return policies.Principal(

@@ -21,6 +21,7 @@
 | `annotated-types` | 0.8.0 | MIT |
 | `anyio` | 4.15.1 | MIT |
 | `attrs` | 26.1.0 | MIT |
+| `Authlib` | 1.9.5 | BSD-3-Clause |
 | `certifi` | 2026.7.22 | MPL-2.0 |
 | `cffi` | 2.1.1 | MIT-0 |
 | `charset-normalizer` | 3.5.2 | MIT |
@@ -39,6 +40,7 @@
 | `itsdangerous` | 2.2.0 | BSD-3-Clause |
 | `Jinja2` | 3.1.6 | BSD-3-Clause |
 | `jiter` | 0.17.0 | MIT |
+| `joserfc` | 1.8.0 | BSD-3-Clause |
 | `jsonpatch` | 1.35 | BSD-3-Clause |
 | `jsonpointer` | 3.2.1 | BSD-3-Clause |
 | `jsonschema-specifications` | 2025.9.1 | MIT |
@@ -46,10 +48,6 @@
 | `langchain-core` | 1.6.10 | MIT |
 | `langchain-openai` | 1.7.1 | MIT |
 | `langchain-protocol` | 0.0.19 | MIT |
-| `langgraph-checkpoint` | 4.3.0 | MIT |
-| `langgraph-prebuilt` | 1.1.0 | MIT |
-| `langgraph-sdk` | 0.4.7 | MIT |
-| `langgraph` | 1.2.15 | MIT |
 | `langsmith` | 0.14.8 | MIT |
 | `MarkupSafe` | 3.0.4 | BSD-3-Clause |
 | `mcp` | 1.30.0 | MIT |

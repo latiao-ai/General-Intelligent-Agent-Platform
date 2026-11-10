@@ -159,7 +159,7 @@ class Settings:
     # 单次任务总预算（秒）。注意要 > llm_attempt_timeout × 重试次数，
     # 否则外层会先砍断内层重试，重试等于白写。
     task_timeout: float = max(30.0, float(os.getenv('TASK_TIMEOUT', '300')))
-    # LangGraph 的递归上限：每个步骤算一跳，留出余量。
+    # 规划节点循环的步数上限（测试驱动与历史计划路径）。每个步骤算一跳，留出余量。
     # 一次工具调用就要 2 跳（run_step + observe_result），再叠加 persist_plan /
     # decide_next / verify_completion / finalize，30 跳连 8 步的计划都不够跑。
     # 按 max_steps 折算，一个步骤给 8 跳（含修订引起的重跑）。
@@ -236,10 +236,8 @@ class Settings:
     # 连续"没有新进展"的容忍次数：相同指纹重复出现就停，而不是继续烧预算。
     run_max_no_progress: int = max(1, int(
         os.getenv('RUN_MAX_NO_PROGRESS', '2')))
-    # 新建 run 的默认引擎（langgraph | pi）。只影响**新建**任务；
-    # 恢复时读库里已存的 runs.runtime_kind，绝不回退到这里。
-    # 未设置环境变量时默认 pi：画布业务 run 走 Pi 工具循环。
-    # 存量 run 仍按行上的 runtime_kind 恢复，LangGraph 分支保留到排空。
+    # 新建 run 的引擎。只影响**新建**任务；恢复读库里已存的 runtime_kind。
+    # 未设置环境变量时默认 pi。历史值 langgraph 不再对应可执行引擎。
     default_runtime_kind: str = os.getenv('DEFAULT_RUNTIME_KIND', 'pi').strip().lower() or 'pi'
 
     # ---------- 身份（webpage_agent/api/auth.py / webpage_agent/governance/ticket_auth.py） ----------

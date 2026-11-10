@@ -1,8 +1,8 @@
 """第七阶段：run 引擎归属持久化（runtime_kind / runtime_version / runtime_state_schema）。
 
 验证：
-- 新 run 创建时确定归属，默认 LangGraph；
-- 显式指定 pi 时按 pi 的版本/schema 落库；
+- 新 run 创建时确定归属，默认 Pi；
+- 显式写入的历史标记 langgraph 仍按旧版本号落库（执行时改挂或拒收）；
 - 恢复读取已存归属；未知引擎 / 不兼容版本明确阻断，不回退默认引擎。
 
 依赖真实 PostgreSQL（PG_TEST_DSN，库名含 test）。
@@ -30,8 +30,8 @@ class RuntimeOwnershipTests(unittest.IsolatedAsyncioTestCase):
     async def _seed_task(self, task_id='t1'):
         await self.store.create_task(task_id, 's1', '测试')
 
-    async def test_default_kind_is_langgraph(self):
-        """显式 langgraph 仍按图的版本落库（排空前的恢复身份）。"""
+    async def test_explicit_langgraph_label_is_stored(self):
+        """显式写入的历史标记仍按旧版本号落库，执行入口不再把它当引擎。"""
         from webpage_agent.agent import runtime_identity
         await self._seed_task()
         await self.store.create_run('r1', 't1', status='queued',

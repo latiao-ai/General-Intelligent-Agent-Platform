@@ -26,7 +26,7 @@ from webpage_agent.governance import core as governance
 from webpage_agent.governance import policies
 from webpage_agent.store import migrations
 from webpage_agent.store.pg_store import SCHEMA, MIGRATIONS
-from tests.exec_env import (PG_DSN, Remote, install_main, install_tools,
+from tests.exec_env import (PG_DSN, Remote, install_host_loop, install_main, install_tools,
                             new_store, reset_db, seed_run, valid_test_dsn)
 from tests.test_runtime_closure import assigned
 
@@ -439,7 +439,8 @@ class UsageLedgerTests(unittest.IsolatedAsyncioTestCase):
         tools = {'read': remote.tool('read', effect='read', output={'answer': '好'})}
         await seed_run(self.store, message='请处理这件事')
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
-                install_tools(tools), assigned(settings, run_max_tokens=10), \
+                install_tools(tools), install_host_loop(), \
+                assigned(settings, run_max_tokens=10), \
                 patch.object(services, 'new_llm', _new_llm(model)):
             await run_once(Hub(self.store), 'worker', run_id='run1')
 
@@ -488,7 +489,8 @@ class UsageLedgerTests(unittest.IsolatedAsyncioTestCase):
         tools = {'read': remote.tool('read', effect='read', output={'answer': '好'})}
         await seed_run(self.store, message='请读一下再决定')
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
-                install_tools(tools), assigned(settings, run_max_tokens=20), \
+                install_tools(tools), install_host_loop(), \
+                assigned(settings, run_max_tokens=20), \
                 patch.object(services, 'new_llm', _new_llm(model)):
             await run_once(Hub(self.store), 'worker', run_id='run1')
 

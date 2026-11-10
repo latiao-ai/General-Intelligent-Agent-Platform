@@ -1,6 +1,6 @@
 # 运行状态机
 
-这篇把运行状态、观察决定、版本计数和失败分段收在一处。依据是当前代码：`src/webpage_agent/core/outcome.py` 的 `RUN_STATUSES`、`src/webpage_agent/core/schemas.py` 的 `ObservationDecision.DECISIONS`、`src/webpage_agent/store/pg_schema.py` 的版本列，以及 `src/webpage_agent/agent/graph.py` 的 `build_graph`。
+这篇把运行状态、观察决定、版本计数和失败分段收在一处。依据是当前代码：`src/webpage_agent/core/outcome.py` 的 `RUN_STATUSES`、`src/webpage_agent/core/schemas.py` 的 `ObservationDecision.DECISIONS`、`src/webpage_agent/store/pg_schema.py` 的版本列，以及规划节点的走向（生产执行是 Pi；节点顺序见 `tests/host_loop.py`）。
 
 这里说的状态是 `runs.status` / `tasks.status` 的通用词汇。步骤、动作、批准、后台作业、决策台账各自另有状态列，不在这张表里。展示词（`answered`、`local_ready`、`deployed`）由 `outcome.label()` 从通用状态和 outcome 推出来，不进状态机。
 
@@ -203,7 +203,7 @@ intake → plan → persist_plan → run_step → observe_result → verify_comp
 
 ## Pi 工具循环与图语义
 
-新建业务 run 的默认引擎是 Pi（`settings.default_runtime_kind`，未设置 `DEFAULT_RUNTIME_KIND` 时为 `pi`）。恢复仍读该 run 已存的 `runtime_kind`：LangGraph 的 run 继续走图，不会因为默认切换被重跑。
+新建业务 run 的引擎是 Pi。库里 `runtime_kind=langgraph` 的存量行在执行前改挂到 Pi（没有副作用时），或停在待核实（已经有步骤或动作时）。
 
 Pi 不是图。它不实现 `plan` / `revise_plan` / `verify_completion` 这些节点，也不在工具循环里假装有步骤游标。画布主路径是：
 

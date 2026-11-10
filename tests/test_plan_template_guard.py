@@ -25,7 +25,7 @@ from webpage_agent.agent import nodes
 from webpage_agent.agent import run_inputs as run_inputs_module
 from webpage_agent.core.schemas import ExecutionPlan, RevisedPlan, ToolSelection
 
-from tests.exec_env import (Remote, install_main, install_tools, new_store,
+from tests.exec_env import (Remote, install_host_loop, install_main, install_tools, new_store,
                             reset_db, seed_run)
 from tests.test_revision_repair import (GOAL, SUPPLEMENT, catalog)
 
@@ -230,7 +230,7 @@ class TemplateGraphTests(unittest.IsolatedAsyncioTestCase):
                                          message=SUPPLEMENT)
         hub = Hub(store, owner_id='w1')
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
-                install_tools(tools), \
+                install_tools(tools), install_host_loop(), \
                 patch.object(nodes, 'structured_call', model):
             await worker.run_once(hub, 'w1', run_id='run1')
         return (remote, await store.run('run1'), await store.plan('run1'),
