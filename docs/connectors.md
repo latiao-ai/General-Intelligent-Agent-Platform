@@ -109,6 +109,54 @@ ima             [连接]
 
 重启后打开「+ → 连接器」，新条目会出现，开关可用。未配置的条目会显示「配置」。
 
+## 4.1 需要登录主体的 stdio MCP（BeeFTV）
+
+BeeFTV 的 MCP 配置里带：
+
+```json
+{
+  "id": "beeftv",
+  "transport": "stdio",
+  "forward_subject": true,
+  "stdio_env": {"BEEFTV_BASE_URL": "http://127.0.0.1:8004"}
+}
+```
+
+`forward_subject` 表示 MCP 子进程需要知道“当前是哪个登录用户”。原来的实现只在 **agent run** 里取 `runs.platform_subject`；连接器开关是在 run 之外做工具发现，所以会报：
+
+```text
+RuntimeError: MCP 服务要求已验证的登录来源主体
+```
+
+修复分两步：
+
+1. 工具发现接受一个已验证的 `subject`：
+   `list_server_tools(server, subject=principal.subject)`；
+   `connect_session(..., subject=...)` 把它写进 stdio 的
+   `MCP_CALLER_SUBJECT`；
+2. BeeFTV 的 MCP 还要求 `MCP_BEARER_TOKEN`（hub MCP token）。
+   在 `MCP_SERVERS` 的 beeftv 条目加：
+
+```json
+{
+  "id": "beeftv",
+  "token": "从 .local/secrets/hub-mcp-token 读取",
+  "stdio_env": {"BEEFTV_BASE_URL": "http://127.0.0.1:8004"}
+}
+```
+
+BeeFTV 服务端本身也要用同一个 token 文件启动：
+
+```text
+BEEFTV_HUB_MCP_TOKEN_FILE=/Users/.../BeefTV/.local/secrets/hub-mcp-token
+```
+
+本项目通过 `run.py` 启动 BeeFTV 时已经会自动读取这个文件。
+
+修复后 BeeFTV 连接返回 216 个工具，输入框出现 🖼 标签：
+
+![BeeFTV 连接成功](assets/workbuddy/beeftv-connected.png)
+
 ## 5. 边界
 
 - 开关会**真实建立 MCP 会话并调用 `list_tools()`**，这是“连接”的证据；

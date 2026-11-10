@@ -252,14 +252,18 @@ async def subject_assertion_headers(server) -> dict:
 
 
 @asynccontextmanager
-async def _borrow_stdio(server, command: str, args: list, token: str | None):
+async def _borrow_stdio(server, command: str, args: list, token: str | None,
+                        subject: str | None = None):
     env = dict(getattr(server, 'stdio_env', {}) or {})
     if token is not None:
         env['MCP_BEARER_TOKEN'] = token
     if getattr(server, 'forward_subject', False):
         # stdio 的子进程是我们自己起的，环境变量就是可信通道；
         # HTTP/SSE 走跨机器通道，改用签名断言（见 subject_assertion_headers）。
-        env['MCP_CALLER_SUBJECT'] = (await current_run()).get('platform_subject') or ''
+        # 连接器发现没有 run 上下文，由 API 传入已验证登录会话的 subject。
+        if subject is None:
+            subject = str((await current_run()).get('platform_subject') or '')
+        env['MCP_CALLER_SUBJECT'] = str(subject or '')
     key = _stdio_key(server, command, args, token, env)
     async with _stdio_guard:
         slot = _stdio_slots.get(key)
@@ -357,7 +361,8 @@ def _sse_http_client(headers=None, timeout=None, auth=None):
 
 
 @asynccontextmanager
-async def connect_session(server=None, *, token: str | None = None):
+async def connect_session(server=None, *, token: str | None = None,
+                          subject: str | None = None):
     """`token=None` 沿用服务端配置；传入字符串则只用它，不再读进程级 token。"""
     problem = sdk_problem()
     if problem:
@@ -385,7 +390,7 @@ async def connect_session(server=None, *, token: str | None = None):
         # "配了鉴权的 stdio 服务端"静默变成未鉴权连接。显式传参优先（按租户解析
         # 出来的钥匙比配置更高），两者都没有才不带。
         stdio_token = token if token is not None else (getattr(server, 'token', '') or None)
-        async with _borrow_stdio(server, command, args, stdio_token) as session:
+        async with _borrow_stdio(server, command, args, stdio_token, subject) as session:
             yield session
     elif transport == 'sse':
         url = _cfg(server, 'url', 'MCP_URL')
@@ -456,7 +461,8 @@ def effect_type(tool) -> str:
     return 'unknown'
 
 
-async def list_server_tools(server=None, *, token: str | None = None):
+async def list_server_tools(server=None, *, token: str | None = None,
+                            subject: str | None = None):
     """发现服务端工具，尽量把能力信息完整带回。
 
     早先只保留 name 与 inputSchema，description/annotations 全被丢掉——
@@ -464,7 +470,7 @@ async def list_server_tools(server=None, *, token: str | None = None):
     这类就完全看不出）。能力描述必须在规划前就到手。
     """
     async with asyncio.timeout(30):
-        async with connect_session(server, token=token) as session:
+        async with connect_session(server, token=token, subject=subject) as session:
             tools = await all_tools(session)
             return [{
                 'name': t.name,

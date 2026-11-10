@@ -93,7 +93,11 @@ async def connect_connector(connector_id: str,
                             detail='该连接器还没有配置 MCP_SERVERS，请先在 .env 添加服务端')
     state = _load(principal)
     try:
-        tools = await asyncio.wait_for(mcp_adapter.list_server_tools(server), 40)
+        # 连接器发现发生在 run 之外，但身份仍必须是已验证的登录主体。
+        # BeeFTV 这类 stdio MCP 会用 MCP_CALLER_SUBJECT 校验画布归属。
+        subject = str(getattr(principal, 'subject', '') or '')
+        tools = await asyncio.wait_for(
+            mcp_adapter.list_server_tools(server, subject=subject), 40)
     except Exception as exc:                            # noqa: BLE001
         message = f'{type(exc).__name__}: {exc}'[:300]
         state[connector_id] = {'enabled': False, 'tools': 0, 'tool_names': [],
