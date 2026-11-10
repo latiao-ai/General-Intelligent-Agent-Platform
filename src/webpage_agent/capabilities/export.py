@@ -6,12 +6,14 @@ JSON 元信息 + Markdown 正文转成一份可部署的静态页面。
 （原先同包内还有"整理成结构化报告 → 渲染模板"的链路，已按需裁剪。）
 """
 import hashlib
+from pathlib import Path
 
 from webpage_agent.core import md
+from webpage_agent.core import sandbox
 from webpage_agent.core import sources
+from webpage_agent.core.config import settings
 from webpage_agent.capabilities.base import ToolError, usable_documents
 from webpage_agent.capabilities.registry import tool
-from webpage_agent.core.config import settings
 from webpage_agent.observe.events import action, emit
 
 # 能力包名，也进 tool_key（local:export:<动作>）
@@ -111,7 +113,24 @@ async def _render_sources_html(args: dict, state: dict) -> dict:
         emit(action('沿用上一轮的正文', f'{len(documents)} 个来源', '♻️'))
     title = str(args.get('title') or state.get('user_input') or '检索资料')
     task_id = state.get('task_id') or 'task'
-    folder = settings.artifact_dir / task_id
+    tenant, user = sandbox.current_scope()
+    tenant = str(state.get('tenant_id') or tenant)
+    user = str(state.get('owner_user_id') or user)
+    if sandbox.is_legacy(tenant, user):
+        folder = Path(settings.artifact_dir) / str(task_id)
+    else:
+        folder = sandbox.task_dir(str(task_id), tenant, user)
+    recorded = str(state.get('artifact_dir') or '')
+    if recorded:
+        candidate = Path(recorded)
+        try:
+            resolved = candidate.resolve()
+            root = sandbox.owner_root(tenant, user)
+            root.mkdir(parents=True, exist_ok=True)
+            if sandbox.inside(root, resolved) and not candidate.is_symlink():
+                folder = resolved
+        except OSError:
+            folder = sandbox.task_dir(str(task_id), tenant, user)
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / 'sources.html'
     path.write_text(_sources_page(title, documents), encoding='utf-8')

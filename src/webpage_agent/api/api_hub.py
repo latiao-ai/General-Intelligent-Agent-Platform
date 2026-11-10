@@ -468,13 +468,30 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
 
         async def execute_round(plan_hint: dict | None) -> dict:
             """跑一轮图。要求版本变化时会被调用多次（**不是**重试同一个计划）。"""
-            return await run_task(
-                record.message, on_event=relay,
-                on_start=on_start, history=history,
-                prior=prior, memory=memory,
-                ledger=book, run_id=record.run_id,
-                resume_plan=plan_hint,
-            )
+            from webpage_agent.core import sandbox
+            private = sandbox.provision(record.tenant_id, record.owner_user_id)
+            stored = await self.store.get_workspace(
+                tenant_id=record.tenant_id, owner_user_id=record.owner_user_id)
+            if not sandbox.stored_path_ok(stored, private):
+                stored = str(private)
+                await self.store.set_workspace(
+                    tenant_id=record.tenant_id, owner_user_id=record.owner_user_id,
+                    path=stored)
+            # 用上下文把主体和工作目录交给 run_task，不增加关键字参数。
+            # 测试里的替身仍是原来的签名。
+            scope_token = sandbox.use_scope(record.tenant_id, record.owner_user_id)
+            workspace_token = sandbox.use_workspace(stored)
+            try:
+                return await run_task(
+                    record.message, on_event=relay,
+                    on_start=on_start, history=history,
+                    prior=prior, memory=memory,
+                    ledger=book, run_id=record.run_id,
+                    resume_plan=plan_hint,
+                )
+            finally:
+                sandbox.reset_workspace(workspace_token)
+                sandbox.reset_scope(scope_token)
 
         try:
             # 先压缩更早的对话：成功则只把"未摘要"的部分当历史，避免摘要与原文重复。

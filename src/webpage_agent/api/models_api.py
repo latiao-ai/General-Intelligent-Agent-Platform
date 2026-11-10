@@ -1,21 +1,21 @@
-"""模型选择：列出可用模型、切换当前模型。
+"""模型选择：列出可用模型、按用户切换当前模型。
 
 模型清单来自 `AVAILABLE_MODELS`（逗号分隔），默认至少包含当前 `LLM_MODEL`。
-选择结果写到 `profile/model.json`，进程启动时恢复；切换后下一轮对话/任务生效。
+选择写在该用户自己的文件里。进程级 `LLM_MODEL` 不被某一次切换改掉，
+下一轮对话按当前用户的选择走。
 """
 from __future__ import annotations
 
-import json
 import os
-from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from webpage_agent.core import model_choice
 from webpage_agent.core.config import settings
+from webpage_agent.governance import policies
 
 router = APIRouter(prefix='/api/models', tags=['models'])
-_PATH = Path(__file__).resolve().parents[3] / 'profile' / 'model.json'
 
 _LABELS = {
     'deepseek-v4-1-flash': 'DeepSeek-V4.1-Flash',
@@ -37,13 +37,15 @@ def _label(model_id: str) -> str:
 
 
 def restore_model() -> None:
-    """启动时恢复上次选择（模型不在可用清单时忽略）。"""
-    try:
-        saved = json.loads(_PATH.read_text(encoding='utf-8')).get('id')
-    except (OSError, ValueError):
-        return
+    """启动钩子。选择按用户保存，不再把某个人的选择写进进程默认模型。"""
+    return None
+
+
+def _current_for(user_id: str) -> str:
+    saved = model_choice.load_id(user_id)
     if saved and saved in _available():
-        object.__setattr__(settings, 'llm_model', saved)
+        return saved
+    return settings.llm_model
 
 
 class SelectModel(BaseModel):
@@ -52,16 +54,25 @@ class SelectModel(BaseModel):
 
 
 @router.get('')
-async def list_models():
-    return {'current': settings.llm_model,
+async def list_models(request: Request):
+    principal = None
+    try:
+        principal = await policies.current_principal(request)
+    except HTTPException as exc:
+        if exc.status_code != 401:
+            raise
+    if principal is None:
+        current = settings.llm_model
+    else:
+        current = _current_for(principal.user_id)
+    return {'current': current,
             'models': [{'id': item, 'name': _label(item)} for item in _available()]}
 
 
 @router.post('/select')
-async def select_model(payload: SelectModel):
+async def select_model(payload: SelectModel,
+                       principal=Depends(policies.current_principal)):
     if payload.id not in _available():
         raise HTTPException(status_code=400, detail='模型不在 AVAILABLE_MODELS 中')
-    object.__setattr__(settings, 'llm_model', payload.id)
-    _PATH.parent.mkdir(parents=True, exist_ok=True)
-    _PATH.write_text(json.dumps({'id': payload.id}, ensure_ascii=False), encoding='utf-8')
+    model_choice.save(principal.user_id, payload.id)
     return {'current': payload.id, 'name': _label(payload.id)}

@@ -118,9 +118,15 @@ def is_stop_command(text: str) -> bool:
     return _NORMALIZE.sub('', text).lower() in _STOP_COMMANDS
 
 
+def _model_id(model: str | None = None) -> str:
+    from webpage_agent.core.model_choice import active as active_model
+    # 测试有时用缺字段的替身替换 settings，缺了就当没配模型。
+    return model or active_model(getattr(settings, 'llm_model', '') or '')
+
+
 def new_llm(model: str | None = None, disable_thinking: bool = False):
     options = dict(
-        model=model or settings.llm_model,
+        model=_model_id(model),
         api_key=settings.llm_key,
         temperature=0,
         timeout=300,
@@ -289,7 +295,7 @@ async def begin_model_request(model: str | None = None, purpose: str = 'pi_turn'
     返回 reservation（可能为 None，表示无治理 scope 不落账）。
     """
     await _note_provider_request()
-    return await governance.reserve(model=model or settings.llm_model,
+    return await governance.reserve(model=_model_id(model),
                                     purpose=purpose)
 
 
@@ -366,7 +372,7 @@ async def structured_call(
         except OpenAIError:
             raise ModelRequestError('模型配置或认证不可用，请联系管理员检查后恢复任务。') from None
         await _note_provider_request()
-        reservation = await governance.reserve(model=model or settings.llm_model,
+        reservation = await governance.reserve(model=_model_id(model),
                                                purpose=charge_purpose)
         accumulated = None
         complete = False
@@ -456,7 +462,7 @@ async def chat_reply(system: str, messages: list[dict], model: str | None = None
         parts = []
         accumulated = None
         complete = False
-        reservation = await governance.reserve(model=model or settings.llm_model,
+        reservation = await governance.reserve(model=_model_id(model),
                                                purpose='final_answer')
         try:
             timeout = settings.llm_attempt_timeout

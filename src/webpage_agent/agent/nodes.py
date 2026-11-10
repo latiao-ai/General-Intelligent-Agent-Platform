@@ -23,6 +23,12 @@ import logging
 import time
 
 from webpage_agent.agent import context
+
+
+def _active_model() -> str:
+    from webpage_agent.core.model_choice import active
+    from webpage_agent.core.config import settings
+    return active(getattr(settings, 'llm_model', '') or '')
 from webpage_agent.observe import errors as errors_module
 from webpage_agent.governance import execution_control
 from webpage_agent.core import files as files_module
@@ -305,7 +311,7 @@ async def plan(state):
 
     usage = list(state.get('usage', []))
     if selection_usage:
-        usage.append({'stage': 'tool_selection', 'model_name': settings.llm_model,
+        usage.append({'stage': 'tool_selection', 'model_name': _active_model(),
                       'model': selection_usage})
     errors = list(state.get('errors', []))
     steps, summary, updates = None, '', {}
@@ -372,7 +378,7 @@ async def plan(state):
             after_segment = str(data.get('after_segment') or 'verify')
             observation_goal = str(data.get('observation_goal') or '')
             updates = data.get('profile_updates') or {}
-            usage.append({'stage': 'plan', 'model_name': settings.llm_model,
+            usage.append({'stage': 'plan', 'model_name': _active_model(),
                           'model': call_usage})
             if not blocking:
                 break
@@ -853,7 +859,7 @@ async def revise_plan(state):
     emit(action('正在按新要求调整', f'要求版本 {intent}', '🧭'))
     usage = list(state.get('usage', []))
     if selection_usage:
-        usage.append({'stage': 'tool_selection_repair', 'model_name': settings.llm_model,
+        usage.append({'stage': 'tool_selection_repair', 'model_name': _active_model(),
                       'model': selection_usage})
     next_version = int(plan_row.get('version') or 0) + 1
     # 两轮：第一版不合法就把**结构化错误**交回模型修一次。首次规划一直是这样
@@ -878,7 +884,7 @@ async def revise_plan(state):
                     rules=run_inputs_module.revision_rules(), max_steps=MAX_STEPS),
                 request, disable_thinking=settings.llm_parse_disable_thinking)
             usage.append({'stage': 'revise' if round_index == 0 else 'revise_repair',
-                          'model_name': settings.llm_model, 'model': call_usage})
+                          'model_name': _active_model(), 'model': call_usage})
         except (execution_control.LeaseLost, execution_control.ControlStopped):
             raise
         except Exception as exc:                        # noqa: BLE001
@@ -908,7 +914,7 @@ async def revise_plan(state):
                         rules=run_inputs_module.revision_rules(), max_steps=MAX_STEPS),
                     json.dumps(retry_input, ensure_ascii=False, default=str),
                     disable_thinking=settings.llm_parse_disable_thinking)
-                usage.append({'stage': 'revise_no_repeat', 'model_name': settings.llm_model,
+                usage.append({'stage': 'revise_no_repeat', 'model_name': _active_model(),
                               'model': retry_usage})
                 data = retried.model_dump()
                 revised = retried

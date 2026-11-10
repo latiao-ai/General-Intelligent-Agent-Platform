@@ -8,6 +8,12 @@ import hashlib
 import json
 import logging
 
+def _active_model() -> str:
+    from webpage_agent.core.model_choice import active
+    from webpage_agent.core.config import settings
+    return active(getattr(settings, 'llm_model', '') or '')
+
+
 from webpage_agent.agent.plan_validate import (
     _completed_step_definitions,
     _completed_write_servers,
@@ -338,7 +344,7 @@ async def decide_next(state):
             ObservationDecision, OBSERVATION_SYSTEM,
             json.dumps(decision_input, ensure_ascii=False, default=str),
             disable_thinking=settings.llm_parse_disable_thinking)
-        usage.append({'stage': 'observe', 'model_name': settings.llm_model,
+        usage.append({'stage': 'observe', 'model_name': _active_model(),
                       'model': call_usage})
     except (execution_control.LeaseLost, execution_control.ControlStopped):
         raise

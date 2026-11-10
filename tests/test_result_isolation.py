@@ -234,7 +234,8 @@ class ResultRegistrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(store.context['tenant_id'], 'acme/corp')
                 self.assertEqual(store.context['owner_user_id'], 'user-1')
                 self.assertEqual(store.context['run_id'], 'run-1')
-                folder_path = tool_results.result_dir(root, 'acme/corp', result_id)
+                folder_path = tool_results.result_dir(
+                    root, 'acme/corp', result_id, 'user-1')
                 self.assertTrue((folder_path / 'structured.json').is_file())
                 self.assertFalse(
                     (tool_results.results_root(root) / 'acme-corp').exists())

@@ -70,6 +70,30 @@ def gc_orphan_task_dirs(root, *, grace_seconds: float, now_ts: float | None = No
         except OSError:
             continue
         removed += 1
+    owners = base / 'owners'
+    if owners.is_dir() and not owners.is_symlink():
+        for tenant_dir in owners.iterdir():
+            if tenant_dir.is_symlink() or not tenant_dir.is_dir():
+                continue
+            for user_dir in tenant_dir.iterdir():
+                if user_dir.is_symlink() or not user_dir.is_dir():
+                    continue
+                for entry in user_dir.iterdir():
+                    if entry.is_symlink() or not entry.is_dir():
+                        continue
+                    if not TASK_DIR_NAME.fullmatch(entry.name) or entry.name in live_task_ids:
+                        continue
+                    try:
+                        age = current - entry.stat().st_mtime
+                    except OSError:
+                        continue
+                    if age < grace_seconds:
+                        continue
+                    try:
+                        shutil.rmtree(entry)
+                    except OSError:
+                        continue
+                    removed += 1
     return removed
 
 

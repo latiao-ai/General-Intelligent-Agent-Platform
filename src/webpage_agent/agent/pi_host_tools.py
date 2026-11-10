@@ -39,7 +39,11 @@ logger = logging.getLogger(__name__)
 # 本阶段 Pi 同步开放的**只读**工具白名单（稳定键）。显式声明，不是「自动开放
 # 所有只读工具」。默认只开放 web_search，保持既有行为；新增只读工具（如平台
 # 的 get_object / get_operation）需显式加入，确认 effect=read 后再放行。
-SYNC_READ_TOOL_KEYS = ('local:web:search',)
+SYNC_READ_TOOL_KEYS = (
+    'local:web:search',
+    'local:files:list_dir',
+    'local:files:read_file',
+)
 
 # 本阶段 Pi 同步开放的**写**工具白名单（稳定键）。**默认空**——写工具绝不默认
 # 开放。扩展必须同时满足两道门：`PI_WRITE_TOOLS_ENABLED=true`，以及
@@ -204,13 +208,17 @@ def _resolve_web_search():
     白名单只读工具」的兼容入口（测试引用）。
     """
     allowed = {key for key in SYNC_READ_TOOL_KEYS}
+    fallback = None
     for tool in registry.load():
         if tool.tool_key not in allowed:
             continue
         if str(tool.effect or '') != 'read':
             continue
-        return tool
-    return None
+        if tool.tool_key == 'local:web:search':
+            return tool
+        if fallback is None:
+            fallback = tool
+    return fallback
 
 
 def _source_excerpt(doc: dict) -> dict:
