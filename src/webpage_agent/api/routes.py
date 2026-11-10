@@ -1435,6 +1435,54 @@ async def session_messages(session_id: str,
     return {'session_id': session_id, 'messages': await hub.history(session_id)}
 
 
+@app.get('/api/sessions/{session_id}/turns/{turn_id}/events')
+async def session_turn_events(session_id: str, turn_id: str, request: Request,
+                              after: int = Query(0, ge=0),
+                              principal=Depends(policies.current_principal)):
+    """会话 turn 的独立 SSE 事件流。
+
+    事件按自增 id 持久化；`after` 或 `Last-Event-ID` 是游标。断线重连时浏览器
+    会自动带 Last-Event-ID，所以不会重复推送或漏掉 delta。
+    """
+    await _owned_session(session_id, principal)
+    turn = await hub.store.turn(turn_id)
+    if not turn or str(turn.get('session_id')) != session_id:
+        raise HTTPException(status_code=404, detail='turn 不存在')
+    cursor = int(after or 0)
+    try:
+        cursor = max(cursor, int(request.headers.get('last-event-id') or 0))
+    except (TypeError, ValueError):
+        pass
+
+    async def events():
+        nonlocal cursor
+        while True:
+            if await request.is_disconnected():
+                return
+            batch = await hub.store.turn_events(turn_id, after=cursor)
+            for item in batch:
+                cursor = int(item['id'])
+                payload = json.dumps(item['event'], ensure_ascii=False)
+                yield f"id: {cursor}\nevent: turn\ndata: {payload}\n\n"
+            current = await hub.store.turn(turn_id) or {}
+            status = str(current.get('status') or '')
+            if status in ('succeeded', 'failed', 'cancelled', 'waiting_clarification'):
+                done = json.dumps({
+                    'type': 'done', 'status': status,
+                    'answer': str(current.get('answer') or ''),
+                    'error': str(current.get('error') or ''),
+                }, ensure_ascii=False)
+                yield f"event: done\ndata: {done}\n\n"
+                return
+            await asyncio.sleep(0.08)
+
+    return StreamingResponse(events(), media_type='text/event-stream', headers={
+        'Cache-Control': 'no-cache, no-transform',
+        'Connection': 'keep-alive',
+        'X-Accel-Buffering': 'no',
+    })
+
+
 @app.get('/api/sessions/{session_id}/timeline')
 async def session_timeline(session_id: str,
                            principal=Depends(policies.current_principal)):

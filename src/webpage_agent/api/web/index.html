@@ -2376,6 +2376,7 @@ function setRunning(on) {
 // 解绑当前事件流（不通知后端取消）。任务仍在服务端跑，切回来能接着看。
 function detachStream() {
   if (S.es) { S.es.close(); S.es = null; }
+  if (S.chatES) { S.chatES.close(); S.chatES = null; }
 }
 
 async function interrupt() {
@@ -2471,6 +2472,43 @@ function chatTurnDone(status) {
 }
 
 // 轮询 timeline，直到该 turn 执行出终态（第十一阶段第 7 点 / A 组第 4 点）。
+// 会话 turn 的独立 SSE：cursor 由服务端自增 id/Last-Event-ID 维护。
+function streamChatTurn(turnId, sessionId) {
+  if (S.chatES) { S.chatES.close(); S.chatES = null; }
+  S.streamBubble = null;
+  const url = `${API_PREFIX}/sessions/${encodeURIComponent(sessionId)}`
+    + `/turns/${encodeURIComponent(turnId)}/events`;
+  let fellBack = false;
+  const es = new EventSource(url);
+  S.chatES = es;
+  es.addEventListener('turn', ev => {
+    let data = null;
+    try { data = JSON.parse(ev.data || '{}'); } catch (e) { return; }
+    if (data.type !== 'answer_delta') return;
+    if (S.sessionId !== sessionId) return;
+    clearPending();
+    onAnswerDelta({text: data.text || ''});
+  });
+  es.addEventListener('done', ev => {
+    es.close();
+    if (S.chatES === es) S.chatES = null;
+    if (S.sessionId === sessionId) {
+      clearPending();
+      S.streamBubble = null;
+      openSession(sessionId, {keepWorkspace: true});
+    }
+    loadSessions();
+  });
+  es.onerror = () => {
+    // 404/代理不支持 SSE 时退化为草稿轮询；可重连的断线交给 EventSource 自己带游标重连。
+    if (es.readyState === EventSource.CLOSED && !fellBack) {
+      fellBack = true;
+      if (S.chatES === es) S.chatES = null;
+      pollChatReply(turnId, sessionId);
+    }
+  };
+}
+
 // 消息 POST 只持久接纳，答复由 Worker 后台生成；只在发送后拉一次时间线会看不到
 // 后台生成的答复。这里按 turn_id 轮询，终态后刷新会话，刷新/重试复用原 request ID。
 //
@@ -2691,7 +2729,7 @@ async function sendSessionMessage(text) {
       // 轮询用的是**发出去时的那个 sessionId**，不是 `S.sessionId`：中途切会话
       // 时后者已经变了，用它判断会让轮询在第一步就自己退出。
       if (data.turn_id) {
-        pollChatReply(data.turn_id, sessionId);
+        streamChatTurn(data.turn_id, sessionId);
       } else {
         openSession(sessionId, {keepWorkspace: true});
       }

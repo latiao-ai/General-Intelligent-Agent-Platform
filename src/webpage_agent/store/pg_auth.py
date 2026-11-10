@@ -674,6 +674,36 @@ class PgAuth:
                 (text, turn_id))
             await conn.commit()
 
+    async def append_turn_event(self, turn_id: str, event: dict) -> int:
+        """追加一条会话 turn 事件，返回自增游标。"""
+        async with self._lease() as conn:
+            row = await self._one(
+                conn,
+                'INSERT INTO session_turn_events (turn_id, event_json, created_at) '
+                'VALUES (%s,%s,%s) RETURNING id',
+                (turn_id, json.dumps(event, ensure_ascii=False), now()))
+            await conn.commit()
+        return int((row or {}).get('id') or 0)
+
+    async def turn_events(self, turn_id: str, *, after: int = 0,
+                          limit: int = 500) -> list[dict]:
+        """按游标读取 turn 事件（id 严格递增）。"""
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn,
+                'SELECT id, event_json, created_at FROM session_turn_events '
+                'WHERE turn_id=%s AND id>%s ORDER BY id LIMIT %s',
+                (turn_id, int(after or 0), max(1, int(limit or 500))))
+        events = []
+        for row in rows or []:
+            try:
+                payload = json.loads(row['event_json'])
+            except (TypeError, ValueError):
+                continue
+            events.append({'id': int(row['id']), 'event': payload,
+                           'created_at': row.get('created_at') or ''})
+        return events
+
     async def settle_turn(self, turn_id: str, *, status: str,
                           answer: str = '', error: str = '',
                           lease_owner: str = '', lease_epoch: int = 0,

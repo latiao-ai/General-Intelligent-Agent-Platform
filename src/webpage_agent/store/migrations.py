@@ -60,7 +60,9 @@ SESSION_CONNECTOR_SELECTION = 'v15_session_connector_selection'
 SESSION_PLATFORM_SUBJECT = 'v16_session_platform_subject'
 # 聊天/查询 turn 的逐字草稿：前端轮询 timeline 时能边生成边显示。
 TURN_DRAFT = 'v17_turn_draft'
-LATEST = TURN_DRAFT
+# 会话 turn 的独立事件流（SSE）：answer_delta 等按自增游标持久化。
+TURN_EVENTS = 'v18_turn_events'
+LATEST = TURN_EVENTS
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -164,6 +166,15 @@ ALTER TABLE sessions
 '''), (TURN_DRAFT, '''
 ALTER TABLE session_turns
     ADD COLUMN IF NOT EXISTS draft_answer TEXT NOT NULL DEFAULT '';
+'''), (TURN_EVENTS, '''
+CREATE TABLE IF NOT EXISTS session_turn_events (
+    id          BIGSERIAL PRIMARY KEY,
+    turn_id     TEXT NOT NULL,
+    event_json  TEXT NOT NULL,
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_turn_events_turn
+    ON session_turn_events(turn_id, id);
 '''))
 
 

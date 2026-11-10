@@ -630,7 +630,13 @@ class HubSessionMessageMixin:
                 nonlocal draft_last
                 if str(event.get('type') or '') != 'answer_delta':
                     return
-                draft_parts.append(str(event.get('text') or ''))
+                text = str(event.get('text') or '')
+                draft_parts.append(text)
+                try:
+                    await self.store.append_turn_event(turn_id, {
+                        'type': 'answer_delta', 'text': text})
+                except Exception:                  # noqa: BLE001
+                    logger.debug('写入 turn 事件失败', exc_info=True)
                 now = time.monotonic()
                 if now - draft_last < 0.12:
                     return
