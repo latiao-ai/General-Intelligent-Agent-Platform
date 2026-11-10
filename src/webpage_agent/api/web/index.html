@@ -912,20 +912,6 @@ body {
   box-shadow: 0 20px 48px rgba(16, 24, 40, .18);
 }
 .connector-pop[hidden] { display: none; }
-/* 右侧抽屉：不再在页面左侧浮一个面板 */
-.connector-pop {
-  position: fixed; top: 0; right: 0; bottom: 0; left: auto;
-  width: 360px; max-height: none;
-  border-radius: 0; border-top: 0; border-right: 0; border-bottom: 0;
-  transform: translateX(100%); transition: transform .18s ease;
-  z-index: 82;
-}
-.connector-pop.drawer-open { transform: translateX(0); }
-.connector-backdrop {
-  position: fixed; inset: 0; z-index: 81;
-  background: rgba(15, 23, 42, .18);
-}
-.connector-backdrop[hidden] { display: none; }
 .cp-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 14px 6px; font-size: 13px; font-weight: 600;
@@ -1067,8 +1053,7 @@ body {
 .wsp-actions .wsp-link { height: 28px; color: var(--muted); font-size: 11.5px; }
 
 @media (max-width: 760px) {
-  .plus-menu { left: 14px; right: 14px; width: auto; }
-  .connector-pop { left: auto; right: 0; width: min(360px, 100%); }
+  .plus-menu, .connector-pop { left: 14px; right: 14px; width: auto; }
   .model-menu { right: 14px; width: min(264px, calc(100% - 28px)); }
   .ws-picker { left: 14px; right: 14px; width: auto; }
 }
@@ -1500,7 +1485,6 @@ body {
         <button class="plus-item" data-act="connector" role="menuitem"><svg class="ic"><use href="#i-plug"/></svg>连接器</button>
       </div>
 
-      <div class="connector-backdrop" id="connectorBackdrop" hidden></div>
       <div class="connector-pop" id="connectorPop" hidden aria-label="连接器">
         <div class="cp-head">
           <span>连接器</span>
@@ -5190,13 +5174,38 @@ setInterval(async () => {
   }
 
   function closePlusMenu() { $id('plusMenu').hidden = true; }
+  let connectorHoverOpen = false;
+  let connectorCloseTimer = null;
 
   function closeConnectorPanel() {
     const pop = $id('connectorPop');
-    pop.classList.remove('drawer-open');
     pop.hidden = true;
-    const backdrop = $id('connectorBackdrop');
-    if (backdrop) backdrop.hidden = true;
+    connectorHoverOpen = false;
+    clearTimeout(connectorCloseTimer);
+    pop.style.position = '';
+    pop.style.left = '';
+    pop.style.top = '';
+    pop.style.bottom = '';
+  }
+
+  function positionConnectorPanel(anchor, rect) {
+    if (!anchor || innerWidth <= 760) return;
+    const box = rect || anchor.getBoundingClientRect();
+    const pop = $id('connectorPop');
+    pop.style.position = 'fixed';
+    pop.style.top = 'auto';
+    const width = pop.offsetWidth || 328;
+    const height = pop.offsetHeight || 420;
+    pop.style.left = Math.max(12, Math.min(box.right + 8, innerWidth - width - 12)) + 'px';
+    pop.style.bottom = Math.max(12, Math.min(innerHeight - box.bottom + 2, innerHeight - height - 12)) + 'px';
+  }
+
+  function scheduleConnectorClose() {
+    if (!connectorHoverOpen) return;
+    clearTimeout(connectorCloseTimer);
+    connectorCloseTimer = setTimeout(() => {
+      if (connectorHoverOpen) closeConnectorPanel();
+    }, 300);
   }
 
   $id('plusBtn').addEventListener('click', e => {
@@ -5211,21 +5220,41 @@ setInterval(async () => {
     const btn = e.target.closest('[data-act]');
     if (!btn) return;
     const act = btn.dataset.act;
-    closePlusMenu();
+    if (act !== 'connector') closePlusMenu();
     if (act === 'file') toast('附件上传暂未开放，可直接粘贴链接');
-    else if (act === 'connector') openConnectorPanel();
+    else if (act === 'connector') {
+      connectorHoverOpen = false;
+      openConnectorPanel(true, $id('plusMenu'));
+    }
     else if (act === 'expert') openHub('expert');
     else if (act === 'skill') openHub('skill');
     else toast('这个入口暂未接入，可以先看「技能」或「连接器」。');
   });
 
-  function openConnectorPanel() {
-    closePlusMenu();
+  const connectorEntry = $id('plusMenu').querySelector('[data-act="connector"]');
+  let connectorHoverTimer = null;
+  if (connectorEntry) {
+    connectorEntry.addEventListener('mouseenter', () => {
+      clearTimeout(connectorHoverTimer);
+      connectorHoverTimer = setTimeout(() => {
+        connectorHoverOpen = true;
+        openConnectorPanel(true, $id('plusMenu'));
+      }, 160);
+    });
+    connectorEntry.addEventListener('mouseleave', () => clearTimeout(connectorHoverTimer));
+  }
+  $id('plusMenu').addEventListener('mouseleave', scheduleConnectorClose);
+  $id('plusMenu').addEventListener('mouseenter', () => clearTimeout(connectorCloseTimer));
+  $id('connectorPop').addEventListener('mouseenter', () => clearTimeout(connectorCloseTimer));
+  $id('connectorPop').addEventListener('mouseleave', scheduleConnectorClose);
+
+  function openConnectorPanel(keepPlus = false, anchor = null) {
+    const rect = anchor ? anchor.getBoundingClientRect() : null;
+    if (!keepPlus) closePlusMenu();
     const pop = $id('connectorPop');
-    const backdrop = $id('connectorBackdrop');
-    if (backdrop) backdrop.hidden = false;
     pop.hidden = false;
-    requestAnimationFrame(() => pop.classList.add('drawer-open'));
+    if (rect) positionConnectorPanel(anchor, rect);
+    else if (!$id('plusMenu').hidden) positionConnectorPanel($id('plusMenu'));
     $id('cpSearch').value = '';
     loadConnectors();
   }
@@ -5326,8 +5355,6 @@ setInterval(async () => {
 
   $id('cpSearch').addEventListener('input', e => renderConnectors(e.target.value));
   $id('cpClose').onclick = closeConnectorPanel;
-  const cpBackdrop = $id('connectorBackdrop');
-  if (cpBackdrop) cpBackdrop.onclick = closeConnectorPanel;
   $id('cpManage').onclick = () => { closeConnectorPanel(); openHub('connector'); };
 
   window.WB_CONNECTOR_CURRENT = currentConnectorIds;
