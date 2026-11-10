@@ -147,6 +147,15 @@ a{color:var(--brand);text-decoration:none}
 .space-row .folder{width:15px;height:15px;flex:0 0 auto;color:#8b9199}
 .space-row .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .space-row b{font-size:10.5px;font-weight:500;color:var(--muted-2);flex:0 0 auto}
+.space-more{font-size:15px;line-height:1;color:var(--muted-2);letter-spacing:1px}
+.space-pop{position:fixed;z-index:90;width:184px;padding:5px;background:#fff;
+  border:1px solid var(--line-2);border-radius:10px;box-shadow:0 16px 40px rgba(16,24,40,.16)}
+.space-pop[hidden]{display:none}
+.space-pop button{display:flex;align-items:center;gap:8px;width:100%;height:34px;padding:0 9px;
+  border:0;border-radius:7px;background:none;color:var(--ink-2);font-size:12.5px;
+  text-align:left;cursor:pointer}
+.space-pop button:hover{background:var(--soft)}
+.space-pop button.danger{color:#c2413a}
 .space-tasks{display:flex;flex-direction:column;gap:1px;padding:1px 0 3px 14px}
 .space-task{display:flex;align-items:center;gap:6px;width:100%;padding:4px 6px;
   border:1px solid transparent;border-radius:6px;background:transparent;color:var(--ink-2);
@@ -1192,6 +1201,18 @@ body {
       </div>
     </div>
   </aside>
+
+  <div class="space-pop" id="spacePop" hidden aria-label="工作空间操作">
+    <button type="button" data-act="open">
+      <svg class="ic sm" viewBox="0 0 24 24"><use href="#i-folder"/></svg>打开文件夹
+    </button>
+    <button type="button" data-act="rename">
+      <svg class="ic sm" viewBox="0 0 24 24"><path d="M4 20l4.2-1 10-10a2.1 2.1 0 0 0-3-3l-10 10z"/><path d="M13.5 6.5l3 3"/></svg>重命名
+    </button>
+    <button type="button" data-act="remove" class="danger">
+      <svg class="ic sm" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M6.5 7l.7 12h9.6l.7-12"/></svg>从列表中移除
+    </button>
+  </div>
 
   <main class="main">
     <header class="topbar">
@@ -3513,10 +3534,27 @@ setInterval(async () => {
   // （没有文件夹概念），所以这一层放在本地：spaces/assign 两个键，不依赖服务端。
   const KEY_SPACES_BASE = 'wb.spaces.v2';
   const KEY_ASSIGN_BASE = 'wb.assign.v2';
+  const KEY_HIDDEN_BASE = 'wb.hidden.v2';
   let spaceUser = 'anon';
   let spaces = [];
   let assign = {};          // sessionId -> spaceId
+  let hiddenNamespaces = new Set();
   let activeSpace = '';
+
+  function spacesKey() { return KEY_SPACES_BASE + '.' + spaceUser; }
+  function assignKey() { return KEY_ASSIGN_BASE + '.' + spaceUser; }
+  function hiddenKey() { return KEY_HIDDEN_BASE + '.' + spaceUser; }
+
+  function loadHiddenNamespaces() {
+    try {
+      const items = JSON.parse(localStorage.getItem(hiddenKey()) || '[]');
+      hiddenNamespaces = new Set(Array.isArray(items) ? items : []);
+    } catch (e) { hiddenNamespaces = new Set(); }
+  }
+
+  function saveHiddenNamespaces() {
+    try { localStorage.setItem(hiddenKey(), JSON.stringify([...hiddenNamespaces])); } catch (e) { /* 忽略 */ }
+  }
 
   function spacesKey() { return KEY_SPACES_BASE + '.' + spaceUser; }
   function assignKey() { return KEY_ASSIGN_BASE + '.' + spaceUser; }
@@ -3546,6 +3584,7 @@ setInterval(async () => {
     serverNamespaces = [];
     wsNamespace = '';
     loadSpaceState();
+    loadHiddenNamespaces();
     loadWsList();
     spacesSig = '';
     syncSpaces();
@@ -3621,26 +3660,29 @@ setInterval(async () => {
         };
         row.ondblclick = ev => {
           ev.preventDefault();
-          const name = (prompt('重命名空间', sp.name) || '').trim();
-          if (name) { sp.name = name; saveSpaceState(); spacesSig = ''; syncSpaces(); }
+          renameSpace(sp);
         };
-        // 悬停出现的"移入"：把当前打开的那个任务挪进这个空间
-        const moveBtn = document.createElement('button');
-        moveBtn.type = 'button';
-        moveBtn.className = 'group-add';
-        moveBtn.title = '把当前任务移入这个空间';
-        moveBtn.innerHTML = '<svg class="ic sm"><use href="#i-move"/></svg>';
-        moveBtn.onclick = ev => {
+        // 悬停动作：新建任务 / 更多（打开文件夹、重命名、从列表移除）
+        const plusBtn = document.createElement('button');
+        plusBtn.type = 'button';
+        plusBtn.className = 'group-add';
+        plusBtn.title = '新建任务';
+        plusBtn.innerHTML = '<svg class="ic sm"><use href="#i-plus"/></svg>';
+        plusBtn.onclick = ev => {
           ev.stopPropagation();
-          if (!S.sessionId) { toast('先在中间发一条消息，或从「任务」里点开一个会话。'); return; }
-          assign[S.sessionId] = sp.id;
-          sp.open = true;
-          saveSpaceState();
-          spacesSig = '';
-          syncSpaces();
-          toast('已移入「' + sp.name + '」');
+          closeSpaceMenu();
+          startTaskInSpace(sp);
         };
-        row.appendChild(moveBtn);
+        const moreBtn = document.createElement('button');
+        moreBtn.type = 'button';
+        moreBtn.className = 'group-add space-more';
+        moreBtn.title = '更多';
+        moreBtn.textContent = '⋯';
+        moreBtn.onclick = ev => {
+          ev.stopPropagation();
+          openSpaceMenu(sp, moreBtn);
+        };
+        row.append(plusBtn, moreBtn);
         node.appendChild(row);
 
         if (sp.open) {
@@ -3678,6 +3720,7 @@ setInterval(async () => {
   }
 
   loadSpaceState();
+  loadHiddenNamespaces();
 
   // 给主脚本「选择工作空间」用：按名称找到/创建本地空间，并切换当前空间。
   window.WB_SPACES = {
@@ -3772,12 +3815,17 @@ setInterval(async () => {
   let serverNamespaces = [];
   let wsNamespace = '';
 
+  function isServerSpace(sp) {
+    return !!sp && serverNamespaces.some(item => item.name === sp.name);
+  }
+
   // 服务端命名空间按用户隔离；每个账号登录后合并到自己侧栏，不共用上一账号的列表。
   function adoptServerNamespaces() {
     if (!Array.isArray(serverNamespaces)) return;
     let changed = false;
     for (const ns of serverNamespaces) {
-      if (!ns || !ns.name || spaces.some(s => s.name === ns.name)) continue;
+      if (!ns || !ns.name || hiddenNamespaces.has(ns.name)) continue;
+      if (spaces.some(s => s.name === ns.name)) continue;
       spaces.push({id: 'sp_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
                    name: ns.name, open: true});
       changed = true;
@@ -3795,9 +3843,9 @@ setInterval(async () => {
     const list = $('wspList');
     if (!list) return;
     const q = ($('wspSearch').value || '').trim().toLowerCase();
-    const named = serverNamespaces.map(item => ({
-      name: item.name, path: '', server: true,
-    }));
+    const named = serverNamespaces
+      .filter(item => !hiddenNamespaces.has(item.name))
+      .map(item => ({name: item.name, path: '', server: true}));
     const local = wsLocal ? workspaces.filter(item => !String(item.path || '').includes('/workspaces/')) : [];
     const items = named.concat(local).filter(item =>
       !q || item.name.toLowerCase().includes(q) || String(item.path || '').toLowerCase().includes(q));
@@ -3920,6 +3968,128 @@ setInterval(async () => {
       closeWsPicker();
     } catch (e) { toast('切换失败'); }
   }
+
+  async function openSpace(sp) {
+    if (!sp) return;
+    const body = isServerSpace(sp) ? {name: sp.name} : {path: sp.path || ''};
+    if (!body.name && !body.path) { toast('这个工作空间还没有绑定文件夹'); return; }
+    try {
+      const res = await fetch(API_PREFIX + '/workspace/open', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { toast(String(data.detail || '打开文件夹失败')); return; }
+      toast('已打开文件夹');
+    } catch (e) { toast('打开文件夹失败'); }
+  }
+
+  async function renameSpace(sp) {
+    if (!sp) return;
+    if (isServerSpace(sp) && sp.name === '我的空间') {
+      toast('默认工作空间不能重命名');
+      return;
+    }
+    const name = (prompt('重命名工作空间', sp.name) || '').trim();
+    if (!name || name === sp.name) return;
+    if (isServerSpace(sp)) {
+      try {
+        const res = await fetch(API_PREFIX + '/workspace/rename', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({name: sp.name, new_name: name}),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) { toast(String(data.detail || '重命名失败')); return; }
+        const old = sp.name;
+        sp.name = name;
+        serverNamespaces = serverNamespaces.map(item =>
+          item.name === old ? {...item, name} : item);
+        if (wsNamespace === old) wsNamespace = name;
+      } catch (e) { toast('重命名失败'); return; }
+    } else {
+      sp.name = name;
+    }
+    saveSpaceState();
+    spacesSig = '';
+    syncSpaces();
+    renderWsList();
+    closeSpaceMenu();
+    toast('已重命名为「' + name + '」');
+  }
+
+  async function removeSpace(sp) {
+    if (!sp) return;
+    if (isServerSpace(sp) && sp.name === '我的空间') {
+      toast('默认工作空间不能移除');
+      return;
+    }
+    const name = sp.name;
+    spaces = spaces.filter(item => item.id !== sp.id);
+    Object.keys(assign).forEach(key => {
+      if (assign[key] === sp.id) delete assign[key];
+    });
+    if (isServerSpace(sp)) {
+      hiddenNamespaces.add(name);
+      saveHiddenNamespaces();
+      serverNamespaces = serverNamespaces.filter(item => item.name !== name);
+    }
+    if (activeSpace === sp.id) activeSpace = spaces[0] ? spaces[0].id : '';
+    if (wsNamespace === name) { wsNamespace = ''; workDir = ''; }
+    saveSpaceState();
+    spacesSig = '';
+    syncSpaces();
+    renderWsList();
+    closeSpaceMenu();
+    toast('已从列表中移除「' + name + '」；文件夹和文件未删除');
+  }
+
+  async function startTaskInSpace(sp) {
+    if (!sp) return;
+    activeSpace = sp.id;
+    sp.open = true;
+    saveSpaceState();
+    spacesSig = '';
+    syncSpaces();
+    if (isServerSpace(sp)) await selectNamespace(sp.name);
+    else if (sp.path) await selectWorkspacePath(sp.path);
+    newSession();
+    toast('已切换到「' + sp.name + '」，可以新建任务');
+  }
+
+  let menuSpace = null;
+
+  function openSpaceMenu(sp, anchor) {
+    menuSpace = sp;
+    const pop = $('spacePop');
+    pop.hidden = false;
+    const rect = anchor.getBoundingClientRect();
+    const width = pop.offsetWidth || 184;
+    const height = pop.offsetHeight || 120;
+    pop.style.left = Math.max(8, Math.min(rect.left, innerWidth - width - 8)) + 'px';
+    pop.style.top = Math.max(8, Math.min(rect.bottom + 6, innerHeight - height - 8)) + 'px';
+  }
+
+  function closeSpaceMenu() {
+    $('spacePop').hidden = true;
+    menuSpace = null;
+  }
+
+  $('spacePop').querySelectorAll('button').forEach(btn => {
+    btn.onclick = ev => {
+      ev.stopPropagation();
+      const sp = menuSpace;
+      if (btn.dataset.act === 'open') openSpace(sp);
+      else if (btn.dataset.act === 'rename') renameSpace(sp);
+      else if (btn.dataset.act === 'remove') removeSpace(sp);
+    };
+  });
+  document.addEventListener('click', e => {
+    if (!$('spacePop').hidden && !e.target.closest('#spacePop') &&
+        !e.target.closest('.space-more')) closeSpaceMenu();
+  });
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape') closeSpaceMenu();
+  });
 
   async function refreshWorkDir() {
     try {

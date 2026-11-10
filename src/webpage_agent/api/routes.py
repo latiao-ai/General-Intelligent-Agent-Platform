@@ -18,6 +18,7 @@ import logging
 import re
 import secrets
 import subprocess
+import sys
 import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
@@ -314,6 +315,16 @@ class WorkspaceNameRequest(StrictBody):
     name: str = Field(min_length=1, max_length=80)
 
 
+class WorkspaceOpenRequest(StrictBody):
+    name: str = Field(default='', max_length=80)
+    path: str = Field(default='', max_length=2048)
+
+
+class WorkspaceRenameRequest(StrictBody):
+    name: str = Field(min_length=1, max_length=80)
+    new_name: str = Field(min_length=1, max_length=80)
+
+
 def _workspace_pick_available() -> bool:
     """原生目录选择框只在"服务端与浏览器同一台 macOS"的本地环境成立。"""
     return sandbox.local_pick_allowed()
@@ -357,6 +368,23 @@ def _resolve_workspace_path(raw: str) -> str:
     if not resolved.is_dir():
         raise HTTPException(status_code=400, detail='选中的不是目录')
     return str(resolved)
+
+
+def _open_directory(path: Path) -> None:
+    """在本机 Finder / 文件管理器中打开目录（仅用于用户自己的目录）。"""
+    if sys.platform == 'darwin':
+        cmd = ['open', str(path)]
+    elif os.name == 'nt':
+        os.startfile(str(path))                    # type: ignore[attr-defined]
+        return
+    elif sys.platform.startswith('linux'):
+        cmd = ['xdg-open', str(path)]
+    else:
+        raise HTTPException(status_code=501, detail='当前环境不支持打开文件夹')
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        raise HTTPException(status_code=501, detail='打开文件夹失败：%s' % exc) from None
 
 
 async def _pick_directory_native(prompt: str) -> str:
@@ -431,6 +459,61 @@ async def workspace_select(payload: WorkspaceNameRequest,
     await hub.store.set_workspace(
         tenant_id=principal.tenant_id, owner_user_id=principal.user_id, path=path)
     return {'path': path, 'name': payload.name.strip()}
+
+
+@app.post('/api/workspace/open')
+async def workspace_open(payload: WorkspaceOpenRequest,
+                         principal=Depends(policies.current_principal)):
+    """打开用户自己的工作空间目录；不会打开任意服务器路径。"""
+    private = sandbox.provision(principal.tenant_id, principal.user_id)
+    target: Path | None = None
+    if payload.name:
+        try:
+            target = sandbox.namespace_path(private, payload.name)
+        except sandbox.SandboxError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    elif payload.path:
+        try:
+            target = Path(payload.path).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise HTTPException(status_code=400, detail='目录不存在') from None
+        current = await hub.store.get_workspace(
+            tenant_id=principal.tenant_id, owner_user_id=principal.user_id)
+        current_path = Path(current).resolve() if current else None
+        if not sandbox.inside(private, target) and (current_path is None or target != current_path):
+            raise HTTPException(status_code=403, detail='只能打开自己的工作空间')
+    else:
+        raise HTTPException(status_code=400, detail='缺少工作空间名称或路径')
+    if not target.is_dir():
+        raise HTTPException(status_code=400, detail='不是目录')
+    _open_directory(target)
+    return {'opened': True, 'path': str(target)}
+
+
+@app.post('/api/workspace/rename')
+async def workspace_rename(payload: WorkspaceRenameRequest,
+                           principal=Depends(policies.current_principal)):
+    """重命名工作空间标签；目录和文件不动。"""
+    private = sandbox.provision(principal.tenant_id, principal.user_id)
+    old = payload.name.strip()
+    new = payload.new_name.strip()
+    if old in ('我的空间', '默认'):
+        raise HTTPException(status_code=400, detail='默认工作空间不能重命名')
+    if (not new or len(new) > 80 or '\x00' in new or '/' in new or '\\' in new
+            or new in ('.', '..')):
+        raise HTTPException(status_code=400, detail='名称不合法')
+    try:
+        folder = sandbox.namespace_path(private, old)
+    except sandbox.SandboxError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    for item in sandbox.list_namespaces(private):
+        if item['name'] == new and item['path'] != str(folder):
+            raise HTTPException(status_code=409, detail='已存在同名工作空间')
+    try:
+        (folder / '.space-name').write_text(new, encoding='utf-8')
+    except OSError:
+        raise HTTPException(status_code=500, detail='重命名失败') from None
+    return {'name': new, 'path': str(folder)}
 
 
 @app.delete('/api/workspace')
