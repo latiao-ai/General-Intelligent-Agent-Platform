@@ -1416,7 +1416,8 @@ async def post_session_message(session_id: str, payload: SessionMessageRequest,
         result = await hub.accept_session_message(
             session_id, request_id=payload.request_id, message=payload.message,
             target_task_id=payload.target_task_id or '', principal=principal,
-            connector_ids=payload.connector_ids)
+            connector_ids=payload.connector_ids,
+            platform_subject=str(getattr(principal, 'subject', '') or ''))
     except TurnRequestConflict:
         raise HTTPException(status_code=409,
                             detail='该 request_id 已用于不同内容的请求') from None

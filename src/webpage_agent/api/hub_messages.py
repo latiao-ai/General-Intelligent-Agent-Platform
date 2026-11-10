@@ -148,7 +148,8 @@ class HubSessionMessageMixin:
     async def accept_session_message(
             self, session_id: str, *, request_id: str, message: str,
             target_task_id: str = '', principal=None,
-            connector_ids: list[str] | None = None) -> dict:
+            connector_ids: list[str] | None = None,
+            platform_subject: str | None = None) -> dict:
         """接纳一条会话消息，返回 202 形状（不等待模型完成）。
 
         同一 request_id 同载荷重放返回原 turn；不同载荷抛 `TurnRequestConflict`。
@@ -214,7 +215,8 @@ class HubSessionMessageMixin:
                 if getattr(principal, 'authenticated', False) else 'member',
                 candidates=candidates, clarification=clarification,
                 source_turn_id=source_turn_id,
-                connector_ids=connector_ids)
+                connector_ids=connector_ids,
+                platform_subject=platform_subject)
         except TurnRequestConflict:
             raise
         return {'turn_id': result['turn_id'],
@@ -434,7 +436,7 @@ class HubSessionMessageMixin:
         api_key = settings.llm_key or None
         return model, api_key
 
-    def _build_pi_runtime(self, *, tools=None, tool_objects=None):
+    def _build_pi_runtime(self, *, tools=None, tool_objects=None, system_prompt=None):
         """构造 PiRuntime：受控模型脚本（测试）经环境变量注入，正式链路走真实模型。"""
         from webpage_agent.agent.pi_runtime import PiRuntime
         model, api_key = self._pi_model_config()
@@ -449,12 +451,42 @@ class HubSessionMessageMixin:
                 mock_script = None
         return PiRuntime(model=model, api_key=api_key,
                          mock_script=mock_script,
+                         system_prompt=system_prompt,
                          tools=tools if tools is not None else [],
                          tool_objects=tool_objects)
 
     async def _chat_history(self, session_id: str, exclude_turn_id: str) -> list:
         """聊天上下文：该 turn 之前的 user/assistant 消息（排除当前 turn 的 user 消息）。"""
         return await self.store.chat_history(session_id, exclude_turn_id)
+
+    def _connector_context(self, connector_ids, tool_objects=None) -> str:
+        """把本轮已选连接器写进系统提示。
+
+        模型看不到宿主状态，只会根据提示词和工具声明判断。用户在输入框选了连接器，
+        这里必须明确告诉它“连了哪些 MCP server”，否则它会回答“没有暴露服务器清单”。
+        """
+        ids = [str(x) for x in (connector_ids or []) if str(x).strip()]
+        if not ids:
+            return ('\n\n【本轮连接器】用户没有选择连接器，因此本轮没有 MCP 工具。'
+                    '用户问连接了哪些 MCP server 时，如实说明当前会话未选择，'
+                    '不要编造服务器或工具。')
+        from webpage_agent.integrations import mcp_servers
+        names = []
+        for connector_id in ids:
+            server = mcp_servers.by_id(connector_id)
+            names.append(f'{connector_id}（{getattr(server, "title", "") or connector_id}）')
+        tool_names = [str(getattr(tool, 'name', '') or '') for tool in (tool_objects or [])]
+        tool_names = [name for name in tool_names if name][:40]
+        lines = [
+            '\n\n【本轮连接器】用户在当前会话选择了以下 MCP 连接器：',
+            '、'.join(names),
+        ]
+        if tool_names:
+            lines.append('已注入的工具：' + '、'.join(tool_names))
+        else:
+            lines.append('本轮暂未注入可调用工具（可能未配置/授权失败），不要因此编造调用结果。')
+        lines.append('当用户问“连接了哪些 MCP server”时，以本清单为准，不要说没有暴露。')
+        return '\n'.join(lines)
 
     async def _run_pi_chat(self, claimed: dict) -> str | None:
         """用真实 Pi 执行一次聊天/查询 turn，返回答复文本（或 None 表示失租/失败）。
@@ -477,22 +509,53 @@ class HubSessionMessageMixin:
         # 会话历史（排除当前 turn 的 user 消息）
         history = await self._chat_history(session_id, turn_id)
 
-        # 只读工具目录：chat 不带工具（纯闲聊），query 带只读工具白名单。
-        tools: list = []
+        # 本轮工具：默认带本地只读工具（含 web_search），chat 也允许联网搜索；
+        # 如果当前会话选了连接器，再把对应 MCP 工具注入进来。
+        from webpage_agent.agent import connector_scope
+        from webpage_agent.agent.pi_runtime import default_tool_catalog, pi_tool_catalog
+
+        session_row = await self.store.session(session_id) or {}
+        platform_subject = str(session_row.get('platform_subject') or '')
+        subject_token = connector_scope.use_subject(platform_subject) if platform_subject else None
+        raw_connectors = claimed.get('connector_ids_json')
+        if raw_connectors is None:
+            raw_connectors = session_row.get('connector_ids_json')
+        try:
+            connector_ids = json.loads(raw_connectors) if raw_connectors not in (None, '') else []
+        except (TypeError, ValueError):
+            connector_ids = []
+        if not isinstance(connector_ids, list):
+            connector_ids = []
+
+        tools: list = default_tool_catalog()
         tool_objects = None
-        if kind == 'query' and settings.session_query_enabled:
-            from webpage_agent.agent.pi_runtime import default_tool_catalog
-            tools = default_tool_catalog()
-            # 只读工具对象目录（无 run 时工具调用会因无可信主体被拒绝，
-            # 回退说明能力限制——这是诚实的能力边界，不是硬编码「不可用」）。
-            tool_objects = None
+        if connector_ids:
+            scope_token = connector_scope.use(connector_ids)
+            try:
+                decls, objects = await pi_tool_catalog()
+                if decls:
+                    tools = decls
+                    tool_objects = objects
+            except Exception:                          # noqa: BLE001
+                # 连不上连接器时仍保留 web_search/list_dir/read_file，
+                # 并在系统提示里如实说明“未注入工具”，不能编造调用。
+                pass
+            finally:
+                connector_scope.reset(scope_token)
+
+        system_prompt = (settings.pi_system_prompt or '') + self._connector_context(
+            connector_ids, tool_objects)
 
         model_token = model_choice.bind(
             owner_user_id, getattr(settings, 'llm_model', '') or '')
         try:
-            runtime = self._build_pi_runtime(tools=tools, tool_objects=tool_objects)
+            runtime = self._build_pi_runtime(
+                tools=tools, tool_objects=tool_objects,
+                system_prompt=system_prompt or None)
         except Exception:
             model_choice.reset(model_token)
+            if subject_token is not None:
+                connector_scope.reset_subject(subject_token)
             raise
 
         # 独立 turn 执行身份（A 组第 5 点 + 第十二阶段缺口修复）：
@@ -568,6 +631,8 @@ class HubSessionMessageMixin:
                                    exc_info=True)
             execution_control.unbind(context_token)
             governance.unbind(billing_token)
+            if subject_token is not None:
+                connector_scope.reset_subject(subject_token)
 
     # ---------- 控制 / 歧义 ----------
 

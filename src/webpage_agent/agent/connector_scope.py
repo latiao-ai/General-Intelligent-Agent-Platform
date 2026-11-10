@@ -11,10 +11,24 @@ from typing import Iterator
 
 _ALLOWED: ContextVar[tuple[str, ...] | None] = ContextVar(
     'run_connector_scope', default=None)
+_SUBJECT: ContextVar[str | None] = ContextVar(
+    'run_connector_subject', default=None)
 
 
 def current() -> tuple[str, ...] | None:
     return _ALLOWED.get()
+
+
+def current_subject() -> str | None:
+    return _SUBJECT.get()
+
+
+def use_subject(subject: str | None):
+    return _SUBJECT.set(str(subject or '') or None)
+
+
+def reset_subject(token) -> None:
+    _SUBJECT.reset(token)
 
 
 def use(ids: list[str] | tuple[str, ...] | None):

@@ -262,6 +262,12 @@ async def _borrow_stdio(server, command: str, args: list, token: str | None,
         # HTTP/SSE 走跨机器通道，改用签名断言（见 subject_assertion_headers）。
         # 连接器发现没有 run 上下文，由 API 传入已验证登录会话的 subject。
         if subject is None:
+            try:
+                from webpage_agent.agent import connector_scope
+                subject = connector_scope.current_subject()
+            except Exception:                          # noqa: BLE001
+                subject = None
+        if subject is None:
             subject = str((await current_run()).get('platform_subject') or '')
         env['MCP_CALLER_SUBJECT'] = str(subject or '')
     key = _stdio_key(server, command, args, token, env)

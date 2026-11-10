@@ -56,7 +56,9 @@ USER_WORKSPACE = 'v13_user_workspace'
 CONNECTOR_SELECTION = 'v14_connector_selection'
 # 会话级选择也落到 sessions 行：业务 run 执行时按会话读取，而不是只看某条 turn。
 SESSION_CONNECTOR_SELECTION = 'v15_session_connector_selection'
-LATEST = SESSION_CONNECTOR_SELECTION
+# 会话的已验证平台主体：聊天/查询没有业务 run，MCP stdio 仍需要它做登录来源校验。
+SESSION_PLATFORM_SUBJECT = 'v16_session_platform_subject'
+LATEST = SESSION_PLATFORM_SUBJECT
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -154,6 +156,9 @@ ALTER TABLE session_turns
 '''), (SESSION_CONNECTOR_SELECTION, '''
 ALTER TABLE sessions
     ADD COLUMN IF NOT EXISTS connector_ids_json TEXT;
+'''), (SESSION_PLATFORM_SUBJECT, '''
+ALTER TABLE sessions
+    ADD COLUMN IF NOT EXISTS platform_subject TEXT;
 '''))
 
 

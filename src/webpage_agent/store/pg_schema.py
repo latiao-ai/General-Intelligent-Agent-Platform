@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     tenant_id     TEXT NOT NULL DEFAULT 'default',
     owner_user_id TEXT NOT NULL DEFAULT 'default',
     connector_ids_json TEXT,
+    platform_subject TEXT,
     created_at    TEXT NOT NULL,
     updated_at    TEXT NOT NULL
 );
@@ -17,6 +18,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS owner_user_id TEXT NOT NULL DEFAULT 'default';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS connector_ids_json TEXT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS platform_subject TEXT;
 -- 用户级工作目录：前端「选择工作空间」选中的本地目录。
 -- 存量库由 v13_user_workspace 迁移建表，这里只是让新库快照保持完整。
 CREATE TABLE IF NOT EXISTS user_workspaces (

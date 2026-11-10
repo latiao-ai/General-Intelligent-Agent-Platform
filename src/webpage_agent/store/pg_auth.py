@@ -448,7 +448,8 @@ class PgAuth:
                           source_turn_id: str = '',
                           candidates: list | None = None,
                           clarification: str = '',
-                          connector_ids: list | None = None) -> dict:
+                          connector_ids: list | None = None,
+                          platform_subject: str | None = None) -> dict:
         """用户消息 + 待执行 turn + 接纳事件同事务提交。
 
         幂等：`(session_id, request_id)` 唯一。同一 request_id 同一 request_hash
@@ -518,6 +519,10 @@ class PgAuth:
                 await self._run(conn,
                     'UPDATE sessions SET updated_at=%s WHERE session_id=%s',
                     (stamp, session_id))
+            if platform_subject is not None:
+                await self._run(conn,
+                    'UPDATE sessions SET platform_subject=%s WHERE session_id=%s',
+                    (str(platform_subject), session_id))
             await conn.commit()
         return {'turn_id': turn_id, 'message_id': int((msg_row or {}).get('id') or 0),
                 'status': 'accepted', 'replayed': False, 'kind': kind,
