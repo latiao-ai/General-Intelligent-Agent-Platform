@@ -140,6 +140,17 @@ class Settings:
     artifact_dir: Path = PROJECT_ROOT / os.getenv('ARTIFACT_DIR', 'artifacts')
     # 每用户私有工作目录的根。ticket 模式按租户/用户自动分配，不接受任意服务器路径。
     workspace_root: Path = PROJECT_ROOT / os.getenv('WORKSPACE_ROOT', 'workspaces')
+    # ---------- 连接器 OAuth ----------
+    # 授权凭据落盘目录：一个主体一个文件（0600）。不进库，与
+    # `credential_ref = file:` 的约定一致；库里只留绑定元信息。
+    oauth_dir: Path = PROJECT_ROOT / os.getenv('OAUTH_DIR', 'secrets/oauth')
+    # 回调地址前缀，例如 https://agent.example.com。留空时按当前请求的
+    # scheme/host 推断，只适合本机联调；生产必须显式配置，否则回调地址
+    # 与动态注册时报的地址不一致，对方会拒绝。
+    oauth_public_base: str = os.getenv('OAUTH_PUBLIC_BASE', '').strip().rstrip('/')
+    # 授权 state 的有效期（秒）。state 是一次性凭证：它同时承载 PKCE verifier
+    # 和"是谁在授权"，过期不候比长期有效的票据安全得多。
+    oauth_state_ttl_seconds: int = max(60, int(os.getenv('OAUTH_STATE_TTL_SECONDS', '600')))
     # 数据库：**只支持 PostgreSQL**（SQLite 实现已删除）。仓储接口见
     # webpage_agent/store/persistence.py；留空会在 open_store() 里直接报错，不静默退回本地文件库。
     database_url: str = os.getenv('DATABASE_URL', '').strip()

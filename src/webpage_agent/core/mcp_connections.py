@@ -53,6 +53,10 @@ async def bearer_for(store, *, tenant_id: str, user_id: str,
 
     `None` = 调用方沿用服务端 / 环境 token。
     非空 = 必须用这把，禁止再退回全局 token。
+
+    绑定上标了 `scope.auth == 'oauth'` 时，`credential_ref` 指向的是一份
+    OAuth 凭据结构而不是一行 token，所以走 `oauth_store`：它会先判断过期、
+    必要时刷新，再返回 access_token。
     """
     binding = await binding_for_server(
         store, tenant_id=tenant_id, user_id=user_id, server_id=server_id,
@@ -62,6 +66,16 @@ async def bearer_for(store, *, tenant_id: str, user_id: str,
             raise credentials_module.CredentialMissing(
                 f'租户 {tenant_id} 没有服务端 {server_id} 的可用凭据，拒绝调用')
         return None
+    if str(credentials_module.scope_of(binding).get('auth') or '') == 'oauth':
+        from webpage_agent.core import oauth_store
+        from webpage_agent.integrations import mcp_servers
+        server = mcp_servers.by_id(server_id)
+        if server is None:
+            raise credentials_module.CredentialMissing(
+                f'服务端 {server_id} 已不在 MCP_SERVERS 配置里，OAuth 凭据无从刷新')
+        return await oauth_store.ensure_access_token(
+            server=server, tenant_id=tenant_id, user_id=user_id,
+            server_id=server_id)
     handle = credentials_module.materialize_credential(
         binding, expected_subject=user_id,
         ttl=float(settings.credential_cache_ttl or 0))
