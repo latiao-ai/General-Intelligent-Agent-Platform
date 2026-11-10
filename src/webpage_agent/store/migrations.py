@@ -58,7 +58,9 @@ CONNECTOR_SELECTION = 'v14_connector_selection'
 SESSION_CONNECTOR_SELECTION = 'v15_session_connector_selection'
 # 会话的已验证平台主体：聊天/查询没有业务 run，MCP stdio 仍需要它做登录来源校验。
 SESSION_PLATFORM_SUBJECT = 'v16_session_platform_subject'
-LATEST = SESSION_PLATFORM_SUBJECT
+# 聊天/查询 turn 的逐字草稿：前端轮询 timeline 时能边生成边显示。
+TURN_DRAFT = 'v17_turn_draft'
+LATEST = TURN_DRAFT
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -159,6 +161,9 @@ ALTER TABLE sessions
 '''), (SESSION_PLATFORM_SUBJECT, '''
 ALTER TABLE sessions
     ADD COLUMN IF NOT EXISTS platform_subject TEXT;
+'''), (TURN_DRAFT, '''
+ALTER TABLE session_turns
+    ADD COLUMN IF NOT EXISTS draft_answer TEXT NOT NULL DEFAULT '';
 '''))
 
 

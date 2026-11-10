@@ -665,6 +665,15 @@ class PgAuth:
             await conn.commit()
             return cur.rowcount > 0
 
+    async def update_turn_draft(self, turn_id: str, draft: str) -> None:
+        """保存聊天/查询 turn 的逐字草稿；只用于展示，不改变终态。"""
+        text = str(draft or '')[:200_000]
+        async with self._lease() as conn:
+            await self._run(
+                conn, 'UPDATE session_turns SET draft_answer=%s WHERE turn_id=%s',
+                (text, turn_id))
+            await conn.commit()
+
     async def settle_turn(self, turn_id: str, *, status: str,
                           answer: str = '', error: str = '',
                           lease_owner: str = '', lease_epoch: int = 0,

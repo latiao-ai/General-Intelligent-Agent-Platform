@@ -1876,6 +1876,20 @@ function onAnswerDelta(ev) {
   S.streamBubble.parentElement.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
 
+// 聊天/查询 turn 的草稿：后端把 Pi 的 answer_delta 节流写入 turn.draft，
+// 前端轮询时用同一气泡覆盖文本，不重复追加。
+function renderChatDraft(text) {
+  if (!S.streamBubble) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg assistant';
+    wrap.innerHTML = '<div class="bubble"></div>';
+    $('messages').appendChild(wrap);
+    S.streamBubble = wrap.querySelector('.bubble');
+  }
+  S.streamBubble.textContent = String(text || '');
+  S.streamBubble.parentElement.scrollIntoView({block: 'end', behavior: 'smooth'});
+}
+
 // 整理报告阶段是全程最长的静默期。模型流式生成工具参数，后端边收边解析出半成品报告，
 // 这里就地渲染，让用户看到报告在长出来。
 function renderDraft(report) {
@@ -2469,11 +2483,12 @@ async function pollChatReply(turnId, sessionId) {
   // 只有"用户还停在这一条会话上"时才动界面。切走了就安静地等——以前这里直接
   // return，等于把还在后台跑的答复丢掉了，切回来只能看到自己那句话。
   const viewing = () => S.sessionId === sessionId;
+  let sawDraft = false;
   showPending('正在思考…');
   while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 800));
+    await new Promise(r => setTimeout(r, 280));
     // 等待超过几秒就把已等待时长显示出来，否则长时间没动静会让人以为坏了
-    if (viewing()) {
+    if (viewing() && !sawDraft) {
       const waited = Math.round((Date.now() - started) / 1000);
       showPending(waited >= 6 ? `正在思考… 已等待 ${waited}s` : '正在思考…');
     }
@@ -2483,10 +2498,16 @@ async function pollChatReply(turnId, sessionId) {
       if (!res.ok) continue;
       const data = await res.json();
       const turn = (data.chat_turns || []).find(t => t.turn_id === turnId);
+      if (turn && turn.draft && viewing()) {
+        sawDraft = true;
+        clearPending();
+        renderChatDraft(turn.draft);
+      }
       if (turn && chatTurnDone(turn.status)) {
         // 终态：幂等全量刷新（openSession 是幂等的，重复调用安全）
         if (viewing()) {
           clearPending();
+          S.streamBubble = null;
           openSession(sessionId, {keepWorkspace: true});
         }
         loadSessions();     // 消息数 / 标题 / 排序都要跟着变

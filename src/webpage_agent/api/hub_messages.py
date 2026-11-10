@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 import uuid
 
 from webpage_agent.core import model_choice
@@ -622,7 +623,24 @@ class HubSessionMessageMixin:
                 'documents': [], 'mcp_calls': [], 'errors': [], 'usage': [],
                 'status': 'created',
             }
-            state = await runtime.run(state)
+            draft_parts: list[str] = []
+            draft_last = 0.0
+
+            async def on_event(event: dict) -> None:
+                nonlocal draft_last
+                if str(event.get('type') or '') != 'answer_delta':
+                    return
+                draft_parts.append(str(event.get('text') or ''))
+                now = time.monotonic()
+                if now - draft_last < 0.12:
+                    return
+                draft_last = now
+                try:
+                    await self.store.update_turn_draft(turn_id, ''.join(draft_parts))
+                except Exception:                  # noqa: BLE001
+                    logger.debug('写入 turn 草稿失败', exc_info=True)
+
+            state = await runtime.run(state, on_event=on_event)
             answer = str(state.get('answer') or '').strip()
             if not answer:
                 # 无有效答复：如实说明，不落空答复冒充成功

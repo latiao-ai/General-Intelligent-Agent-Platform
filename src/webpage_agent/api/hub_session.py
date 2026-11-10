@@ -113,6 +113,7 @@ class HubSessionMixin:
                     'status': turn.get('status'),
                     'message': turn.get('message'),
                     'answer': turn.get('answer'),
+                    'draft': turn.get('draft_answer') or '',
                     'target_task_id': turn.get('target_task_id'),
                     'target_run_id': turn.get('target_run_id'),
                     'created_at': turn.get('created_at'),
