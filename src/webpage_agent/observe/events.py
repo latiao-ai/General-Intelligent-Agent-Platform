@@ -173,6 +173,11 @@ def draft(report: dict | None) -> dict:
     return {'type': 'draft', 'report': report}
 
 
+def reasoning_delta(text: str) -> dict:
+    """模型的思考/推理增量（与最终答复分开）。"""
+    return {'type': 'reasoning_delta', 'text': str(text or '')}
+
+
 def answer_delta(text: str) -> dict:
     """直接回答时的增量文本（打字机效果）。
 

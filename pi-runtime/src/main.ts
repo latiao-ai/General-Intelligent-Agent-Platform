@@ -473,6 +473,16 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
         };
         send(ev);
       },
+      onThinkingDelta: (delta) => {
+        const ev: EventMessage = {
+          protocol_version: PROTOCOL_VERSION,
+          execution_id: executionId,
+          type: 'event',
+          kind: 'thinking_delta',
+          delta,
+        };
+        send(ev);
+      },
       onToolCall: (call) => {
         toolCalls.push(call);
       },

@@ -234,6 +234,7 @@ export class PiSession {
     signal: AbortSignal,
     handlers: {
       onTextDelta: (delta: string) => void;
+      onThinkingDelta?: (delta: string) => void;
       onToolCall: (toolCall: import('@mariozechner/pi-ai').ToolCall) => void;
       onModelRequest: (requestId: string) => Promise<boolean>;
       onModelUsage: (
@@ -309,6 +310,9 @@ export class PiSession {
         case 'text_delta':
           answer += event.delta;
           handlers.onTextDelta(event.delta);
+          break;
+        case 'thinking_delta':
+          handlers.onThinkingDelta?.(event.delta);
           break;
         case 'toolcall_end':
           sawToolCall = true;
@@ -429,6 +433,7 @@ export class PiSession {
     requestId: string,
     handlers: {
       onTextDelta: (delta: string) => void;
+      onThinkingDelta?: (delta: string) => void;
       onToolCall: (toolCall: import('@mariozechner/pi-ai').ToolCall) => void;
       onModelUsage: (
         requestId: string,

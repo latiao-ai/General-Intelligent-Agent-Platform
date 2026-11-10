@@ -57,6 +57,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -70,6 +71,7 @@ from webpage_agent.agent.pi_protocol import ProtocolError
 from webpage_agent.core.errors import RecursionBudgetExceeded
 from webpage_agent.observe.events import (
     answer_delta,
+    reasoning_delta,
     bind_sink,
     drain_events,
     emit_async,
@@ -212,6 +214,34 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
         tool_objects = [tool for tool in tool_objects
                         if getattr(tool, 'name', '') not in dropped_names]
     return kept, tool_objects
+
+
+def _tool_event_args(args) -> dict:
+    """工具参数的事件摘要：保留 query 等可读字段，屏蔽凭据。"""
+    if not isinstance(args, dict):
+        return {}
+    secret = ('token', 'secret', 'password', 'authorization', 'cookie', 'api_key')
+    out = {}
+    for key, value in list(args.items())[:12]:
+        name = str(key)
+        if any(part in name.lower() for part in secret):
+            out[name] = '***'
+        elif isinstance(value, (str, int, float, bool)) or value is None:
+            out[name] = str(value)[:300] if isinstance(value, str) else value
+        else:
+            try:
+                out[name] = json.dumps(value, ensure_ascii=False)[:300]
+            except (TypeError, ValueError):
+                out[name] = str(value)[:300]
+    return out
+
+
+async def _emit_tool_call(tool_name: str, args) -> None:
+    try:
+        await emit_async({'type': 'tool_call', 'name': str(tool_name),
+                          'args': _tool_event_args(args)})
+    except Exception:                              # noqa: BLE001
+        logger.debug('tool_call 事件发送失败', exc_info=True)
 
 
 class PiRuntime:
@@ -620,6 +650,8 @@ class PiRuntime:
             answer_parts.append(delta)
             # 公共事件契约：answer_delta 使用 text 字段
             await emit_async(answer_delta(delta))
+        elif kind == "thinking_delta":
+            await emit_async(reasoning_delta(str(msg.get("delta", ""))))
         elif kind == "progress" or kind == "stage":
             await self._open_named_stage(str(msg.get("label", "") or "pi"))
 
@@ -687,6 +719,7 @@ class PiRuntime:
             await self._park_for_input(bridge, state, call_id, tool_name, blocked)
             return
         self._tool_calls += 1
+        await _emit_tool_call(tool_name, args)
 
         if self._tool_executor is not None:
             # 测试注入的假工具替身

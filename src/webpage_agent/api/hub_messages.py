@@ -628,15 +628,16 @@ class HubSessionMessageMixin:
 
             async def on_event(event: dict) -> None:
                 nonlocal draft_last
-                if str(event.get('type') or '') != 'answer_delta':
+                event_type = str(event.get('type') or '')
+                if event_type in ('answer_delta', 'reasoning_delta', 'tool_call', 'tool_result'):
+                    try:
+                        await self.store.append_turn_event(turn_id, event)
+                    except Exception:              # noqa: BLE001
+                        logger.debug('写入 turn 事件失败', exc_info=True)
+                if event_type != 'answer_delta':
                     return
                 text = str(event.get('text') or '')
                 draft_parts.append(text)
-                try:
-                    await self.store.append_turn_event(turn_id, {
-                        'type': 'answer_delta', 'text': text})
-                except Exception:                  # noqa: BLE001
-                    logger.debug('写入 turn 事件失败', exc_info=True)
                 now = time.monotonic()
                 if now - draft_last < 0.12:
                     return
@@ -646,6 +647,11 @@ class HubSessionMessageMixin:
                 except Exception:                  # noqa: BLE001
                     logger.debug('写入 turn 草稿失败', exc_info=True)
 
+            try:
+                await self.store.append_turn_event(
+                    turn_id, {'type': 'started', 'at': time.time()})
+            except Exception:                      # noqa: BLE001
+                logger.debug('写入 turn started 失败', exc_info=True)
             state = await runtime.run(state, on_event=on_event)
             answer = str(state.get('answer') or '').strip()
             if not answer:

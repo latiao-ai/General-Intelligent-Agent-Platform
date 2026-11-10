@@ -24,7 +24,7 @@ export interface ReadyMessage extends BaseMessage {
 /** 文本增量 / 进度 / 完成提示（展示用） */
 export interface EventMessage extends BaseMessage {
   type: 'event';
-  kind: 'text_delta' | 'progress' | 'stage';
+  kind: 'text_delta' | 'thinking_delta' | 'progress' | 'stage';
   /** text_delta 时的文本增量 */
   delta?: string;
   /** progress/stage 时的说明 */

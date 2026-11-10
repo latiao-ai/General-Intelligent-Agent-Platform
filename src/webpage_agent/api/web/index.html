@@ -268,6 +268,29 @@ a{color:var(--brand);text-decoration:none}
 .msg.assistant .bubble{background:transparent;border:0;border-radius:0;padding:2px 0;
   max-width:100%;color:var(--ink-2)}
 .msg.assistant .bubble a{color:var(--brand);word-break:break-all}
+/* 聊天 turn 的思考/过程卡（WorkBuddy 风格） */
+.chat-process{display:block;max-width:100%;margin:2px 0 12px;color:var(--ink-2)}
+.cp-agent{display:flex;align-items:center;gap:9px;margin-bottom:8px}
+.cp-avatar{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;
+  background:linear-gradient(140deg,#2fd2ab,#00a884);color:#fff;flex:none}
+.cp-avatar .ic{width:16px;height:16px}
+.cp-agent b{font-size:13px;font-weight:600;color:var(--ink);white-space:nowrap}
+.cp-elapsed{font-size:11.5px;color:var(--muted-2);margin-left:8px}
+.cp-think-head{display:flex;align-items:center;gap:5px;border:0;background:none;padding:2px 0;
+  color:var(--muted);font-size:12.5px;cursor:pointer}
+.cp-think-head .ic{width:12px;height:12px;transition:transform .15s}
+.chat-process.collapsed .cp-think-head .ic{transform:rotate(-90deg)}
+.cp-think-body{border-left:2px solid var(--line-2);margin:4px 0 6px 4px;padding:2px 0 2px 12px;
+  color:var(--muted);font-size:12.5px;line-height:1.7;white-space:pre-wrap;
+  max-height:260px;overflow:auto}
+.chat-process.collapsed .cp-think-body{display:none}
+.cp-steps{display:flex;flex-direction:column;gap:2px;margin-top:4px}
+.cp-step{display:flex;align-items:flex-start;gap:7px;padding:2px 0;font-size:12.5px;color:var(--ink-2)}
+.cp-step .cp-step-ico{flex:none;width:16px;text-align:center;color:var(--muted-2)}
+.cp-step .cp-step-text{min-width:0;overflow-wrap:anywhere}
+.cp-step .cp-step-meta{margin-left:auto;flex:none;font-size:10.5px;color:var(--muted-2)}
+.cp-step.done .cp-step-ico{color:var(--brand)}
+
 /* 等待答复的占位气泡 */
 #pendingReply .bubble{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:13px}
 #pendingReply .dots{display:inline-flex;gap:3px;flex:0 0 auto}
@@ -1876,6 +1899,98 @@ function onAnswerDelta(ev) {
   S.streamBubble.parentElement.scrollIntoView({block: 'end', behavior: 'smooth'});
 }
 
+function formatElapsed(ms) {
+  const sec = Math.max(0, Math.round(ms / 1000));
+  if (sec < 60) return `已处理 ${sec}s`;
+  return `已处理 ${Math.floor(sec / 60)}m${sec % 60}s`;
+}
+
+function resetChatProcess() {
+  if (S.chatProcess && S.chatProcess.timer) clearInterval(S.chatProcess.timer);
+  S.chatProcess = null;
+}
+
+function ensureChatProcess(startedAt) {
+  if (S.chatProcess) return S.chatProcess;
+  clearPending();
+  const wrap = document.createElement('div');
+  wrap.className = 'msg assistant chat-process';
+  wrap.innerHTML = `
+    <div class="cp-agent">
+      <div class="cp-avatar"><svg class="ic"><use href="#i-bot"/></svg></div>
+      <b>网页研究智能体</b><span class="cp-elapsed">已处理 0s</span>
+    </div>
+    <button type="button" class="cp-think-head">
+      <span class="cp-think-title">深度思考中</span>
+      <svg class="ic"><use href="#i-chevron"/></svg>
+    </button>
+    <div class="cp-think-body" hidden></div>
+    <div class="cp-steps"></div>`;
+  const pending = $('pendingReply');
+  $('messages').insertBefore(wrap, pending || null);
+  const started = Number(startedAt) > 0 ? Number(startedAt) * 1000 : Date.now();
+  const state = {el: wrap, startedAt: started, timer: null, reasoning: '', steps: []};
+  const elapsedEl = wrap.querySelector('.cp-elapsed');
+  const tick = () => { elapsedEl.textContent = formatElapsed(Date.now() - state.startedAt); };
+  tick();
+  state.timer = setInterval(tick, 1000);
+  wrap.querySelector('.cp-think-head').onclick = () => {
+    wrap.classList.toggle('collapsed');
+  };
+  S.chatProcess = state;
+  return state;
+}
+
+function appendChatReasoning(text) {
+  const state = ensureChatProcess();
+  state.reasoning += String(text || '');
+  const body = state.el.querySelector('.cp-think-body');
+  body.hidden = false;
+  body.textContent = state.reasoning.slice(-6000);
+  state.el.classList.remove('collapsed');
+}
+
+function addChatStep(name, args) {
+  const state = ensureChatProcess();
+  const tool = String(name || '工具');
+  let label = tool;
+  let meta = '';
+  const query = args && (args.query || args.q || args.keyword || args.search);
+  if (tool === 'web_search' || tool.includes('search')) {
+    label = '网页搜索';
+    meta = query ? String(query) : '';
+  } else {
+    label = tool;
+    meta = query ? String(query) : '';
+  }
+  const row = document.createElement('div');
+  row.className = 'cp-step';
+  row.innerHTML = `<span class="cp-step-ico">${tool === 'web_search' ? '🌐' : '⚙'}</span>`
+    + `<span class="cp-step-text"></span><span class="cp-step-meta"></span>`;
+  row.querySelector('.cp-step-text').textContent = label + (meta ? '  ' + meta : '');
+  row.querySelector('.cp-step-meta').textContent = '进行中';
+  state.el.querySelector('.cp-steps').appendChild(row);
+  state.steps.push(row);
+  return row;
+}
+
+function finishChatProcess(status) {
+  const state = S.chatProcess;
+  if (!state) return;
+  if (state.timer) { clearInterval(state.timer); state.timer = null; }
+  const elapsed = state.el.querySelector('.cp-elapsed');
+  elapsed.textContent = formatElapsed(Date.now() - state.startedAt);
+  const title = state.el.querySelector('.cp-think-title');
+  if (title && !state.reasoning) title.textContent = '处理过程';
+  else if (title) title.textContent = '深度思考';
+  for (const row of state.steps) {
+    row.classList.add('done');
+    const meta = row.querySelector('.cp-step-meta');
+    if (meta) meta.textContent = status === 'failed' ? '失败' : '完成';
+  }
+  state.el.classList.add('finished');
+}
+
 // 聊天/查询 turn 的草稿：后端把 Pi 的 answer_delta 节流写入 turn.draft，
 // 前端轮询时用同一气泡覆盖文本，不重复追加。
 function renderChatDraft(text) {
@@ -2364,6 +2479,7 @@ function clearAll() {
   S.skew = 0;
   S.lastEventAt = 0;
   S.streamBubble = null;
+  resetChatProcess();
 }
 
 // 只有一个按钮：跑着的时候再发一条就会自动打断上一轮，不做额外提示。
@@ -2475,6 +2591,7 @@ function chatTurnDone(status) {
 // 会话 turn 的独立 SSE：cursor 由服务端自增 id/Last-Event-ID 维护。
 function streamChatTurn(turnId, sessionId) {
   if (S.chatES) { S.chatES.close(); S.chatES = null; }
+  resetChatProcess();
   S.streamBubble = null;
   const url = `${API_PREFIX}/sessions/${encodeURIComponent(sessionId)}`
     + `/turns/${encodeURIComponent(turnId)}/events`;
@@ -2484,18 +2601,36 @@ function streamChatTurn(turnId, sessionId) {
   es.addEventListener('turn', ev => {
     let data = null;
     try { data = JSON.parse(ev.data || '{}'); } catch (e) { return; }
-    if (data.type !== 'answer_delta') return;
     if (S.sessionId !== sessionId) return;
-    clearPending();
-    onAnswerDelta({text: data.text || ''});
+    if (data.type === 'started') {
+      ensureChatProcess(data.at);
+      clearPending();
+    } else if (data.type === 'reasoning_delta') {
+      appendChatReasoning(data.text || '');
+    } else if (data.type === 'tool_call') {
+      addChatStep(data.name || '工具', data.args || {});
+    } else if (data.type === 'answer_delta') {
+      const state = ensureChatProcess();
+      for (const row of state.steps) {
+        row.classList.add('done');
+        const meta = row.querySelector('.cp-step-meta');
+        if (meta) meta.textContent = '完成';
+      }
+      clearPending();
+      onAnswerDelta({text: data.text || ''});
+    }
   });
   es.addEventListener('done', ev => {
     es.close();
     if (S.chatES === es) S.chatES = null;
+    let data = {};
+    try { data = JSON.parse(ev.data || '{}'); } catch (e) { /* 忽略 */ }
+    finishChatProcess(data.status || 'succeeded');
     if (S.sessionId === sessionId) {
       clearPending();
+      if (!S.streamBubble && data.answer) addMessage('assistant', data.answer);
+      else if (S.streamBubble && data.answer) S.streamBubble.textContent = data.answer;
       S.streamBubble = null;
-      openSession(sessionId, {keepWorkspace: true});
     }
     loadSessions();
   });
@@ -2504,6 +2639,7 @@ function streamChatTurn(turnId, sessionId) {
     if (es.readyState === EventSource.CLOSED && !fellBack) {
       fellBack = true;
       if (S.chatES === es) S.chatES = null;
+      finishChatProcess('failed');
       pollChatReply(turnId, sessionId);
     }
   };
