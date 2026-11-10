@@ -207,6 +207,8 @@ class HubSessionMessageMixin:
                 target_run_id=route.get('target_run_id') or '',
                 kind=route_kind,
                 tenant_id=tenant, owner_user_id=owner,
+                owner_role=(getattr(principal, 'role', '') or 'member')
+                if getattr(principal, 'authenticated', False) else 'member',
                 candidates=candidates, clarification=clarification,
                 source_turn_id=source_turn_id)
         except TurnRequestConflict:
@@ -509,6 +511,7 @@ class HubSessionMessageMixin:
             # 工具仍会因 no_run 被拒，退化为诚实的能力边界说明。
             created = await self.store.create_turn_run(
                 run_id=turn_id, tenant_id=tenant_id, owner_user_id=owner_user_id,
+                owner_role=str(claimed.get('owner_role') or 'member'),
                 lease_owner=lease_owner, lease_epoch=lease_epoch,
                 lease_ttl=float(settings.session_turn_lease_seconds))
             if created is not None:

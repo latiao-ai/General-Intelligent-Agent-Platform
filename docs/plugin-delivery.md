@@ -227,7 +227,7 @@
 
 ### 6.7 知识产权与开源许可（⚠️ 现状有缺口）
 - **仓库当前没有 `LICENSE` 文件**。商业交付前必须决定：源码交付 / 二进制交付 / 仅 SaaS 使用，并配对应许可文本。
-- 直接依赖许可：`fastapi`/`langgraph`/`langchain-core`/`jsonschema`/`pydantic` = **MIT**；`uvicorn` = **BSD-3-Clause**；
+- 直接依赖许可：`fastapi`/`langchain-core`/`jsonschema`/`pydantic` = **MIT**；`uvicorn` = **BSD-3-Clause**；
   **`psycopg` 3.3.6 = LGPL-3.0-only**（实测元数据）。LGPL 在"以独立 Python 包形式导入、不静态链接修改"的常规用法下可控，
   但**对外分发时必须附第三方许可声明并提供其源码获取途径**（D7）。给客户交付前跑一次 SBOM 是硬要求。
 

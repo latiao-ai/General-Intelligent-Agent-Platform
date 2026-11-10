@@ -35,6 +35,11 @@ def main():
     parser.add_argument('--port', type=int, default=8002)
     parser.add_argument('--reload', action='store_true', help='开发模式：改代码自动重启')
     args = parser.parse_args()
+    # 技能中心：默认从本服务自带的 registry 走 HTTP 拉取；.env 里显式配置时以 .env 为准。
+    from dotenv import load_dotenv
+    load_dotenv(_ROOT / '.env')
+    if not os.getenv('SKILLHUB_URL'):
+        os.environ['SKILLHUB_URL'] = f'http://127.0.0.1:{args.port}/api/skillhub/v1/skills'
     if args.lan:
         if args.host and args.host != '0.0.0.0':
             parser.error('--lan 与指定的 --host 冲突')

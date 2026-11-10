@@ -15,6 +15,15 @@ CREATE TABLE IF NOT EXISTS sessions (
 -- 旧库升级：PG 支持 ADD COLUMN IF NOT EXISTS，直接并进建表脚本即可当迁移
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT 'default';
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS owner_user_id TEXT NOT NULL DEFAULT 'default';
+-- 用户级工作目录：前端「选择工作空间」选中的本地目录。
+-- 存量库由 v13_user_workspace 迁移建表，这里只是让新库快照保持完整。
+CREATE TABLE IF NOT EXISTS user_workspaces (
+    tenant_id     TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    path          TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, owner_user_id)
+);
 CREATE TABLE IF NOT EXISTS messages (
     id         BIGSERIAL PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -82,7 +91,7 @@ CREATE TABLE IF NOT EXISTS runs (
     compensated_at      TEXT,
     created_at          TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
-    runtime_kind        TEXT NOT NULL DEFAULT 'langgraph',
+    runtime_kind        TEXT NOT NULL DEFAULT 'pi',
     runtime_version     INTEGER NOT NULL DEFAULT 1,
     runtime_state_schema INTEGER NOT NULL DEFAULT 1
 );
@@ -630,9 +639,10 @@ ALTER TABLE actions ADD COLUMN IF NOT EXISTS external_task_id TEXT NOT NULL DEFA
 -- 已验证的现场上下文（当前项目 / 选中对象）。浏览器自报的 JSON 不能直接当它用。
 ALTER TABLE tasks_meta ADD COLUMN IF NOT EXISTS scene_context_json TEXT NOT NULL DEFAULT '';
 
--- run 的引擎归属：由哪个引擎驱动（langgraph | pi）、运行时实现版本、状态格式版本。
--- 恢复入口据此分流；存量 run 默认回填 langgraph，新 run 创建时确定归属。
-ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_kind TEXT NOT NULL DEFAULT 'langgraph';
+-- run 的引擎归属：runtime_kind / 运行时实现版本 / 状态格式版本。
+-- v5 给存量行回填过 langgraph（历史标记，不再有对应引擎）；
+-- v11 把列默认改成 pi。已存在的行不会被这条 ALTER 改写。
+ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_kind TEXT NOT NULL DEFAULT 'pi';
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_version INTEGER NOT NULL DEFAULT 1;
 ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_state_schema INTEGER NOT NULL DEFAULT 1;
 
@@ -690,6 +700,7 @@ CREATE TABLE IF NOT EXISTS session_turns (
     execution_generation INTEGER NOT NULL DEFAULT 0,
     tenant_id          TEXT NOT NULL DEFAULT 'default',
     owner_user_id      TEXT NOT NULL DEFAULT 'default',
+    owner_role         TEXT NOT NULL DEFAULT 'member',
     answer             TEXT NOT NULL DEFAULT '',
     error              TEXT NOT NULL DEFAULT '',
     created_at         TEXT NOT NULL,

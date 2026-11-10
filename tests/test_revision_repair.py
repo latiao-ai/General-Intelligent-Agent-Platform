@@ -20,14 +20,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from webpage_agent.governance import execution_control
-from webpage_agent.agent import graph
+from tests import host_loop as graph
 from webpage_agent.store import ledger as ledger_module
 from webpage_agent.agent import nodes
 from webpage_agent.agent import run_inputs as run_inputs_module
 from webpage_agent.capabilities.registry import Tool
 from webpage_agent.core.schemas import RevisedPlan, ToolSelection
 
-from tests.exec_env import (Remote, install_main, install_tools, new_store,
+from tests.exec_env import (Remote, install_host_loop, install_main, install_tools, new_store,
                             reset_db, seed_run)
 
 
@@ -269,7 +269,7 @@ class RevisionRepairGraphTests(unittest.IsolatedAsyncioTestCase):
 
         hub = Hub(store, owner_id='w1')
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
-                install_tools(tools), \
+                install_tools(tools), install_host_loop(), \
                 patch.object(nodes, 'structured_call', model):
             if first_plan is None:
                 await worker.run_once(hub, 'w1', run_id='run1')

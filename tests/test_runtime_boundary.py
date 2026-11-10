@@ -1,8 +1,8 @@
-"""运行时边界测试（Pi 改造第一阶段）。
+"""运行时边界测试。
 
-验证 `agent.runtime.Runtime` 契约与 `agent.langgraph_runtime.LangGraphRuntime` 的
-行为：驱动图执行、合并状态增量、转发 custom 事件、记录节点耗时，以及异常原样穿透。
-同时验证 `run_task()` 经新运行时接口后行为不回归（首次执行 + 恢复执行）。
+生产引擎只有 Pi。这一组里需要「规划节点逐步合并状态」的用例走进程内节点循环
+（`tests.host_loop`），不启动 Node，也不再依赖 LangGraph。
+`run_task()` 的终态、恢复和步数预算仍由宿主收口。
 """
 import tempfile
 import unittest
@@ -12,18 +12,18 @@ from unittest.mock import patch
 from tests.core_support import reset_db
 
 
-class LangGraphRuntimeTests(unittest.IsolatedAsyncioTestCase):
-    """LangGraphRuntime 的驱动与事件透传边界。"""
+class HostLoopRuntimeTests(unittest.IsolatedAsyncioTestCase):
+    """进程内节点循环的驱动与事件透传边界。"""
 
     def runtime(self):
-        from webpage_agent.agent.langgraph_runtime import LangGraphRuntime
-        return LangGraphRuntime()
+        from tests.host_loop import HostLoopRuntime
+        return HostLoopRuntime()
 
     def test_satisfies_runtime_protocol(self):
-        """LangGraphRuntime 应当实现 Runtime 契约。"""
+        """节点循环应当实现 Runtime 契约。"""
         from webpage_agent.agent.runtime import Runtime
-        from webpage_agent.agent.langgraph_runtime import LangGraphRuntime
-        self.assertIsInstance(LangGraphRuntime(), Runtime)
+        from tests.host_loop import HostLoopRuntime
+        self.assertIsInstance(HostLoopRuntime(), Runtime)
 
     async def test_merges_updates_and_forwards_custom_events(self):
         """updates 增量要合并进 state，custom 事件要透传给回调。"""
@@ -97,19 +97,15 @@ class LangGraphRuntimeTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_control_exceptions_pass_through(self):
         """控制流异常必须原样穿透，不能被运行时吞掉或包装。"""
+        from webpage_agent.agent import nodes
         from webpage_agent.governance import execution_control
 
-        class _StubGraph:
-            def astream(self, *args, **kwargs):
-                async def _gen():
-                    raise execution_control.ControlStopped('停')
-                    yield
-                return _gen()
+        async def boom(state):
+            raise execution_control.ControlStopped('停')
 
         with tempfile.TemporaryDirectory() as folder:
             state = {'task_id': 'x', 'artifact_dir': folder, 'timings': []}
-            with patch('webpage_agent.agent.langgraph_runtime.build_graph',
-                       return_value=_StubGraph()):
+            with patch.object(nodes, 'intake', boom):
                 with self.assertRaises(execution_control.ControlStopped):
                     await self.runtime().run(state)
 
@@ -189,47 +185,43 @@ class LangGraphRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     await self.runtime().run(state, on_event=boom)
 
     async def test_recursion_budget_maps_to_generic_exception(self):
-        """LangGraph 的 GraphRecursionError 应在适配层折成通用 RecursionBudgetExceeded。"""
-        from langgraph.errors import GraphRecursionError
+        """步数超过上限时抛通用 RecursionBudgetExceeded，宿主不用认识具体引擎。"""
+        from dataclasses import replace
+        from webpage_agent.agent import nodes
+        from webpage_agent.core.config import settings as real_settings
         from webpage_agent.core.errors import RecursionBudgetExceeded
+        import tests.host_loop as host_loop
 
-        class _StubGraph:
-            def astream(self, *args, **kwargs):
-                async def _gen():
-                    raise GraphRecursionError('recursion limit')
-                    yield
-                return _gen()
+        async def stay(state):
+            return {'entry_route': 'intake'}
 
         with tempfile.TemporaryDirectory() as folder:
             state = {'task_id': 'x', 'artifact_dir': folder, 'timings': []}
-            with patch('webpage_agent.agent.langgraph_runtime.build_graph',
-                       return_value=_StubGraph()):
+            limited = replace(real_settings, graph_recursion_limit=1)
+            with patch.object(nodes, 'intake', stay), \
+                    patch.object(host_loop, 'settings', limited):
                 with self.assertRaises(RecursionBudgetExceeded):
                     await self.runtime().run(state)
 
     async def test_state_keeps_partial_updates_on_exception(self):
         """异常发生时，运行时已合并进 state 的部分增量必须保留（同一 dict 引用）。"""
+        from webpage_agent.agent import nodes
         from webpage_agent.governance import execution_control
 
-        class _StubGraph:
-            def astream(self, *args, **kwargs):
-                async def _gen():
-                    # 先产出一个节点增量（真实 updates 模式下 chunk 是 {node: dict}），
-                    # 再抛控制流异常
-                    yield 'updates', {'plan_node': {
-                        'plan': {'steps': [{'step_id': 's1'}]},
-                        'status': 'planned'}}
-                    raise execution_control.ControlStopped('停')
-                return _gen()
+        async def intake(state):
+            return {'plan': {'steps': [{'step_id': 's1'}]}, 'status': 'planned',
+                    'entry_route': 'plan'}
+
+        async def plan(state):
+            raise execution_control.ControlStopped('停')
 
         with tempfile.TemporaryDirectory() as folder:
             state = {'task_id': 'x', 'artifact_dir': folder, 'timings': [],
                      'status': 'created'}
-            with patch('webpage_agent.agent.langgraph_runtime.build_graph',
-                       return_value=_StubGraph()):
+            with patch.object(nodes, 'intake', intake), \
+                    patch.object(nodes, 'plan', plan):
                 with self.assertRaises(execution_control.ControlStopped):
                     await self.runtime().run(state)
-            # 同一份 state 引用里仍保留异常前的部分增量
             self.assertEqual(state['status'], 'planned')
             self.assertIn('plan', state)
 
@@ -241,7 +233,7 @@ class RunTaskRuntimeBoundaryTests(unittest.IsolatedAsyncioTestCase):
         await reset_db()
 
     async def test_run_task_uses_runtime_and_preserves_contract(self):
-        """run_task 通过 LangGraphRuntime 驱动，返回协议与终态不变。"""
+        """run_task 经运行时驱动，返回协议与终态不变。"""
         from tests.exec_env import install_main, install_plan, install_tools
         from webpage_agent.api.main import run_task
 
@@ -313,11 +305,22 @@ class RuntimeFactoryAndContractTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         await reset_db()
 
-    async def test_get_runtime_returns_langgraph_by_default(self):
-        """生产默认运行时是 LangGraphRuntime。"""
+    async def test_get_runtime_follows_default_kind(self):
+        """工厂只给 Pi。langgraph 这个历史名字不再返回引擎。"""
+        from webpage_agent.agent import runtime_identity
         from webpage_agent.agent.runtime import get_runtime
-        from webpage_agent.agent.langgraph_runtime import LangGraphRuntime
-        self.assertIsInstance(get_runtime(), LangGraphRuntime)
+        from webpage_agent.agent.pi_runtime import PiRuntime
+        from tests.exec_env import override_settings
+        with override_settings(default_runtime_kind='pi',
+                               pi_system_prompt='停手规则'):
+            runtime = get_runtime()
+            self.assertIsInstance(runtime, PiRuntime)
+            self.assertEqual(runtime._system_prompt, '停手规则')
+        with override_settings(default_runtime_kind='langgraph'):
+            self.assertIsInstance(get_runtime(), PiRuntime)
+        with self.assertRaises(runtime_identity.RetiredRuntime):
+            get_runtime('langgraph')
+        self.assertIsInstance(get_runtime('pi'), PiRuntime)
 
     async def test_run_task_uses_factory_not_hardcoded_impl(self):
         """run_task 通过工厂取运行时，测试可注入替代实现。

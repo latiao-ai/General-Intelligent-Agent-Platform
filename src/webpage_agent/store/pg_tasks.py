@@ -38,7 +38,7 @@ class PgTasks:
         from webpage_agent.store.idempotency import IdempotencyConflict, IdempotencyInFlight
         from webpage_agent.agent import runtime_identity
 
-        # 引擎身份：显式给，否则用全局默认（生产默认 LangGraph）。
+        # 引擎身份：显式给，否则用全局默认（生产只有 Pi）。
         if not runtime_kind:
             runtime_kind = runtime_identity.default_kind()
         runtime_version = runtime_identity.version_for_kind(runtime_kind)

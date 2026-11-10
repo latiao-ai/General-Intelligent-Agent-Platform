@@ -13,14 +13,14 @@ from openai import APIConnectionError, AuthenticationError, RateLimitError
 from pydantic import BaseModel
 
 from webpage_agent.agent import context
-from webpage_agent.agent import graph
+from tests import host_loop as graph
 from webpage_agent.agent import nodes
 from webpage_agent.core import services
 from webpage_agent.api.api_hub import Hub
 from webpage_agent.capabilities.registry import Tool
 from webpage_agent.core.config import settings
 from webpage_agent.core.schemas import ExecutionPlan, RevisedPlan
-from tests.exec_env import (Remote, install_main, install_tools, new_store,
+from tests.exec_env import (Remote, install_host_loop, install_main, install_tools, new_store,
                             reset_db, seed_run)
 
 
@@ -303,7 +303,7 @@ class PlanningRecoveryTests(unittest.IsolatedAsyncioTestCase):
         remote = Remote()
         available = {'answer_directly': remote.tool('answer_directly', effect='read',
                                                      output={'answer': '已完成'})}
-        with tempfile.TemporaryDirectory() as folder, install_main(folder), install_tools(available):
+        with tempfile.TemporaryDirectory() as folder, install_main(folder), install_tools(available), install_host_loop():
             hub = Hub(self.store)
             with patch.object(nodes, 'structured_call', AsyncMock(side_effect=services.ModelRequestError())):
                 await run_once(hub, 'first', run_id='run1')
@@ -323,7 +323,7 @@ class PlanningRecoveryTests(unittest.IsolatedAsyncioTestCase):
         from scripts.run_worker import run_once
         remote = Remote()
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
-                install_tools({'read': remote.tool('read', effect='read')}), \
+                install_tools({'read': remote.tool('read', effect='read')}), install_host_loop(), \
                 patch.object(services, 'settings', replace(settings, llm_input_budget=100)), \
                 patch.object(services, 'new_llm') as factory:
             await run_once(Hub(self.store), 'worker', run_id='run1')
@@ -349,7 +349,7 @@ class PlanningRecoveryTests(unittest.IsolatedAsyncioTestCase):
         plan = ExecutionPlan(steps=[{'tool': 'write', 'step_id': 's1',
                                      'compensate': {'tool': 'undo', 'args': {}}},
                                     {'tool': 'answer', 'step_id': 's2'}])
-        with tempfile.TemporaryDirectory() as folder, install_main(folder), install_tools(available), \
+        with tempfile.TemporaryDirectory() as folder, install_main(folder), install_tools(available), install_host_loop(), \
                 patch.object(nodes, 'structured_call', AsyncMock(return_value=(plan, {}))), \
                 patch.object(services, 'settings', replace(settings, llm_input_budget=100)), \
                 patch.object(services, 'new_llm') as factory:

@@ -1,8 +1,8 @@
 """第七阶段：run 引擎归属持久化（runtime_kind / runtime_version / runtime_state_schema）。
 
 验证：
-- 新 run 创建时确定归属，默认 LangGraph；
-- 显式指定 pi 时按 pi 的版本/schema 落库；
+- 新 run 创建时确定归属，默认 Pi；
+- 显式写入的历史标记 langgraph 仍按旧版本号落库（执行时改挂或拒收）；
 - 恢复读取已存归属；未知引擎 / 不兼容版本明确阻断，不回退默认引擎。
 
 依赖真实 PostgreSQL（PG_TEST_DSN，库名含 test）。
@@ -30,16 +30,32 @@ class RuntimeOwnershipTests(unittest.IsolatedAsyncioTestCase):
     async def _seed_task(self, task_id='t1'):
         await self.store.create_task(task_id, 's1', '测试')
 
-    async def test_default_kind_is_langgraph(self):
+    async def test_explicit_langgraph_label_is_stored(self):
+        """显式写入的历史标记仍按旧版本号落库，执行入口不再把它当引擎。"""
         from webpage_agent.agent import runtime_identity
         await self._seed_task()
-        await self.store.create_run('r1', 't1', status='queued')
+        await self.store.create_run('r1', 't1', status='queued',
+                                    runtime_kind='langgraph')
         run = await self.store.run('r1')
         self.assertEqual(run['runtime_kind'], 'langgraph')
         self.assertEqual(run['runtime_version'],
                          runtime_identity.LANGGRAPH_RUNTIME_VERSION)
         self.assertEqual(run['runtime_state_schema'],
                          runtime_identity.LANGGRAPH_STATE_SCHEMA)
+
+    async def test_configured_pi_default_persists_pi_identity(self):
+        """DEFAULT_RUNTIME_KIND=pi 时，新建 run 的引擎身份是 pi，而不是图。"""
+        from webpage_agent.agent import runtime_identity
+        from tests.exec_env import override_settings
+        await self._seed_task('t-pi')
+        with override_settings(default_runtime_kind='pi'):
+            self.assertEqual(runtime_identity.default_kind(), 'pi')
+            await self.store.create_run('r-pi', 't-pi', status='queued')
+        run = await self.store.run('r-pi')
+        self.assertEqual(run['runtime_kind'], 'pi')
+        self.assertEqual(run['runtime_version'], runtime_identity.PI_RUNTIME_VERSION)
+        self.assertEqual(run['runtime_state_schema'],
+                         runtime_identity.PI_STATE_SCHEMA)
 
     async def test_explicit_pi_kind(self):
         from webpage_agent.agent import runtime_identity

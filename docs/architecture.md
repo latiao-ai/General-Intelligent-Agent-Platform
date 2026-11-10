@@ -8,7 +8,7 @@
 webpage-agent-main/
 ├── src/webpage_agent/        # 唯一的可导入包
 │   ├── api/                  # 对外接口层
-│   ├── agent/                # LangGraph 执行内核
+│   ├── agent/                # Pi 执行内核
 │   ├── tools/                # 工具调用与权限策略
 │   ├── store/                # 持久化
 │   ├── governance/           # 治理、审批、身份
@@ -24,17 +24,29 @@ webpage-agent-main/
 └── pyproject.toml            # 打包 + ruff + mypy 配置，单一来源
 ```
 
+## 执行引擎
+
+宿主经 `get_runtime()` 取运行时，生产只有 Pi（`PiRuntime` + `pi-runtime/`）。
+
+新建业务 run、补偿 run 和「部署上一份产物」都走 Pi。工具循环包含 governed_call、检查点、审批 / 外部等待 / 缺参 `waiting_input`、写后 `platform_verify`。补偿和部署另走脚本模式（`pi_script.py`）：不启动模型，按既定步骤调用。画布上的确认边界、重复调用停手、产物与部署回执核对挂在这条循环上。
+
+库里 `runtime_kind=langgraph` 的存量行不再启动旧引擎。没有动作、没有已执行步骤、没有未完成外部任务时，执行前改挂成 Pi 再跑。已经产生副作用的，停在 `needs_reconcile` 并写明原因，避免把旧步骤重放一遍。
+
+恢复读库里的 `runtime_kind` / `runtime_version` / `runtime_state_schema`。不认识的引擎直接拒绝。系统提示是 `settings.pi_system_prompt`（可用 `PI_SYSTEM_PROMPT` 覆盖）。
+
+各阶段关闭说明（`docs/phase8` 至 `phase12`）记录的是当时「尚未切换默认引擎」。以本节和 `core/config.py` 的当前默认值为准。
+
 ## 分层职责
 
 | 包 | 职责 | 关键模块 |
 |---|---|---|
 | `api/` | HTTP 层：路由、鉴权、应用装配 | `routes.py`（对外接口与页面）、`api_hub.py`（任务编排入口）、`main.py`（执行流程与阶段标签）、`auth.py`、`auth_connections.py` |
-| `agent/` | LangGraph 图与节点，只依赖状态与工具 | `graph.py`、`nodes.py`（规划/续跑/执行/观察/核对/补偿）、`context.py`、`run_inputs.py`、`scene_context.py` |
+| `agent/` | Pi 执行内核。补偿和部署走脚本模式。规划节点仍在 `nodes.py`，生产入口不靠它们驱动 | `runtime.py`、`pi_runtime.py`、`pi_script.py`、`pi_product.py`、`nodes.py`、`context.py`、`run_inputs.py`、`scene_context.py` |
 | `tools/` | 工具汇总、调用上下文、权限策略、结果整形 | `core.py`（内核工具汇总，不 import 任何业务包）、`tool_context.py`、`tool_policy.py`、`tool_authorization.py`、`tool_results.py` |
 | `store/` | 持久化仓储，唯一实现是 PostgreSQL | `pg_store.py`、`persistence.py`（`Repository` 协议）、`migrations.py`、`ledger.py`、`idempotency.py`、`artifact_store.py` |
 | `governance/` | 治理：策略、审批、票据、执行控制、复核 | `policies.py`、`core.py`、`approvals.py`、`ticket_auth.py`、`request_review.py`、`execution_control.py` |
 | `observe/` | 可观测性：事件、观测、健康检查、日志、遥测 | `events.py`、`observation.py`、`runtime_check.py`、`logging_setup.py`、`telemetry.py`、`maintenance.py`、`task_notify.py`、`errors.py` |
-| `core/` | 领域模型与共享设施 | `schemas.py`（LangGraph 状态定义）、`config.py`（设置与项目根）、`services.py`、`messages.py`、`outcome.py`、`memory.py`、`credentials.py`、`external_tasks.py`、`async_contracts.py`、`profile.py`、`mcp_connections.py`、`md.py`、`files.py`、`sources.py` |
+| `core/` | 领域模型与共享设施 | `schemas.py`（运行状态）、`config.py`（设置与项目根）、`services.py`、`messages.py`、`outcome.py`、`memory.py`、`credentials.py`、`external_tasks.py`、`async_contracts.py`、`profile.py`、`mcp_connections.py`、`md.py`、`files.py`、`sources.py` |
 | `capabilities/` | 本地能力插件，`@tool` 声明，import 即注册 | `registry.py`、`base.py`、`web.py`、`answers.py`、`export.py`、`publishing.py` |
 | `integrations/` | 外部平台集成 | `mcp_adapter.py`、`mcp_servers.py`、`mcp_subject.py`、`mcp_tasks.py`、`search.py` |
 

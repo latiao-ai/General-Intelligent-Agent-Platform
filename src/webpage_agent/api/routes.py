@@ -16,13 +16,19 @@ import os
 import mimetypes
 import logging
 import re
+import secrets
+import subprocess
+import sys
 import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
+from typing import Literal
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               Response, StreamingResponse)
+                               RedirectResponse, Response, StreamingResponse)
+import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from webpage_agent.store import idempotency
@@ -63,6 +69,8 @@ async def lifespan(app: FastAPI):
     现在只处理**自己名下的或租约已过期**的运行。
     """
     setup_logging('api')
+    from webpage_agent.api.models_api import restore_model
+    restore_model()
     problems = runtime_check.issues()
     if problems:
         raise RuntimeError('；'.join(problems))
@@ -114,6 +122,18 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title='通用 Agent 执行中台 API', version='2.0', lifespan=lifespan)
+from webpage_agent.api.oidc import router as oidc_router
+app.include_router(oidc_router)
+from webpage_agent.api.skillhub_api import router as skillhub_router
+from webpage_agent.api.skillhub_api import registry_router
+from webpage_agent.api.skillhub_registry_api import router as registry_api_router
+from webpage_agent.api.connectors_api import router as connectors_router
+from webpage_agent.api.models_api import router as models_router
+app.include_router(skillhub_router)
+app.include_router(registry_router)
+app.include_router(registry_api_router, prefix='/api/skillhub')
+app.include_router(connectors_router)
+app.include_router(models_router)
 
 
 @app.middleware('http')
@@ -265,15 +285,137 @@ def _clear_session_cookie(response: Response) -> None:
 
 
 @app.get('/api/me')
-async def whoami(principal=Depends(policies.current_principal)):
+async def whoami(request: Request, principal=Depends(policies.current_principal)):
     """当前主体。身份来自**已验证的中台登录会话**（ticket 模式）。"""
+    display_name = ''
+    if principal.authenticated:
+        store = getattr(request.app.state, 'store', None)
+        if store is not None:
+            try:
+                row = await store.user(principal.user_id)
+                display_name = str((row or {}).get('display_name') or '')
+            except Exception:                           # noqa: BLE001
+                logger.warning('读取用户显示名失败', exc_info=True)
     return {'tenant_id': principal.tenant_id,
             'user_id': principal.user_id,
+            'display_name': display_name,
             'role': principal.role,
             'platform_id': principal.platform_id,
             'authenticated': principal.authenticated,
             'anonymous': principal.anonymous,
             'auth_mode': settings.auth_mode}
+
+
+class WorkspacePathRequest(BaseModel):
+    path: str = Field(min_length=1, max_length=2048)
+
+
+def _workspace_pick_available() -> bool:
+    """原生目录选择框只在"服务端与浏览器同一台 macOS"的本地环境成立。"""
+    return sys.platform == 'darwin' and settings.app_env != 'production'
+
+
+def _resolve_workspace_path(raw: str) -> str:
+    """规范化并校验工作目录：必须是已存在的目录，不创建、不猜测。"""
+    text = str(raw or '').strip()
+    if not text or '\x00' in text:
+        raise HTTPException(status_code=400, detail='路径不合法')
+    try:
+        resolved = Path(text).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise HTTPException(status_code=400, detail='目录不存在') from None
+    if not resolved.is_dir():
+        raise HTTPException(status_code=400, detail='选中的不是目录')
+    return str(resolved)
+
+
+async def _pick_directory_native(prompt: str) -> str:
+    """在服务端机器上弹原生目录选择框（macOS 的 Finder），返回 POSIX 路径。
+
+    浏览器出于安全限制拿不到本地绝对路径（`<input webkitdirectory>` 只给相对
+    路径、File System Access 只给句柄），所以选中即落库这一步必须由服务端完成。
+    """
+    script = 'POSIX path of (choose folder with prompt "%s")' % prompt.replace('"', "'")
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, ['osascript', '-e', script],
+            capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504, detail='等待选择超时') from None
+    if proc.returncode != 0:
+        err = (proc.stderr or '').strip()
+        if '-128' in err or 'canceled' in err.lower() or 'cancelled' in err.lower():
+            raise HTTPException(status_code=409, detail='已取消选择')
+        raise HTTPException(status_code=502,
+                            detail='无法打开目录选择框：%s' % (err[:200] or '未知错误'))
+    return (proc.stdout or '').strip()
+
+
+@app.get('/api/workspace')
+async def workspace_get(principal=Depends(policies.current_principal)):
+    """当前工作目录。`enabled` 表示这台机器上能不能点开原生选择框。"""
+    path = await hub.store.get_workspace(
+        tenant_id=principal.tenant_id, owner_user_id=principal.user_id)
+    return {'enabled': _workspace_pick_available(), 'path': path}
+
+
+@app.post('/api/workspace')
+async def workspace_set(payload: WorkspacePathRequest,
+                        principal=Depends(policies.current_principal)):
+    path = _resolve_workspace_path(payload.path)
+    await hub.store.set_workspace(
+        tenant_id=principal.tenant_id, owner_user_id=principal.user_id, path=path)
+    return {'path': path}
+
+
+@app.delete('/api/workspace')
+async def workspace_clear(principal=Depends(policies.current_principal)):
+    await hub.store.clear_workspace(
+        tenant_id=principal.tenant_id, owner_user_id=principal.user_id)
+    return {'path': ''}
+
+
+@app.post('/api/workspace/pick')
+async def workspace_pick(principal=Depends(policies.current_principal)):
+    """弹原生目录选择框，选中后立即落库。取消返回 409。"""
+    if not _workspace_pick_available():
+        raise HTTPException(status_code=501, detail='当前环境不支持原生目录选择')
+    path = _resolve_workspace_path(await _pick_directory_native('选择工作目录'))
+    await hub.store.set_workspace(
+        tenant_id=principal.tenant_id, owner_user_id=principal.user_id, path=path)
+    return {'path': path}
+
+
+def _beeftv_launch_url() -> str | None:
+    url = os.getenv('BEEFTV_LAUNCH_URL', '').strip()
+    allowed = {item.strip() for item in os.getenv('BEEFTV_LAUNCH_ALLOWLIST', '').split(',') if item.strip()}
+    if not url or url not in allowed or any(ord(c) < 33 or ord(c) == 127 for c in url) or '\\' in url:
+        return None
+    try:
+        parsed = urlsplit(url)
+        if parsed.query or parsed.fragment or runtime_check.transport_issue(
+                url, allow_loopback=settings.app_env != 'production'):
+            return None
+    except ValueError:
+        return None
+    return url
+
+
+@app.get('/api/beeftv/status')
+async def beeftv_status():
+    return JSONResponse({'enabled': _beeftv_launch_url() is not None},
+                        headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/api/beeftv/launch')
+async def beeftv_launch(principal=Depends(policies.current_principal)):
+    if not principal.authenticated:
+        raise HTTPException(status_code=401, detail='请先登录中台')
+    url = _beeftv_launch_url()
+    if not url:
+        raise HTTPException(status_code=404, detail='BeeFTV 入口未启用')
+    return RedirectResponse(url, status_code=303,
+                            headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'})
 
 
 @app.post('/api/auth/exchange')
@@ -319,6 +461,114 @@ async def drop_session(request: Request, response: Response):
         logger.warning('撤销登录会话失败', exc_info=True)
     _clear_session_cookie(response)
     return {'ok': True, 'revoked': revoked}
+
+
+# ---------- 平台账号密码登录 ----------
+# 给"只想用平台账号进中台"的场景兜一条路：密码交给**平台自己的登录接口**校验，
+# 中台不保存、不校验密码；校验通过后按 platform 用户标识绑定身份、发中台会话。
+# 首次登录自动建号，之后复用同一个中台账号（与 OIDC 登录共用一套 identities）。
+# 未配置 `BEEFTV_API_BASE` 时整体关闭——默认不开放这条入口。
+
+class PlatformLoginRequest(StrictBody):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=256)
+
+
+def _platform_api_base() -> str | None:
+    """平台 API 根地址（只允许 http/https、无 query/fragment）。"""
+    raw = os.getenv('BEEFTV_API_BASE', '').strip().rstrip('/')
+    if not raw:
+        return None
+    try:
+        parsed = urlsplit(raw)
+        if parsed.query or parsed.fragment or not parsed.path:
+            return None
+        if runtime_check.transport_issue(
+                raw, allow_loopback=settings.app_env != 'production'):
+            return None
+    except ValueError:
+        return None
+    return raw
+
+
+def _platform_login_tenant() -> str:
+    return (os.getenv('PLATFORM_LOGIN_TENANT', '').strip()
+            or policies.DEFAULT_TENANT)
+
+
+@app.get('/api/auth/platform-login/status')
+async def platform_login_status():
+    """前端据此决定要不要显示"账号密码登录"。"""
+    return JSONResponse({'enabled': _platform_api_base() is not None
+                         and settings.auth_mode != 'off'},
+                        headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/api/auth/platform-login')
+async def platform_login(payload: PlatformLoginRequest, request: Request,
+                         response: Response):
+    """平台账号密码 → 中台会话。首次登录自动创建账号并绑定身份。"""
+    if settings.auth_mode == 'off':
+        raise HTTPException(status_code=400, detail='AUTH_MODE=off，未启用认证')
+    base = _platform_api_base()
+    if not base:
+        raise HTTPException(status_code=404, detail='平台账号登录未启用')
+    store = getattr(request.app.state, 'store', None)
+    if store is None:
+        raise HTTPException(status_code=503, detail='身份仓储未就绪')
+
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+            upstream = await client.post(base + '/auth/login',
+                                         json={'username': payload.username,
+                                               'password': payload.password})
+    except Exception:                                   # noqa: BLE001
+        logger.warning('平台登录校验不可用', exc_info=True)
+        raise HTTPException(status_code=503, detail='平台身份服务不可用') from None
+    if upstream.status_code in (401, 403):
+        raise HTTPException(status_code=401, detail='账号或密码不正确')
+    if upstream.status_code == 429:
+        raise HTTPException(status_code=429, detail='尝试过于频繁，请稍后再试')
+    if upstream.status_code >= 400:
+        raise HTTPException(status_code=502, detail='平台身份服务返回异常')
+
+    try:
+        body = upstream.json() or {}
+    except ValueError:
+        raise HTTPException(status_code=502, detail='平台身份服务返回异常') from None
+    platform_user = (body.get('data') or {}).get('user') or {}
+    subject = str(platform_user.get('id') or '').strip()
+    if not subject:
+        raise HTTPException(status_code=502, detail='平台未返回用户标识')
+    if str(platform_user.get('status') or 'active') != 'active':
+        raise HTTPException(status_code=403, detail='平台账号已停用')
+    role = ('operator' if str(platform_user.get('role') or '').lower()
+            in ('admin', 'owner', 'operator') else 'member')
+
+    token = auth.new_session_token()
+    try:
+        row = await store.login_platform_identity(
+            platform_id='beeftv', provider='beeftv', subject=subject,
+            display_name=str(platform_user.get('username') or payload.username),
+            role=role, tenant_id=_platform_login_tenant(),
+            session_id='as_' + secrets.token_hex(12),
+            session_digest=auth.digest_of(token),
+            session_expires_at=time.time() + settings.auth_session_ttl,
+            user_agent=request.headers.get('user-agent', ''),
+            remote_addr=(request.client.host if request.client else ''))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail='账号已停用') from exc
+    except Exception:                                   # noqa: BLE001
+        logger.exception('平台账号登录失败')
+        raise HTTPException(status_code=503, detail='登录失败，请重试') from None
+
+    _set_session_cookie(response, token, settings.auth_session_ttl)
+    logger.info('平台账号登录 user=%s platform=beeftv first=%s',
+                row['user_id'], row['created'])
+    return {'user_id': row['user_id'], 'tenant_id': row['tenant_id'],
+            'role': row['role'], 'platform_id': 'beeftv',
+            'first_login': row['created'],
+            'auth_session_id': row['auth_session_id']}
 
 
 # ---------- 对象权限 ----------
@@ -1020,6 +1270,56 @@ def _require_operator(principal) -> None:
     raise HTTPException(status_code=403, detail='需要运维身份（AUTH_OPERATORS）')
 
 
+@app.get('/api/admin/users')
+async def list_admin_users(principal=Depends(policies.current_principal)):
+    if not principal.authenticated or not principal.auth_session_id:
+        raise HTTPException(status_code=401, detail='请先登录')
+    if principal.role != 'operator':
+        raise HTTPException(status_code=403, detail='需要 operator 角色')
+    users = await hub.store.list_tenant_users(principal.tenant_id)
+    return JSONResponse({'total': len(users), 'users': users},
+                        headers={'Cache-Control': 'no-store'})
+
+
+class AdminUserStatusRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    status: Literal['active', 'disabled']
+
+
+@app.patch('/api/admin/users/{user_id}/status')
+async def update_admin_user_status(user_id: str, payload: AdminUserStatusRequest,
+                                   request: Request,
+                                   principal=Depends(policies.current_principal)):
+    if not principal.authenticated or not principal.auth_session_id:
+        raise HTTPException(status_code=401, detail='请先登录')
+    if principal.role != 'operator':
+        raise HTTPException(status_code=403, detail='需要 operator 角色')
+    origins = request.headers.getlist('origin')
+    origin = origins[0] if len(origins) == 1 else ''
+    try:
+        parsed = urlsplit(origin)
+        valid = (parsed.scheme in ('http', 'https') and bool(parsed.hostname)
+                 and not parsed.username and not parsed.password and not parsed.path
+                 and not parsed.query and not parsed.fragment and parsed.port != 0
+                 and not any(c.isspace() for c in origin))
+    except ValueError:
+        valid = False
+    if not valid or origin not in settings.auth_allowed_origins:
+        raise HTTPException(status_code=403, detail='Origin 不在允许列表')
+    try:
+        result = await hub.store.set_tenant_user_status(
+            tenant_id=principal.tenant_id, user_id=user_id,
+            operator_id=principal.user_id, session_id=principal.auth_session_id,
+            status=payload.status)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+
+
 def _own_tenant(principal, tenant_id: str) -> None:
     if tenant_id != principal.tenant_id:
         raise HTTPException(status_code=403, detail='只能管理本企业的接入')
@@ -1085,6 +1385,33 @@ def _public_approval(row: dict) -> dict:
             'manifest_hash': row.get('manifest_hash'),
             'manifest': manifest,
             'expires_at': row.get('expires_at')}
+
+
+@app.get('/api/admin/server-bindings')
+async def read_server_bindings(principal=Depends(policies.current_principal)):
+    """本租户已接入的 MCP 服务端（连接器面板用，只读）。
+
+    只回展示所需字段：`config_ref` 里可能是凭据引用，不对页面暴露。
+    """
+    _require_operator(principal)
+    rows = await hub.store.server_bindings(principal.tenant_id)
+    return {'bindings': [{'server_id': row.get('server_id'),
+                          'transport': row.get('transport'),
+                          'enabled': bool(row.get('enabled')),
+                          'revision': row.get('revision')} for row in rows]}
+
+
+@app.get('/api/admin/tool-policies')
+async def read_tool_policies(principal=Depends(policies.current_principal)):
+    """本租户的工具准入政策（技能面板用，只读）。"""
+    _require_operator(principal)
+    rows = await hub.store.tool_policies(principal.tenant_id)
+    return {'policies': [{'tool_key': row.get('tool_key'),
+                          'effect': row.get('effect'),
+                          'approval_mode': row.get('approval_mode'),
+                          'enabled': bool(row.get('enabled')),
+                          'role': row.get('role') or '',
+                          'user_id': row.get('user_id') or ''} for row in rows]}
 
 
 @app.post('/api/admin/server-bindings')

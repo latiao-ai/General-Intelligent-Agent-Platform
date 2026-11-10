@@ -33,6 +33,12 @@ jobs:
           cache: pip
       - run: python -m pip install -r requirements.lock.txt -r requirements-dev.txt
       - run: python -m pip check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Pi runtime typecheck, tests, and schema golden
+        working-directory: pi-runtime
+        run: npm ci && npm run check
       - run: python -m ruff check src scripts tests
       - run: python -m mypy
       - run: python -W error::RuntimeWarning -m unittest discover -s tests -t . -v

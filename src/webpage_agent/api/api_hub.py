@@ -52,7 +52,7 @@ from webpage_agent.api.task_record import TaskRecord
 from webpage_agent.api.hub_session import HubSessionMixin
 from webpage_agent.api.hub_inputs import HubInputsMixin
 from webpage_agent.api.hub_compensation import HubCompensationMixin
-from webpage_agent.api.hub_recovery import HubRecoveryMixin, _resume_index
+from webpage_agent.api.hub_recovery import HubRecoveryMixin
 from webpage_agent.api.hub_messages import HubSessionMessageMixin
 
 
@@ -246,10 +246,23 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
         epoch = int(run.get('lease_epoch') or 0)
         owner = str(run.get('lease_owner') or '')
 
-        # 第七阶段：在读取/解释旧计划之前先确定运行时。未知引擎或版本不兼容
-        # 在这里抛异常（不回退默认引擎），由上层收尾。
+        # 执行前收成 Pi。存量 langgraph：没有副作用就改挂；已经有步骤或动作
+        # 则停在待核实，不启动旧引擎，也不把副作用重放一遍。
         from webpage_agent.agent import runtime_identity
-        runtime_kind = await runtime_identity.resolve_kind(self.store, run_id)
+        try:
+            await runtime_identity.prepare_execution(
+                self.store, run_id, lease_owner=owner, lease_epoch=epoch)
+        except runtime_identity.RetiredRuntime as exc:
+            logger.error('run %s 不能改挂到 Pi：%s', run_id, exc)
+            await self.store.update_run_owned(
+                run_id, lease_owner=owner, lease_epoch=epoch,
+                status='needs_reconcile', error=str(exc))
+            record = self.tasks.get(task_id) or await self.get(task_id)
+            if record is None:
+                return None
+            record.status = 'needs_reconcile'
+            await record.persist(status='needs_reconcile', state=record.state)
+            return record
 
         task = await self.store.task(task_id)
         if task is None:
@@ -284,56 +297,9 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
         context = execution_control.ExecutionContext(
             run_id=run_id, lease_owner=owner, lease_epoch=epoch)
 
-        # 计划：有就恢复，没有才规划。**空计划不等于"没有计划"**——
-        # `{'steps': []} or None` 会得到一个非空字典，正是旧代码的坑。
-        # 第七阶段：这段「图计划 + 步骤游标」的恢复解释**只属于 LangGraph**。
-        # Pi 有动作却没有「图计划」是**正常状态**——它有自己的版本化快照装配，
-        # 不套用「有动作但没有图计划就异常」这条 LangGraph 规则。
-        if runtime_kind == runtime_identity.KIND_LANGGRAPH:
-            plan = await self.store.plan(run_id) or {}
-            steps = plan.get('steps') or []
-            actions = await self.store.actions_of(run_id)
-            snapshot_state = await self._recovery_state(run_id)
-            waiting = {
-                'asked_questions': [str(q) for q in (snapshot_state.get('asked_questions') or [])
-                                    if str(q).strip()],
-                'clarification': str(snapshot_state.get('clarification') or ''),
-                'intent_version': int(run.get('intent_version') or 0),
-                'processed_intent_version': int(run.get('processed_intent_version') or 0),
-            }
-            if steps:
-                plan_version = int(plan.get('version') or 1)
-                context = context.with_plan_version(plan_version)
-                resume_plan = {'steps': steps, 'summary': plan.get('goal') or '续跑',
-                               'plan_version': plan_version,
-                               'step_index': _resume_index(steps, actions),
-                               **waiting}
-                if actions:
-                    # 落库 + 投递都要 await：这里本来就在协程里，"同步投递"只会
-                    # 得到一个没被 await 的协程（事件静默丢失）。
-                    await record.publish(action(
-                        '沿用已提交的计划',
-                        f'{len(steps)} 步 · 第 {resume_plan["step_index"] + 1} 步继续',
-                        '↩️'))
-            elif actions:
-                # 有动作却没有计划：这不该发生。**不能拿新规划冒充恢复**——那会绕开
-                # 原有动作身份，可能重复副作用。
-                logger.error('run %s 有 %s 个动作但没有计划，转待核实',
-                             run_id, len(actions))
-                # 执行者收尾：这是我们领到的 run，写结论必须带上自己的租约
-                await self.store.update_run_owned(
-                    run_id, lease_owner=owner, lease_epoch=epoch,
-                    status='needs_reconcile', error='有动作但缺失计划，需人工核实')
-                record.status = 'needs_reconcile'
-                await record.persist(status='needs_reconcile', state=record.state)
-                return record
-            else:
-                # 停在追问、计划还没提交：下一轮仍要带着问过的问题和版本，不能从零规划
-                resume_plan = waiting
-        else:
-            # Pi：用自己的版本化快照装配恢复（第七阶段）。不读 plans/steps，
-            # 不套 LangGraph 的「有动作但没图计划就异常」。
-            resume_plan = await self._pi_resume_plan(run_id, run)
+        # 恢复走 Pi 快照。库里若还有计划步骤，附在续跑输入上：
+        # Pi 遇到待核实会停住；按计划收尾的路径用这些步骤复用账本。
+        resume_plan = await self._resume_for_engine(run_id)
 
         history = await self.history(record.session_id)
         prior = await self.prior_context(record.session_id)
@@ -342,22 +308,6 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
         # 让 live/done 这些判断仍然有效：当前协程就是这次执行
         record._task = asyncio.current_task()
 
-        # 所有步骤都已结算、但 run 没来得及收尾（进程在"最后一次结算"与
-        # "写终态"之间消失）：这里只剩收尾，**不能**再跑一遍图——图拿不到
-        # 上一次的 step_outputs，只会得出"什么都没有产出"（文档 §5.4）。
-        # 这条「看快照收尾」的捷径也只属于 LangGraph 的步骤游标；Pi 的
-        # 收尾决策走它自己的快照与恢复决策表。
-        if runtime_kind == runtime_identity.KIND_LANGGRAPH \
-                and resume_plan and resume_plan.get('steps') \
-                and resume_plan['step_index'] >= len(resume_plan['steps']) \
-                and not self._needs_observation():
-            snapshot = await self._recovery_state(run_id)
-            if not snapshot.get('step_outputs'):
-                # 没有快照（旧数据，或崩溃在"结算已提交但快照没写全"）：
-                # 用动作回执重建——已成功的动作本来就把结果留在 receipt 里。
-                snapshot = self._state_from_actions(resume_plan['steps'], actions)
-            if snapshot.get('step_outputs'):
-                return await self._finish_recovered(record, snapshot, context)
         try:
             await self._run(record, history, prior, resume_plan=resume_plan,
                             memory=memory, context=context)
@@ -457,8 +407,8 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
         async def close_open_stage(status: str) -> None:
             """兜底关闭仍未结束的阶段。
 
-            任务被取消时，节点自己发的 stage_end 会丢：它写进 LangGraph 的流队列，
-            而 run_task 的消费循环此刻已经被取消，没人来取。因此必须由中枢直接补发，
+            任务被取消时，节点自己发的 stage_end 可能来不及交给宿主回调。
+            因此必须由中枢直接补发，
             否则前端那一行会永远停在"进行中"、耗时一路涨下去。
             """
             opened = record.open_stage
@@ -551,8 +501,10 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
             max_rounds = max(1, int(settings.run_max_revisions or 1)) + 1
             for round_index in range(max_rounds):
                 if round_index:
-                    # 新一轮要读数据库里最新的计划与补充，而不是拿着旧的提示
-                    resume_plan = await self._resume_plan(record.run_id)
+                    # 新一轮要读数据库里最新的进度与补充，而不是拿着旧的提示。
+                    # Pi 走自己的快照装配；这里若误用图的 `_resume_plan`，
+                    # 有动作、没计划的 Pi run 会丢掉快照并从头再执行。
+                    resume_plan = await self._resume_for_engine(record.run_id)
                 state = await execute_round(resume_plan)
                 status_now = outcome_module.check_run_status(
                     state.get('status') or 'failed')

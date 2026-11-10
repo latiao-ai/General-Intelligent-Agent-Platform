@@ -1,12 +1,12 @@
 # 运行状态机
 
-这篇把运行状态、观察决定、版本计数和失败分段收在一处。依据是当前代码：`src/webpage_agent/core/outcome.py` 的 `RUN_STATUSES`、`src/webpage_agent/core/schemas.py` 的 `ObservationDecision.DECISIONS`、`src/webpage_agent/store/pg_schema.py` 的版本列，以及 `src/webpage_agent/agent/graph.py` 的 `build_graph`。
+这篇把运行状态、观察决定、版本计数和失败分段收在一处。依据是当前代码：`src/webpage_agent/core/outcome.py` 的 `RUN_STATUSES`、`src/webpage_agent/core/schemas.py` 的 `ObservationDecision.DECISIONS`、`src/webpage_agent/store/pg_schema.py` 的版本列，以及规划节点的走向（生产执行是 Pi；节点顺序见 `tests/host_loop.py`）。
 
 这里说的状态是 `runs.status` / `tasks.status` 的通用词汇。步骤、动作、批准、后台作业、决策台账各自另有状态列，不在这张表里。展示词（`answered`、`local_ready`、`deployed`）由 `outcome.label()` 从通用状态和 outcome 推出来，不进状态机。
 
 ## 状态全集与派生集合
 
-`RUN_STATUSES` 是封闭集合，当前 12 个值：
+`RUN_STATUSES` 是封闭集合，当前 13 个值：
 
 | 值 | 在派生集合里 |
 |---|---|
@@ -15,6 +15,7 @@
 | `reconciling` | `ACTIVE_RUN_STATUSES` |
 | `waiting_input` | `STOPPED_RUN_STATUSES`，并因此落在 `TERMINAL_RUN_STATUSES` |
 | `waiting_approval` | `STOPPED_RUN_STATUSES`，并因此落在 `TERMINAL_RUN_STATUSES` |
+| `waiting_external` | `STOPPED_RUN_STATUSES`，并因此落在 `TERMINAL_RUN_STATUSES` |
 | `paused` | `STOPPED_RUN_STATUSES`、`RESUMABLE_RUN_STATUSES`，并因此落在 `TERMINAL_RUN_STATUSES` |
 | `succeeded` | `TERMINAL_RUN_STATUSES` |
 | `partially_succeeded` | `TERMINAL_RUN_STATUSES`、`ATTENTION_RUN_STATUSES` |
@@ -28,14 +29,14 @@
 | 常量 | 怎么来的 | 成员 |
 |---|---|---|
 | `ACTIVE_RUN_STATUSES` | 手写 | `queued`、`running`、`reconciling` |
-| `STOPPED_RUN_STATUSES` | 手写 | `paused`、`waiting_input`、`waiting_approval` |
+| `STOPPED_RUN_STATUSES` | 手写 | `paused`、`waiting_input`、`waiting_approval`、`waiting_external` |
 | `TERMINAL_RUN_STATUSES` | **差集** `RUN_STATUSES - ACTIVE_RUN_STATUSES` | 除上面三个活跃值以外的全部，含暂停和等待 |
 | `ATTENTION_RUN_STATUSES` | 手写 | `needs_reconcile`、`partially_succeeded` |
 | `RESUMABLE_RUN_STATUSES` | 手写。`resume` 只接受这些 | `paused`、`interrupted`、`queued` |
 
 `TERMINAL_RUN_STATUSES` 用差集，意味着往 `RUN_STATUSES` 里加一个新值时，只要没同时写进 `ACTIVE_RUN_STATUSES`，它会自动变成终态。它不会自动变成可领取、可恢复或可接受补充。领取条件是另一份手写列表（`queued` / `running` / `reconciling`），和 `ACTIVE_RUN_STATUSES` 目前一致，但是复制出来的，不是引用这份集合。
 
-这里的「终态」是「这次执行不再往前推进」，不是「目标已经结束、也不能再回来」。`paused`、`waiting_input`、`waiting_approval` 既在 `STOPPED_RUN_STATUSES` 里，也在 `TERMINAL_RUN_STATUSES` 里。SSE 用终态集合判断要不要收流，所以停下来等人时连接也会结束。
+这里的「终态」是「这次执行不再往前推进」，不是「目标已经结束、也不能再回来」。`paused`、`waiting_input`、`waiting_approval`、`waiting_external` 既在 `STOPPED_RUN_STATUSES` 里，也在 `TERMINAL_RUN_STATUSES` 里。SSE 用终态集合判断要不要收流，所以停下来等人或等外部任务时连接也会结束。
 
 `check_run_status` 只接受 `RUN_STATUSES`（历史展示词先经 `normalize_status` / `LEGACY_STATUS` 折进来）。越界时不抛异常：打一条 error 日志，返回 `failed`。调用方会把这个 `failed` 写进去，原来的非法值不会留在库里。
 
@@ -43,7 +44,7 @@
 
 图内部的 `AgentState.status` 还会出现 `planned` 和空字符串。它们不是 `RUN_STATUSES` 的成员。`run_task` 收尾时，不在 `TERMINAL_RUN_STATUSES` 里的值会先交给 `final_status` 重算，再经过 `check_run_status`。因此 `planned` 通常到不了 `runs.status`。
 
-`waiting_external` 是 `runs` 上的整数标记，表示还在等外部任务，不是第 13 个状态。
+`waiting_external` **是** `RUN_STATUSES` 里的状态：`runs.status = 'waiting_external'` 表示 Pi 已退出、在等已受理的外部任务。`runs.waiting_external` 另外还有一个整数列，只做租约围栏（旧执行者不能把标记改回去），不是第二套状态词汇。以前把整数列写成「不是状态」，和代码里的 `RUN_STATUSES` 不一致；以状态值为准。
 
 ## 每个状态怎么进入、怎么离开
 
@@ -56,8 +57,9 @@
 | `queued` | 创建 run（新任务、补偿、手动部署）时的初值；领到了却没能执行时 `requeue_run_owned` 放回；租约失效且没有 `in_flight` 动作时对账放回；`resume` 先改回排队再领；批准通过；`waiting_input` 收到补充后重新排队；外部任务完成且当时停在 `waiting_input` | `claim_run` 变成 `running`。还没人领时暂停，同一事务直接变成 `paused` |
 | `running` | `claim_run`。条件是当前为 `queued` / `running` / `reconciling`，且租约为空或已过期。成功时 `lease_epoch` 加 1 | 收尾写成下面各停住状态；安全边界上的暂停写成 `paused`；取消且没有未定动作写成 `cancelled`；执行器未捕获异常写成 `failed`；租约失效后对账写成 `queued` 或 `reconciling` |
 | `reconciling` | 对账发现 `running` / `reconciling` 的租约已死，且有 `in_flight` 动作。那些动作先改成 `unknown`，run 改成这个状态 | 仍可被 `claim_run` 领回 `running`。下一步碰到未定动作后通常再进入 `needs_reconcile`。对 `reconciling` 发暂停只登记 `pause_requested`，不立刻改状态 |
-| `waiting_input` | 预算用尽（上下文、运行次数、工具次数、决策次数、修订次数）；计划校验失败或模型没给出可执行步骤；决定是 `wait_input`，或修订候选没通过校验；`wait_async` 发现外部任务已受理；`planning_failure` 遇到预算类异常 | 不走 `resume`。补充被接受后重新排队，回到 `queued`。外部任务失败时，若当时是 `waiting_input` / `running` / `queued`，会改成 `needs_reconcile` |
-| `waiting_approval` | 决定是 `wait_approval`；执行步骤时授权层抛出 `ApprovalRequired` | 批准通过回到 `queued`。拒绝写成 `failed`。没有本机待批单时，补充也可以把它重新排队 |
+| `waiting_input` | 预算用尽（上下文、运行次数、工具次数、决策次数、修订次数）；计划校验失败或模型没给出可执行步骤；决定是 `wait_input`，或修订候选没通过校验；`wait_async` 发现外部任务已受理；`planning_failure` 遇到预算类异常。Pi 路径：`request_input`，或同一工具参数连续校验失败 | 不走 `resume`。补充被接受后重新排队，回到 `queued`。外部任务失败时，若当时是 `waiting_input` / `running` / `queued`，会改成 `needs_reconcile` |
+| `waiting_approval` | 决定是 `wait_approval`；执行步骤时授权层抛出 `ApprovalRequired`。Pi 路径：工具回执 `needs_approval`，快照 `phase=awaiting_approval` | 批准通过回到 `queued`。拒绝写成 `failed`。没有本机待批单时，补充也可以把它重新排队 |
+| `waiting_external` | Pi 工具回执 `accepted`（远端已受理、结果未定），或恢复决策 `resume_wait` 且没有待审批。图路径的 `wait_async` 仍可能写成 `waiting_input`（见下），不把外部等待记成这个状态 | 外部任务完成后重新排队。失败改成 `needs_reconcile`。这是持久等待：收尾不写最终答复，避免占掉 `final:<run_id>` 去重键 |
 | `paused` | `queued` 上调用暂停，直接改状态。`running` 上调用暂停只写 `pause_requested`，执行者在下一次准入前看到后，由 `pause_at_boundary` 写成 `paused` | `resume` 在没有未定动作时改回 `queued`。可以接受补充 |
 | `succeeded` | `verify_completion` 判定完成条件已满足；或 `finalize` 调用 `final_status`：补偿计划没有失败、部署回执成功、有回答或产物、或计划里的步骤全部成功且副作用都已核实 | 停在这里。补充被拒绝，`resume` 不接受 |
 | `partially_succeeded` | 完成条件有未满足项但已经有产物；要求核对失败或判定未完成；工具失败后补偿回滚也有失败 | 停在这里，属于 `ATTENTION_RUN_STATUSES`。补充按已结束拒绝。收尾时要求没有未处理补充 |
@@ -79,7 +81,7 @@
 | 决定 | 图接下来去哪 | 对 run 状态 |
 |---|---|---|
 | `continue` | 还有剩余步骤就去 `run_step`；片段已经走完则改去 `verify_completion`，避免空转 | 不改 |
-| `revise` | 候选通过校验后去 `persist_plan`。图状态会写成 `planned`，这不是十二个运行状态之一 | 校验失败则停在 `waiting_input`。通过校验不把 run 收成终态 |
+| `revise` | 候选通过校验后去 `persist_plan`。图状态会写成 `planned`，这不是十三个运行状态之一 | 校验失败则停在 `waiting_input`。通过校验不把 run 收成终态 |
 | `wait_input` | 问题没问过：结束本轮图。同一组问题换措辞再问：改去 `verify_completion` | 新问题写成 `waiting_input` |
 | `wait_approval` | 结束本轮图 | 写成 `waiting_approval` |
 | `finish` | 去 `verify_completion`。完成由程序核对，不由这条决定宣布 | 不直接写成 `succeeded` |
@@ -199,6 +201,29 @@ intake → plan → persist_plan → run_step → observe_result → verify_comp
 
 文件顶部的控制流注释还写着 `revise_plan` 直接去 `persist_plan`、`persist_plan` 不去 `revise_plan`。以 `build_graph` 的条件边为准。
 
+## Pi 工具循环与图语义
+
+新建业务 run 的引擎是 Pi。库里 `runtime_kind=langgraph` 的存量行在执行前改挂到 Pi（没有副作用时），或停在待核实（已经有步骤或动作时）。
+
+Pi 不是图。它不实现 `plan` / `revise_plan` / `verify_completion` 这些节点，也不在工具循环里假装有步骤游标。画布主路径是：
+
+`创建任务 → claim → PiRuntime → 工具经 governed_call → 检查点/快照 → 等待或终态`
+
+和画布有关的等待：
+
+| 宿主状态 | Pi 怎么进入 | 怎么离开 |
+|---|---|---|
+| `waiting_input` | 模型调用宿主工具 `request_input`，或同一工具参数连续两次校验失败 | 补充输入后 `_pi_resume_plan` 把停靠的 tool result 交付回去，再继续工具循环。没有新输入则 `resume_wait_input`，不重跑、不报成功 |
+| `waiting_approval` | 授权层 `needs_approval` | 批准后 `resume_admit` 重放原调用；拒绝或过期转 `needs_reconcile` |
+| `waiting_external` | 工具回执 `accepted` | 外部任务完成后 `resume_deliver` 注入结果。Pi 崩溃不自动重放未定调用 |
+| `succeeded` / `needs_reconcile` | 有答复，或平台写经 `platform_verify` 回读 | 写证据不齐是 `needs_reconcile`，不能靠模型解释文本收成成功 |
+
+补偿和「部署上一份产物」也是 Pi run（`runtime_kind=pi`），但不是模型自由挑工具。两条都新建脚本化 Pi run：`resume_plan.scripted=true`，步骤按既定顺序经 `HostToolCaller.call_declared` → `governed_call` 执行，不启动模型桥接。补偿步骤来自图计划里已成功且声明了 `compensate` 的步骤；Pi 原 run 没有计划时，来自账本成功回执里结算时冻住的 `compensate`。部署是单步 `deploy`。脚本记在 Pi 快照的 `host_result_state.script`，恢复走 `_pi_resume_plan`，不走图的 `_resume_plan`。原 run 的引擎不变。没有 `scripted` 标记时，Pi 仍忽略 `resume_plan.steps`——那是只改引擎、不执行步骤的空转。
+
+补充要求若在收尾时才进来，下一轮必须走 `_resume_for_engine`。Pi 不能改读图的 `plans/steps`，否则快照被丢掉，已执行的工具会再跑一遍。显式 `resume` 同样不把「有动作、没有图计划」当成异常：那是 Pi 的正常形态。图路径仍拒绝这种组合。
+
+写工具默认关闭。`PI_WRITE_TOOL_KEYS` 只有在 `PI_WRITE_TOOLS_ENABLED=true` 时才并入白名单，并写审计日志。只配键、不开开关，键被忽略。
+
 ## 已知问题与后续
 
 1. 运行状态的写入分散在 `agent/nodes.py`、`agent/decide.py`、`api/`、`store/`，另外 `core/external_tasks.py` 会写成 `needs_reconcile` 或 `queued`，批准通过/拒绝会写成 `queued` 或 `failed`。按十二个状态字面量粗查，节点、决定、接口、仓储大约分别是 28、12、39、23 处；`status=某个变量` 还不在这些数字里。图的边已经集中在 `build_graph`。这次只把事实记下来，不合并写入点。
@@ -209,4 +234,4 @@ intake → plan → persist_plan → run_step → observe_result → verify_comp
 6. `verify_completion` 在存在未检查条件时，事件文案写「按部分完成报告」，接着仍把状态设为 `succeeded`，除非后续的要求核对失败。部分完成这个状态要看 `partially_succeeded` 的赋值，不能看这句文案。
 7. 登录失效时 SSE 会发 `status` 为 `interrupted` 的结束帧，不修改 `runs.status`。
 8. `dispatch` 没有赋值点；`planning_failure.stage` 会吃进工具名；`STAGE_LABELS` 写死了当前能力包的工具名，还留着没有引用的 `manual_deploy`。三套词表要分开改。
-9. `pg_schema.py` 和 `run_intent` 的注释仍把版本说成三个，而且两处点名的成员不一样。状态以 `RUN_STATUSES` 的 12 个值为准（含 `paused`），版本以本节的四个计数器为准。`docs/README.md` 第 4 节的个数已与这 12 个值对齐，细节以本页为准。
+9. `pg_schema.py` 和 `run_intent` 的注释仍把版本说成三个，而且两处点名的成员不一样。状态以 `RUN_STATUSES` 的 13 个值为准（含 `paused` 与 `waiting_external`），版本以本节的四个计数器为准。`docs/README.md` 第 4 节的个数已与这 13 个值对齐，细节以本页为准。

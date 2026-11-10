@@ -17,5 +17,7 @@ os.environ.setdefault('AUTH_MODE', 'off')
 os.environ.setdefault('API_RATE_LIMIT_ENABLED', 'false')
 os.environ.setdefault('TENANT_BUDGET_ENABLED', 'false')
 os.environ.setdefault('MCP_SERVERS', '[]')
+# 不钉引擎。生产默认是 Pi，用例跟同一默认。子进程若要覆盖，自己写
+# DEFAULT_RUNTIME_KIND，不要指望本进程偷偷改回旧引擎。
 # PG_TEST_DSN 故意不设默认值：`reset_db()` 会 TRUNCATE，指错库就是数据事故。
 # 必须由调用方显式给出（库名含 test），否则用例按 SkipTest 跳过。

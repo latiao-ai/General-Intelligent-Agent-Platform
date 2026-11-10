@@ -1,10 +1,16 @@
-"""补偿 mixin：把已成功步骤翻成撤销计划，另起一条 run 执行。
+"""补偿 mixin：把已成功步骤翻成撤销计划，另起一条 Pi run 按脚本执行。
 
-方法体与拆分前逐字相同。
+撤销步骤有两个来源，都是事先写好的，不让模型看着账本现编：
+
+1. 图计划里声明了 `compensate`、并且步骤状态是 succeeded（存量 LangGraph run）；
+2. 账本成功动作的回执里冻着 `compensate`（Pi run 没有计划时走这条）。
+   回执由 `tools.compensation.attach_compensate` 在结算时写入。
 """
 import asyncio
 import uuid
 
+from webpage_agent.agent import runtime_identity
+from webpage_agent.agent.pi_script import scripted_resume
 from webpage_agent.core import outcome as outcome_module
 from webpage_agent.store.pg_store import now
 
@@ -15,11 +21,18 @@ class HubCompensationMixin:
     # ---------- 补偿（文档 §8.4） ----------
 
     async def compensation_steps(self, run_id: str) -> list[dict]:
-        """把"已成功且声明了 compensate 的步骤"翻成一组撤销步骤（逆序）。
+        """把已成功、且事先声明了撤销的动作翻成一组撤销步骤（逆序）。
 
-        状态只认**库里**的 steps：进程重启后内存里的 state 已经没了，而
-        "哪些步骤真的成功过"必须以落库结果为准，不能凭计划推断。
+        图计划优先：存量 run 的 `compensate` 写在计划步骤上，步骤状态以库为准。
+        计划给不出撤销步骤时（Pi 原 run 通常没有 plan.steps），改读账本成功
+        动作回执里冻住的 `compensate`。两种都只认已经落库的成功，不凭推断。
         """
+        from_plan = await self._compensation_steps_from_plan(run_id)
+        if from_plan:
+            return from_plan
+        return await self._compensation_steps_from_actions(run_id)
+
+    async def _compensation_steps_from_plan(self, run_id: str) -> list[dict]:
         plan = await self.store.plan(run_id) or {}
         done = {row['step_id']: row.get('status')
                 for row in await self.store.steps_of(run_id)}
@@ -30,13 +43,25 @@ class HubCompensationMixin:
                 continue
             if done.get(step.get('step_id')) != 'succeeded':
                 continue
-            undo.append({'tool': comp['tool'],
-                         'step_id': f'undo:{step["step_id"]}',
-                         'args': comp.get('args') or {},
-                         'depends_on': [], 'why': f'补偿步骤 {step["step_id"]}',
-                         'tool_key': comp.get('tool_key') or '',
-                         'effect': comp.get('effect') or 'unknown',
-                         'compensates': step['step_id']})
+            undo.append(_undo_step(comp, origin=str(step.get('step_id') or '')))
+        return undo
+
+    async def _compensation_steps_from_actions(self, run_id: str) -> list[dict]:
+        actions = await self.store.actions_of(run_id)
+        undo = []
+        seen: set[str] = set()
+        for act in reversed(actions or []):
+            if str(act.get('status') or '') != 'succeeded':
+                continue
+            receipt = act.get('receipt') if isinstance(act.get('receipt'), dict) else {}
+            comp = receipt.get('compensate') if isinstance(receipt, dict) else None
+            if not isinstance(comp, dict) or not comp.get('tool'):
+                continue
+            origin = str(act.get('step_id') or '')
+            if not origin or origin in seen:
+                continue
+            seen.add(origin)
+            undo.append(_undo_step(comp, origin=origin))
         return undo
 
     async def compensate(self, run_id: str) -> dict | None:
@@ -64,16 +89,20 @@ class HubCompensationMixin:
 
         before = dict(record.state or {})
         new_run_id = uuid.uuid4().hex[:12]
+        # 补偿 run 跟默认引擎一样走 Pi，但步骤是脚本，不是模型自由挑工具。
+        # 原 run 的 runtime_kind 不动。
         await self.store.create_run(new_run_id, record.task_id, status='queued',
                               tenant_id=run.get('tenant_id') or 'default',
-                              owner_user_id=str(run.get('owner_user_id') or 'default'))
+                              owner_user_id=str(run.get('owner_user_id') or 'default'),
+                              runtime_kind=runtime_identity.KIND_PI)
+        created = await self.store.run(new_run_id) or {}
         record.run_id = new_run_id
+        resume_plan = scripted_resume(
+            undo, kind='compensation', summary='补偿已完成步骤',
+            intent_version=int(created.get('intent_version') or 1))
         outcome = await self._claim_and_arm(
             record, new_run_id,
-            lambda claimed: self._run(
-                record, [], {},
-                resume_plan={'steps': undo, 'summary': '补偿已完成步骤',
-                             'kind': 'compensation'}),
+            lambda claimed: self._run(record, [], {}, resume_plan=resume_plan),
             wait=True)
         if outcome != 'started':
             raise RuntimeError('无法领取补偿运行，请稍后重试')
@@ -93,3 +122,13 @@ class HubCompensationMixin:
         return {'run_id': new_run_id,
                 **outcome_module.view(record.status, state),
                 'steps': state.get('compensations') or []}
+
+
+def _undo_step(comp: dict, *, origin: str) -> dict:
+    return {'tool': comp['tool'],
+            'step_id': f'undo:{origin}',
+            'args': comp.get('args') or {},
+            'depends_on': [], 'why': f'补偿步骤 {origin}',
+            'tool_key': comp.get('tool_key') or '',
+            'effect': comp.get('effect') or 'unknown',
+            'compensates': origin}

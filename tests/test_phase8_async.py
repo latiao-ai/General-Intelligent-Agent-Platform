@@ -12,7 +12,6 @@
 
 真实 MCP / 远端服务联调另行报告（需真实供应商凭据与可查询任务身份）。
 """
-import os
 import unittest
 
 from tests.exec_env import PG_DSN, new_store, reset_db, seed_run, valid_test_dsn
@@ -307,7 +306,6 @@ class PiWaitProtocolTests(unittest.TestCase):
 
     def test_tool_result_accepts_accepted_fields(self):
         from webpage_agent.agent import pi_protocol as proto
-        from webpage_agent.agent.pi_protocol import PROTOCOL_VERSION
         # make_message 允许 accepted / remote_task_id 字段（回执形状校验不拒绝）
         msg = proto.make_message('e1', 'tool_result', call_id='c1', ok=False,
                                  accepted=True, remote_task_id='job-9')

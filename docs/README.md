@@ -174,8 +174,8 @@ python --version             # Python 3.12.15
 - 任务成功、中断、失败三种结局下，进行中那一行都会被冻结并标注状态（`已中断` / `已失败`），
   不会一直停在"进行中"、耗时一路涨
 
-> 中断场景需要任务中枢**兜底补发**结束事件：节点自己发的 `stage_end` 会写进 LangGraph
-> 的流队列，而消费循环此刻已被取消、没人来取，事件就此丢失。前端也有一层兜底。
+> 中断场景需要任务中枢**兜底补发**结束事件：进行中的阶段写在宿主回调里，
+> 消费循环被取消时没人来收尾。前端也有一层兜底。
 
 > 「收到指令 → 开始搜索」这个合成阶段**不在界面上展示**：它 = 解析耗时 + 提交开销
 > （实测只差 0.05 秒），在逐步显示的过程流里和「解析需求」完全重复。后端仍会记录它，
@@ -184,8 +184,8 @@ python --version             # Python 3.12.15
 用服务端时刻（事件里的 `at`）而不是"前端收到的时刻"来算：事件经网络/轮询到达会晚
 几十到几百毫秒，按收到时刻计时会偏短。本机与服务端的时钟差在首个事件时自动校正。
 
-> 节点包装层统一包成 `async` 是有意为之：LangGraph 会把**同步**节点丢进线程池，
-> 而 `get_stream_writer()` 依赖 contextvars，跨线程会拿不到 writer、事件静默丢失。
+> 事件通过 `observe/events.py` 的 sink 交给当前执行。没有绑定 sink 时直接跳过，
+> 不依赖额外的流式框架。
 
 ### 实时展示执行过程
 
@@ -569,8 +569,10 @@ psql -d agent_platform -c "SELECT (SELECT count(*) FROM sessions) 会话,
   账本 action、`compensated_at`），不共用这把钥匙。键按 `主体+接口+键` 作用域化，
   默认 24 小时过期（`IDEMPOTENCY_TTL_SECONDS`）。
 - **补偿依赖"有撤销工具"**。计划里给某一步写了 `compensate`，失败时才会逆序执行；
-  服务端没有撤销工具时这一步就是空的，系统不会假装撤回过。结果未定（unknown）
-  的动作**不自动补偿**——那等于猜着再发一次写请求。
+  服务端没有撤销工具时这一步就是空的，系统不会假装撤回过。没有图计划的 Pi run，
+  手工补偿读的是写动作结算时冻进回执的 `compensate`（能力包声明，参数已解析），
+  不是让模型看着账本现编。结果未定（unknown）的动作**不自动补偿**——那等于猜着再发一次写请求。
+  手工补偿和「部署上一份产物」新建的是脚本化 Pi run：按既定步骤走治理链，不启动模型。
 - **多 MCP 服务端已支持，但只在本机用假服务端验证过**。`MCP_SERVERS` 配多个后，
   工具名变成 `mcp__<server_id>__<tool>`；只有一个服务端时保持 `mcp__<tool>`，
   旧计划仍可用（`find_tool` 会按尾部唯一匹配回退）。
@@ -639,7 +641,7 @@ python -m scripts.mock_identity_platform --port 8090 --hub http://127.0.0.1:8010
 
 | 层 | 存在哪 | 词汇 | 会不会随能力增长 |
 |---|---|---|---|
-| 状态机 | `tasks.status` / `runs.status` | 12 个通用值：`queued` `running` `reconciling` `waiting_input` `waiting_approval` `paused` `succeeded` `partially_succeeded` `needs_reconcile` `failed` `cancelled` `interrupted` | **不会**。接第 N 个 MCP Server 只让 `tool_key` 的行数变多 |
+| 状态机 | `tasks.status` / `runs.status` | 13 个通用值：`queued` `running` `reconciling` `waiting_input` `waiting_approval` `waiting_external` `paused` `succeeded` `partially_succeeded` `needs_reconcile` `failed` `cancelled` `interrupted` | **不会**。接第 N 个 MCP Server 只让 `tool_key` 的行数变多 |
 | outcome | `state.outcome`（随任务持久化、随接口返回） | `{kind, produced[], effects[], answered, unverified}` | 会。它是数据，可以有无穷多种组合 |
 | 展示标签 | 接口字段 `status` / 前端文案表 | `answered` `local_ready` `deployed` `deploy_needs_check` `compensated` … | 会，而且随便加——它不进状态机、不写库 |
 

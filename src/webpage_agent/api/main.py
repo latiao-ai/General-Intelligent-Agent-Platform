@@ -109,16 +109,28 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         # LangGraphRuntime）负责驱动图、合并增量、记录耗时并透传节点内部事件。
         # 控制流异常与取消原样穿过，由下面这段宿主收尾统一处理（§4.3、§7.2）。
         #
-        # 第七阶段：按 run 的引擎归属分流。有账本时从库里读已存归属（在解释旧
-        # 计划之前），Pi 走 PiRuntime；无账本（CLI 直调）走默认 LangGraph。
+        # 按 run 的引擎归属分流。有账本时从库里读已存归属（在解释旧计划之前）。
+        # 无账本的 CLI 直调走 default_kind()：未设置环境变量时是 Pi。
         runtime_kind = ''
         if ledger is not None and getattr(ledger, 'store', None) is not None \
                 and run_id:
             from webpage_agent.agent import runtime_identity
-            runtime_kind = await runtime_identity.resolve_kind(ledger.store, run_id)
-        async with asyncio.timeout(settings.task_timeout):
-            await get_runtime(runtime_kind).run(
-                state, on_event=on_event, progress=progress)
+            ctx = getattr(ledger, 'context', None)
+            try:
+                runtime_kind = await runtime_identity.prepare_execution(
+                    ledger.store, run_id,
+                    lease_owner=str(getattr(ctx, 'lease_owner', '') or ''),
+                    lease_epoch=int(getattr(ctx, 'lease_epoch', 0) or 0))
+            except runtime_identity.RetiredRuntime as exc:
+                state['status'] = 'needs_reconcile'
+                state['failure'] = str(exc)
+                state['errors'].append({
+                    'stage': 'runtime', 'type': 'RetiredRuntime', 'detail': str(exc)})
+                runtime_kind = None
+        if runtime_kind is not None:
+            async with asyncio.timeout(settings.task_timeout):
+                await get_runtime(runtime_kind).run(
+                    state, on_event=on_event, progress=progress)
             # 第七阶段收口：pi_resume 是**运行时专用**的恢复输入（含不可 JSON 序列化
             # 的 RecoveryDecision 对象）。runtime 已原地消费完毕，这里 pop 掉，避免
             # 落盘 state.json 时序列化失败——恢复事实已由 runtime 写进版本化 Pi 快照，
@@ -129,14 +141,18 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         # "失租"和"暂停"退化成普通失败，中枢再也没法区分该由谁收尾（§4.3、§7.2）。
         raise
     except RecursionBudgetExceeded as exc:
-        # 保留已执行步骤和真实副作用，预算耗尽按可恢复的中断处理。
-        # 这是运行时适配层折出的通用结果，宿主不感知底层是 LangGraph 还是 Pi。
-        limit = getattr(exc, 'limit', None) or settings.graph_recursion_limit
-        logger.warning('任务 %s 达到步数上限（%s），按可续跑收尾', task_id, limit)
+        # 保留已执行步骤和真实副作用，步数预算或无进展停手都按可续跑的中断处理。
+        limit = getattr(exc, 'limit', None)
+        detail = str(getattr(exc, 'safe_message', '') or exc)
+        if limit and str(limit) not in detail:
+            detail = (
+                f'这一轮已经用满 {limit} 步预算，先停在这里；'
+                '已经完成的步骤与产物都保留，可以从断点继续。')
+        elif not detail:
+            detail = '这一轮先停在这里；已经完成的步骤与产物都保留，可以从断点继续。'
+        logger.warning('任务 %s 中断（%s），按可续跑收尾', task_id, detail)
         state['status'] = 'interrupted'
-        state['failure'] = (
-            f'这一轮已经用满 {limit} 步预算，先停在这里；'
-            '已经完成的步骤与产物都保留，可以从断点继续。')
+        state['failure'] = detail
     except Exception as exc:
         state['status'] = 'failed'
         state['errors'].append({'stage': 'runtime', 'type': type(exc).__name__})

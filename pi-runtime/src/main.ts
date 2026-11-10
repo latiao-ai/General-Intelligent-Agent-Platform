@@ -35,7 +35,7 @@ import {
   type ToolCallMessage,
 } from './protocol.js';
 import { PiSession } from './session.js';
-import { buildToolsFromHost, toToolCallMessage } from './tools.js';
+import { assembleToolsFromHost, toToolCallMessage } from './tools.js';
 
 // ---- 输出（stdout 只写协议） ----
 
@@ -66,6 +66,7 @@ interface PendingTool {
     remote_task_id?: string;
     needs_approval?: boolean;
     approval_id?: string;
+    needs_input?: boolean;
   }) => void;
   timer: NodeJS.Timeout;
 }
@@ -160,6 +161,9 @@ function handleModelAdmit(msg: Extract<InboundMessage, { type: 'model_admit' }>)
   }
   pendingModelRequests.delete(msg.request_id);
   clearTimeout(pending.timer);
+  if (msg.allow && typeof msg.current_time_prompt === 'string') {
+    session?.setCurrentTimePrompt(msg.current_time_prompt);
+  }
   pending.resolve(!!msg.allow);
 }
 
@@ -315,6 +319,7 @@ function handleToolResult(msg: Extract<InboundMessage, { type: 'tool_result' }>)
     remote_task_id: msg.remote_task_id,
     needs_approval: !!msg.needs_approval,
     approval_id: msg.approval_id,
+    needs_input: !!msg.needs_input,
   });
 }
 
@@ -339,7 +344,7 @@ function handleShutdown(): void {
 }
 
 /** 发送一次工具调用请求，等待 Python 回执（call_id → Promise）。 */
-function dispatchToolCall(call: ToolCall): Promise<{ ok: boolean; result?: unknown; error?: string; accepted?: boolean; remote_task_id?: string; needs_approval?: boolean; approval_id?: string }> {
+function dispatchToolCall(call: ToolCall): Promise<{ ok: boolean; result?: unknown; error?: string; accepted?: boolean; remote_task_id?: string; needs_approval?: boolean; approval_id?: string; needs_input?: boolean }> {
   // 执行内重复 call_id 检查：同一个 call_id 已在等待回执，说明 Pi 重复派发，
   // 明确报错而不是覆盖旧 Promise（否则旧的会永久挂起、新的丢失回执）。
   if (pendingTools.has(call.id)) {
@@ -348,7 +353,7 @@ function dispatchToolCall(call: ToolCall): Promise<{ ok: boolean; result?: unkno
   }
   const msg: ToolCallMessage = toToolCallMessage(executionId, call);
   send(msg);
-  return new Promise<{ ok: boolean; result?: unknown; error?: string; accepted?: boolean; remote_task_id?: string; needs_approval?: boolean; approval_id?: string }>((resolve) => {
+  return new Promise<{ ok: boolean; result?: unknown; error?: string; accepted?: boolean; remote_task_id?: string; needs_approval?: boolean; approval_id?: string; needs_input?: boolean }>((resolve) => {
     const timer = setTimeout(() => {
       const pending = pendingTools.get(call.id);
       if (pending) {
@@ -424,6 +429,18 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
       };
       const reply = await dispatchToolCall(call);
       if (cancelled) {
+        return;
+      }
+      if (reply.accepted) {
+        sendFinished('waiting', { wait_reason: 'external' });
+        return;
+      }
+      if (reply.needs_approval) {
+        sendFinished('waiting', { wait_reason: 'approval' });
+        return;
+      }
+      if (reply.needs_input) {
+        sendFinished('waiting', { wait_reason: 'input' });
         return;
       }
       if (reply.ok) {
@@ -532,6 +549,10 @@ async function runTurn(input: string, systemPrompt?: string, history?: Array<{ r
         sendFinished('waiting', { wait_reason: 'approval' });
         return;
       }
+      if (reply.needs_input) {
+        sendFinished('waiting', { wait_reason: 'input' });
+        return;
+      }
       // 失败回执：向模型传 reply.error（保留原始错误正文），不能继续传空的
       // reply.result —— 否则模型会拿到「成功但结果为空」，无法区分失败。
       if (reply.ok) {
@@ -567,7 +588,12 @@ async function handleStart(msg: Extract<InboundMessage, { type: 'start' }>): Pro
   // tools=[] 表示本轮无工具，**不回退** echo/add。失败则明确报错。
   let tools;
   try {
-    tools = buildToolsFromHost(msg.tools ?? []);
+    const assembled = assembleToolsFromHost(msg.tools ?? []);
+    if (assembled.dropped.length) {
+      log('已跳过参数 schema 不合格的工具：',
+        assembled.dropped.map((item) => item.name).join(','));
+    }
+    tools = assembled.tools;
   } catch (e) {
     sendError(e instanceof Error ? e.message : String(e));
     return;

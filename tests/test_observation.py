@@ -158,8 +158,10 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub(store, owner_id='w1')
         stack = install_tools(tools or {})
         from webpage_agent.agent import nodes as nodes_module
+        from tests.exec_env import install_host_loop
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
                 stack, patch.object(nodes_module, 'structured_call', model), \
+                install_host_loop(), \
                 override_settings(observe_enabled=observe_enabled):
             await worker.run_once(hub, 'w1', run_id='run1')
         return store, remote, model
@@ -423,8 +425,9 @@ class ObserveDecideTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub(store, owner_id='w1')
         import scripts.run_worker as worker
         from webpage_agent.agent import nodes as nodes_module
+        from tests.exec_env import install_host_loop
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
-                install_tools(tools), \
+                install_tools(tools), install_host_loop(), \
                 patch.object(nodes_module, 'structured_call', model), \
                 override_settings(run_max_decisions=0):
             await worker.run_once(hub, 'w1', run_id='run1')
@@ -484,9 +487,11 @@ class ProgressGuardTests(unittest.IsolatedAsyncioTestCase):
         hub = self.hub(store, owner_id='w1')
         import scripts.run_worker as worker
         from webpage_agent.agent import nodes as nodes_module
+        from tests.exec_env import install_host_loop
         with tempfile.TemporaryDirectory() as folder, install_main(folder), \
                 install_tools(tools), \
                 patch.object(nodes_module, 'structured_call', model), \
+                install_host_loop(), \
                 override_settings(run_max_no_progress=1):
             await worker.run_once(hub, 'w1', run_id='run1')
         run = await store.run('run1')

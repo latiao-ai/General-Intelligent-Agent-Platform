@@ -65,6 +65,10 @@ def reply_text(state: dict) -> str:
             return f'本次未完成：{reason}。'
         return '本次没有产出可用结果。'
 
+    if status == 'waiting_external':
+        return (state.get('failure')
+                or '已交给外部处理，结果回来后会继续，这一轮先停在这里。')
+
     if status in ('waiting_input', 'waiting_approval'):
         # 计划没过校验就停下来等人补信息——不能说"任务结束"了事
         reason = state.get('failure') or '需要补充信息后才能继续'

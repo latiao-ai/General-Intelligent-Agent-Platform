@@ -44,7 +44,15 @@ TURN_FOLLOWUP = 'v9_turn_followup'
 # 会话 turn 可信主体：tenant_id / owner_user_id（供只读查询工具从 turn 本身取得
 # 当前用户身份，不依赖业务 run 碰巧提供）。第十一阶段 A 组第 5 点。
 TURN_PRINCIPAL = 'v10_turn_principal'
-LATEST = TURN_PRINCIPAL
+# 新建 run 的列默认改为 pi。已有行保持原 runtime_kind（存量仍是 langgraph）。
+RUNTIME_DEFAULT_PI = 'v11_runtime_default_pi'
+# 会话 turn 上的角色。接纳时已经传入 owner_role，领取后要原样交给查询执行记录。
+# 编号沿用已发布的 v12_turn_owner_role（与未发布的 v12_session_turn_role 同一列，
+# 不另起一个 v12，避免存量库对同一列记两套版本号）。
+TURN_OWNER_ROLE = 'v12_turn_owner_role'
+# 用户级工作目录：前端「选择工作空间」选中的本地目录，按租户+用户落一行。
+USER_WORKSPACE = 'v13_user_workspace'
+LATEST = USER_WORKSPACE
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -124,6 +132,18 @@ ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAU
 ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS owner_user_id TEXT NOT NULL DEFAULT 'default';
 CREATE INDEX IF NOT EXISTS idx_session_turns_principal
     ON session_turns(tenant_id, owner_user_id);
+'''), (RUNTIME_DEFAULT_PI, '''
+ALTER TABLE runs ALTER COLUMN runtime_kind SET DEFAULT 'pi';
+'''), (TURN_OWNER_ROLE, '''
+ALTER TABLE session_turns ADD COLUMN IF NOT EXISTS owner_role TEXT NOT NULL DEFAULT 'member';
+'''), (USER_WORKSPACE, '''
+CREATE TABLE IF NOT EXISTS user_workspaces (
+    tenant_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, owner_user_id)
+);
 '''))
 
 

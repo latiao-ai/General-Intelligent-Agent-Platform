@@ -19,7 +19,7 @@ MCP 平台**（`tests/mcp_platform_server.py`，stdio transport + JSON 持久化
 - answer 轮用 `expect` 验证 Pi 真的消费了写结果（Node 侧校验 toolResult 含该标记）。
 
 依赖：真实 PostgreSQL（`PG_TEST_DSN`）、已构建的 Node 桥接（`pi-runtime/dist`）、
-受控 MCP 平台（`.venv-pi-test/bin/python -m tests.mcp_platform_server`）。
+受控 MCP 平台（当前解释器 `-m tests.mcp_platform_server`）。
 """
 from __future__ import annotations
 
@@ -115,7 +115,7 @@ class PiWriteLoopProcessTests(unittest.IsolatedAsyncioTestCase):
         folder = tempfile.mkdtemp()
         mcp_servers = [{
             'id': 'platform', 'transport': 'stdio',
-            'stdio_command': str(ROOT / '.venv-pi-test/bin/python'),
+            'stdio_command': sys.executable,
             'stdio_args': ['-m', 'tests.mcp_platform_server',
                            '--state-file', state_file],
             'idempotency_arg': 'operation_id',
@@ -144,6 +144,7 @@ class PiWriteLoopProcessTests(unittest.IsolatedAsyncioTestCase):
             'TENANT_BUDGET_ENABLED': 'false',
             # 写闭环：显式扩展读/写白名单（受控 MCP 平台工具）
             'PI_READ_TOOL_KEYS': json.dumps(['mcp:platform:get_object']),
+            'PI_WRITE_TOOLS_ENABLED': 'true',
             'PI_WRITE_TOOL_KEYS': json.dumps(['mcp:platform:update_object']),
             # 受控模型脚本：驱动 Pi 自主读→写→答复
             'PI_MOCK_SCRIPT': _mock_script(),

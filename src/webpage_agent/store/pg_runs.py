@@ -58,6 +58,7 @@ class PgRuns:
     async def create_turn_run(self, *, run_id: str, tenant_id: str,
                               owner_user_id: str, lease_owner: str,
                               lease_epoch: int, lease_ttl: float,
+                              owner_role: str = 'member',
                               budget: dict | None = None) -> dict | None:
         """为会话 turn（chat/query）建一条内部执行记录（run 行）。
 
@@ -81,11 +82,12 @@ class PgRuns:
                 'lease_owner, lease_expires_at, lease_epoch, '
                 'runtime_kind, runtime_version, runtime_state_schema, '
                 'created_at, updated_at, trace_id) '
-                "VALUES (%s, %s, %s, 'running', %s, '{}', %s, 'member', "
+                "VALUES (%s, %s, %s, 'running', %s, '{}', %s, %s, "
                 "%s, %s, %s, 'pi', 1, 2, %s, %s, %s) "
                 'ON CONFLICT (run_id) DO NOTHING',
                 (run_id, run_id, tenant_id,
                  json.dumps(budget or {}, ensure_ascii=False), owner_user_id,
+                 str(owner_role or 'member'),
                  lease_owner, expires, int(lease_epoch or 0),
                  stamp, stamp, uuid.uuid4().hex))
             await conn.commit()
@@ -118,8 +120,8 @@ class PgRuns:
             raise runtime_identity.UnknownRuntimeKind(run_id, '<missing>')
         kind = runtime_identity.normalize_kind(str(row.get('runtime_kind') or ''))
         if not kind:
-            # 存量 run 没有这列（旧库迁移前）或值未知：按默认回填 LangGraph 属存量，
-            # 但「写了一个不认识的值」必须阻断，不能静默退回。
+            # 空值是迁移前的存量行（v5 才加上这列，缺省回填过 langgraph）。
+            # 不认识的非空值必须阻断，不能静默改成 pi 再跑一遍。
             stored = str(row.get('runtime_kind') or '')
             if stored in ('', None):
                 kind = runtime_identity.KIND_LANGGRAPH
@@ -136,6 +138,28 @@ class PgRuns:
             raise runtime_identity.IncompatibleRuntimeVersion(
                 run_id, kind, 'runtime_state_schema', schema, expected_schema)
         return {'kind': kind, 'version': version, 'state_schema': schema}
+
+    async def adopt_pi_runtime(self, run_id: str, *, lease_owner: str,
+                               lease_epoch: int) -> bool:
+        """把一条还没有副作用的存量 langgraph run 改挂到 Pi。
+
+        只在当前租约仍属于这个执行者时改。已经是 pi、或租约对不上，返回 False。
+        """
+        from webpage_agent.agent import runtime_identity
+        async with self._lease() as conn:
+            cur = await self._run(
+                conn,
+                "UPDATE runs SET runtime_kind=%s, runtime_version=%s, "
+                'runtime_state_schema=%s, updated_at=%s '
+                "WHERE run_id=%s AND runtime_kind=%s "
+                'AND lease_owner=%s AND lease_epoch=%s',
+                (runtime_identity.KIND_PI,
+                 runtime_identity.PI_RUNTIME_VERSION,
+                 runtime_identity.PI_STATE_SCHEMA,
+                 now(), run_id, runtime_identity.KIND_LANGGRAPH,
+                 lease_owner, int(lease_epoch or 0)))
+            await conn.commit()
+            return bool(cur.rowcount)
 
     async def update_run(self, run_id: str, **fields) -> None:
         allowed = {'status', 'plan_version', 'intent_version',

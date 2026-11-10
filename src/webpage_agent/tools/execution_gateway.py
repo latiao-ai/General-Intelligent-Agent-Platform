@@ -1,7 +1,7 @@
 """一次受治理的工具调用：授权、准入、撤权复查、真实调用、结果归一、结算。
 
 这是从 `agent/nodes.py` 的 `run_step` 里**抽取**出来的「单次执行边界」，供
-LangGraph 图（`run_step`）与 Pi 运行时（`pi_runtime`）**共同复用**。两者都必须
+规划节点（`run_step`）与 Pi 运行时（`pi_runtime`）**共同复用**。两者都必须
 走同一条治理链：控制检查 → 授权 → 调用预算 → 准入（`ActionLedger.admit`）→
 撤权复查 → 真实调用 → 结果归一 → 结算（`ActionLedger.settle`）。
 
@@ -270,7 +270,6 @@ async def _external_registration(book, ctx, *, tool_key: str,
     tenant_id = 'default'
     owner_user_id = 'default'
     credential_subject = ''
-    platform_id = ''
     if ctx is not None:
         tenant_id = str(getattr(ctx, 'tenant_id', None) or 'default')
         owner_user_id = str(getattr(ctx, 'user_id', None) or 'default')
@@ -283,7 +282,6 @@ async def _external_registration(book, ctx, *, tool_key: str,
                 tenant_id = str(run.get('tenant_id') or tenant_id)
                 owner_user_id = str(run.get('owner_user_id') or owner_user_id)
                 credential_subject = str(run.get('platform_subject') or '')
-                platform_id = str(run.get('platform_id') or '')
         except Exception:                                # noqa: BLE001
             logger.warning('读取 run 归属失败 run=%s', run_id, exc_info=True)
     submission_key = remote_task_id or idempotency_key or step_id
@@ -689,6 +687,10 @@ async def governed_call(
     # 读回「同一次调用」的真实参数，而不是用模型重发的参数冒充原调用。授权、
     # 审批指纹、账本准入、远端发送针对的正是这份最终参数。
     receipt['final_args'] = dict(args or {})
+    # 有副作用的工具若声明了 compensate，把解析后的撤销参数冻进回执。
+    # Pi 原 run 没有图计划，手工补偿之后只读这份元数据，不让模型现决定撤什么。
+    from webpage_agent.tools.compensation import attach_compensate
+    attach_compensate(receipt, tool, updates)
     # 第八阶段收口第 2 点：accepted 时**先**装配 external（含 external_task_id），
     # 再把 external 交给 build_snapshot，让 awaiting_calls 在结算的同一事务里
     # 随快照写入。不能依赖结算返回后的第二次快照写补齐关键关联——否则崩溃在

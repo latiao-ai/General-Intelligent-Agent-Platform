@@ -9,7 +9,6 @@
 成功场景必须断言 succeeded、最终答复恰好一条、远端提交一次，并验证答复使用了
 指定远端结果。真实 MCP / 供应商联调另行报告。
 """
-import asyncio
 import os
 import subprocess
 import sys

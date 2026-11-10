@@ -7,8 +7,20 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { classifyTurnEnd, extractText } from './session.js';
-import { buildToolsFromHost, schemaFromJson } from './tools.js';
+import { classifyTurnEnd, extractText, PiSession } from './session.js';
+import { assembleToolsFromHost, buildToolsFromHost, schemaFromJson } from './tools.js';
+
+test('时间更新保留自定义提示并替换旧时间，恢复消息不影响提示', () => {
+  const session = new PiSession({
+    systemPrompt: '自定义规则', tools: [], model: { id: 'test', baseUrl: 'http://localhost' },
+  });
+  session.importContext([{ role: 'user', content: '今天几号' }]);
+  session.setCurrentTimePrompt('第一天');
+  session.setCurrentTimePrompt('第二天');
+  const context = (session as unknown as { context: { systemPrompt: string } }).context;
+  assert.equal(context.systemPrompt, '自定义规则\n\n第二天');
+  assert.equal(session.exportContext().length, 1);
+});
 
 // ---- 停止原因归类：未知停止原因必须按 error，绝不冒充 answered ----
 
@@ -135,6 +147,46 @@ test('buildToolsFromHost 转出带 name/description/parameters 的工具', () =>
   assert.equal(tools.length, 1);
   assert.equal(tools[0].name, 'web_search');
   assert.equal(tools[0].description, '搜索网页');
+});
+
+test('object 加 oneOf 编译后顶层仍是 object', () => {
+  const tools = buildToolsFromHost([{
+    name: 'inspect_media',
+    description: '查看媒体',
+    parameters: {
+      type: 'object',
+      properties: {
+        fileRef: { type: 'string' },
+        projectId: { type: 'string' },
+      },
+      oneOf: [{ required: ['fileRef'] }, { required: ['projectId'] }],
+    },
+  }]);
+  assert.equal(tools.length, 1);
+  const params = JSON.parse(JSON.stringify(tools[0].parameters));
+  assert.equal(params.type, 'object');
+});
+
+test('根为 anyOf 的工具被跳过，同目录里的 object 工具仍保留', () => {
+  const assembled = assembleToolsFromHost([
+    {
+      name: 'mcp__libtv__inspect_media',
+      description: '坏根',
+      parameters: { anyOf: [{ type: 'string' }, { type: 'integer' }] },
+    },
+    {
+      name: 'get_object',
+      description: '读对象',
+      parameters: {
+        type: 'object',
+        properties: { object_id: { type: 'string' } },
+        required: ['object_id'],
+      },
+    },
+  ]);
+  assert.deepEqual(assembled.tools.map((tool) => tool.name), ['get_object']);
+  assert.equal(assembled.dropped.length, 1);
+  assert.equal(assembled.dropped[0].name, 'mcp__libtv__inspect_media');
 });
 
 test('buildToolsFromHost 拒绝缺 name 的工具', () => {

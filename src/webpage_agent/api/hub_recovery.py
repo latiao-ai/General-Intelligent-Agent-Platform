@@ -10,6 +10,10 @@ import asyncio
 import logging
 import time
 import uuid
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from webpage_agent.agent.pi_recovery import RecoveryDecision
 
 from webpage_agent.api.task_record import TaskRecord
 from webpage_agent.capabilities import registry as capability_registry
@@ -166,6 +170,55 @@ class HubRecoveryMixin:
                 'asked_questions': asked, 'clarification': clarified,
                 'step_index': _resume_index(steps, actions)}
 
+    async def _resume_for_engine(self, run_id: str) -> dict | None:
+        """按这条 run 已存的引擎装配续跑输入。
+
+        Pi 没有图计划。补充要求触发的下一轮如果仍走 `_resume_plan`，
+        会丢掉 `pi_resume`，PiRuntime 会当成首次执行再跑一遍工具。
+        """
+        from webpage_agent.agent import runtime_identity
+        ident = await self.store.runtime_identity(run_id)
+        run = await self.store.run(run_id) or {}
+        if ident['kind'] == runtime_identity.KIND_LANGGRAPH:
+            facts = await runtime_identity.collect_legacy_facts(self.store, run_id, run)
+            if not runtime_identity.legacy_resume_safe(facts):
+                return runtime_identity.refused_resume(run)
+            return await self._include_plan_steps(
+                run_id, runtime_identity.fresh_pi_resume(run))
+        if ident['kind'] == runtime_identity.KIND_PI:
+            plan = await self._pi_resume_plan(run_id, run)
+            return await self._include_plan_steps(run_id, plan)
+        raise runtime_identity.UnknownRuntimeKind(run_id, ident['kind'])
+
+    async def _include_plan_steps(self, run_id: str, resume: dict | None) -> dict | None:
+        """库里已有计划时，把步骤附到续跑输入上。
+
+        Pi 看到 `resume_reconcile` 仍会停住，不会按步骤重放。
+        按计划收尾的路径（以及续跑接口的返回形状）需要这些步骤。
+        """
+        if not isinstance(resume, dict) or resume.get('steps'):
+            return resume
+        from webpage_agent.agent import runtime_identity
+        pi = resume.get('pi_resume') if isinstance(resume.get('pi_resume'), dict) else {}
+        snap = pi.get('snapshot') if isinstance(pi.get('snapshot'), dict) else None
+        # 已经是 Pi 自己的快照（含脚本化补偿/部署）时，不要再贴图步骤，
+        # 否则续跑输入会同时像图计划又像 Pi 快照。
+        if isinstance(snap, dict) and int(snap.get('state_schema') or 0) == runtime_identity.PI_STATE_SCHEMA:
+            return resume
+        if not hasattr(self.store, 'plan'):
+            return resume
+        saved = await self.store.plan(run_id) or {}
+        steps = [step for step in (saved.get('steps') or []) if isinstance(step, dict)]
+        if not steps:
+            return resume
+        resume = dict(resume)
+        resume['steps'] = steps
+        resume['summary'] = saved.get('goal') or resume.get('summary') or '续跑'
+        resume.setdefault('step_index', 0)
+        if saved.get('version'):
+            resume['plan_version'] = int(saved['version'])
+        return resume
+
     async def _pi_resume_plan(self, run_id: str, run: dict) -> dict:
         """Pi 恢复装配：读版本化 Pi 快照，构造续跑所需的 resume 上下文。
 
@@ -198,23 +251,59 @@ class HubRecoveryMixin:
 
         snapshot = None
         if raw is not None:
-            # 有快照行：严格解析（版本不兼容在这里抛）
-            snapshot = pi_snapshot.parse_row(raw)
-        elif actions:
-            # 已有动作却缺快照：转待核实，不退回空状态重新执行
+            inner = raw.get('state') if isinstance(raw.get('state'), dict) else {}
+            schema = int(inner.get('state_schema') or raw.get('schema') or 0)
+            # 旧图快照不是 Pi 的版本化快照。没有副作用就当首次执行；
+            # 已经有动作或步骤产出则待核实，不能按空状态重放。
+            legacy_snapshot = (
+                schema == runtime_identity.LANGGRAPH_STATE_SCHEMA
+                or (schema == 0 and not inner.get('state_schema')
+                    and not inner.get('messages')))
+            if legacy_snapshot:
+                if actions or inner.get('step_outputs'):
+                    decision = pi_recovery.RecoveryDecision(
+                        kind=pi_recovery.RESUME_RECONCILE,
+                        reason=runtime_identity.RETIRED_REASON)
+                    return {
+                        'runtime_kind': runtime_identity.KIND_PI,
+                        'refused': True,
+                        'intent_version': int(run.get('intent_version') or 0),
+                        'processed_intent_version': int(
+                            run.get('processed_intent_version') or 0),
+                        'plan_version': int(run.get('plan_version') or 1),
+                        'pi_resume': {'snapshot': None,
+                                      'recovery': decision.to_dict()},
+                        'user_input': str(run.get('goal') or ''),
+                    }
+                raw = None
+            else:
+                snapshot = pi_snapshot.parse_row(raw)
+        if raw is None and actions and snapshot is None:
+            # 已有动作却缺 Pi 快照：不能退回空状态重新执行。
+            # 库里若还有图计划，把步骤附上，供按计划收尾的路径复用账本。
+            # Pi 运行时看到 resume_reconcile 会停住，不会按这些步骤重放。
             decision = pi_recovery.RecoveryDecision(
                 kind=pi_recovery.RESUME_RECONCILE,
                 reason='有动作但缺失快照，无法确定进度，需核实')
-            return {
+            saved = {}
+            if hasattr(self.store, 'plan'):
+                saved = await self.store.plan(run_id) or {}
+            steps = list(saved.get('steps') or [])
+            resume = {
                 'runtime_kind': runtime_identity.KIND_PI,
                 'intent_version': int(run.get('intent_version') or 0),
                 'processed_intent_version': int(
                     run.get('processed_intent_version') or 0),
-                'plan_version': int(run.get('plan_version') or 1),
+                'plan_version': int(saved.get('version') or run.get('plan_version') or 1),
                 'pi_resume': {'snapshot': None,
                               'recovery': decision.to_dict()},
                 'user_input': str(run.get('goal') or ''),
             }
+            if steps:
+                resume['steps'] = steps
+                resume['summary'] = saved.get('goal') or '续跑'
+                resume['step_index'] = 0
+            return resume
 
         decision = pi_recovery.decide(
             snapshot, actions, str(run.get('status') or ''))
@@ -319,6 +408,12 @@ class HubRecoveryMixin:
             for item in pending_inputs
             if isinstance(item, dict) and str(item.get('message') or '').strip()
         ]
+        # 缺参停在 waiting_input：有新补充就把停靠的工具结果交付回去再继续；
+        # 没有补充则保持等待，不重新推理。
+        decision, snapshot = pi_recovery.apply_pending_input(
+            decision, snapshot, resume['pending_inputs'])
+        resume['pi_resume']['snapshot'] = snapshot
+        resume['pi_resume']['recovery'] = decision.to_dict()
         return resume
 
     async def _decide_approval_recovery(self, run_id: str, awaiting: list,
@@ -640,11 +735,16 @@ class HubRecoveryMixin:
             return None
         if record.live:
             return record
-        plan = await self.store.plan(run_id) or {}
-        steps = plan.get('steps') or []
-        if not steps and await self.store.actions_of(run_id):
-            # 有动作却没有计划必须核实；首次规划尚未成功且没有动作时可以重试规划。
-            return None
+        from webpage_agent.agent import runtime_identity
+        ident = await self.store.runtime_identity(run_id)
+        if ident['kind'] == runtime_identity.KIND_LANGGRAPH:
+            facts = await runtime_identity.collect_legacy_facts(self.store, run_id, run)
+            if not runtime_identity.legacy_resume_safe(facts):
+                logger.warning('run %s 是已下线引擎上的存量运行，且已有副作用，拒绝恢复',
+                               run_id)
+                return None
+            # 没有副作用：下面照常排队并领取。改挂发生在领取之后的
+            # prepare_execution，这里不在没有租约时改归属。
         # 续跑也要先占租约：否则同一份计划可能被 Worker 与本次 resume 同时执行。
         # 但已被别人持有租约时不能动它的状态——先把 running 改成 queued 就等于
         # 替正在执行的进程改账。
@@ -690,19 +790,28 @@ class HubRecoveryMixin:
         if not tool_name:
             raise RuntimeError('没有声明部署动作的能力包')
         run_id = uuid.uuid4().hex[:12]
+        # 部署仍是事先定好的一步，不是模型自由挑工具。引擎用 Pi，执行走脚本，
+        # 与补偿同一条治理链（governed_call / 账本 / 事件 / 取消与租约）。
+        from webpage_agent.agent import runtime_identity
+        from webpage_agent.agent.pi_script import scripted_resume
         await self.store.create_run(run_id, record.task_id, status='queued',
                               tenant_id=tenant,
                               owner_user_id=str(getattr(principal, 'user_id', '')
-                                                or record.owner_user_id or 'default'))
+                                                or record.owner_user_id or 'default'),
+                              runtime_kind=runtime_identity.KIND_PI)
+        created = await self.store.run(run_id) or {}
         step = {'tool': tool_name, 'step_id': 's1', 'args': {},
                 'depends_on': [], 'why': '用户点击部署'}
         keep_artifact_id = record.artifact_id
         record.run_id = run_id
+        resume_plan = scripted_resume(
+            [step], kind='deployment', summary='部署上一轮产物',
+            intent_version=int(created.get('intent_version') or 1))
         outcome = await self._claim_and_arm(
             record, run_id,
             lambda claimed: self._run(
                 record, [], {'artifact': prior_artifact},
-                resume_plan={'steps': [step], 'summary': '部署上一轮产物'}),
+                resume_plan=resume_plan),
             wait=True)
         if outcome != 'started':
             raise RuntimeError('无法领取部署运行，请稍后重试')

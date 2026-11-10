@@ -8,12 +8,13 @@
  * OpenAI 兼容的自定义 Model。凭据只经初始化通道传递，绝不写命令行参数或日志。
  */
 import { randomUUID } from 'node:crypto';
-import {
-  stream,
-  type AssistantMessage,
-  type Context,
-  type Model,
-  type Tool,
+import { streamOpenAICompletions } from '@mariozechner/pi-ai/openai-completions';
+import type {
+  AssistantMessage,
+  Context,
+  Model,
+  Tool,
+  ToolCall,
 } from '@mariozechner/pi-ai';
 
 export interface SessionConfig {
@@ -120,6 +121,7 @@ export function classifyTurnEnd(
 
 export class PiSession {
   private context: Context;
+  private systemPrompt?: string;
   private model: Model<'openai-completions'>;
   private apiKey?: string;
   private modelTimeoutMs: number;
@@ -130,11 +132,17 @@ export class PiSession {
     this.apiKey = cfg.apiKey;
     this.modelTimeoutMs = cfg.modelTimeoutMs ?? 180_000;
     this.mockScript = cfg.mockScript;
+    this.systemPrompt = cfg.systemPrompt;
     this.context = {
       systemPrompt: cfg.systemPrompt,
       messages: [],
       tools: cfg.tools,
     };
+  }
+
+  /** 每次模型准入时替换时间，保留原有系统提示。 */
+  setCurrentTimePrompt(timePrompt: string): void {
+    this.context.systemPrompt = [this.systemPrompt, timePrompt].filter(Boolean).join('\n\n');
   }
 
   /** 追加用户输入（含历史时按序塞进 messages）。 */
@@ -282,7 +290,15 @@ export class PiSession {
       return this.runMock(requestId, handlers, answer);
     }
 
-    const s = stream(this.model, this.context, {
+    // 直接调 openai-completions provider，而不是 SDK 顶层的 `stream()`。
+    //
+    // `stream()` 只是按 model.api 去注册表里找 provider，但它的入口
+    // (`@mariozechner/pi-ai`) 会连带加载 typebox 与全部 provider 注册代码，
+    // 实测单次 import ≈ 5.5s；本文件是「一 run 一进程」的内核，这笔开销每次
+    // 都要付。`buildModel` 已把 api 固定为 openai-completions，等价替换后
+    // 加载降到 ≈1.1s。若将来要支持别的 api，必须在这里显式分支，**不做**
+    // 静默回退——回退会让「配置写错」表现成「模型行为异常」，极难排查。
+    const s = streamOpenAICompletions(this.model, this.context, {
       signal,
       apiKey: this.apiKey,
       timeoutMs: this.modelTimeoutMs,

@@ -1,7 +1,7 @@
 """Planner-Executor 编排（入口、规划、执行、核对、收尾）。
 
-**控制流不在这里**，见 `webpage_agent/agent/graph.py` 的模块文档；节点之间的
-边、条件分支与循环都由那张图定义。本文件保留这些节点：
+这些节点仍是规划库：入口、计划、执行、核对、收尾。生产执行走 Pi 工具循环；
+需要按计划逐步跑的用例用 `tests/host_loop.py` 驱动，不再经过图框架。本文件保留：
 
     intake → plan → persist_plan → run_step ↺ → verify_completion → finalize
 

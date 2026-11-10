@@ -1,8 +1,8 @@
 """PiRuntime：通过 Node 桥接驱动 Pi 推理，实现 `agent.runtime.Runtime` 契约。
 
 第三阶段目标：打通「Python → Node 中的 Pi → Python 假工具 → Pi 答复」这一条
-最小链路。生产入口 `get_runtime()` 仍然默认 `LangGraphRuntime`，本实现只通过
-测试注入和独立 smoke 入口验证，不开放全局切换、不新增数据库字段。
+最小链路。生产执行引擎只有 Pi。存量 langgraph 行在进入这里之前
+已经改挂，或被宿主停在待核实。
 
 契约遵守（与 Runtime 接口一致）：
 
@@ -37,6 +37,12 @@
     - 模型 usage 结算失败不阻断 ack（模型已跑完，usage 是事后记账），但「全零
       或缺失 usage」在 `core.services.end_model_request` 里走保守估算、不填零。
 
+脚本化补偿 / 部署（仍是本类，不另开运行时）：
+
+    - `resume_plan.scripted` 或快照 `host_result_state.script` 为真时，不启动
+      Node，按步骤顺序走 `HostToolCaller.call_declared`。没有这个标记时，
+      `resume_plan.steps` 仍然被忽略——那是只改引擎、不执行步骤的空转。
+
 第六阶段（共享网关）修正：
 
     - `HostToolCaller.call()` 传入**真实 state**（含 task_id / artifact_dir /
@@ -52,16 +58,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
+from dataclasses import replace as dataclass_replace
 from typing import Any, Awaitable, Callable
 
 from webpage_agent.agent import pi_protocol as proto
 from webpage_agent.agent.pi_bridge import PiBridge, PiBridgeError
 from webpage_agent.agent.pi_protocol import ProtocolError
+from webpage_agent.core.errors import RecursionBudgetExceeded
 from webpage_agent.observe.events import (
     answer_delta,
     bind_sink,
     drain_events,
     emit_async,
+    stage_end,
     stage_start,
     unbind_sink,
 )
@@ -81,6 +92,35 @@ def _tool_decl(tool) -> dict[str, Any]:
         "description": tool.description,
         "parameters": tool.args,
     }
+
+
+# 模型端点对函数名的要求：1~128 个 ASCII 字母/数字/下划线/连字符。MCP 工具名
+# 常带点（如 BeeFTV 的 canvas.get），原样下发会让**整次请求** 400，一个工具都
+# 调不了。这里只改「对模型暴露的名字」，Tool 的 run 闭包仍绑定真实 MCP 工具。
+_UNSAFE_TOOL_NAME = re.compile(r'[^A-Za-z0-9_-]+')
+
+
+def _safe_tool_name(name: str) -> str:
+    base = _UNSAFE_TOOL_NAME.sub('_', str(name or '')).strip('_')
+    return (base or 'tool')[:64]
+
+
+def sanitize_tool_names(tools: list) -> list:
+    """把工具名收成供应商允许的字符集；改名后重名的保留第一个并告警。"""
+    seen: set[str] = set()
+    result: list = []
+    for tool in tools:
+        original = getattr(tool, 'name', '')
+        safe = _safe_tool_name(original)
+        if safe in seen:
+            logger.warning('Pi 工具改名后重名，已丢弃：%s', original)
+            continue
+        seen.add(safe)
+        if safe != original:
+            logger.info('Pi 工具改名：%s -> %s（仅对模型暴露名）', original, safe)
+            tool = dataclass_replace(tool, name=safe)
+        result.append(tool)
+    return result
 
 
 def default_tool_catalog() -> list[dict[str, Any]]:
@@ -103,7 +143,10 @@ def default_tool_catalog() -> list[dict[str, Any]]:
         if str(tool.effect or '') != 'read':
             continue
         declared.append(_tool_decl(tool))
-    return declared
+    declared.append(pi_host_tools.request_input_decl())
+    from webpage_agent.agent.pi_tool_schema import prepare_declarations
+    kept, _dropped = prepare_declarations(declared)
+    return kept
 
 
 async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
@@ -123,25 +166,10 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
     from webpage_agent.tools import core as tools_core
     from webpage_agent.capabilities import registry as cap_registry
 
-    read_keys = set(pi_host_tools.SYNC_READ_TOOL_KEYS)
-    write_keys = set(pi_host_tools.WRITE_TOOL_KEYS)
-    # 第十阶段收口：正式链路测试经环境变量**显式扩展**读/写白名单（受控启用，
-    # 不靠测试注入或临时全局切换——环境变量是显式配置，生产未设置时白名单保持
-    # 默认：只读 web_search、不开放写）。
-    import json as _json
-    import os as _os
-    _extra_read = _os.environ.get('PI_READ_TOOL_KEYS')
-    if _extra_read:
-        try:
-            read_keys |= {str(k) for k in _json.loads(_extra_read)}
-        except ValueError:
-            pass
-    _extra_write = _os.environ.get('PI_WRITE_TOOL_KEYS')
-    if _extra_write:
-        try:
-            write_keys |= {str(k) for k in _json.loads(_extra_write)}
-        except ValueError:
-            pass
+    # 读白名单可经 PI_READ_TOOL_KEYS 扩展。写白名单默认空，且必须再开
+    # PI_WRITE_TOOLS_ENABLED 才会并入 PI_WRITE_TOOL_KEYS（见 pi_host_tools）。
+    read_keys = pi_host_tools._effective_read_keys()
+    write_keys = pi_host_tools._effective_write_keys()
     tool_objects: list = []
 
     # 本地只读工具
@@ -162,8 +190,18 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
         elif key in write_keys:
             tool_objects.append(tool)
 
+    # 名字先收成供应商允许的字符集，声明与执行目录用同一份名字。
+    tool_objects = sanitize_tool_names(tool_objects)
     decls = [_tool_decl(t) for t in tool_objects]
-    return decls, tool_objects
+    decls.append(pi_host_tools.request_input_decl())
+    from webpage_agent.agent.pi_tool_schema import prepare_declarations
+    kept, dropped = prepare_declarations(decls)
+    if dropped:
+        logger.warning('Pi 工具目录丢弃 %s 个参数 schema 不合格的工具', len(dropped))
+        dropped_names = {item.get('name') for item in dropped}
+        tool_objects = [tool for tool in tool_objects
+                        if getattr(tool, 'name', '') not in dropped_names]
+    return kept, tool_objects
 
 
 class PiRuntime:
@@ -196,6 +234,11 @@ class PiRuntime:
         # tools=None 表示用默认目录（web_search）；tools=[] 表示本轮无工具。
         # 不再回退到 echo/add。
         self._tools = tools if tools is not None else default_tool_catalog()
+        # 是否由调用方**显式**给出工具目录。显式目录优先于 run() 里的惰性发现：
+        # 发现逻辑只看环境变量（PI_READ/WRITE_TOOL_KEYS），不加这个标记的话，
+        # 只要环境里配了白名单，任何显式传入的目录都会在 run() 里被悄悄覆盖成
+        # 真实工具目录——调用方的意图被环境变量劫持，且失败时表现为"工具不对"。
+        self._tools_explicit = tools is not None
         # 第十阶段：Tool 对象目录（含执行器），供 HostToolCaller 按请求工具名
         # 唯一匹配（读/写白名单）。None 时 HostToolCaller 回退到本地能力 registry。
         self._tool_objects = tool_objects
@@ -213,10 +256,23 @@ class PiRuntime:
         # 受控工具执行器（测试）：覆盖真实 web_search 的 tool.run，但仍走完整
         # 受治理结算链路（产生 action/attempt），用于无网络下验证恢复不变量。
         self._tool_runner = tool_runner
+        # 同一工具参数校验连续失败的次数。达到上限就停在 waiting_input，
+        # 不再把错误回给模型空转。
+        self._schema_rejects: dict[str, int] = {}
         # 模型请求握手：request_id → reservation，准入时存、结算时取。
         self._model_reservations: dict[str, Any] = {}
         # 第七阶段：版本化 Pi 快照（检查点/恢复用），run() 里初始化。
         self._snapshot: dict[str, Any] = {}
+        # 产品循环：步数、重复指纹、确认边界用的已调用工具。每次 run() 清零。
+        self._tool_calls = 0
+        self._repeat_counts: dict[str, int] = {}
+        self._call_trace: list[dict] = []
+        self._progress = None
+        self._live_state: dict | None = None
+        self._progress_started = 0.0
+        self._progress_marked = 0.0
+        self._open_stage = ''
+        self._stage_opened = 0.0
 
     async def run(
         self,
@@ -237,6 +293,14 @@ class PiRuntime:
         bridge = self._bridge or PiBridge()
         own_bridge = self._bridge is None
         answer_parts: list[str] = []
+        self._tool_calls = 0
+        self._repeat_counts = {}
+        self._call_trace = []
+        self._progress = progress
+        self._live_state = state
+        self._progress_started = time.perf_counter()
+        self._progress_marked = self._progress_started
+        self._open_stage = ''
 
         # 第七阶段收口：恢复输入用**单一字段** `pi_resume`（快照 + 恢复决策）承载，
         # 由 Hub 的 _pi_resume_plan 装配、run_task 展平进 state。这里只从这一处读，
@@ -247,13 +311,31 @@ class PiRuntime:
         self._snapshot = dict(resume_snapshot) if resume_snapshot else \
             pi_snapshot.new_snapshot(user_input=str(state.get('user_input') or ''))
 
+        # 脚本化补偿 / 部署：步骤是宿主定好的，不能交给模型，也不能把「已结算但
+        # 没有模型消息」理解成要把结果送回 Node。这条路径在恢复决策之前返回。
+        from webpage_agent.agent import pi_script
+        script = pi_script.script_of(state, self._snapshot)
+        if script is not None:
+            token = bind_sink(on_event) if on_event else None
+            try:
+                await pi_script.execute(self, state, script)
+            finally:
+                if token is not None:
+                    try:
+                        await drain_events()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("排空事件失败：%s", exc)
+                    unbind_sink(token)
+            state['_pi_snapshot'] = pi_snapshot.serialize(self._snapshot)
+            return state
+
         # 恢复决策。resume_finish / resume_reconcile / resume_block / resume_wait
         # 属于「不重新推理」的结局，在进入桥接前直接写回 state 收尾。
         # recovery 是 dict（pi_resume 里 to_dict 后），用 .get 读。
         recovery = (pi_resume or {}).get('recovery') if pi_resume else None
         if isinstance(recovery, dict) and recovery.get('kind') in (
                 'resume_finish', 'resume_reconcile', 'resume_block',
-                'resume_wait'):
+                'resume_wait', 'resume_wait_input'):
             kind = recovery['kind']
             if kind == 'resume_finish':
                 state['answer'] = recovery.get('final_answer') or ''
@@ -268,12 +350,28 @@ class PiRuntime:
                     state['status'] = 'waiting_approval'
                 else:
                     state['status'] = 'waiting_external'
+            elif kind == 'resume_wait_input':
+                fact = recovery.get('input_request') if isinstance(
+                    recovery.get('input_request'), dict) else {}
+                question = str(fact.get('question') or recovery.get('reason')
+                               or '需要补充信息后才能继续')
+                self._mark_waiting_input(state, question)
             else:
+                # resume_reconcile / resume_block：结果未定，既不重试也不当成功。
+                # 两个字段分工不同，别混用：
+                # - errors[].detail 留恢复决策的原始说明（含内部 action_id 与英文
+                #   状态），排障要看这个；
+                # - state['failure'] 是给用户的回执正文，由 core/messages.py 直接
+                #   拼进句子，不能塞内部标识，也不能缺——缺了会退化成默认那句
+                #   "有写操作的结果没能确认"，而这里可能只是一次只读检索，等于
+                #   凭空告诉用户产生了副作用、要去核对线上数据。
+                detail = recovery.get('reason') or '结果未定，需核实后再继续'
                 state['pi_outcome'] = 'failed'
                 state['status'] = 'needs_reconcile'
+                state['failure'] = ('有一步操作执行到一半，没能确认是否已经生效'
+                                    '（未重试，避免重复执行）')
                 state.setdefault('errors', []).append({
-                    'stage': 'pi', 'type': 'RecoveryBlocked',
-                    'detail': recovery.get('reason') or '结果未定，需核实后再继续'})
+                    'stage': 'pi', 'type': 'RecoveryBlocked', 'detail': detail})
             state['_pi_snapshot'] = pi_snapshot.serialize(self._snapshot)
             return state
 
@@ -295,7 +393,7 @@ class PiRuntime:
         # 让正式链路能真实走 MCP transport 的 update_object / get_object / get_operation。
         # 未设置环境变量时保持默认（只读 web_search），不改变生产行为。
         import os as _os
-        if self._tool_objects is None and (
+        if not self._tools_explicit and self._tool_objects is None and (
                 _os.environ.get('PI_WRITE_TOOL_KEYS')
                 or _os.environ.get('PI_READ_TOOL_KEYS')):
             decls, tool_objects = await pi_tool_catalog()
@@ -316,7 +414,10 @@ class PiRuntime:
                     content = str(item.get("content", "") or "")[:max_input]
                     history.append({"role": item["role"], "content": content})
 
-            # 工具目录发送前校验：完整 JSON Schema，非法则明确报错
+            # 白名单装配的最后一道：坏 schema 在这里丢掉，不让它进 start。
+            # validate_tool_catalog 仍然要求留下的每一条根都是 type:object。
+            from webpage_agent.agent.pi_tool_schema import prepare_declarations
+            self._tools, _dropped = prepare_declarations(self._tools)
             proto.validate_tool_catalog(self._tools)
 
             # 恢复上下文：有已提交的完整消息就带上，Node 据此重建、不重复追加
@@ -415,6 +516,8 @@ class PiRuntime:
                     await self._handle_checkpoint(bridge, msg)
                 elif mtype == "finished":
                     self._apply_finished(state, msg, bridge.execution_id)
+                    await self._close_stage('done')
+                    self._note_progress('pi', str(state.get('status') or ''))
                     break
                 elif mtype == "error":
                     raise PiBridgeError(
@@ -444,8 +547,12 @@ class PiRuntime:
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("排空事件失败：%s", exc)
                 unbind_sink(token)
-            if own_bridge:
+            # 注入的桥接也要在循环还活着时关掉。测试常把真实 PiBridge 交进来
+            # 却不自己 close，管道会拖到循环关闭后才析构。
+            try:
                 await bridge.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("关闭桥接失败：%s", exc)
 
         # 第八阶段第 1 点：把**真正的版本化 Pi 快照**序列化后交给宿主，供收尾时
         # 落库。宿主的 `_finish_run` 据此提交版本化 Pi 快照（经 `pi_snapshot.
@@ -453,6 +560,42 @@ class PiRuntime:
         from webpage_agent.agent import pi_snapshot as _snap
         state['_pi_snapshot'] = _snap.serialize(self._snapshot)
         return state
+
+    def _note_progress(self, stage: str, status: str) -> None:
+        """节点级进度：写入 timings，并调用宿主的同步 progress 回调。"""
+        now = time.perf_counter()
+        state = self._live_state
+        if isinstance(state, dict):
+            state.setdefault('timings', []).append({
+                'stage': stage,
+                'seconds': round(now - self._progress_marked, 2),
+                'status': state.get('status') or status,
+            })
+        self._progress_marked = now
+        if self._progress is not None:
+            elapsed = round(now - self._progress_started, 2)
+            shown = ''
+            if isinstance(state, dict):
+                shown = str(state.get('status') or status)
+            self._progress(stage, shown, elapsed)
+
+    async def _close_stage(self, status: str) -> None:
+        if not self._open_stage:
+            return
+        elapsed = time.perf_counter() - self._stage_opened
+        stage = self._open_stage
+        self._open_stage = ''
+        await emit_async(stage_end(stage, elapsed, status or 'done'))
+
+    async def _open_named_stage(self, stage: str) -> None:
+        if self._open_stage and self._open_stage != stage:
+            await self._close_stage('done')
+        if self._open_stage == stage:
+            return
+        self._open_stage = stage
+        self._stage_opened = time.perf_counter()
+        await emit_async(stage_start(stage))
+        self._note_progress(stage, '')
 
     async def _handle_event(self, msg: dict, answer_parts: list[str]) -> None:
         """转发事件：text_delta 走 answer_delta（text 字段），阶段走 stage 契约。"""
@@ -463,8 +606,7 @@ class PiRuntime:
             # 公共事件契约：answer_delta 使用 text 字段
             await emit_async(answer_delta(delta))
         elif kind == "progress" or kind == "stage":
-            stage = str(msg.get("label", ""))
-            await emit_async(stage_start(stage))
+            await self._open_named_stage(str(msg.get("label", "") or "pi"))
 
     async def _handle_tool_call(self, bridge: PiBridge, msg: dict, state: dict) -> None:
         """校验并执行工具，回执（保留错误正文）。
@@ -492,8 +634,44 @@ class PiRuntime:
         try:
             proto.validate_args_against_schema(args, allowed["parameters"])
         except ProtocolError as exc:
+            strikes = self._schema_rejects.get(tool_name, 0) + 1
+            self._schema_rejects[tool_name] = strikes
+            # 同一工具参数反复不合格：停下来问人，不再把错误喂回模型空转。
+            if strikes >= 2:
+                await self._park_for_input(
+                    bridge, state, call_id, tool_name,
+                    f'调用 {tool_name} 的参数仍不完整：{exc}。请补充后继续。')
+                return
             await self._send_tool_error(bridge, call_id, f"参数不符合 schema：{exc}")
             return
+
+        from webpage_agent.agent import pi_host_tools
+        from webpage_agent.agent import pi_product
+        from webpage_agent.core.config import settings
+        if tool_name == pi_host_tools.REQUEST_INPUT_NAME:
+            question = str((args or {}).get('question') or '').strip()
+            if not question:
+                await self._send_tool_error(bridge, call_id, 'question 不能为空')
+                return
+            await self._park_for_input(
+                bridge, state, call_id, tool_name, question)
+            return
+
+        limit = max(1, int(getattr(settings, 'run_max_tool_calls', 40) or 40))
+        if self._tool_calls >= limit:
+            raise RecursionBudgetExceeded('这一轮已经用满步数预算', limit=limit)
+        fingerprint = pi_product.repeat_key(tool_name, args if isinstance(args, dict) else {})
+        stalled = pi_product.repeat_block(
+            self._repeat_counts, fingerprint,
+            int(getattr(settings, 'run_max_no_progress', 2) or 2))
+        if stalled:
+            raise RecursionBudgetExceeded(stalled)
+        blocked = pi_product.confirmation_block(
+            self._call_trace, self._tool_for_guard(tool_name), self._guard_catalog())
+        if blocked:
+            await self._park_for_input(bridge, state, call_id, tool_name, blocked)
+            return
+        self._tool_calls += 1
 
         if self._tool_executor is not None:
             # 测试注入的假工具替身
@@ -507,6 +685,9 @@ class PiRuntime:
                 error=None if ok else str(result),
             )
             await bridge.send(reply)
+            if ok:
+                pi_product.note_repeat(self._repeat_counts, fingerprint)
+                self._call_trace.append({'tool': tool_name, 'step_id': call_id, 'args': {}})
             return
 
         # 真实受治理调用：走 HostToolCaller（授权 → 准入 → 撤权复查 → 真实调用 → 结算）
@@ -642,6 +823,8 @@ class PiRuntime:
             await bridge.send(reply)
             return
         if receipt.ok:
+            pi_product.note_repeat(self._repeat_counts, fingerprint)
+            self._call_trace.append({'tool': tool_name, 'step_id': call_id, 'args': {}})
             # 成功结算后合并认可增量回宿主 state（documents/usage/errors）
             if receipt.updates:
                 for key, value in receipt.updates.items():
@@ -677,6 +860,9 @@ class PiRuntime:
                 f"非法 model_request：{exc}", stderr_tail=bridge.stderr_tail()
             ) from exc
         request_id = msg["request_id"]
+        from webpage_agent.agent.context import current_time_prompt
+        from webpage_agent.core.config import settings
+        time_prompt = current_time_prompt(settings.prompt_timezone)
         try:
             reservation = await self._begin_model(request_id)
         except Exception as exc:  # noqa: BLE001 预算耗尽/无 scope 都按拒绝处理
@@ -687,7 +873,8 @@ class PiRuntime:
             return
         self._model_reservations[request_id] = reservation
         await bridge.send(proto.make_message(
-            bridge.execution_id, "model_admit", request_id=request_id, allow=True))
+            bridge.execution_id, "model_admit", request_id=request_id, allow=True,
+            current_time_prompt=time_prompt))
 
     async def _handle_model_usage(self, bridge: PiBridge, msg: dict) -> None:
         """模型用量结算握手：Node 上报 usage，宿主结算后回 ack。
@@ -841,6 +1028,58 @@ class PiRuntime:
         )
         await bridge.send(reply)
 
+    def _mark_waiting_input(self, state: dict, question: str) -> None:
+        """缺参/需要补充：写宿主状态，清掉旧答复，避免被收成成功。"""
+        text = str(question or '').strip() or '需要补充信息后才能继续'
+        state['pi_outcome'] = 'waiting'
+        state['status'] = 'waiting_input'
+        state['failure'] = text
+        # clarification 留空：reply_text 在两者相同时会藏起问题正文。
+        # 问题放在 failure 里，收尾回执会原样带给用户。
+        state['clarification'] = ''
+        asked = [str(item) for item in (state.get('asked_questions') or []) if str(item).strip()]
+        if text not in asked:
+            asked.append(text)
+        state['asked_questions'] = asked
+        state.pop('answer', None)
+
+    async def _park_for_input(self, bridge: PiBridge, state: dict, call_id: str,
+                              tool_name: str, question: str) -> None:
+        """把当前工具调用停成 waiting_input，并让 Node 结束本轮。"""
+        from webpage_agent.agent import pi_snapshot
+        text = str(question or '').strip() or '需要补充信息后才能继续'
+        host = dict(self._snapshot.get('host_result_state') or {})
+        host['awaiting_input'] = {
+            'call_id': call_id,
+            'tool_name': tool_name,
+            'question': text,
+        }
+        self._snapshot['host_result_state'] = host
+        self._snapshot['phase'] = 'awaiting_input'
+        pending = [item for item in (self._snapshot.get('pending_calls') or [])
+                   if not (isinstance(item, dict) and item.get('call_id') == call_id)]
+        self._snapshot['pending_calls'] = pending
+        self._mark_waiting_input(state, text)
+        state['_pi_snapshot'] = pi_snapshot.serialize(self._snapshot)
+        await self._persist_snapshot()
+        reply = proto.make_message(
+            bridge.execution_id, 'tool_result', call_id=call_id,
+            ok=False, result=None, error='', needs_input=True)
+        await bridge.send(reply)
+
+    def _guard_catalog(self) -> list:
+        if self._tool_objects:
+            return list(self._tool_objects)
+        caller = self._host_caller
+        catalog = getattr(caller, '_tools_catalog', None) if caller is not None else None
+        return list(catalog or [])
+
+    def _tool_for_guard(self, name: str):
+        for tool in self._guard_catalog():
+            if getattr(tool, 'name', '') == name:
+                return tool
+        return None
+
     def _allowed_tool(self, name: str) -> dict[str, Any] | None:
         for tool in self._tools:
             if tool.get("name") == name:
@@ -884,6 +1123,15 @@ class PiRuntime:
                 return
             state["answer"] = answer
             state["pi_outcome"] = "answered"
+            from webpage_agent.agent import pi_product
+            gap = pi_product.completion_block(state)
+            if gap:
+                # 有答复不等于做完：产物缺失或部署回执未确认时不能当成功。
+                state["pi_outcome"] = "failed"
+                state.pop("answer", None)
+                state["failure"] = gap
+                state.setdefault("errors", []).append(
+                    {"stage": "verify_completion", "type": "UnmetCriteria", "detail": gap})
         elif outcome == "cancelled":
             state["pi_outcome"] = "cancelled"
             # 第七阶段收口：取消**不得**因残留旧 answer 被归一为成功。清除旧答复，
@@ -908,9 +1156,15 @@ class PiRuntime:
             state["pi_outcome"] = "waiting"
             if msg.get("wait_reason") == "approval":
                 state["status"] = "waiting_approval"
+                state.pop("answer", None)
+            elif msg.get("wait_reason") == "input":
+                question = str(
+                    ((self._snapshot.get('host_result_state') or {}).get('awaiting_input')
+                     or {}).get('question') or '需要补充信息后才能继续')
+                self._mark_waiting_input(state, question)
             else:
                 state["status"] = "waiting_external"
-            state.pop("answer", None)
+                state.pop("answer", None)
         else:
             # validate_finished 已保证 outcome 只可能是上述四者，此分支防御性兜底
             state["pi_outcome"] = "failed"

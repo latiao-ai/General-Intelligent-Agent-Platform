@@ -16,8 +16,8 @@
 """
 from __future__ import annotations
 
-import asyncio
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,7 +32,7 @@ from tests.exec_env import PG_DSN, new_store, reset_db, valid_test_dsn
 def _platform_server(state_file: Path) -> mcp_servers.Server:
     return mcp_servers.Server(
         id='platform', transport='stdio',
-        stdio_command='.venv-pi-test/bin/python',
+        stdio_command=sys.executable,
         stdio_args=('-m', 'tests.mcp_platform_server',
                     '--state-file', str(state_file)),
         idempotency_arg='operation_id')
@@ -112,6 +112,7 @@ class HostWriteReadbackEvidenceTests(unittest.IsolatedAsyncioTestCase):
             # 显式扩展写白名单（正式链路测试经环境变量受控启用，不靠测试注入
             # 或临时全局切换——环境变量是显式配置）。
             import json
+            os.environ['PI_WRITE_TOOLS_ENABLED'] = 'true'
             os.environ['PI_WRITE_TOOL_KEYS'] = json.dumps(
                 ['mcp:platform:update_object'])
             os.environ['PI_READ_TOOL_KEYS'] = json.dumps(
@@ -157,6 +158,7 @@ class HostWriteReadbackEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 st = read_state(sf)
             finally:
                 os.environ.pop('PI_WRITE_TOOL_KEYS', None)
+                os.environ.pop('PI_WRITE_TOOLS_ENABLED', None)
                 os.environ.pop('PI_READ_TOOL_KEYS', None)
 
         # 两个对象各写一次（revision 1→2）

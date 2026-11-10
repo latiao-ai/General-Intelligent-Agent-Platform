@@ -222,7 +222,8 @@ class AttemptTimeout(ModelRequestError):
 def _prepare(system, messages, *, schema=None, purpose='final_answer'):
     try:
         conversation, report = context.prepare_request(
-            system, messages, schema=schema, purpose=purpose, settings=settings)
+            f'{system}\n\n{context.current_time_prompt(settings.prompt_timezone)}',
+            messages, schema=schema, purpose=purpose, settings=settings)
     except context.ContextBudgetExceeded as exc:
         emit({'type': 'context_budget', 'report': exc.report})
         logger.info('模型请求被上下文预算拦截：%s', exc.report)

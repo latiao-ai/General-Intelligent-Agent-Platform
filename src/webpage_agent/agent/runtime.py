@@ -11,7 +11,9 @@
         - 运行时只负责「驱动一次执行」——消费准备好的状态、把节点级进度与
           内部细粒度事件交回给回调，最后返回最终状态。
 
-    生产默认只有 `LangGraphRuntime` 一个实现，外部行为与改造前完全一致。
+    唯一的执行引擎是 Pi。无 run 身份的调用按 `default_kind()`（pi）取。
+    库里 `runtime_kind=langgraph` 的存量行不在这里启动旧引擎：执行入口先
+    `prepare_execution`，没有副作用就改挂到 Pi，已经有副作用就停在待核实。
 
 契约约定（状态归属是关键）：
 
@@ -30,8 +32,8 @@
       职责，宿主保证「最终落盘、outcome 生成、Hub 收尾」读取同一份有效 state；
     - 控制流异常（`LeaseLost` / `ControlStopped`）与取消（`CancelledError`）必须
       **原样穿透**，不得被运行时吞掉或包成普通异常；
-    - 底层引擎专属的预算耗尽（如 LangGraph 的递归上限）由**适配层**折成通用
-      结果（`core.errors.RecursionBudgetExceeded`），宿主不感知底层引擎类型。
+    - 步数预算用尽由运行时折成通用结果（`core.errors.RecursionBudgetExceeded`），
+      宿主按可续跑的中断收尾，不关心计数发生在哪一层。
 """
 from typing import Awaitable, Callable, Optional, Protocol, runtime_checkable
 
@@ -65,8 +67,7 @@ async def invoke_callback(callback, event: dict) -> None:
 class Runtime(Protocol):
     """驱动一次智能体执行的最小接口。
 
-    所有实现（当前是 LangGraphRuntime，后续是 PiRuntime）都遵守同一份契约，
-    宿主侧（run_task）不感知底层是 LangGraph 还是 Pi。
+    生产实现是 PiRuntime。宿主侧（run_task）只依赖这份契约。
     """
 
     async def run(
@@ -91,23 +92,24 @@ class Runtime(Protocol):
 def get_runtime(kind: str = '') -> Runtime:
     """运行时工厂：宿主经这里取运行时，而不是写死具体实现。
 
-    第七阶段起按**引擎归属**分流：
+    - `kind` 为空或 `pi` → 返回 `PiRuntime`，系统提示来自 `settings.pi_system_prompt`；
+    - `kind == 'langgraph'` → 抛 `RetiredRuntime`。存量行的改挂/拒收在
+      `prepare_execution`，工厂不再提供第二套引擎；
+    - 未知 `kind` → 抛 `UnknownRuntimeKind`，**不回退**。
 
-    - `kind` 为空（CLI 直调 / 无账本单测）→ 返回 `LangGraphRuntime`（生产默认）；
-    - `kind == 'pi'` → 返回 `PiRuntime`；
-    - 未知 `kind` → 抛 `UnknownRuntimeKind`，**不回退默认引擎**。
-
-    调用方（`run_task` / Hub）负责从 `store.runtime_identity(run_id)` 读已存归属
-    再传到这里。测试仍可 `patch` 本函数注入替身。
+    调用方（`run_task` / Hub）先 `prepare_execution`，再把得到的 `pi` 传到这里。
+    测试仍可 `patch` 本函数注入替身。
     """
     from webpage_agent.agent import runtime_identity
 
     normalized = runtime_identity.normalize_kind(kind) if kind else ''
     if not kind:
-        normalized = runtime_identity.KIND_LANGGRAPH
+        normalized = runtime_identity.default_kind()
     if normalized == runtime_identity.KIND_LANGGRAPH:
-        from webpage_agent.agent.langgraph_runtime import LangGraphRuntime
-        return LangGraphRuntime()
+        raise runtime_identity.RetiredRuntime(
+            '<runtime>',
+            'LangGraph 引擎已下线。存量运行请走 prepare_execution：'
+            '没有副作用会改挂到 Pi，已经产生步骤或动作则停在待核实。')
     if normalized == runtime_identity.KIND_PI:
         from webpage_agent.agent.pi_runtime import PiRuntime
         # 第七阶段收口：受控模型脚本（测试专用）经环境变量注入，让正式
@@ -147,5 +149,21 @@ def get_runtime(kind: str = '') -> Runtime:
                         'url': 'https://mock.example', 'chars': 3,
                     }],
                 }
-        return PiRuntime(mock_script=mock_script, tool_runner=tool_runner)
+        # 凭据缺失会让真实链路直接 401：PiRuntime 的默认模型配置里没有 key，
+        # 必须由宿主从 settings 注入，否则正式入口只能跑受控模型（PI_MOCK_SCRIPT）。
+        from webpage_agent.core.config import settings
+        return PiRuntime(
+            mock_script=mock_script, tool_runner=tool_runner,
+            model={
+                'id': settings.llm_model,
+                'base_url': settings.llm_base_url,
+                'provider': 'deepseek',
+                'api': 'openai-completions',
+            },
+            api_key=settings.llm_key or None,
+            # 系统提示是配置，不是临时环境变量说明。
+            # settings.pi_system_prompt 默认带画布停手规则；PI_SYSTEM_PROMPT
+            # 可覆盖，显式空字符串则不注入。
+            system_prompt=settings.pi_system_prompt or None,
+        )
     raise runtime_identity.UnknownRuntimeKind('<new-run>', kind)

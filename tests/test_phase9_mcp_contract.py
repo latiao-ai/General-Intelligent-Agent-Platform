@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import tempfile
 import unittest
 from contextlib import contextmanager
@@ -44,7 +45,7 @@ def _probe_server(state_file: Path) -> mcp_servers.Server:
     """一个指向受控 stdio 服务端的 Server 配置。"""
     return mcp_servers.Server(
         id='probe', transport='stdio',
-        stdio_command='.venv-pi-test/bin/python',
+        stdio_command=sys.executable,
         stdio_args=('-m', 'tests.mcp_probe_server',
                     '--state-file', str(state_file)))
 

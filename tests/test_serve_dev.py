@@ -141,7 +141,7 @@ class MainPortHandlingTests(unittest.TestCase):
         state = {8001: True, 8002: False}
         procs = []
 
-        def fake_spawn(label, argv):
+        def fake_spawn(label, argv, env=None):
             procs.append((label, argv))
             return _InterruptingProc(argv)
 
@@ -157,8 +157,9 @@ class MainPortHandlingTests(unittest.TestCase):
              patch.object(serve_dev, 'stop_process', side_effect=fake_stop) as stop:
             self.assertEqual(self._run(['--with-frontend', '--force'], fake_spawn), 0)
             stop.assert_called_once_with(4242)
-        self.assertEqual([label for label, _ in procs], ['后端', 'Worker', '前端代理'])
-        self.assertIn('8001', procs[2][1])
+        self.assertEqual([label for label, _ in procs],
+                         ['SkillHub', '后端', 'Worker', '前端代理'])
+        self.assertIn('8001', procs[3][1])
 
     def test_force_refuses_foreign_holder_and_skips_spawn(self):
         with patch.object(serve_dev, 'port_in_use', side_effect=lambda p: p == 8001), \
@@ -166,24 +167,27 @@ class MainPortHandlingTests(unittest.TestCase):
              patch.object(serve_dev, 'process_command', return_value='/usr/bin/redis-server'), \
              patch.object(serve_dev, 'is_project_process', return_value=False), \
              patch.object(serve_dev, 'stop_process') as stop:
-            self.assertEqual(self._run(['--with-frontend', '--force'], lambda *a: _InterruptingProc(a[1])), 2)
+            self.assertEqual(self._run(['--with-frontend', '--force'],
+                                       lambda *a, **k: _InterruptingProc(a[1])), 2)
             stop.assert_not_called()
 
     def test_busy_port_without_flags_still_exits(self):
         with patch.object(serve_dev, 'port_in_use', side_effect=lambda p: p == 8001):
-            self.assertEqual(self._run(['--with-frontend'], lambda *a: _InterruptingProc(a[1])), 2)
+            self.assertEqual(self._run(['--with-frontend'],
+                                       lambda *a, **k: _InterruptingProc(a[1])), 2)
 
     def test_auto_port_moves_frontend_and_reports_real_address(self):
         procs = []
 
-        def fake_spawn(label, argv):
+        def fake_spawn(label, argv, env=None):
             procs.append((label, argv))
             return _InterruptingProc(argv)
 
         with patch.object(serve_dev, 'port_in_use', side_effect=lambda p: p == 8001):
             self.assertEqual(self._run(['--with-frontend', '--auto-port', '--no-worker'], fake_spawn), 0)
-        self.assertEqual([label for label, _ in procs], ['后端', '前端代理'])
-        self.assertEqual(procs[1][1][procs[1][1].index('--port') + 1], '8003')
+        self.assertEqual([label for label, _ in procs], ['SkillHub', '后端', '前端代理'])
+        frontend = procs[2][1]
+        self.assertEqual(frontend[frontend.index('--port') + 1], '8003')
 
     def test_force_and_auto_port_conflict(self):
         with patch.object(serve_dev.sys, 'argv', ['serve_dev', '--force', '--auto-port']):
@@ -193,13 +197,14 @@ class MainPortHandlingTests(unittest.TestCase):
     def test_local_skips_lan_flag(self):
         procs = []
 
-        def fake_spawn(label, argv):
+        def fake_spawn(label, argv, env=None):
             procs.append((label, argv))
             return _InterruptingProc(argv)
 
         with patch.object(serve_dev, 'port_in_use', return_value=False):
             self.assertEqual(self._run(['--local', '--no-worker'], fake_spawn), 0)
-        self.assertNotIn('--lan', procs[0][1])
+        backend = next(argv for label, argv in procs if label == '后端')
+        self.assertNotIn('--lan', backend)
 
 
 if __name__ == '__main__':

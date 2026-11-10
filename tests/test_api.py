@@ -700,9 +700,9 @@ class MessageTests(unittest.TestCase):
 
 class TimingLabelTests(unittest.TestCase):
     def test_every_graph_node_has_a_chinese_label(self):
-        from webpage_agent.agent.graph import NODE_NAMES
+        from webpage_agent.observe.events import ORCHESTRATION_STAGES
         from webpage_agent.api.main import STAGE_LABELS
-        missing = [name for name in NODE_NAMES if name not in STAGE_LABELS]
+        missing = [name for name in ORCHESTRATION_STAGES if name not in STAGE_LABELS]
         self.assertEqual(missing, [])
 
     def test_format_timings_includes_label_and_seconds(self):

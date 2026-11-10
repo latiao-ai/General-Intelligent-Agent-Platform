@@ -19,6 +19,47 @@ def _bridge(**kwargs) -> PiBridge:
     return PiBridge(node_script=_FAKE_SCRIPT, **kwargs)
 
 
+class CurrentTimeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_model_admission_refreshes_host_time(self):
+        from unittest.mock import AsyncMock, patch
+        from webpage_agent.agent import context, pi_protocol
+
+        class Bridge:
+            execution_id = 'x'
+            send = AsyncMock()
+
+        bridge = Bridge()
+        runtime = PiRuntime(tools=[], system_prompt='自定义规则')
+        runtime._begin_model = AsyncMock(return_value='reservation')
+        with patch.object(context, 'current_time_prompt', side_effect=['第一天', '第二天']):
+            for request_id in ('one', 'two'):
+                msg = pi_protocol.make_message('x', 'model_request', request_id=request_id)
+                await runtime._handle_model_request(bridge, msg)
+        sent = [call.args[0] for call in bridge.send.await_args_list]
+        self.assertEqual([item['current_time_prompt'] for item in sent], ['第一天', '第二天'])
+        self.assertTrue(all(item['allow'] for item in sent))
+        self.assertEqual(runtime._system_prompt, '自定义规则')
+
+    def test_prepare_uses_shanghai_time_and_keeps_system(self):
+        from datetime import datetime, timezone
+        from unittest.mock import patch
+        from webpage_agent.agent import context
+        from webpage_agent.core import services
+
+        instant = datetime(2030, 1, 1, 16, 30, tzinfo=timezone.utc)
+        with patch.object(context, 'datetime') as clock:
+            clock.now.side_effect = lambda tz: instant.astimezone(tz)
+            with patch.object(services, 'emit'):
+                conversation = services._prepare('自定义系统规则', [('user', '今天几号')])
+            shanghai = conversation[0][1]
+            utc = context.current_time_prompt('UTC')
+        self.assertIn('自定义系统规则', shanghai)
+        self.assertIn('2030-01-02T00:30:00+08:00', shanghai)
+        self.assertIn('Asia/Shanghai', shanghai)
+        self.assertIn('2030-01-01T16:30:00+00:00', utc)
+        self.assertEqual(conversation[1], ('user', '今天几号'))
+
+
 class PiProtocolTests(unittest.TestCase):
     """协议编解码与校验的纯单元测试。"""
 
@@ -435,7 +476,8 @@ class PiRuntimeContractTests(unittest.IsolatedAsyncioTestCase):
         # 默认工具目录只开放 web_search（稳定键 local:web:search），无 echo/add
         runtime = PiRuntime()
         names = [t["name"] for t in runtime._tools]
-        self.assertEqual(names, ["web_search"])
+        self.assertEqual(names[0], "web_search")
+        self.assertIn("request_input", names)
         # web_search 参数是完整 JSON Schema（type/properties/required）
         ws = runtime._tools[0]
         self.assertEqual(ws["parameters"]["type"], "object")
@@ -562,9 +604,62 @@ class EventSinkIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([e["text"] for e in received_b], ["b1"])
 
     async def test_no_sink_falls_back_to_writer(self):
-        # 无 sink 绑定：emit 回退到 LangGraph writer（此处无 writer，静默跳过，不抛错）
+        # 没有绑定 sink 时静默跳过，不抛错。
         from webpage_agent.observe.events import emit_async
         await emit_async({"type": "answer_delta", "text": "x"})  # 不抛错
+
+
+class PiRecoveryReplyTests(unittest.IsolatedAsyncioTestCase):
+    """恢复决策落到用户回执上的措辞（回归：只读结果未定不得说成写操作）。
+
+    `pi_recovery.decide()` 的 `reason` 明确标注「排障用」，里面带内部 action_id
+    与英文状态；而 `core/messages.py` 把 `state['failure']` 直接拼进给用户看的
+    句子。两者混用会同时造成两个问题：
+
+      - 不写 `failure` → 回退成默认句"有写操作的结果没能确认"，可这条动作可能
+        只是 `local:web:search`（effect=read），等于凭空告诉用户产生了副作用；
+      - 直接写 `reason` → 内部标识漏进用户文案。
+
+    这里锁住「内部留痕走 errors、用户文案单独写」这条边界。
+    """
+
+    def _state(self, kind: str, reason: str = '') -> dict:
+        from webpage_agent.agent import pi_snapshot
+        snapshot = pi_snapshot.new_snapshot(user_input='查天气')
+        return {
+            'task_id': 't', 'run_id': 'r', 'user_input': '查天气', 'history': [],
+            'pi_resume': {
+                'snapshot': snapshot,
+                'recovery': {'kind': kind, 'reason': reason,
+                             'tool_results': [], 'pending_calls': [],
+                             'deliver_results': [], 'final_answer': None},
+            },
+        }
+
+    async def test_reconcile_message_does_not_claim_write_side_effect(self):
+        from webpage_agent.core.messages import reply_text
+
+        reason = '动作 act_abc123 状态 in_flight，结果未定，需核实'
+        state = await PiRuntime(bridge=_bridge()).run(self._state('resume_reconcile', reason))
+
+        self.assertEqual(state['status'], 'needs_reconcile')
+        # 用户文案：说清"这一步生没生效不确定、且没有重试"，不出现内部标识
+        self.assertIn('没能确认', state['failure'])
+        self.assertNotIn('act_abc123', state['failure'])
+        self.assertNotIn('in_flight', state['failure'])
+        # 排障信息不丢：原始 reason 仍在 errors 里
+        self.assertEqual(state['errors'][-1]['detail'], reason)
+
+        reply = reply_text(state)
+        # 只读场景不得提"写操作"
+        self.assertNotIn('写操作', reply)
+        self.assertIn('没能确认', reply)
+
+    async def test_block_kind_uses_same_user_facing_failure(self):
+        state = await PiRuntime(bridge=_bridge()).run(
+            self._state('resume_block', '结果未知，保守阻断'))
+        self.assertEqual(state['status'], 'needs_reconcile')
+        self.assertTrue(state['failure'])
 
 
 if __name__ == "__main__":

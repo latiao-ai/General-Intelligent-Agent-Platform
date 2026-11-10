@@ -1,9 +1,11 @@
 """Pi 宿主工具调用对象：把「模型发起的工具调用」接到受治理的真实执行。
 
-第五阶段：Pi 不再用假工具（echo/add），而是通过这里调用**唯一开放的真实工具**
-`local:web:search`（web_search）。每一次调用都走 `tools/execution_gateway.py` 的
-同一条治理链（授权 → 准入 → 撤权复查 → 真实调用 → 结算），并把搜索结果转成
-模型可用的回执。
+第五阶段：Pi 不再用假工具（echo/add），而是通过这里调用**白名单内的真实工具**。
+默认只开放 `local:web:search`（web_search）；第十/十二阶段起，读/写白名单可经
+`PI_READ_TOOL_KEYS` / `PI_WRITE_TOOL_KEYS` 环境变量**显式扩展**（读工具要求
+`effect=read`，写工具必须逐个点名，默认空）。每一次调用都走
+`tools/execution_gateway.py` 的同一条治理链
+（授权 → 准入 → 撤权复查 → 真实调用 → 结算），并把结果转成模型可用的回执。
 
 关键纪律：
 
@@ -11,7 +13,9 @@
   库里已提交的 run 行，**不**从 Node 或模型输出取；桥接 `call_id` 只用于
   往返关联，Python 分配稳定执行身份（step_id / action_id / attempt_id），
   不假定模型生成的 ID 能用于重启恢复；
-- **只开放 local:web:search**：执行点再次解析并检查工具，其它工具一律拒绝；
+- **只执行白名单内的工具**：执行点按请求名再次解析并检查工具，白名单外一律拒绝；
+- **必须有执行账本**：`governed_call(require_ledger=True)` 是正式路径，没有账本时
+  返回 `E_NO_LEDGER`、绝不落到真实调用。不存在"无账本直接执行"的兼容旁路——
 - **成功结算前不向 Pi 发成功回执**：结算失败就停止后续模型执行；
 - **结果归一**：工具内部返回的 `status="searched"` 是阶段小结，不是业务终态；
   回执保留来源 ID / 标题 / URL / 限长正文摘录，正文经 sources 存储读取，
@@ -38,9 +42,14 @@ logger = logging.getLogger(__name__)
 SYNC_READ_TOOL_KEYS = ('local:web:search',)
 
 # 本阶段 Pi 同步开放的**写**工具白名单（稳定键）。**默认空**——写工具绝不默认
-# 开放。第十阶段仅启用受控平台的 update_object（经显式配置注入，见
-# `pi_tool_catalog()`），生产不开放通用写工具。
+# 开放。扩展必须同时满足两道门：`PI_WRITE_TOOLS_ENABLED=true`，以及
+# `PI_WRITE_TOOL_KEYS` 里逐个点名。只配了键、没开开关，会被忽略并告警，
+# 不能靠误配静默扩权。
 WRITE_TOOL_KEYS: tuple[str, ...] = ()
+
+# 宿主控制工具：缺参时模型调用它，本轮结束并进入 waiting_input。
+# 不是业务工具，不走 governed_call，也不占用写白名单。
+REQUEST_INPUT_NAME = 'request_input'
 
 # 第九阶段保留别名（向后兼容旧测试引用）：只读白名单。
 READ_TOOL_KEYS = SYNC_READ_TOOL_KEYS
@@ -48,30 +57,84 @@ READ_TOOL_KEYS = SYNC_READ_TOOL_KEYS
 
 def _effective_read_keys() -> set[str]:
     """当前生效的读白名单：模块级常量 + 环境变量显式扩展（正式链路测试用）。"""
-    import json as _json
     import os as _os
     keys = set(SYNC_READ_TOOL_KEYS)
     extra = _os.environ.get('PI_READ_TOOL_KEYS')
     if extra:
-        try:
-            keys |= {str(k) for k in _json.loads(extra)}
-        except ValueError:
-            pass
+        parsed = _parse_key_list(extra, 'PI_READ_TOOL_KEYS')
+        if parsed:
+            keys |= parsed
     return keys
+
+
+def write_tools_gate_open() -> bool:
+    """写白名单扩展门禁。环境变量优先（进程启动与测试改 env 都认），否则看 settings。"""
+    import os as _os
+    raw = _os.environ.get('PI_WRITE_TOOLS_ENABLED')
+    if raw is not None:
+        return raw.strip().lower() == 'true'
+    from webpage_agent.core.config import settings
+    return bool(settings.pi_write_tools_enabled)
+
+
+def _parse_key_list(raw: str, name: str) -> set[str] | None:
+    import json as _json
+    try:
+        parsed = _json.loads(raw)
+    except ValueError:
+        logger.warning('%s 不是合法 JSON，已忽略', name)
+        return None
+    if not isinstance(parsed, list):
+        logger.warning('%s 必须是 JSON 数组，已忽略', name)
+        return None
+    return {str(key) for key in parsed}
 
 
 def _effective_write_keys() -> set[str]:
-    """当前生效的写白名单：模块级常量 + 环境变量显式扩展（正式链路测试用）。"""
-    import json as _json
+    """当前生效的写白名单。
+
+    模块级常量（默认空）之外的键，必须打开 `PI_WRITE_TOOLS_ENABLED` 才会并入。
+    门开时打审计日志；门关时丢弃环境变量里的键并告警。
+    """
     import os as _os
     keys = set(WRITE_TOOL_KEYS)
     extra = _os.environ.get('PI_WRITE_TOOL_KEYS')
-    if extra:
-        try:
-            keys |= {str(k) for k in _json.loads(extra)}
-        except ValueError:
-            pass
-    return keys
+    if not extra:
+        return keys
+    parsed = _parse_key_list(extra, 'PI_WRITE_TOOL_KEYS')
+    if not parsed:
+        return keys
+    if not write_tools_gate_open():
+        logger.warning(
+            '拒绝静默扩权：PI_WRITE_TOOL_KEYS=%s 已忽略。'
+            '要开放这些写工具，必须同时设置 PI_WRITE_TOOLS_ENABLED=true',
+            sorted(parsed))
+        return keys
+    enabled = keys | parsed
+    logger.info('审计：Pi 写白名单经显式门禁扩展为 %s', sorted(enabled))
+    return enabled
+
+
+def request_input_decl() -> dict:
+    """缺参时让模型停下来问人的宿主工具声明。"""
+    return {
+        'name': REQUEST_INPUT_NAME,
+        'description': (
+            '向用户索取继续执行所缺的信息（选中对象、字段或必须由人做的选择）。'
+            '调用后本轮立即停止，进入 waiting_input。不要猜测缺的值，也不要改用别的工具空转。'
+        ),
+        'parameters': {
+            'type': 'object',
+            'additionalProperties': False,
+            'properties': {
+                'question': {
+                    'type': 'string',
+                    'description': '需要用户补充的具体问题，一句话',
+                },
+            },
+            'required': ['question'],
+        },
+    }
 
 # 单条来源给模型的正文摘录上限（字符）。正文太长只摘开头，避免撑爆上下文。
 SNIPPET_MAX_CHARS = 400
@@ -88,7 +151,9 @@ MAX_SOURCES = 8
 _MERGEABLE_KEYS = ('documents', 'usage', 'errors',
                    'mcp_calls', 'object_id', 'operation_id', 'revision',
                    'new_revision', 'modified_fields', 'write_result',
-                   'readback', 'readback_match')
+                   'readback', 'readback_match',
+                   # 脚本化部署的业务回执。身份、租约、status 仍不在这份白名单里。
+                   'deployment')
 
 
 @dataclass
@@ -126,6 +191,8 @@ class ToolReceipt:
     # 供批准后恢复原调用、重查约束（不能靠模型重发的参数冒充原调用）。
     final_args: dict | None = None
     args_hash: str = ''
+    # 结果未定（in_flight / unknown）：脚本化恢复要停在待核实，不能当普通失败重试。
+    blocked: bool = False
 
 
 def _resolve_web_search():
@@ -594,15 +661,36 @@ class HostToolCaller:
             return ToolReceipt(
                 ok=False,
                 error=f'工具未开放或不在白名单：{tool_name}')
+        return await self._call_resolved(
+            call_id=call_id, tool=tool, tool_name=tool_name, args=args,
+            state=state, build_snapshot=build_snapshot, step_id=None)
 
+    async def call_declared(self, *, step_id: str, tool, args: dict,
+                            state: dict, build_snapshot=None) -> ToolReceipt:
+        """执行宿主已经点名的工具（脚本化补偿 / 部署）。
+
+        不经过模型白名单：步骤是事先定好的，不是模型从目录里挑的。治理链与
+        `call` 相同，仍然是 `governed_call`。账本身份用脚本里的 `step_id`，
+        不用 `pi:call:N`——中断后续跑必须对上同一步，不能换成新幂等键再写一次。
+        """
+        name = str(getattr(tool, 'name', '') or step_id)
+        return await self._call_resolved(
+            call_id=step_id, tool=tool, tool_name=name, args=args,
+            state=state, build_snapshot=build_snapshot, step_id=step_id)
+
+    async def _call_resolved(self, *, call_id: str, tool, tool_name: str,
+                             args: dict, state: dict, build_snapshot=None,
+                             step_id: str | None) -> ToolReceipt:
+        """`call` / `call_declared` 共用的治理调用。`step_id` 为空时才分配逻辑序号。"""
         tool_key = tool.tool_key or tool.name
-        # 逻辑调用身份：宿主分配并持久化的 run 内序号，与参数哈希解耦。
-        # 第七阶段收口：按桥接 call_id 直接绑定（ToolCall.id），不再拼 node_call_key。
-        try:
-            step_id = self._registry.logical_id(
-                call_id, tool_name=tool_name, tool_key=tool_key, args=args)
-        except RuntimeError as exc:
-            return ToolReceipt(ok=False, error=str(exc), step_id='')
+        if not step_id:
+            # 逻辑调用身份：宿主分配并持久化的 run 内序号，与参数哈希解耦。
+            # 第七阶段收口：按桥接 call_id 直接绑定（ToolCall.id），不再拼 node_call_key。
+            try:
+                step_id = self._registry.logical_id(
+                    call_id, tool_name=tool_name, tool_key=tool_key, args=args)
+            except RuntimeError as exc:
+                return ToolReceipt(ok=False, error=str(exc), step_id='')
 
         # 第十阶段第 4 点：宿主分配逻辑调用身份后，复用 execution_arguments 生成
         # **最终发送参数**（含幂等键注入）。授权、审批指纹、账本准入、远端发送
@@ -630,7 +718,8 @@ class HostToolCaller:
             replay = result.replay if isinstance(result.replay, dict) else {}
             has_content = isinstance(replay.get('documents'), list) or \
                 bool(replay.get('object_id') or replay.get('write_result')
-                     or replay.get('mcp_calls') or replay.get('new_revision'))
+                     or replay.get('mcp_calls') or replay.get('new_revision')
+                     or replay.get('deployment'))
             if not has_content:
                 return ToolReceipt(
                     ok=False, action_id=result.action_id,
@@ -700,7 +789,7 @@ class HostToolCaller:
                                args_hash=ledger_module.args_hash(final_args or {}))
         if result.kind == 'blocked':
             return ToolReceipt(ok=False, error=result.error or '结果未定，需核实',
-                               step_id=step_id)
+                               step_id=step_id, blocked=True)
         # failed
         return ToolReceipt(ok=False, error=result.error or '工具执行失败',
                            action_id=result.action_id,
