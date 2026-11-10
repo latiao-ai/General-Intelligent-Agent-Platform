@@ -43,6 +43,8 @@ logger = logging.getLogger(__name__)
 MCP_PREFIX = 'mcp__'
 DEFAULT_TRANSPORT = 'streamable_http'
 VALID_TRANSPORTS = {'streamable_http', 'sse', 'stdio'}
+# 连接器授权方式：空 = 静态 token；oauth = 按登录主体走授权码流程。
+VALID_AUTH_MODES = {'', 'oauth'}
 
 # 配置解析失败时的最后一次错误，供 /api/health 与排障看
 LAST_ERROR: str = ''
@@ -80,6 +82,8 @@ class Server:
     # 内核不再替某一家编写业务语义（删站点、生成视频、画布节点这类话写在这里）。
     prompt_rules: str = ''
     stdio_env: dict = field(default_factory=dict)
+    # 用户自定义远程 MCP 的静态请求头（例如私有网关注入的鉴权头）。
+    http_headers: dict = field(default_factory=dict)
     # `forward_subject` 在 stdio 上用环境变量传主体（子进程是我们自己起的，可信）。
     # HTTP/SSE 是跨机器的通道，明文主体头既不能被对端当依据、又会被"拿到 token 的人"伪造，
     # 所以改为签发短期签名断言：密钥引用走 env:/file:/literal:，密钥本身不进配置。
@@ -99,6 +103,21 @@ class Server:
     # 规划校验只据此判"提议和提交是否被塞进了同一片段"。
     confirmation_tools: tuple = ()
     proposal_tools: tuple = ()
+    # ---------- 连接器授权 ----------
+    # 空串：用本条目 / 环境里的静态 token（历史行为，不感知用户）。
+    # `oauth`：按登录主体走授权码流程，token 由 `core/oauth_store.py` 解析。
+    # 只有 HTTP/SSE 能走 OAuth —— stdio 没有 Authorization 头，凭据只能来自
+    # 进程环境变量（见 `forward_subject` 那段注释）。
+    auth: str = ''
+    oauth_issuer: str = ''
+    oauth_scopes: tuple = ()
+    oauth_client_name: str = ''
+    oauth_resource: str = ''
+    oauth_redirect_path: str = ''
+    # 预注册模式用：有些企业级 server 不给动态注册端点，要求先在对方后台报备。
+    # 这两个值属于"应用级"配置（全中台一份），不是用户凭据。
+    oauth_client_id: str = ''
+    oauth_client_secret_ref: str = ''
 
 
 def _legacy_server() -> Server | None:
@@ -180,6 +199,26 @@ def _from_entry(entry: dict) -> Server | None:
     if transport == 'stdio' and not command:
         logger.warning('MCP 服务端 %s 缺少 stdio_command，已跳过', server_id)
         return None
+    oauth_raw = entry.get('oauth')
+    oauth = oauth_raw if isinstance(oauth_raw, dict) else {}
+    auth_mode = str(entry.get('auth') or '').strip().lower()
+    if auth_mode and auth_mode not in VALID_AUTH_MODES:
+        logger.warning('MCP 服务端 %s 的 auth 无效（%s），只能是 %s，已跳过',
+                       server_id, auth_mode, ' / '.join(sorted(VALID_AUTH_MODES)))
+        return None
+    oauth_issuer = str(oauth.get('issuer') or '').strip()
+    if auth_mode == 'oauth':
+        # 这两种配错都是"看起来能用、实际上永远连不上"，必须在加载时就拒掉：
+        # stdio 没有请求头，OAuth 的 Bearer 无处可挂；没有 issuer 则无法发现
+        # 授权端点，只能靠猜地址。
+        if transport == 'stdio':
+            logger.warning('MCP 服务端 %s 配了 oauth 但 transport 是 stdio：'
+                           'stdio 没有 Authorization 头，已跳过', server_id)
+            return None
+        if not oauth_issuer:
+            logger.warning('MCP 服务端 %s 配了 oauth 但 oauth.issuer 为空，已跳过',
+                           server_id)
+            return None
     return Server(
         id=server_id,
         transport=transport,
@@ -198,6 +237,7 @@ def _from_entry(entry: dict) -> Server | None:
         tool_hints=dict(entry.get('tool_hints') or {}),
         prompt_rules=_prompt_rules(entry.get('prompt_rules')),
         stdio_env={str(k): str(v) for k, v in (entry.get('stdio_env') or {}).items()},
+        http_headers={str(k): str(v) for k, v in (entry.get('headers') or {}).items()},
         forward_subject=bool(entry.get('forward_subject', False)),
         subject_secret_ref=str(entry.get('subject_secret_ref') or '').strip(),
         subject_header=str(entry.get('subject_header') or '').strip(),
@@ -207,9 +247,75 @@ def _from_entry(entry: dict) -> Server | None:
         idempotency_arg=str(entry.get('idempotency_arg') or '').strip(),
         confirmation_tools=tuple(str(x) for x in (entry.get('confirmation_tools') or [])),
         proposal_tools=tuple(str(x) for x in (entry.get('proposal_tools') or [])),
+        auth=auth_mode,
+        oauth_issuer=oauth_issuer,
+        oauth_scopes=tuple(str(x) for x in (oauth.get('scopes') or ()) if str(x).strip()),
+        oauth_client_name=str(oauth.get('client_name') or '').strip() or '智能体中台',
+        oauth_resource=str(oauth.get('resource') or '').strip(),
+        oauth_redirect_path=str(oauth.get('redirect_path') or '').strip(),
+        oauth_client_id=str(oauth.get('client_id') or '').strip(),
+        oauth_client_secret_ref=str(oauth.get('client_secret_ref') or '').strip(),
         default=bool(entry.get('default')),
         title=str(entry.get('title') or ''),
     )
+
+
+
+# ---------------------------------------------------------------- 用户自定义远程 MCP
+#
+# 与 WorkBuddy 的 ~/.workbuddy/mcp.json 保持同一种文件形态：
+#   {"mcpServers": {"name": {"type": "streamable-http", "url": "...", "headers": {}}}}
+# 中台只接受 HTTP/SSE；stdio 等本地进程由运维通过 MCP_SERVERS 配置，避免
+# 浏览器里的一条 JSON 变成任意命令执行。
+_USER_CONFIG_ENV = 'MCP_USER_CONFIG_FILE'
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+
+
+def user_config_path() -> Path:
+    raw = os.getenv(_USER_CONFIG_ENV, '').strip()
+    if raw:
+        return Path(raw).expanduser()
+    return _REPO_ROOT / 'profile' / 'mcp.json'
+
+
+def _user_server_entries() -> list[Server]:
+    path = user_config_path()
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError) as exc:
+        global LAST_ERROR
+        LAST_ERROR = f'用户 MCP 配置读取失败：{type(exc).__name__}'
+        logger.warning(LAST_ERROR)
+        return []
+    raw = data.get('mcpServers') if isinstance(data, dict) else None
+    if not isinstance(raw, dict):
+        return []
+    out: list[Server] = []
+    for name, entry in raw.items():
+        if not isinstance(entry, dict) or entry.get('disabled') is True:
+            continue
+        if str(entry.get('command') or '').strip() or str(entry.get('type') or '').lower() == 'stdio':
+            logger.warning('用户 MCP %s 使用 stdio，中台只接受 HTTP/SSE，已跳过', name)
+            continue
+        kind = str(entry.get('type') or 'streamable-http').strip().lower()
+        transport = 'sse' if kind == 'sse' else 'streamable_http'
+        url = str(entry.get('url') or '').strip()
+        if not url:
+            logger.warning('用户 MCP %s 缺少 url，已跳过', name)
+            continue
+        headers = entry.get('headers')
+        headers = headers if isinstance(headers, dict) else {}
+        server = _from_entry({
+            'id': str(name), 'transport': transport, 'url': url,
+            'headers': {str(k): str(v) for k, v in headers.items()},
+            'title': str(entry.get('title') or name),
+        })
+        if server:
+            out.append(server)
+    return out
+
 
 
 def servers() -> list[Server]:
@@ -268,6 +374,13 @@ def servers() -> list[Server]:
             if filename or os.getenv('APP_ENV', '').strip().lower() == 'production':
                 return []
             logger.warning('MCP 服务端 id %s 重复，已忽略后一个', server.id)
+            continue
+        seen.add(server.id)
+        unique.append(server)
+    for server in _user_server_entries():
+        # 系统配置优先；用户不能覆盖运维配置，避免同名静默替换鉴权。
+        if server.id in seen:
+            logger.warning('用户 MCP %s 与系统配置重名，已忽略用户项', server.id)
             continue
         seen.add(server.id)
         unique.append(server)

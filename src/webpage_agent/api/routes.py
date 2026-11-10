@@ -129,11 +129,13 @@ from webpage_agent.api.skillhub_api import router as skillhub_router
 from webpage_agent.api.skillhub_api import registry_router
 from webpage_agent.api.skillhub_registry_api import router as registry_api_router
 from webpage_agent.api.connectors_api import router as connectors_router
+from webpage_agent.api.mcp_manager_api import router as mcp_manager_router
 from webpage_agent.api.models_api import router as models_router
 app.include_router(skillhub_router)
 app.include_router(registry_router)
 app.include_router(registry_api_router, prefix='/api/skillhub')
 app.include_router(connectors_router)
+app.include_router(mcp_manager_router)
 app.include_router(models_router)
 
 

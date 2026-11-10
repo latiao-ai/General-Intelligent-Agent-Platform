@@ -375,6 +375,9 @@ async def connect_session(server=None, *, token: str | None = None,
         raise SDKIncompatible(problem)
     transport = _cfg(server, 'transport', 'MCP_TRANSPORT', 'streamable_http')
     headers = auth_headers(token, _cfg(server, 'token', 'MCP_BEARER_TOKEN', ''))
+    custom_headers = getattr(server, 'http_headers', None) if transport != 'stdio' else None
+    if custom_headers:
+        headers = {**(headers or {}), **{str(k): str(v) for k, v in custom_headers.items()}}
     if transport != 'stdio' and getattr(server, 'forward_subject', False):
         # 跨机器传输：身份用签名断言（对端可验），不是明文主体头。
         assertion = await subject_assertion_headers(server)
