@@ -472,6 +472,42 @@ a{color:var(--brand);text-decoration:none}
 .modal-actions button.warn{background:#fff6f5;border-color:#f6cfc9;color:var(--danger)}
 .modal-actions button.primary{background:var(--ink);border-color:var(--ink);color:#fff}
 
+
+/* MCP 服务管理 */
+.mcp-manager{position:fixed;inset:0;z-index:90;display:flex;align-items:center;justify-content:center;
+  padding:20px;background:rgba(17,21,27,.40);backdrop-filter:blur(4px)}
+.mcp-manager[hidden]{display:none}
+.mcp-card{width:min(820px,100%);height:min(82vh,760px);display:flex;flex-direction:column;
+  padding:20px 22px;border-radius:16px;background:#fff;box-shadow:0 24px 70px rgba(16,24,40,.28)}
+.mcp-head{display:flex;align-items:flex-start;gap:12px}
+.mcp-head b{font-size:16px;color:var(--ink)}
+.mcp-head p{margin:4px 0 0;font-size:12px;color:var(--muted)}
+.mcp-x{margin-left:auto;border:0;background:none;color:var(--muted);font-size:24px;line-height:1;cursor:pointer}
+.mcp-bar{display:flex;align-items:center;gap:10px;margin:14px 0 10px}
+.mcp-path{flex:1;min-width:0;font-size:11.5px;color:var(--muted-2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mcp-actions{display:flex;gap:8px;flex:none}
+.mcp-actions button{height:32px;padding:0 12px;border:1px solid var(--line-2);border-radius:8px;
+  background:#fff;color:var(--ink-2);font-size:12px;cursor:pointer}
+.mcp-actions button:hover{background:var(--soft)}
+.mcp-actions button.primary{background:var(--ink);border-color:var(--ink);color:#fff}
+.mcp-list{flex:1;min-height:0;overflow:auto;border:1px solid var(--line);border-radius:12px}
+.mcp-row{display:flex;align-items:center;gap:12px;padding:12px 14px;border-bottom:1px solid var(--line)}
+.mcp-row:last-child{border-bottom:0}
+.mcp-row .mcp-ico{width:30px;height:30px;flex:none;border-radius:8px;display:grid;place-items:center;
+  background:var(--soft);font-size:15px}
+.mcp-row .mcp-main{flex:1;min-width:0}
+.mcp-row .mcp-name{font-size:13px;color:var(--ink);font-weight:500}
+.mcp-row .mcp-meta{font-size:11px;color:var(--muted-2);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mcp-row .mcp-tag{flex:none;font-size:10.5px;color:var(--muted);border:1px solid var(--line);border-radius:999px;padding:2px 7px}
+.mcp-empty{padding:34px 14px;text-align:center;font-size:12px;color:var(--muted-2)}
+#mmEditor{flex:1;min-height:0;display:flex;flex-direction:column}
+#mmEditor[hidden]{display:none}
+#mmText{flex:1;min-height:260px;margin-top:4px;padding:12px 14px;border:1px solid var(--line-2);
+  border-radius:10px;outline:none;resize:none;background:#fff;color:var(--ink);
+  font:12.5px/1.8 ui-monospace,SFMono-Regular,Menlo,monospace}
+#mmText:focus{border-color:#cfd4db}
+.mcp-error{min-height:18px;margin-top:6px;font-size:11.5px;color:var(--danger)}
+
 /* 登录（平台账号密码） */
 .auth-card{width:min(400px,100%)}
 .auth-form{display:flex;flex-direction:column;gap:9px;margin-top:12px}
@@ -1530,6 +1566,31 @@ body {
       </div>
     </div>
   </main>
+</div>
+
+<div id="mcpManager" class="mcp-manager" hidden>
+  <div class="mcp-card">
+    <div class="mcp-head">
+      <div><b>MCP 服务管理</b><p>安装 MCP 服务，为智能体扩展工具能力</p></div>
+      <button class="mcp-x" id="mmClose" aria-label="关闭">×</button>
+    </div>
+    <div id="mmListView">
+      <div class="mcp-bar">
+        <span class="mcp-path" id="mmPath"></span>
+        <div class="mcp-actions"><button id="mmAdd">＋ 添加 MCP</button><button id="mmEdit">编辑 JSON</button></div>
+      </div>
+      <div class="mcp-list" id="mmList"></div>
+    </div>
+    <div id="mmEditor" hidden>
+      <div class="mcp-bar">
+        <button id="mmBack">‹ 返回 MCP 列表</button>
+        <div class="mcp-actions"><button id="mmCancel">取消</button><button class="primary" id="mmSave">保存</button></div>
+      </div>
+      <div class="mcp-path" id="mmEditorPath"></div>
+      <textarea id="mmText" spellcheck="false" aria-label="MCP JSON 配置"></textarea>
+      <div class="mcp-error" id="mmError"></div>
+    </div>
+  </div>
 </div>
 
 <div class="modal" id="memoryModal" style="display:none">
@@ -5489,19 +5550,12 @@ setInterval(async () => {
       name.textContent = item.name;
       const meta = document.createElement('div');
       meta.className = 'cp-meta';
-      meta.textContent = item.configured
-        ? (item.enabled ? (item.tools ? `${item.tools} 个工具` : '已连接') : (item.error ? '连接失败' : '未连接'))
-        : '未配置';
+      meta.textContent = !item.configured ? '未配置'
+        : (item.need_authorize ? '待授权'
+        : (item.enabled ? (item.tools ? `${item.tools} 个工具` : '已连接')
+                        : (item.error ? '连接失败' : '未连接')));
       row.append(icon, name, meta);
-      if (item.configured) {
-        const sw = document.createElement('button');
-        const chosen = selectedForConversation.has(item.id);
-        sw.type = 'button';
-        sw.className = 'switch' + (chosen ? ' on' : '');
-        sw.setAttribute('aria-label', chosen ? '从当前会话移除' : '加入当前会话');
-        sw.onclick = e => { e.stopPropagation(); toggleConnector(item, sw); };
-        row.appendChild(sw);
-      } else {
+      if (!item.configured) {
         const link = document.createElement('button');
         link.type = 'button';
         link.className = 'cp-link';
@@ -5511,10 +5565,154 @@ setInterval(async () => {
           toast('在 .env 的 MCP_SERVERS 添加该服务端后重启即可');
         };
         row.appendChild(link);
+      } else if (item.need_authorize) {
+        const link = document.createElement('button');
+        link.type = 'button';
+        link.className = 'cp-link';
+        link.textContent = '授权';
+        link.onclick = e => { e.stopPropagation(); startConnectorAuth(item); };
+        row.appendChild(link);
+      } else {
+        const sw = document.createElement('button');
+        const chosen = selectedForConversation.has(item.id);
+        sw.type = 'button';
+        sw.className = 'switch' + (chosen ? ' on' : '');
+        sw.setAttribute('aria-label', chosen ? '从当前会话移除' : '加入当前会话');
+        sw.onclick = e => { e.stopPropagation(); toggleConnector(item, sw); };
+        row.appendChild(sw);
       }
       return row;
     }));
   }
+
+  // 需要用户授权（OAuth）的连接器：开新窗口走授权页，回来后刷新面板。
+  // 不用整页跳转——对话还在，跳走等于把用户从工作流里踢出去。
+  async function startConnectorAuth(item) {
+    try {
+      const res = await fetch(`${PREFIX}/connectors/${encodeURIComponent(item.id)}/oauth/start`, {method: 'POST'});
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+      const win = window.open(data.authorize_url, '_blank', 'width=560,height=720');
+      if (!win) {
+        toast('弹窗被拦截，请允许弹窗后重试');
+        return;
+      }
+      toast('已打开授权页，完成授权后回到这里即可');
+      const timer = setInterval(() => {
+        if (win.closed) {
+          clearInterval(timer);
+          loadConnectors();
+        }
+      }, 1200);
+    } catch (err) {
+      toast('发起授权失败：' + (err.message || '网络错误'));
+    }
+  }
+
+  window.addEventListener('message', e => {
+    if (e.data && e.data.type === 'wb-connector-authorized') loadConnectors();
+  });
+
+  // ---------------------------------------------------------- MCP 服务管理
+  let mcpConfigCache = '';
+
+  function closeMcpManager() {
+    $id('mcpManager').hidden = true;
+  }
+
+  async function openMcpManager() {
+    $id('mcpManager').hidden = false;
+    $id('mmEditor').hidden = true;
+    $id('mmListView').hidden = false;
+    await loadMcpManager();
+  }
+
+  async function loadMcpManager() {
+    $id('mmList').innerHTML = '<div class="mcp-empty">读取中…</div>';
+    try {
+      const cfgRes = checkAuth(await fetch(PREFIX + '/mcp/config', {cache: 'no-store'}));
+      const srvRes = checkAuth(await fetch(PREFIX + '/mcp/servers', {cache: 'no-store'}));
+      const cfg = await cfgRes.json().catch(() => ({}));
+      const srv = await srvRes.json().catch(() => ({}));
+      if (!cfgRes.ok) throw new Error(cfg.detail || ('HTTP ' + cfgRes.status));
+      mcpConfigCache = String(cfg.content || '{"mcpServers": {}}');
+      $id('mmPath').textContent = '配置文件：' + (cfg.path || '');
+      $id('mmEditorPath').textContent = '配置文件：' + (cfg.path || '');
+      const tools = new Map((connectorItems || []).map(x => [x.id, x]));
+      const items = srv.items || [];
+      if (!items.length) {
+        $id('mmList').innerHTML = '<div class="mcp-empty">还没有 MCP 服务。点「添加 MCP」写入配置。</div>';
+        return;
+      }
+      $id('mmList').replaceChildren(...items.map(item => {
+        const row = document.createElement('div'); row.className = 'mcp-row';
+        const ico = document.createElement('div'); ico.className = 'mcp-ico';
+        ico.textContent = item.source === 'system' ? '🗄️' : '🌐';
+        const main = document.createElement('div'); main.className = 'mcp-main';
+        const name = document.createElement('div'); name.className = 'mcp-name';
+        name.textContent = item.name || item.id;
+        const meta = document.createElement('div'); meta.className = 'mcp-meta';
+        const tool = tools.get(item.id);
+        meta.textContent = `${item.transport || 'mcp'} · ${item.url || '本地 stdio'}`
+          + (tool ? ` · ${tool.tools || 0} 个工具` : '');
+        main.append(name, meta);
+        const tag = document.createElement('span'); tag.className = 'mcp-tag';
+        tag.textContent = item.source === 'system' ? '系统' : '自定义';
+        row.append(ico, main, tag);
+        return row;
+      }));
+    } catch (err) {
+      $id('mmList').innerHTML = `<div class="mcp-empty">读取失败：${esc(err.message || '网络错误')}</div>`;
+    }
+  }
+
+  function openMcpEditor(addNew) {
+    let content = mcpConfigCache;
+    if (addNew) {
+      try {
+        const parsed = JSON.parse(content || '{}');
+        if (!parsed.mcpServers || typeof parsed.mcpServers !== 'object') parsed.mcpServers = {};
+        if (!Object.keys(parsed.mcpServers).length) {
+          parsed.mcpServers['my-mcp'] = {
+            type: 'streamable-http',
+            url: 'https://example.com/mcp'
+          };
+          content = JSON.stringify(parsed, null, 2);
+        }
+      } catch (e) { /* 保留原文本，让用户自己修 */ }
+    }
+    $id('mmText').value = content;
+    $id('mmError').textContent = '';
+    $id('mmListView').hidden = true;
+    $id('mmEditor').hidden = false;
+    $id('mmText').focus();
+  }
+
+  async function saveMcpConfig() {
+    const content = $id('mmText').value;
+    $id('mmError').textContent = '';
+    try {
+      const res = await checkAuth(fetch(PREFIX + '/mcp/config', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({content}),
+      }));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+      mcpConfigCache = data.content || content;
+      $id('mmEditor').hidden = true;
+      $id('mmListView').hidden = false;
+      if (window.WB_CONNECTOR_REFRESH) window.WB_CONNECTOR_REFRESH();
+      toast('MCP 配置已保存，连接器列表已刷新');
+      await loadMcpManager();
+    } catch (err) {
+      $id('mmError').textContent = err.message || '保存失败';
+    }
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && !$id('mcpManager').hidden) closeMcpManager();
+  });
 
   async function toggleConnector(item, btn) {
     const chosen = currentConnectorIds().includes(item.id);
@@ -5530,6 +5728,12 @@ setInterval(async () => {
       try {
         const res = await fetch(`${PREFIX}/connectors/${encodeURIComponent(item.id)}/connect`, {method: 'POST'});
         const data = await res.json().catch(() => ({}));
+        if (res.status === 428) {
+          // 428 = 还没授权。这不是"连接失败"，别让用户以为服务坏了。
+          btn.disabled = false;
+          await startConnectorAuth(item);
+          return;
+        }
         if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
         item.enabled = true;
         item.tools = data.tools || 0;
@@ -5550,7 +5754,14 @@ setInterval(async () => {
 
   $id('cpSearch').addEventListener('input', e => renderConnectors(e.target.value));
   $id('cpClose').onclick = closeConnectorPanel;
-  $id('cpManage').onclick = () => { closeConnectorPanel(); openHub('connector'); };
+  $id('cpManage').onclick = () => { closeConnectorPanel(); openMcpManager(); };
+  $id('mmClose').onclick = closeMcpManager;
+  $id('mmCancel').onclick = closeMcpManager;
+  $id('mmBack').onclick = () => { $id('mmEditor').hidden = true; $id('mmListView').hidden = false; };
+  $id('mmEdit').onclick = () => openMcpEditor(false);
+  $id('mmAdd').onclick = () => openMcpEditor(true);
+  $id('mmSave').onclick = saveMcpConfig;
+  $id('mcpManager').onclick = e => { if (e.target === $id('mcpManager')) closeMcpManager(); };
 
   window.WB_CONNECTOR_CURRENT = currentConnectorIds;
   window.WB_CONNECTOR_CLEAR_DRAFT = () => { draftConnectorIds = []; renderConnectorChips(); };
