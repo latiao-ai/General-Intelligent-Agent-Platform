@@ -266,7 +266,8 @@ class AnswerCapabilityTests(unittest.IsolatedAsyncioTestCase):
         from webpage_agent.tools import core as tool_module
         self.assertEqual(sorted(tool_module.BUILTIN_BY_NAME),
                          ['answer_directly', 'answer_with_sources',
-                          'fetch_pages', 'render_sources_html', 'web_search'])
+                          'fetch_pages', 'list_dir', 'read_file',
+                          'render_sources_html', 'web_search', 'write_file'])
         keys = {name: tool.tool_key
                 for name, tool in tool_module.BUILTIN_BY_NAME.items()}
         self.assertEqual(keys['web_search'], 'local:web:search')

@@ -60,6 +60,7 @@ import asyncio
 import logging
 import re
 import time
+from pathlib import Path
 from dataclasses import replace as dataclass_replace
 from typing import Any, Awaitable, Callable
 
@@ -143,6 +144,7 @@ def default_tool_catalog() -> list[dict[str, Any]]:
         if str(tool.effect or '') != 'read':
             continue
         declared.append(_tool_decl(tool))
+    declared.sort(key=lambda item: (item['name'] != 'web_search', item['name']))
     declared.append(pi_host_tools.request_input_decl())
     from webpage_agent.agent.pi_tool_schema import prepare_declarations
     kept, _dropped = prepare_declarations(declared)
@@ -292,6 +294,11 @@ class PiRuntime:
         """
         bridge = self._bridge or PiBridge()
         own_bridge = self._bridge is None
+        workspace = str((state or {}).get('workspace_dir') or '').strip()
+        if workspace and isinstance(bridge, PiBridge):
+            folder = Path(workspace)
+            if folder.is_dir() and not folder.is_symlink():
+                bridge.cwd = str(folder.resolve())
         answer_parts: list[str] = []
         self._tool_calls = 0
         self._repeat_counts = {}

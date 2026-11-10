@@ -241,8 +241,20 @@ def result_locations(tenant_id: str, result_id: str) -> set[tuple[str, str]]:
     return pairs
 
 
-def result_dir(base_dir, tenant_id: str, result_id: str) -> Path:
-    return (results_root(base_dir) / tenant_segment(tenant_id)
+def scoped_base(base_dir, tenant_id: str, owner_user_id: str = 'default') -> Path:
+    """非默认用户的结果落在自己的目录下。default/default 仍用原来的产物根。"""
+    from webpage_agent.core import sandbox
+    base = Path(base_dir)
+    if sandbox.is_legacy(str(tenant_id or 'default'), str(owner_user_id or 'default')):
+        return base
+    return (base / 'owners' / sandbox.segment(str(tenant_id or 'default'))
+            / sandbox.segment(str(owner_user_id or 'default')))
+
+
+def result_dir(base_dir, tenant_id: str, result_id: str,
+               owner_user_id: str = 'default') -> Path:
+    root = scoped_base(base_dir, tenant_id, owner_user_id)
+    return (results_root(root) / tenant_segment(tenant_id)
             / result_segment(result_id))
 
 
@@ -283,6 +295,7 @@ def new_result_id() -> str:
 
 
 def stage_result(base_dir, captured: CapturedResult, *, tenant_id: str = 'default',
+                 owner_user_id: str = 'default',
                  result_id: str = '', max_bytes: int = DEFAULT_MAX_BYTES) -> dict:
     """把采集到的结果**落到受控存储**，返回待登记的 manifest 与 parts。
 
@@ -293,7 +306,7 @@ def stage_result(base_dir, captured: CapturedResult, *, tenant_id: str = 'defaul
     拿到一份看起来完整、其实缺了尾巴的数据。
     """
     result_id = result_id or new_result_id()
-    folder = result_dir(base_dir, tenant_id, result_id)
+    folder = result_dir(base_dir, tenant_id, result_id, owner_user_id)
     folder.mkdir(parents=True, exist_ok=True)
 
     parts: list[dict] = []
@@ -495,14 +508,30 @@ def legacy_projection(envelope: dict) -> dict:
 
 # ---------- 读取（受控） ----------
 
+def _open_owned(base_dir, *, tenant_id: str, owner_user_id: str,
+                result_id: str, storage_key: str) -> Path:
+    """先打开该用户自己的目录。旧文件还在共享根下时，本人仍能读到。"""
+    scoped = open_registered_file(
+        scoped_base(base_dir, tenant_id, owner_user_id),
+        tenant_id=tenant_id, result_id=result_id, storage_key=storage_key)
+    if scoped.is_file() or str(owner_user_id or 'default') == 'default':
+        return scoped
+    legacy = open_registered_file(
+        base_dir, tenant_id=tenant_id, result_id=result_id, storage_key=storage_key)
+    if legacy.is_file():
+        return legacy
+    return scoped
+
+
 def read_structured(base_dir, manifest: dict):
     """读登记上的 structured/raw 引用。JSON 损坏时返回 None，路径不对则拒绝。"""
     ref = str((manifest or {}).get('raw_ref') or '') or str(
         (manifest or {}).get('structured_ref') or '')
     if not ref:
         raise ResultError('结果不存在')
-    path = open_registered_file(
+    path = _open_owned(
         base_dir, tenant_id=str(manifest.get('tenant_id') or 'default'),
+        owner_user_id=str(manifest.get('owner_user_id') or 'default'),
         result_id=str(manifest.get('result_id') or ''), storage_key=ref)
     if not path.is_file():
         raise ResultError('结果不存在')
@@ -515,15 +544,16 @@ def read_structured(base_dir, manifest: dict):
 
 
 def read_part(base_dir, tenant_id: str, part: dict, *, result_id: str,
+              owner_user_id: str = 'default',
               offset: int = 0, limit: int = DEFAULT_PAGE_LIMIT) -> dict:
     """读一个分块（有界）。
 
     `offset`/`limit` 是**字节**偏移；返回 `total` 与 `next_read_ref`，
     让调用方知道"还有多少、接着从哪读"。路径必须落在这个 result_id 自己的目录里。
     """
-    path = open_registered_file(
-        base_dir, tenant_id=tenant_id, result_id=result_id,
-        storage_key=str(part.get('storage_key') or ''))
+    path = _open_owned(
+        base_dir, tenant_id=tenant_id, owner_user_id=owner_user_id,
+        result_id=result_id, storage_key=str(part.get('storage_key') or ''))
     if not path.is_file():
         raise ResultError('结果分块不存在')
     payload = path.read_bytes()

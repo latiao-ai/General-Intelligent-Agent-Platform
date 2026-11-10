@@ -75,6 +75,7 @@ class PgAuth:
                                       subject: str, display_name: str = '',
                                       email: str = '', role: str = 'member',
                                       tenant_id: str = 'default',
+                                      identity_provider_id: str = '',
                                       session_id: str, session_digest: str,
                                       session_expires_at: float,
                                       user_agent: str = '',
@@ -85,20 +86,21 @@ class PgAuth:
         登录接口的校验结果。落库形态完全一致——身份仍然写 `identities`，会话仍然
         只存凭证摘要，**密码不进这个库**。
 
-        身份复用规则：同一租户下 subject 相同就复用已有中台账号（哪怕它最早是
-        OIDC 绑进来的），否则才建新号。这条保证"一个平台用户 = 一个中台账号"，
-        不会因为换登录方式把历史会话和权限拆成两个账号。
+        身份复用键是「租户 + 身份源 + 子平台用户」。同一个 subject 在两个身份源下
+        是两个中台账号，不能因为编号碰巧相同就合并。同一身份源再次登录复用已有
+        user_id。密码不进这个库。
         """
         stamp = now()
+        idp = (identity_provider_id or provider).strip()
         async with self._lease() as conn:
             # 首登并发靠 advisory lock 串行化，避免两个请求各建一个账号
             await self._run(conn, 'SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))',
-                            (json.dumps(['identity', tenant_id, provider, subject]),))
+                            (json.dumps(['identity', tenant_id, idp, subject]),))
             row = await self._one(
                 conn,
                 'SELECT user_id, tenant_id, role, identity_provider_id FROM identities '
-                'WHERE tenant_id=%s AND subject=%s ORDER BY created_at LIMIT 1',
-                (tenant_id, subject))
+                'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
+                (tenant_id, idp, subject))
             created = False
             if row is None:
                 created = True
@@ -109,7 +111,7 @@ class PgAuth:
                     '(user_id, display_name, email, status, created_at, updated_at) '
                     'VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (user_id) DO NOTHING',
                     (user_id, display_name, email, 'active', stamp, stamp))
-                await self._run(
+                inserted = await self._one(
                     conn,
                     'INSERT INTO identities '
                     '(provider, subject, user_id, tenant_id, identity_provider_id, '
@@ -119,25 +121,31 @@ class PgAuth:
                     "  WHERE identity_provider_id <> '' "
                     '  DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at '
                     'RETURNING user_id, tenant_id, role',
-                    (provider, subject, user_id, tenant_id, provider, email, role,
+                    (idp, subject, user_id, tenant_id, idp, email, role,
                      stamp, stamp))
-                row = {'user_id': user_id, 'tenant_id': tenant_id,
-                       'role': role, 'identity_provider_id': provider}
+                # 并发首登时输的一方必须用赢家的 user_id，不能返回自己刚生成、
+                # 实际没绑定上的那个。
+                if inserted is None:
+                    raise RuntimeError('身份绑定失败')
+                if inserted['user_id'] != user_id:
+                    await self._run(conn, 'DELETE FROM app_users WHERE user_id=%s',
+                                    (user_id,))
+                    created = False
+                row = {'user_id': inserted['user_id'], 'tenant_id': inserted['tenant_id'],
+                       'role': inserted['role'], 'identity_provider_id': idp}
             else:
                 await self._run(
                     conn,
                     'UPDATE identities SET last_seen_at=%s '
                     'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
-                    (stamp, tenant_id, row['identity_provider_id'], subject))
-                # 只同步"平台自己绑的身份"；联合身份（OIDC 等）的角色不在这里改，
-                # 否则平台侧改个角色就能提权到中台 operator。
-                if (row.get('identity_provider_id') or '') == provider:
-                    await self._run(
-                        conn,
-                        'UPDATE identities SET role=%s, email=%s '
-                        'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
-                        (role, email, tenant_id, provider, subject))
-                    row = dict(row, role=role)
+                    (stamp, tenant_id, idp, subject))
+                # 只同步这条身份源自己的角色，不改别的身份源。
+                await self._run(
+                    conn,
+                    'UPDATE identities SET role=%s, email=%s '
+                    'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
+                    (role, email, tenant_id, idp, subject))
+                row = dict(row, role=role)
             user = await self._one(
                 conn, 'SELECT status, display_name FROM app_users WHERE user_id=%s FOR UPDATE',
                 (row['user_id'],))

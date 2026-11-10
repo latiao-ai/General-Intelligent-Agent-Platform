@@ -138,6 +138,8 @@ class Settings:
     platform_context_max_chars: int = max(800, min(64000, int(
         os.getenv('PLATFORM_CONTEXT_MAX_CHARS', '12000'))))
     artifact_dir: Path = PROJECT_ROOT / os.getenv('ARTIFACT_DIR', 'artifacts')
+    # 每用户私有工作目录的根。ticket 模式按租户/用户自动分配，不接受任意服务器路径。
+    workspace_root: Path = PROJECT_ROOT / os.getenv('WORKSPACE_ROOT', 'workspaces')
     # 数据库：**只支持 PostgreSQL**（SQLite 实现已删除）。仓储接口见
     # webpage_agent/store/persistence.py；留空会在 open_store() 里直接报错，不静默退回本地文件库。
     database_url: str = os.getenv('DATABASE_URL', '').strip()

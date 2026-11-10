@@ -779,7 +779,8 @@ async def _stage_result(payload: dict, *, tool_key: str = '') -> str:
                 ordinal=0, kind='json', content_type='application/json',
                 text=json.dumps(payload, ensure_ascii=False, default=str))])
         staged = tool_results.stage_result(
-            settings.artifact_dir, captured, tenant_id=tenant_id)
+            settings.artifact_dir, captured, tenant_id=tenant_id,
+            owner_user_id=owner_user_id)
         envelope = tool_results.envelope_v2(
             result_id=str(staged.get('result_id') or ''), tool_key=tool_key,
             structured_ref=str(staged.get('raw_ref') or ''),

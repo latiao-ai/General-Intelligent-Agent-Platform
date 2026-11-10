@@ -11,6 +11,7 @@
 import re
 from pathlib import Path
 
+from webpage_agent.core import sandbox
 from webpage_agent.core.config import settings
 
 _SAFE = re.compile(r'[^A-Za-z0-9_-]')
@@ -23,7 +24,12 @@ def _safe(name: str) -> str:
 
 
 def folder(task_id: str) -> Path:
-    return settings.artifact_dir / _safe(task_id) / 'sources'
+    name = _safe(task_id) or 'task'
+    tenant, user = sandbox.current_scope()
+    # 单用户测试会替换本模块的 settings.artifact_dir，这里继续认它。
+    if sandbox.is_legacy(tenant, user):
+        return Path(settings.artifact_dir) / name / 'sources'
+    return sandbox.task_dir(name, tenant, user) / 'sources'
 
 
 def text_path(task_id: str, source_id: str) -> Path:
