@@ -3750,19 +3750,27 @@ setInterval(async () => {
     return hit;
   }
 
+  let serverNamespaces = [];
+  let wsNamespace = '';
+
   function renderWsList() {
     const list = $('wspList');
     if (!list) return;
     const q = ($('wspSearch').value || '').trim().toLowerCase();
-    const items = workspaces.filter(item =>
-      !q || item.name.toLowerCase().includes(q) || item.path.toLowerCase().includes(q));
+    const named = serverNamespaces.map(item => ({
+      name: item.name, path: item.name, server: true,
+    }));
+    const local = wsLocal ? workspaces : [];
+    const items = named.concat(local).filter(item =>
+      !q || item.name.toLowerCase().includes(q) || String(item.path || '').toLowerCase().includes(q));
     if (!items.length) {
       list.innerHTML = '<div class="wsp-path" style="padding:14px 10px">还没有工作空间，点下面新建</div>';
       return;
     }
     list.replaceChildren(...items.map(item => {
       const row = document.createElement('div');
-      row.className = 'wsp-row' + (item.path === workDir ? ' active' : '');
+      const active = item.server ? item.name === wsNamespace : item.path === workDir;
+      row.className = 'wsp-row' + (active ? ' active' : '');
       const icon = document.createElement('div');
       icon.className = 'wsp-icon';
       icon.innerHTML = '<svg class="ic sm"><use href="#i-folder"/></svg>';
@@ -3776,13 +3784,13 @@ setInterval(async () => {
       path.textContent = item.path;
       body.append(name, path);
       row.append(icon, body);
-      if (item.path === workDir) {
+      if (active) {
         const check = document.createElement('span');
         check.className = 'wsp-check';
         check.textContent = '✓';
         row.append(check);
       }
-      row.onclick = () => selectWorkspacePath(item.path);
+      row.onclick = () => item.server ? selectNamespace(item.name) : selectWorkspacePath(item.path);
       return row;
     }));
   }
@@ -3811,14 +3819,61 @@ setInterval(async () => {
 
   function closeWsPicker() { $('wsPicker').hidden = true; }
 
+  let wsLocal = false;
+
+  function applyWorkspaceMode() {
+    $('wspOpen').hidden = !wsLocal;
+    $('wspManual').hidden = !wsLocal;
+    const pathRow = $('wsPathInput') && $('wsPathInput').parentElement;
+    if (pathRow) pathRow.hidden = !wsLocal;
+    if ($('wsPick')) $('wsPick').hidden = !wsLocal;
+  }
+
   $('wspSearch').addEventListener('input', renderWsList);
   $('wspClose').onclick = closeWsPicker;
-  $('wspNew').onclick = () => pickWorkDir();
-  $('wspOpen').onclick = () => pickWorkDir();
+  $('wspNew').onclick = () => createNamespace();
+  $('wspOpen').onclick = () => {
+    if (wsLocal) pickWorkDir();
+    else toast('当前环境为每个账号分配私有目录，不能选择服务器路径');
+  };
   $('wspManual').onclick = () => {
+    if (!wsLocal) { toast('当前环境不能手动填写服务器路径'); return; }
     const path = (prompt('输入本地文件夹的绝对路径，例如 /Users/me/work') || '').trim();
     if (path) selectWorkspacePath(path);
   };
+
+  async function createNamespace() {
+    if (!auth.authed && !auth.off) { toast('请先登录中台'); return; }
+    const name = (prompt('新建命名空间：给它一个名字') || '').trim();
+    if (!name) return;
+    try {
+      const res = await fetch(API_PREFIX + '/workspace/namespace', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { toast(String(data.detail || '创建失败')); return; }
+      workDir = String(data.path || '');
+      renderWorkDir();
+      closeWsPicker();
+      toast('已新建命名空间 ' + name);
+      refreshWorkDir();
+    } catch (e) { toast('创建失败'); }
+  }
+
+  async function selectNamespace(name) {
+    try {
+      const res = await fetch(API_PREFIX + '/workspace/select', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name}),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { toast(String(data.detail || '切换失败')); return; }
+      workDir = String(data.path || '');
+      renderWorkDir();
+      closeWsPicker();
+    } catch (e) { toast('切换失败'); }
+  }
 
   async function refreshWorkDir() {
     try {
@@ -3826,7 +3881,11 @@ setInterval(async () => {
       if (!res.ok) return;
       const data = await res.json();
       workDir = String(data.path || '');
-      if (workDir) addWorkspace(workDir);
+      wsLocal = !!data.enabled;
+      serverNamespaces = Array.isArray(data.namespaces) ? data.namespaces : [];
+      wsNamespace = String(data.namespace || '');
+      applyWorkspaceMode();
+      if (workDir && wsLocal) addWorkspace(workDir);
       else renderWsList();
       renderWorkDir();
     } catch (e) { /* 读不到工作目录不影响发消息 */ }

@@ -6,6 +6,7 @@
 .env.*.bak
 *.env.bak
 artifacts/
+workspaces/
 __pycache__/
 *.pyc
 # SQLite 持久化（会话、任务、事件日志）

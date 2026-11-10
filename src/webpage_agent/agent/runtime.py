@@ -151,11 +151,12 @@ def get_runtime(kind: str = '') -> Runtime:
                 }
         # 凭据缺失会让真实链路直接 401：PiRuntime 的默认模型配置里没有 key，
         # 必须由宿主从 settings 注入，否则正式入口只能跑受控模型（PI_MOCK_SCRIPT）。
+        from webpage_agent.core import model_choice
         from webpage_agent.core.config import settings
         return PiRuntime(
             mock_script=mock_script, tool_runner=tool_runner,
             model={
-                'id': settings.llm_model,
+                'id': model_choice.active(getattr(settings, 'llm_model', '') or ''),
                 'base_url': settings.llm_base_url,
                 'provider': 'deepseek',
                 'api': 'openai-completions',

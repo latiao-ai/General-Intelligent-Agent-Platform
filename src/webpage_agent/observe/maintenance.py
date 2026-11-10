@@ -10,6 +10,7 @@ from pathlib import Path
 
 from webpage_agent.store import artifact_store
 from webpage_agent.tools import tool_results
+from webpage_agent.core import sandbox
 from webpage_agent.core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -53,8 +54,11 @@ async def run_once(store, *, root=None, now_ts=None):
                     for manifest in manifests:
                         for tenant, result in tool_results.result_locations(manifest['tenant_id'], manifest['result_id']):
                             relative = f'_tool_results/{tenant}/{result}'
+                            base = tool_results.scoped_base(
+                                root, manifest['tenant_id'],
+                                manifest.get('owner_user_id') or 'default')
                             try:
-                                folder = artifact_store.contained(root, relative)
+                                folder = artifact_store.contained(base, relative)
                             except artifact_store.PathDenied:
                                 continue
                             if folder.is_dir():
@@ -70,9 +74,22 @@ async def run_once(store, *, root=None, now_ts=None):
                         stats['results'] += 1
                 name = task.get('artifact_id') or ''
                 if re.fullmatch(r'[a-f0-9]{32}', name):
-                    folder = artifact_store.contained(root, name)
-                    if folder.is_dir():
-                        await asyncio.to_thread(shutil.rmtree, folder)
+                    relatives = [name]
+                    owner = (runs[0].get('owner_user_id') if runs else '') or 'default'
+                    tenant_id = (runs[0].get('tenant_id') if runs else '') or 'default'
+                    if not sandbox.is_legacy(tenant_id, owner):
+                        relatives.append(
+                            f'owners/{sandbox.segment(tenant_id)}/{sandbox.segment(owner)}/{name}')
+                    removed_artifact = False
+                    for relative in relatives:
+                        try:
+                            folder = artifact_store.contained(root, relative)
+                        except artifact_store.PathDenied:
+                            continue
+                        if folder.is_dir() and not folder.is_symlink():
+                            await asyncio.to_thread(shutil.rmtree, folder)
+                            removed_artifact = True
+                    if removed_artifact:
                         stats['artifacts'] += 1
                 await conn.execute('DELETE FROM artifacts WHERE run_id IN '
                     '(SELECT run_id FROM runs WHERE task_id=%s)', (task['task_id'],))
@@ -82,10 +99,16 @@ async def run_once(store, *, root=None, now_ts=None):
             registered_ids={r['result_id'] for r in registered})
         # 任务目录没有登记表，保留策略扫不到"库重建后剩下的目录"——按 task_id
         # 是否还在库里判断孤儿，与 retention_artifacts_days 相互独立。
-        live = await store._all(conn, 'SELECT task_id FROM tasks')
+        live = await store._all(conn, 'SELECT task_id, artifact_id FROM tasks')
+        live_ids = set()
+        for row in live:
+            if row.get('task_id'):
+                live_ids.add(row['task_id'])
+            if row.get('artifact_id'):
+                live_ids.add(row['artifact_id'])
         stats['orphan_tasks'] = await asyncio.to_thread(artifact_store.gc_orphan_task_dirs, root,
             grace_seconds=settings.result_gc_grace_seconds, now_ts=current,
-            live_task_ids={row['task_id'] for row in live})
+            live_task_ids=live_ids)
     return stats
 
 

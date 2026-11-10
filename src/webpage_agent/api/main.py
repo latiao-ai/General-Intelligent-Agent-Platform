@@ -15,6 +15,8 @@ from webpage_agent.core import outcome as outcome_module
 from webpage_agent.capabilities.publishing import deploy_once
 from webpage_agent.agent.runtime import get_runtime
 from webpage_agent.core.errors import RecursionBudgetExceeded
+from webpage_agent.core import model_choice
+from webpage_agent.core import sandbox
 from webpage_agent.core.files import save_json
 
 logger = logging.getLogger(__name__)
@@ -41,7 +43,8 @@ async def deploy_task(task_id: str) -> dict:
 
 async def run_task(text: str, progress=None, on_event=None, history=None,
                   on_start=None, prior=None, memory=None, ledger=None,
-                  run_id=None, resume_plan=None):
+                  run_id=None, resume_plan=None, tenant_id: str = 'default',
+                  owner_user_id: str = 'default', workspace_dir: str = ''):
     """跑一次任务。
 
     progress(node, status, elapsed)  节点级进度
@@ -55,8 +58,20 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     if len(text) > 10000:
         raise ValueError('首版输入限制为 10000 字符')
     task_id = uuid.uuid4().hex
-    folder = settings.artifact_dir / task_id
+    if tenant_id == 'default' and owner_user_id == 'default':
+        tenant_id, owner_user_id = sandbox.current_scope()
+    if not workspace_dir:
+        workspace_dir = sandbox.current_workspace()
+    scope_token = sandbox.use_scope(tenant_id, owner_user_id)
+    model_token = model_choice.bind(
+        owner_user_id, getattr(settings, 'llm_model', '') or '')
+    folder = sandbox.task_dir(task_id, tenant_id, owner_user_id)
     folder.mkdir(parents=True, exist_ok=True)
+    if workspace_dir and sandbox.stored_path_ok(
+            workspace_dir, sandbox.provision(tenant_id, owner_user_id)):
+        workspace = workspace_dir
+    else:
+        workspace = str(sandbox.provision(tenant_id, owner_user_id))
     if on_start:
         # 早点把 task_id 交出去，外部才能在任务被取消后定位已生成的产物。
         await on_start(task_id)
@@ -74,6 +89,8 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     effective_input = resumed_input if (pi_resume and resumed_input) else text
     state = {
         'task_id': task_id, 'user_input': effective_input,
+        'tenant_id': tenant_id, 'owner_user_id': owner_user_id,
+        'workspace_dir': workspace,
         # 原目标：运行中补充要求时，"最初要做什么"不能被新要求顶掉——
         # 修订计划要同时看到原目标和按序补充（文档 §5 第八步）。
         'original_goal': text,
@@ -165,6 +182,8 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         raise RuntimeError(f'任务 {task_id} 失败：{detail}') from None
     finally:
         ledger_module.unbind(ledger_token)
+        sandbox.reset_scope(scope_token)
+        model_choice.reset(model_token)
         state['elapsed_seconds'] = round(time.perf_counter() - started, 2)
         # 终态与 outcome 在**一处**收口：
         # - 图内部只写通用状态（succeeded / failed / waiting_input …）；

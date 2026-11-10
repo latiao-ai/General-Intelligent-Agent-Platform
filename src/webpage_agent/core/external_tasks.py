@@ -165,12 +165,14 @@ def _materialize(task: dict, contract, payload: dict) -> dict:
     output = async_contracts.pointer(payload, contract.output_pointer) if contract else payload
     result_id = 'ext-' + str(task.get('external_task_id') or 'result')
     tenant_id = str(task.get('tenant_id') or 'default')
+    owner_user_id = str(task.get('owner_user_id') or 'default')
     # 用标准采集结构：structured 统一保存可 JSON 化的结果（非对象结果包成
     # {'result': ...}，保证交付时 read_structured 能读回），不丢。
     structured = output if isinstance(output, dict) else {'result': output}
     captured = tr.CapturedResult(structured=structured)
     return tr.stage_result(
-        settings.artifact_dir, captured, tenant_id=tenant_id, result_id=result_id)
+        settings.artifact_dir, captured, tenant_id=tenant_id,
+        owner_user_id=owner_user_id, result_id=result_id)
 
 
 def _envelope_for(task: dict, staged: dict) -> dict:

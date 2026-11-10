@@ -19,7 +19,9 @@ import json
 import logging
 import uuid
 
+from webpage_agent.core import model_choice
 from webpage_agent.core import outcome as outcome_module
+from webpage_agent.core import sandbox
 from webpage_agent.core.config import settings
 from webpage_agent.store.pg_store import TurnRequestConflict
 
@@ -421,7 +423,7 @@ class HubSessionMessageMixin:
     def _pi_model_config(self) -> tuple[dict, str | None]:
         """从配置构造 Pi 模型端点（复用 settings 的 LLM 模型/网关/密钥）。"""
         model = {
-            'id': settings.llm_model or 'deepseek-v4-1-flash',
+            'id': model_choice.active(getattr(settings, 'llm_model', '') or '') or 'deepseek-v4-1-flash',
             'base_url': settings.llm_base_url or 'https://www.hi-x.cn/v1',
             'provider': 'deepseek',
             'api': 'openai-completions',
@@ -463,6 +465,7 @@ class HubSessionMessageMixin:
         session_id = str(claimed.get('session_id') or '')
         kind = str(claimed.get('kind') or 'chat')
         tenant_id = str(claimed.get('tenant_id') or 'default')
+        owner_user_id = str(claimed.get('owner_user_id') or 'default')
 
         # 测试注入的确定性答复生成器：优先（不碰真实 Pi）。
         if self.chat_responder is not None:
@@ -481,7 +484,13 @@ class HubSessionMessageMixin:
             # 回退说明能力限制——这是诚实的能力边界，不是硬编码「不可用」）。
             tool_objects = None
 
-        runtime = self._build_pi_runtime(tools=tools, tool_objects=tool_objects)
+        model_token = model_choice.bind(
+            owner_user_id, getattr(settings, 'llm_model', '') or '')
+        try:
+            runtime = self._build_pi_runtime(tools=tools, tool_objects=tool_objects)
+        except Exception:
+            model_choice.reset(model_token)
+            raise
 
         # 独立 turn 执行身份（A 组第 5 点 + 第十二阶段缺口修复）：
         # - billing scope 用 turn_id 作为 run_id 标识（费用结算独立于业务 run）；
@@ -494,7 +503,6 @@ class HubSessionMessageMixin:
         from webpage_agent.governance import core as governance
         from webpage_agent.governance import execution_control
         from webpage_agent.store import ledger as ledger_module
-        owner_user_id = str(claimed.get('owner_user_id') or 'default')
         lease_owner = str(claimed.get('lease_owner') or '')
         lease_epoch = int(claimed.get('lease_epoch') or 0)
         exec_ctx = execution_control.ExecutionContext(
@@ -505,21 +513,26 @@ class HubSessionMessageMixin:
         context_token = execution_control.bind(exec_ctx)
         ledger_token = None
         turn_run_created = False
-        if kind == 'query':
-            # 内部查询执行记录：为 turn_id 建 runs 行（复用 turn 租约），并绑定
-            # ActionLedger 走完整治理链。成功与否不硬阻断 turn——建行失败时只读
-            # 工具仍会因 no_run 被拒，退化为诚实的能力边界说明。
-            created = await self.store.create_turn_run(
-                run_id=turn_id, tenant_id=tenant_id, owner_user_id=owner_user_id,
-                owner_role=str(claimed.get('owner_role') or 'member'),
-                lease_owner=lease_owner, lease_epoch=lease_epoch,
-                lease_ttl=float(settings.session_turn_lease_seconds))
-            if created is not None:
-                turn_run_created = True
-                book = ledger_module.ActionLedger(
-                    self.store, turn_id, 1, context=exec_ctx)
-                ledger_token = ledger_module.bind(book)
         try:
+            if kind == 'query':
+                # 内部查询执行记录：为 turn_id 建 runs 行（复用 turn 租约），并绑定
+                # ActionLedger 走完整治理链。成功与否不硬阻断 turn——建行失败时只读
+                # 工具仍会因 no_run 被拒，退化为诚实的能力边界说明。
+                created = await self.store.create_turn_run(
+                    run_id=turn_id, tenant_id=tenant_id, owner_user_id=owner_user_id,
+                    owner_role=str(claimed.get('owner_role') or 'member'),
+                    lease_owner=lease_owner, lease_epoch=lease_epoch,
+                    lease_ttl=float(settings.session_turn_lease_seconds))
+                if created is not None:
+                    turn_run_created = True
+                    book = ledger_module.ActionLedger(
+                        self.store, turn_id, 1, context=exec_ctx)
+                    ledger_token = ledger_module.bind(book)
+            private = sandbox.provision(tenant_id, owner_user_id)
+            stored = await self.store.get_workspace(
+                tenant_id=tenant_id, owner_user_id=owner_user_id)
+            if not sandbox.stored_path_ok(stored, private):
+                stored = str(private)
             state = {
                 'user_input': message,
                 'history': history,
@@ -527,6 +540,7 @@ class HubSessionMessageMixin:
                 'run_id': turn_id,
                 'owner_user_id': owner_user_id,
                 'tenant_id': tenant_id,
+                'workspace_dir': stored,
                 'documents': [], 'mcp_calls': [], 'errors': [], 'usage': [],
                 'status': 'created',
             }
@@ -537,6 +551,7 @@ class HubSessionMessageMixin:
                 return '抱歉，我暂时无法回答这个问题。'
             return answer
         finally:
+            model_choice.reset(model_token)
             if ledger_token is not None:
                 ledger_module.unbind(ledger_token)
             # 收尾内部查询执行记录（清租约、置终态），不留 running 僵尸行

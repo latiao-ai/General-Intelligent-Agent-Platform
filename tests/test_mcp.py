@@ -765,7 +765,10 @@ class CapabilityRegistryTests(unittest.IsolatedAsyncioTestCase):
                           'fetch_pages': 'local:web:fetch',
                           'render_sources_html': 'local:export:sources_html',
                           'answer_with_sources': 'local:answers:with_sources',
-                          'answer_directly': 'local:answers:direct'})
+                          'answer_directly': 'local:answers:direct',
+                          'list_dir': 'local:files:list_dir',
+                          'read_file': 'local:files:read_file',
+                          'write_file': 'local:files:write_file'})
 
     async def test_kernel_does_not_import_business_packages(self):
         """内核（tools/core.py）不许 import 具体业务能力包——那是一切耦合的源头。"""

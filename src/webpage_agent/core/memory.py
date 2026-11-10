@@ -15,7 +15,6 @@
 import json
 
 from webpage_agent.agent import context
-from webpage_agent.core.config import settings
 from webpage_agent.core.schemas import SessionMemory
 from webpage_agent.core.services import structured_call
 
@@ -87,7 +86,7 @@ async def compact(store, session_id: str) -> dict:
     try:
         result, _ = await structured_call(
             SessionMemory, SUMMARY_SYSTEM, payload,
-            model=settings.llm_model, disable_thinking=True)
+            model=None, disable_thinking=True)
         data = result.model_dump()
     except Exception:
         return {**memory, 'compacted': False}

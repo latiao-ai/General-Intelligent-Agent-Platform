@@ -18,7 +18,6 @@ import logging
 import re
 import secrets
 import subprocess
-import sys
 import time
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
@@ -40,6 +39,7 @@ from webpage_agent.observe import task_notify
 from webpage_agent.api import auth
 from webpage_agent.governance import policies
 from webpage_agent.core import profile
+from webpage_agent.core import sandbox
 from webpage_agent.core import credentials as credentials_module
 from webpage_agent.agent import run_inputs as run_inputs_module
 from webpage_agent.tools import core as tool_module
@@ -306,13 +306,43 @@ async def whoami(request: Request, principal=Depends(policies.current_principal)
             'auth_mode': settings.auth_mode}
 
 
-class WorkspacePathRequest(BaseModel):
+class WorkspacePathRequest(StrictBody):
     path: str = Field(min_length=1, max_length=2048)
+
+
+class WorkspaceNameRequest(StrictBody):
+    name: str = Field(min_length=1, max_length=80)
 
 
 def _workspace_pick_available() -> bool:
     """原生目录选择框只在"服务端与浏览器同一台 macOS"的本地环境成立。"""
-    return sys.platform == 'darwin' and settings.app_env != 'production'
+    return sandbox.local_pick_allowed()
+
+
+async def _ensure_private_workspace(tenant_id: str, user_id: str) -> str:
+    """保证该用户有一块私有目录。生产环境不沿用目录外的旧路径。"""
+    private = sandbox.provision(tenant_id, user_id)
+    current = await hub.store.get_workspace(
+        tenant_id=tenant_id, owner_user_id=user_id)
+    if sandbox.stored_path_ok(current, private):
+        return current
+    path = str(private)
+    await hub.store.set_workspace(
+        tenant_id=tenant_id, owner_user_id=user_id, path=path)
+    return path
+
+
+def _workspace_view(tenant_id: str, user_id: str, path: str) -> dict:
+    private = sandbox.provision(tenant_id, user_id)
+    names = sandbox.list_namespaces(private)
+    active = ''
+    for item in names:
+        if item['path'] == path:
+            active = item['name']
+            break
+    return {'enabled': _workspace_pick_available(), 'path': path,
+            'private_root': str(private), 'namespace': active,
+            'namespaces': [{'name': item['name']} for item in names]}
 
 
 def _resolve_workspace_path(raw: str) -> str:
@@ -354,22 +384,63 @@ async def _pick_directory_native(prompt: str) -> str:
 @app.get('/api/workspace')
 async def workspace_get(principal=Depends(policies.current_principal)):
     """当前工作目录。`enabled` 表示这台机器上能不能点开原生选择框。"""
-    path = await hub.store.get_workspace(
-        tenant_id=principal.tenant_id, owner_user_id=principal.user_id)
-    return {'enabled': _workspace_pick_available(), 'path': path}
+    if settings.auth_mode == 'ticket' or principal.authenticated:
+        path = await _ensure_private_workspace(principal.tenant_id, principal.user_id)
+    else:
+        path = await hub.store.get_workspace(
+            tenant_id=principal.tenant_id, owner_user_id=principal.user_id)
+    return _workspace_view(principal.tenant_id, principal.user_id, path)
 
 
 @app.post('/api/workspace')
 async def workspace_set(payload: WorkspacePathRequest,
                         principal=Depends(policies.current_principal)):
+    if not _workspace_pick_available():
+        raise HTTPException(status_code=403, detail='当前环境不能指定服务器目录')
     path = _resolve_workspace_path(payload.path)
     await hub.store.set_workspace(
         tenant_id=principal.tenant_id, owner_user_id=principal.user_id, path=path)
     return {'path': path}
 
 
+@app.post('/api/workspace/namespace')
+async def workspace_namespace(payload: WorkspaceNameRequest,
+                              principal=Depends(policies.current_principal)):
+    """新建命名空间：目录由服务端分配在该用户的私有根下，不接受服务器路径。"""
+    private = sandbox.provision(principal.tenant_id, principal.user_id)
+    try:
+        folder = sandbox.namespace_dir(private, payload.name)
+    except sandbox.SandboxError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    path = str(folder)
+    await hub.store.set_workspace(
+        tenant_id=principal.tenant_id, owner_user_id=principal.user_id, path=path)
+    return {'path': path, 'name': payload.name.strip()}
+
+
+@app.post('/api/workspace/select')
+async def workspace_select(payload: WorkspaceNameRequest,
+                           principal=Depends(policies.current_principal)):
+    """切回该用户自己的命名空间。不能靠传入绝对路径指向别人的目录。"""
+    private = sandbox.provision(principal.tenant_id, principal.user_id)
+    try:
+        folder = sandbox.namespace_path(private, payload.name)
+    except sandbox.SandboxError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    path = str(folder)
+    await hub.store.set_workspace(
+        tenant_id=principal.tenant_id, owner_user_id=principal.user_id, path=path)
+    return {'path': path, 'name': payload.name.strip()}
+
+
 @app.delete('/api/workspace')
 async def workspace_clear(principal=Depends(policies.current_principal)):
+    """清掉本机文件夹选择，回到自动分配的私有目录。"""
+    if settings.auth_mode == 'ticket' or principal.authenticated:
+        path = str(sandbox.provision(principal.tenant_id, principal.user_id))
+        await hub.store.set_workspace(
+            tenant_id=principal.tenant_id, owner_user_id=principal.user_id, path=path)
+        return {'path': path}
     await hub.store.clear_workspace(
         tenant_id=principal.tenant_id, owner_user_id=principal.user_id)
     return {'path': ''}
@@ -439,6 +510,10 @@ async def exchange_ticket(payload: ExchangeRequest, request: Request,
     except auth.ExchangeError as exc:
         raise HTTPException(status_code=exc.status, detail=exc.reason) from exc
 
+    try:
+        await _ensure_private_workspace(result['tenant_id'], result['user_id'])
+    except Exception:                                   # noqa: BLE001
+        logger.warning('兑换后分配私有目录失败', exc_info=True)
     _set_session_cookie(response, result['token'], settings.auth_session_ttl)
     # 凭证原文只在 Set-Cookie 里出现一次，响应体不再重复（避免被日志/前端留存）
     return {'user_id': result['user_id'],
@@ -496,6 +571,11 @@ def _platform_login_tenant() -> str:
             or policies.DEFAULT_TENANT)
 
 
+def _platform_identity_provider() -> str:
+    """账号密码登录使用的身份源。与票据连接的 identity_provider_id 对齐后才会复用同一账号。"""
+    return (os.getenv('PLATFORM_LOGIN_IDP', 'beeftv').strip() or 'beeftv')[:80]
+
+
 @app.get('/api/auth/platform-login/status')
 async def platform_login_status():
     """前端据此决定要不要显示"账号密码登录"。"""
@@ -546,11 +626,13 @@ async def platform_login(payload: PlatformLoginRequest, request: Request,
             in ('admin', 'owner', 'operator') else 'member')
 
     token = auth.new_session_token()
+    provider = _platform_identity_provider()
     try:
         row = await store.login_platform_identity(
-            platform_id='beeftv', provider='beeftv', subject=subject,
+            platform_id='beeftv', provider=provider, subject=subject,
             display_name=str(platform_user.get('username') or payload.username),
             role=role, tenant_id=_platform_login_tenant(),
+            identity_provider_id=provider,
             session_id='as_' + secrets.token_hex(12),
             session_digest=auth.digest_of(token),
             session_expires_at=time.time() + settings.auth_session_ttl,
@@ -562,6 +644,10 @@ async def platform_login(payload: PlatformLoginRequest, request: Request,
         logger.exception('平台账号登录失败')
         raise HTTPException(status_code=503, detail='登录失败，请重试') from None
 
+    try:
+        await _ensure_private_workspace(row['tenant_id'], row['user_id'])
+    except Exception:                                   # noqa: BLE001
+        logger.warning('登录后分配私有目录失败', exc_info=True)
     _set_session_cookie(response, token, settings.auth_session_ttl)
     logger.info('平台账号登录 user=%s platform=beeftv first=%s',
                 row['user_id'], row['created'])
@@ -920,15 +1006,25 @@ async def artifact(task_id: str,
     record = await _owned_task(task_id, principal)
     meta = (record.state or {}).get('artifact') or {}
     recorded = meta.get('path') or meta.get('html_path')
-    if recorded:
-        path = Path(recorded)
-    elif record.artifact_id:
-        # 旧任务没有记录路径，按约定回退
-        path = settings.artifact_dir / record.artifact_id / 'index.html'
-    else:
-        raise HTTPException(status_code=404, detail='产物不存在')
-    if not path.exists():
-        raise HTTPException(status_code=404, detail='产物不存在')
+    root = sandbox.owner_root(record.tenant_id, record.owner_user_id)
+    try:
+        if recorded:
+            path = Path(recorded)
+            # 单用户旧任务的路径记在任务状态里，可能不在产物根下。
+            # 真实用户的文件必须落在自己的目录里，不能凭状态指向别人的文件。
+            if sandbox.is_legacy(record.tenant_id, record.owner_user_id):
+                if path.is_symlink() or not path.is_file():
+                    raise sandbox.SandboxError('产物不存在')
+            else:
+                path = sandbox.contained_file(root, path)
+        elif record.artifact_id:
+            path = sandbox.contained_file(
+                root, sandbox.task_dir(record.artifact_id, record.tenant_id,
+                                       record.owner_user_id) / 'index.html')
+        else:
+            raise sandbox.SandboxError('产物不存在')
+    except sandbox.SandboxError:
+        raise HTTPException(status_code=404, detail='产物不存在') from None
     # 媒体类型别写死 text/html：视频产物那样会被浏览器当成网页而放不出来。
     # 优先级：产物自己声明的 mime → 按扩展名推断 → 兜底二进制流。
     media_type = (meta.get('mime')
@@ -1643,6 +1739,7 @@ async def read_result_part(result_id: str, part_id: str,
         return tool_results.read_part(
             settings.artifact_dir, str(manifest.get('tenant_id') or ''),
             part, result_id=str(manifest.get('result_id') or ''),
+            owner_user_id=str(manifest.get('owner_user_id') or 'default'),
             offset=offset, limit=page_limit)
     except tool_results.ResultError:
         raise HTTPException(status_code=404, detail='分块不存在') from None

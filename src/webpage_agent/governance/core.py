@@ -52,6 +52,11 @@ def _reservation_micros(provider: str) -> int:
     return settings.search_request_cost_micros
 
 
+def _active_model(model: str | None) -> str:
+    from webpage_agent.core.model_choice import active
+    return model or active(getattr(settings, 'llm_model', '') or '')
+
+
 async def reserve(*, provider='llm', model='', purpose=''):
     scope = _scope.get()
     # 日额度关掉时，没绑运行的直接调用仍不落账，避免单测和本地试跑写进共享库。
@@ -65,7 +70,7 @@ async def reserve(*, provider='llm', model='', purpose=''):
     from webpage_agent.observe.telemetry import trace_id, span_id
     await store.reserve_provider_charge(
         charge_id, tenant_id=tenant, run_id=run_id, provider=provider,
-        model=model or settings.llm_model, cost_micros=_reservation_micros(provider),
+        model=_active_model(model), cost_micros=_reservation_micros(provider),
         max_requests=settings.tenant_daily_provider_requests,
         max_cost_micros=settings.tenant_daily_cost_micros,
         trace_id=trace_id.get(), purpose=purpose or '',
@@ -73,7 +78,7 @@ async def reserve(*, provider='llm', model='', purpose=''):
     parent_span = span_id.get()
     token = span_id.set(uuid.uuid4().hex[:16])
     logger.info('provider_span_start charge=%s provider=%s model=%s purpose=%s parent_span=%s',
-                charge_id, provider, model or settings.llm_model, purpose or '', parent_span)
+                charge_id, provider, _active_model(model), purpose or '', parent_span)
     return store, charge_id, time.monotonic(), token, provider
 
 

@@ -92,6 +92,7 @@ class PiBridge:
         self._kill_timeout = kill_timeout
         self._max_message_bytes = max_message_bytes
         self._extra_env = env or {}
+        self.cwd: str | None = None
 
         self.execution_id = uuid.uuid4().hex
         self._proc: Optional[asyncio.subprocess.Process] = None
@@ -123,6 +124,7 @@ class PiBridge:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
+                cwd=self.cwd or None,
             )
         except (FileNotFoundError, OSError) as exc:
             raise PiBridgeError(f"无法启动 Node 子进程：{exc}") from exc
