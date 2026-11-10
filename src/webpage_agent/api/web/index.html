@@ -1174,7 +1174,7 @@ body {
       <button class="user-card" id="userCard" aria-expanded="false" aria-controls="userMenu">
         <span class="avatar" id="userAvatar">L</span>
         <span class="user-meta">
-          <b id="userName">本地访客</b>
+          <b id="userName">未登录</b>
           <small id="userSub">点击查看账号与设置</small>
         </span>
         <span class="foot-ico"><svg class="ic sm"><use href="#i-gear"/></svg></span>
@@ -4037,7 +4037,7 @@ setInterval(async () => {
     const authed = auth.authed;
     const raw = authed
       ? String(d.display_name || d.user_id || '已登录用户')
-      : (auth.off ? '本地访客（免登录）' : '本地访客');
+      : (auth.off ? '本地演示模式（免登录）' : '未登录');
     $('userName').textContent = raw;
     $('userAvatar').textContent =
       (raw.replace(/[^0-9a-zA-Z\u4e00-\u9fa5]/g, '').slice(0, 1) || 'L').toUpperCase();
