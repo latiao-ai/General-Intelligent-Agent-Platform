@@ -54,7 +54,9 @@ TURN_OWNER_ROLE = 'v12_turn_owner_role'
 USER_WORKSPACE = 'v13_user_workspace'
 # 会话级连接器选择：每条 turn 记住用户在当前会话选中的连接器，供工具注入与审计。
 CONNECTOR_SELECTION = 'v14_connector_selection'
-LATEST = CONNECTOR_SELECTION
+# 会话级选择也落到 sessions 行：业务 run 执行时按会话读取，而不是只看某条 turn。
+SESSION_CONNECTOR_SELECTION = 'v15_session_connector_selection'
+LATEST = SESSION_CONNECTOR_SELECTION
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -149,6 +151,9 @@ CREATE TABLE IF NOT EXISTS user_workspaces (
 '''), (CONNECTOR_SELECTION, '''
 ALTER TABLE session_turns
     ADD COLUMN IF NOT EXISTS connector_ids_json TEXT NOT NULL DEFAULT '[]';
+'''), (SESSION_CONNECTOR_SELECTION, '''
+ALTER TABLE sessions
+    ADD COLUMN IF NOT EXISTS connector_ids_json TEXT;
 '''))
 
 

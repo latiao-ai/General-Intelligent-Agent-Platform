@@ -214,7 +214,7 @@ class HubSessionMessageMixin:
                 if getattr(principal, 'authenticated', False) else 'member',
                 candidates=candidates, clarification=clarification,
                 source_turn_id=source_turn_id,
-                connector_ids=connector_ids or [])
+                connector_ids=connector_ids)
         except TurnRequestConflict:
             raise
         return {'turn_id': result['turn_id'],

@@ -182,6 +182,40 @@ _item('my-skill', '我的技能', 'skill', '✨', '#e9faf5',
 
 重启服务后自动出现在目录里；前端不需要改。
 
+## 4.1 远端 SkillHub
+
+`remote.py` 支持两种目录形状：
+
+```env
+# 我们自己的 SkillHub（默认）
+SKILLHUB_PROVIDER=native
+SKILLHUB_URL=http://127.0.0.1:8010/v1/skills
+
+# WorkBuddy / lightmake 风格
+SKILLHUB_PROVIDER=workbuddy
+SKILLHUB_URL=https://lightmake.site
+SKILLHUB_REMOTE_LIMIT=300
+```
+
+WorkBuddy 形状的接口：
+
+```text
+GET /api/skills?page=&pageSize=&keyword=&category=
+GET /api/v1/skills/{slug}?namespace=
+```
+
+本项目会把它归一化成内部的 `id/name/description/author/installs/usage/...`，
+与本地种子目录合并；当前实测拉到 300 条远端技能 + 30 条本地技能，共 330 张卡片。
+
+注意：
+
+- 远端只保证**目录读取**；公开目录没有提供技能包下载地址，所以远端条目直接安装会失败；
+- 需要可安装的远端时，配置 `SKILLHUB_PACKAGE_URL` 模板（`{slug}`、`{version}`），
+  或把 `SKILLHUB_URL` 指向你自己的、带 `package.url/sha256` 的 SkillHub；
+- 远端失败自动回退缓存/本地种子，不会让页面空白。
+
+![远端 SkillHub](assets/workbuddy/skillhub-remote.png)
+
 ## 5. 安装状态
 
 - 路径：`profile/skillhub/<tenant>__<user>.json`；
@@ -206,7 +240,7 @@ PY
 
 ## 7. 边界与下一步
 
-- 目录是**静态**的，真实 SkillHub 还需要远端 registry、签名/校验、版本与依赖解析；
+- 目录已支持远端（native / workbuddy 两种形状），但远端安装依赖技能包地址；
 - 安装目前只记录状态，不会自动注册工具；下一步可把已安装技能注入系统提示或工具白名单；
 - 单机 JSON 适合当前部署；多副本/多租户应换 PostgreSQL 表；
 - 需要 RBAC：普通用户只能安装，operator 才能上架/下架；

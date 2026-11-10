@@ -226,7 +226,7 @@ class SessionMessageRequest(StrictBody):
                             pattern=r'^[A-Za-z0-9_.:-]+$')
     message: str = Field(min_length=1, max_length=10000)
     target_task_id: str | None = Field(default=None, max_length=64)
-    connector_ids: list[str] = Field(default_factory=list, max_length=100)
+    connector_ids: list[str] | None = Field(default=None, max_length=100)
 
 
 class PlatformContextRequest(StrictBody):

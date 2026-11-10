@@ -184,6 +184,14 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
         mcp = await tools_core.mcp_tools()
     except Exception:                                # noqa: BLE001
         mcp = []
+    from webpage_agent.agent import connector_scope
+    allowed_connectors = connector_scope.current()
+    if allowed_connectors is not None:
+        allowed = set(allowed_connectors)
+        def _mcp_server_id(tool) -> str:
+            parts = str(getattr(tool, 'tool_key', '') or '').split(':', 2)
+            return parts[1] if len(parts) >= 3 else ''
+        mcp = [tool for tool in mcp if _mcp_server_id(tool) in allowed]
     for tool in mcp:
         key = getattr(tool, 'tool_key', '') or ''
         effect = str(getattr(tool, 'effect', '') or 'unknown')

@@ -508,8 +508,16 @@ class PgAuth:
             msg_row = await self._one(conn,
                 'SELECT id FROM messages WHERE session_id=%s AND dedupe_key=%s',
                 (session_id, f'turn:{turn_id}'))
-            await self._run(conn, 'UPDATE sessions SET updated_at=%s WHERE session_id=%s',
-                            (stamp, session_id))
+            if connector_ids is not None:
+                await self._run(conn,
+                    'UPDATE sessions SET updated_at=%s, connector_ids_json=%s '
+                    'WHERE session_id=%s',
+                    (stamp, json.dumps([str(x) for x in connector_ids],
+                                       ensure_ascii=False), session_id))
+            else:
+                await self._run(conn,
+                    'UPDATE sessions SET updated_at=%s WHERE session_id=%s',
+                    (stamp, session_id))
             await conn.commit()
         return {'turn_id': turn_id, 'message_id': int((msg_row or {}).get('id') or 0),
                 'status': 'accepted', 'replayed': False, 'kind': kind,

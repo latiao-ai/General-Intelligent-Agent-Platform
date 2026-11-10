@@ -14,6 +14,7 @@
 与轮询（早期 Streamlit 版本那份实现已随 UI 迁移删除）。
 """
 import asyncio
+import json
 import logging
 import time
 import uuid
@@ -481,6 +482,17 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
             # 测试里的替身仍是原来的签名。
             scope_token = sandbox.use_scope(record.tenant_id, record.owner_user_id)
             workspace_token = sandbox.use_workspace(stored)
+            from webpage_agent.agent import connector_scope
+            session_row = await self.store.session(record.session_id) or {}
+            raw_connectors = session_row.get('connector_ids_json')
+            if raw_connectors in (None, ''):
+                selected_connectors = None          # 旧会话：沿用全部已配置工具
+            else:
+                try:
+                    selected_connectors = json.loads(raw_connectors)
+                except (TypeError, ValueError):
+                    selected_connectors = []
+            connector_token = connector_scope.use(selected_connectors)
             try:
                 return await run_task(
                     record.message, on_event=relay,
@@ -490,6 +502,7 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
                     resume_plan=plan_hint,
                 )
             finally:
+                connector_scope.reset(connector_token)
                 sandbox.reset_workspace(workspace_token)
                 sandbox.reset_scope(scope_token)
 
