@@ -3703,12 +3703,15 @@ setInterval(async () => {
   function renderWorkDir() {
     const label = $('wsPillLabel');
     if (label) {
-      label.textContent = workDir
-        ? (workDir.split('/').filter(Boolean).pop() || workDir)
-        : '选择工作空间';
+      label.textContent = wsNamespace
+        || (workDir ? (workDir.split('/').filter(Boolean).pop() || workDir) : '选择工作空间');
     }
     const pill = $('wsPill');
-    if (pill) pill.title = workDir ? ('工作目录：' + workDir) : '选择一个本地文件夹作为工作目录';
+    if (pill) {
+      pill.title = wsNamespace
+        ? ('命名空间：' + wsNamespace)
+        : (workDir ? ('工作目录：' + workDir) : '选择一个工作空间或本地文件夹');
+    }
     const box = $('wsDirPath');
     if (box) box.textContent = workDir || '尚未选择工作目录';
     const clear = $('wsClear');
@@ -3735,6 +3738,8 @@ setInterval(async () => {
   function addWorkspace(path) {
     const p = String(path || '').trim();
     if (!p) return null;
+    // 服务端私有目录不是"本地文件夹"，由命名空间列表展示，避免重复。
+    if (p.includes('/workspaces/')) return null;
     let hit = workspaces.find(item => item.path === p);
     if (hit) hit.name = wsBaseName(p);
     else {
@@ -3758,9 +3763,9 @@ setInterval(async () => {
     if (!list) return;
     const q = ($('wspSearch').value || '').trim().toLowerCase();
     const named = serverNamespaces.map(item => ({
-      name: item.name, path: item.name, server: true,
+      name: item.name, path: '私有命名空间', server: true,
     }));
-    const local = wsLocal ? workspaces : [];
+    const local = wsLocal ? workspaces.filter(item => !String(item.path || '').includes('/workspaces/')) : [];
     const items = named.concat(local).filter(item =>
       !q || item.name.toLowerCase().includes(q) || String(item.path || '').toLowerCase().includes(q));
     if (!items.length) {
@@ -3804,6 +3809,7 @@ setInterval(async () => {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { toast(String(data.detail || '保存失败')); return; }
       workDir = String(data.path || path);
+      wsNamespace = '';
       addWorkspace(workDir);
       renderWorkDir();
       closeWsPicker();
@@ -3854,9 +3860,10 @@ setInterval(async () => {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { toast(String(data.detail || '创建失败')); return; }
       workDir = String(data.path || '');
+      wsNamespace = String(data.name || name);
       renderWorkDir();
       closeWsPicker();
-      toast('已新建命名空间 ' + name);
+      toast('已新建命名空间 ' + wsNamespace);
       refreshWorkDir();
     } catch (e) { toast('创建失败'); }
   }
@@ -3870,6 +3877,7 @@ setInterval(async () => {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { toast(String(data.detail || '切换失败')); return; }
       workDir = String(data.path || '');
+      wsNamespace = String(data.name || name);
       renderWorkDir();
       closeWsPicker();
     } catch (e) { toast('切换失败'); }
@@ -3885,7 +3893,7 @@ setInterval(async () => {
       serverNamespaces = Array.isArray(data.namespaces) ? data.namespaces : [];
       wsNamespace = String(data.namespace || '');
       applyWorkspaceMode();
-      if (workDir && wsLocal) addWorkspace(workDir);
+      if (workDir && wsLocal && !wsNamespace) addWorkspace(workDir);
       else renderWsList();
       renderWorkDir();
     } catch (e) { /* 读不到工作目录不影响发消息 */ }
@@ -3901,6 +3909,7 @@ setInterval(async () => {
       if (res.status === 409) return;                       // 用户自己取消，不打扰
       if (!res.ok) { toast(String(data.detail || '选择工作目录失败')); return; }
       workDir = String(data.path || '');
+      wsNamespace = '';
       addWorkspace(workDir);
       renderWorkDir();
       closeWsPicker();
