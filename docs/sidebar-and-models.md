@@ -40,13 +40,16 @@ WorkBuddy 的「选择工作空间」和左侧「空间」是**同一组实体**
 
 本项目的对应实现：
 
-- 输入框的 `#wsPill` 打开 `#wsPicker`：搜索、空间列表、当前项打勾；
-- 列表数据来自侧栏空间（`window.WB_SPACES`），不再维护第二份列表；
-- 「新建工作空间」`prompt` 名称 → 创建 `path=''` 的空间 → 清空 `/api/workspace`；
-- 「打开本地文件夹」→ `/api/workspace/pick` 原生目录框 → 以目录名创建/更新空间并绑定路径；
-- 「手动输入路径」是原生框不可用时的退路；
-- 侧栏点击空间时也会同步路径/清空，标签显示当前空间名；
-- BeeFTV 画布模式（`data-workspace="true"`）仍保留原来的 `#workspace` 浮层，和本地空间不冲突。
+- 输入框的 `#wsPill` 打开 `#wsPicker`：搜索、工作空间列表、当前项打勾；
+- 服务端 `/api/workspace` 返回**当前登录用户自己的**命名空间，登录后合并进左侧「空间」；
+- 「新建工作空间」→ `POST /api/workspace/namespace`，按用户私有目录创建；
+- 切换工作空间 → `POST /api/workspace/select`；
+- 「打开本地文件夹」→ `/api/workspace/pick` 原生目录框，绑定当前用户自己的路径；
+- 本地空间/任务归属按用户分键存储：
+  `wb.spaces.v2.<user_id>`、`wb.assign.v2.<user_id>`、`wb.workspaces.v2.<user_id>`；
+  切换账号会重新加载，不会复用上一个账号的侧栏；
+- 列表不再显示「私有命名空间」副标题，只有名称；
+- BeeFTV 画布模式（`data-workspace="true"`）仍保留原来的 `#workspace` 浮层，和本地工作空间不冲突。
 
 ## 3. 模型选择
 
@@ -95,6 +98,6 @@ AVAILABLE_MODELS=deepseek-v4-1-flash,deepseek-chat,deepseek-reasoner
 
 - 模型切换是**进程级全局**（本地单用户够用），不是每个会话独立；多租户应改成会话级字段；
 - 切换模型后正在跑的任务不会中途换模型，下一轮生效；
-- 本地工作空间选择不依赖 BeeFTV；画布工作空间仍需要 `data-workspace="true"`；
-- 未绑定文件夹的工作空间只归档会话，不会把某个目录作为 agent 工作目录；
+- 服务端命名空间按用户隔离；本地空间/任务归属按 `.v2.<user_id>` 分键，同一浏览器切换账号不会串；
+- 本地文件夹工作空间绑定的是当前用户的路径；未绑定目录的空间只归档会话；
 - `AVAILABLE_MODELS` 必须与 `LLM_BASE_URL` 网关实际支持的模型一致，否则下一轮请求会失败。

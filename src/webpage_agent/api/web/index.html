@@ -1163,7 +1163,7 @@ body {
       <button class="session-more" id="sessionMore" hidden>查看更多</button>
       <div class="group-head" id="spaceGroup">
         <svg class="ic sm caret"><use href="#i-chevron"/></svg><span>空间</span><b id="spaceCount">0</b>
-        <button class="group-add" id="spaceAdd" title="新建空间" aria-label="新建空间">
+        <button class="group-add" id="spaceAdd" title="新建工作空间" aria-label="新建工作空间">
           <svg class="ic sm"><use href="#i-plus"/></svg>
         </button>
       </div>
@@ -3511,20 +3511,24 @@ setInterval(async () => {
   /* ---------- 7. 空间：文件夹 + 里面的任务 ---------- */
   // WorkBuddy 的「空间」是文件夹，展开后是这个空间里的任务。后端目前只有会话
   // （没有文件夹概念），所以这一层放在本地：spaces/assign 两个键，不依赖服务端。
-  const KEY_SPACES = 'wb.spaces.v1';
-  const KEY_ASSIGN = 'wb.assign.v1';
+  const KEY_SPACES_BASE = 'wb.spaces.v2';
+  const KEY_ASSIGN_BASE = 'wb.assign.v2';
+  let spaceUser = 'anon';
   let spaces = [];
   let assign = {};          // sessionId -> spaceId
   let activeSpace = '';
 
+  function spacesKey() { return KEY_SPACES_BASE + '.' + spaceUser; }
+  function assignKey() { return KEY_ASSIGN_BASE + '.' + spaceUser; }
+
   function saveSpaceState() {
-    try { localStorage.setItem(KEY_SPACES, JSON.stringify(spaces)); } catch (e) { /* 忽略 */ }
-    try { localStorage.setItem(KEY_ASSIGN, JSON.stringify(assign)); } catch (e) { /* 忽略 */ }
+    try { localStorage.setItem(spacesKey(), JSON.stringify(spaces)); } catch (e) { /* 忽略 */ }
+    try { localStorage.setItem(assignKey(), JSON.stringify(assign)); } catch (e) { /* 忽略 */ }
   }
 
   function loadSpaceState() {
-    try { spaces = JSON.parse(localStorage.getItem(KEY_SPACES) || '[]'); } catch (e) { spaces = []; }
-    try { assign = JSON.parse(localStorage.getItem(KEY_ASSIGN) || '{}'); } catch (e) { assign = {}; }
+    try { spaces = JSON.parse(localStorage.getItem(spacesKey()) || '[]'); } catch (e) { spaces = []; }
+    try { assign = JSON.parse(localStorage.getItem(assignKey()) || '{}'); } catch (e) { assign = {}; }
     if (!Array.isArray(spaces)) spaces = [];
     if (!assign || typeof assign !== 'object') assign = {};
     if (!spaces.length) spaces = [{id: 'sp_default', name: '我的空间', open: true}];
@@ -3532,6 +3536,22 @@ setInterval(async () => {
     activeSpace = spaces[0].id;
     saveSpaceState();
   }
+
+  // 切换账号时重新加载该账号自己的空间/任务归属，避免两个账号共用 localStorage。
+  window.WB_SET_USER = userId => {
+    const next = String(userId || 'anon');
+    if (next === spaceUser) return;
+    spaceUser = next;
+    workDir = '';
+    serverNamespaces = [];
+    wsNamespace = '';
+    loadSpaceState();
+    loadWsList();
+    spacesSig = '';
+    syncSpaces();
+    renderWsList();
+    renderWorkDir();
+  };
 
   function spaceOf(sessionId) {
     const id = assign[sessionId];
@@ -3547,15 +3567,7 @@ setInterval(async () => {
     spacesSig = '';       // 下一次 syncSpaces 强制重画
   };
 
-  $('spaceAdd').onclick = () => {
-    const name = (prompt('新建空间：给它一个名字（用来归拢同一件事的任务）') || '').trim();
-    if (!name) return;
-    spaces.push({id: 'sp_' + Date.now().toString(36), name, open: true});
-    activeSpace = spaces[spaces.length - 1].id;
-    saveSpaceState();
-    spacesSig = '';
-    syncSpaces();
-  };
+  $('spaceAdd').onclick = () => createNamespace();
 
   let spacesSig = '';
 
@@ -3719,20 +3731,22 @@ setInterval(async () => {
   }
 
   /* ---------- 工作空间列表 ---------- */
-  const KEY_WORKSPACES = 'wb.workspaces.v1';
+  const KEY_WORKSPACES_BASE = 'wb.workspaces.v2';
   let workspaces = [];
+
+  function wsListKey() { return KEY_WORKSPACES_BASE + '.' + spaceUser; }
 
   function wsBaseName(path) {
     return String(path || '').split('/').filter(Boolean).pop() || String(path || '');
   }
 
   function loadWsList() {
-    try { workspaces = JSON.parse(localStorage.getItem(KEY_WORKSPACES) || '[]'); } catch (e) { workspaces = []; }
+    try { workspaces = JSON.parse(localStorage.getItem(wsListKey()) || '[]'); } catch (e) { workspaces = []; }
     if (!Array.isArray(workspaces)) workspaces = [];
   }
 
   function saveWsList() {
-    try { localStorage.setItem(KEY_WORKSPACES, JSON.stringify(workspaces)); } catch (e) { /* 忽略 */ }
+    try { localStorage.setItem(wsListKey(), JSON.stringify(workspaces)); } catch (e) { /* 忽略 */ }
   }
 
   function addWorkspace(path) {
@@ -3758,12 +3772,31 @@ setInterval(async () => {
   let serverNamespaces = [];
   let wsNamespace = '';
 
+  // 服务端命名空间按用户隔离；每个账号登录后合并到自己侧栏，不共用上一账号的列表。
+  function adoptServerNamespaces() {
+    if (!Array.isArray(serverNamespaces)) return;
+    let changed = false;
+    for (const ns of serverNamespaces) {
+      if (!ns || !ns.name || spaces.some(s => s.name === ns.name)) continue;
+      spaces.push({id: 'sp_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+                   name: ns.name, open: true});
+      changed = true;
+    }
+    if (changed) {
+      const current = spaces.find(s => wsNamespace && s.name === wsNamespace);
+      if (current) activeSpace = current.id;
+      saveSpaceState();
+      spacesSig = '';
+      syncSpaces();
+    }
+  }
+
   function renderWsList() {
     const list = $('wspList');
     if (!list) return;
     const q = ($('wspSearch').value || '').trim().toLowerCase();
     const named = serverNamespaces.map(item => ({
-      name: item.name, path: '私有命名空间', server: true,
+      name: item.name, path: '', server: true,
     }));
     const local = wsLocal ? workspaces.filter(item => !String(item.path || '').includes('/workspaces/')) : [];
     const items = named.concat(local).filter(item =>
@@ -3784,10 +3817,13 @@ setInterval(async () => {
       const name = document.createElement('div');
       name.className = 'wsp-name';
       name.textContent = item.name;
-      const path = document.createElement('div');
-      path.className = 'wsp-path';
-      path.textContent = item.path;
-      body.append(name, path);
+      body.append(name);
+      if (item.path) {
+        const path = document.createElement('div');
+        path.className = 'wsp-path';
+        path.textContent = item.path;
+        body.append(path);
+      }
       row.append(icon, body);
       if (active) {
         const check = document.createElement('span');
@@ -3850,7 +3886,7 @@ setInterval(async () => {
 
   async function createNamespace() {
     if (!auth.authed && !auth.off) { toast('请先登录中台'); return; }
-    const name = (prompt('新建命名空间：给它一个名字') || '').trim();
+    const name = (prompt('新建工作空间：给它一个名字（不需要选择文件夹）') || '').trim();
     if (!name) return;
     try {
       const res = await fetch(API_PREFIX + '/workspace/namespace', {
@@ -3863,7 +3899,7 @@ setInterval(async () => {
       wsNamespace = String(data.name || name);
       renderWorkDir();
       closeWsPicker();
-      toast('已新建命名空间 ' + wsNamespace);
+      toast('已新建工作空间 ' + wsNamespace);
       refreshWorkDir();
     } catch (e) { toast('创建失败'); }
   }
@@ -3878,6 +3914,8 @@ setInterval(async () => {
       if (!res.ok) { toast(String(data.detail || '切换失败')); return; }
       workDir = String(data.path || '');
       wsNamespace = String(data.name || name);
+      const sp = spaces.find(s => s.name === wsNamespace);
+      if (sp) { activeSpace = sp.id; saveSpaceState(); spacesSig = ''; syncSpaces(); }
       renderWorkDir();
       closeWsPicker();
     } catch (e) { toast('切换失败'); }
@@ -3893,6 +3931,7 @@ setInterval(async () => {
       serverNamespaces = Array.isArray(data.namespaces) ? data.namespaces : [];
       wsNamespace = String(data.namespace || '');
       applyWorkspaceMode();
+      adoptServerNamespaces();
       if (workDir && wsLocal && !wsNamespace) addWorkspace(workDir);
       else renderWsList();
       renderWorkDir();
@@ -4047,6 +4086,7 @@ setInterval(async () => {
       : (auth.off ? '本地演示模式 · 无需登录' : '未登录中台 · 点击登录');
     applyAuth();
     maybeAutoLogin();
+    if (window.WB_SET_USER) window.WB_SET_USER(authed && d ? d.user_id : '');
     refreshWorkDir();
   }
 
