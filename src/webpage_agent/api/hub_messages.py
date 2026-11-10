@@ -147,7 +147,8 @@ class HubSessionMessageMixin:
 
     async def accept_session_message(
             self, session_id: str, *, request_id: str, message: str,
-            target_task_id: str = '', principal=None) -> dict:
+            target_task_id: str = '', principal=None,
+            connector_ids: list[str] | None = None) -> dict:
         """接纳一条会话消息，返回 202 形状（不等待模型完成）。
 
         同一 request_id 同载荷重放返回原 turn；不同载荷抛 `TurnRequestConflict`。
@@ -212,7 +213,8 @@ class HubSessionMessageMixin:
                 owner_role=(getattr(principal, 'role', '') or 'member')
                 if getattr(principal, 'authenticated', False) else 'member',
                 candidates=candidates, clarification=clarification,
-                source_turn_id=source_turn_id)
+                source_turn_id=source_turn_id,
+                connector_ids=connector_ids or [])
         except TurnRequestConflict:
             raise
         return {'turn_id': result['turn_id'],
@@ -223,6 +225,7 @@ class HubSessionMessageMixin:
                 'target_run_id': result.get('target_run_id') or '',
                 'candidates': candidates,
                 'clarification': clarification,
+                'connector_ids': list(connector_ids or []),
                 'replayed': result.get('replayed', False)}
 
     def _ambiguous_prompt(self, message: str, candidates: list[str],

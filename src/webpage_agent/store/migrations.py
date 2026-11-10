@@ -52,7 +52,9 @@ RUNTIME_DEFAULT_PI = 'v11_runtime_default_pi'
 TURN_OWNER_ROLE = 'v12_turn_owner_role'
 # 用户级工作目录：前端「选择工作空间」选中的本地目录，按租户+用户落一行。
 USER_WORKSPACE = 'v13_user_workspace'
-LATEST = USER_WORKSPACE
+# 会话级连接器选择：每条 turn 记住用户在当前会话选中的连接器，供工具注入与审计。
+CONNECTOR_SELECTION = 'v14_connector_selection'
+LATEST = CONNECTOR_SELECTION
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -144,6 +146,9 @@ CREATE TABLE IF NOT EXISTS user_workspaces (
     updated_at TEXT NOT NULL,
     PRIMARY KEY (tenant_id, owner_user_id)
 );
+'''), (CONNECTOR_SELECTION, '''
+ALTER TABLE session_turns
+    ADD COLUMN IF NOT EXISTS connector_ids_json TEXT NOT NULL DEFAULT '[]';
 '''))
 
 

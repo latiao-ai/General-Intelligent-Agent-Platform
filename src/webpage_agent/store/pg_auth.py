@@ -447,7 +447,8 @@ class PgAuth:
                           owner_role: str = 'member',
                           source_turn_id: str = '',
                           candidates: list | None = None,
-                          clarification: str = '') -> dict:
+                          clarification: str = '',
+                          connector_ids: list | None = None) -> dict:
         """用户消息 + 待执行 turn + 接纳事件同事务提交。
 
         幂等：`(session_id, request_id)` 唯一。同一 request_id 同一 request_hash
@@ -489,14 +490,16 @@ class PgAuth:
             await self._run(conn, 'INSERT INTO session_turns '
                 '(turn_id, session_id, turn_seq, request_id, request_hash, message, '
                 ' target_task_id, target_run_id, kind, status, source_turn_id, '
-                ' candidates_json, clarification, execution_generation, '
+                ' candidates_json, clarification, connector_ids_json, execution_generation, '
                 ' tenant_id, owner_user_id, owner_role, created_at, updated_at) '
-                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
                 (turn_id, session_id, turn_seq, request_id, request_hash, message,
                  target_task_id, target_run_id, kind, 'accepted',
                  source_turn_id or '',
                  json.dumps(candidates or [], ensure_ascii=False),
-                 clarification or '', 0, tenant_id, owner_user_id,
+                 clarification or '',
+                 json.dumps([str(x) for x in (connector_ids or [])], ensure_ascii=False),
+                 0, tenant_id, owner_user_id,
                  str(owner_role or 'member'), stamp, stamp))
             # 用户消息（同事务）
             await self._run(conn, 'INSERT INTO messages (session_id, role, content, created_at, dedupe_key) '

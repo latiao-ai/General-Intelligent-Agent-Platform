@@ -1741,6 +1741,8 @@ async function openSession(id, options = {}) {
   S.clarification = '';
   S.lastEventSeq = 0;
   S.status = null;
+  if (window.WB_CONNECTOR_CLEAR_DRAFT) window.WB_CONNECTOR_CLEAR_DRAFT();
+  if (window.WB_CONNECTOR_REFRESH) window.WB_CONNECTOR_REFRESH();
   renderSessionList();          // 高亮当前会话
   try {
     const res = checkAuth(await fetch(`${API_PREFIX}/sessions/${id}/timeline`));
@@ -1856,6 +1858,8 @@ async function newSession() {
   S.askedQuestions = [];
   S.clarification = '';
   S.lastEventSeq = 0;
+  if (window.WB_CONNECTOR_CLEAR_DRAFT) window.WB_CONNECTOR_CLEAR_DRAFT();
+  if (window.WB_CONNECTOR_REFRESH) window.WB_CONNECTOR_REFRESH();
   renderSessionList();
 }
 
@@ -2402,7 +2406,10 @@ function validSessionId(id) {
 }
 
 function ensureSessionId() {
-  if (!validSessionId(S.sessionId)) S.sessionId = newSessionId();
+  if (!validSessionId(S.sessionId)) {
+    S.sessionId = newSessionId();
+    if (window.WB_CONNECTOR_RESET) window.WB_CONNECTOR_RESET(S.sessionId);
+  }
   return S.sessionId;
 }
 
@@ -2429,6 +2436,8 @@ async function postSessionMessage(text, requestId, targetTaskId, sessionId) {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({request_id: requestId, message: text,
+                          connector_ids: (window.WB_CONNECTOR_CURRENT
+                            ? window.WB_CONNECTOR_CURRENT() : []),
                           ...(targetTaskId ? {target_task_id: targetTaskId} : {})}),
   };
   const sid = validSessionId(sessionId) ? sessionId : ensureSessionId();
@@ -5072,6 +5081,7 @@ setInterval(async () => {
     ima: '🪄', lexshare: '📚', bilibili: '📺',
   };
   let connectorItems = [];
+  let draftConnectorIds = [];
 
   function connectorIcon(item) {
     const byId = CONNECTOR_ICONS[item.id];
@@ -5083,17 +5093,67 @@ setInterval(async () => {
     return item.icon || '🔗';
   }
 
+  function connectorSelectionKey() {
+    return 'wb.connector.selection.v1.' + (window.WB_AUTH?.info?.user_id || 'anon');
+  }
+
+  function connectorSelectionStore() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(connectorSelectionKey()) || '{}');
+      return raw && typeof raw === 'object' ? raw : {};
+    } catch (e) { return {}; }
+  }
+
+  function currentConnectorIds() {
+    if (!S.sessionId) return draftConnectorIds;
+    const store = connectorSelectionStore();
+    if (Object.prototype.hasOwnProperty.call(store, S.sessionId)) {
+      return Array.isArray(store[S.sessionId])
+        ? store[S.sessionId].filter(id => typeof id === 'string') : [];
+    }
+    // 老会话没有保存过选择时，沿用“已连接”作为初始选中。
+    return connectorItems.filter(item => item.enabled).map(item => item.id);
+  }
+
+  function setConnectorIds(ids) {
+    const clean = [...new Set((ids || []).filter(id => typeof id === 'string'))].slice(0, 100);
+    if (!S.sessionId) {
+      draftConnectorIds = clean;
+      renderConnectorChips();
+      return;
+    }
+    const store = connectorSelectionStore();
+    store[S.sessionId] = clean;
+    try { localStorage.setItem(connectorSelectionKey(), JSON.stringify(store)); } catch (e) { /* 忽略 */ }
+    renderConnectorChips();
+  }
+
+  function resetConnectorSelection(sessionId) {
+    if (!sessionId) return;
+    const store = connectorSelectionStore();
+    store[sessionId] = draftConnectorIds;
+    draftConnectorIds = [];
+    try { localStorage.setItem(connectorSelectionKey(), JSON.stringify(store)); } catch (e) { /* 忽略 */ }
+    if (S.sessionId === sessionId) renderConnectorChips();
+  }
+
   function renderConnectorChips() {
     const box = $id('connectorChips');
     if (!box) return;
-    const enabled = connectorItems.filter(item => item.enabled);
-    box.replaceChildren(...enabled.map(item => {
+    const selected = new Set(currentConnectorIds());
+    const chosen = connectorItems.filter(item => selected.has(item.id));
+    box.replaceChildren(...chosen.map(item => {
       const chip = document.createElement('button');
       chip.type = 'button';
       chip.className = 'connector-chip';
-      chip.title = `${item.name}（已连接，点击断开）`;
+      chip.title = `${item.name}（当前会话已选，点击移除）`;
       chip.innerHTML = `<span class="cc-x">×</span><span class="cc-ico">${esc(connectorIcon(item))}</span>`;
-      chip.onclick = e => { e.stopPropagation(); disconnectConnector(item); };
+      chip.onclick = e => {
+        e.stopPropagation();
+        setConnectorIds(currentConnectorIds().filter(id => id !== item.id));
+        renderConnectors($id('cpSearch').value);
+        toast(`已从当前会话移除「${item.name}」`);
+      };
       return chip;
     }));
   }
@@ -5221,6 +5281,7 @@ setInterval(async () => {
       list.innerHTML = '<div class="cp-note" style="padding:14px 8px">没有匹配的连接器</div>';
       return;
     }
+    const selectedForConversation = new Set(currentConnectorIds());
     list.replaceChildren(...items.map(item => {
       const row = document.createElement('div');
       row.className = 'cp-row';
@@ -5238,9 +5299,10 @@ setInterval(async () => {
       row.append(icon, name, meta);
       if (item.configured) {
         const sw = document.createElement('button');
+        const chosen = selectedForConversation.has(item.id);
         sw.type = 'button';
-        sw.className = 'switch' + (item.enabled ? ' on' : '');
-        sw.setAttribute('aria-label', item.enabled ? '断开连接' : '连接');
+        sw.className = 'switch' + (chosen ? ' on' : '');
+        sw.setAttribute('aria-label', chosen ? '从当前会话移除' : '加入当前会话');
         sw.onclick = e => { e.stopPropagation(); toggleConnector(item, sw); };
         row.appendChild(sw);
       } else {
@@ -5259,34 +5321,48 @@ setInterval(async () => {
   }
 
   async function toggleConnector(item, btn) {
-    const enabling = !item.enabled;
-    const before = item.enabled;
-    item.enabled = enabling;
-    btn.classList.toggle('on', enabling);
-    btn.disabled = true;
-    try {
-      const res = await fetch(`${PREFIX}/connectors/${encodeURIComponent(item.id)}/${enabling ? 'connect' : 'disconnect'}`, {method: 'POST'});
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
-      item.enabled = !!data.enabled;
-      item.tools = data.tools || 0;
-      toast(enabling
-        ? `已连接「${item.name}」${item.tools ? `，发现 ${item.tools} 个工具` : ''}`
-        : `已断开「${item.name}」`);
+    const chosen = currentConnectorIds().includes(item.id);
+    if (chosen) {
+      setConnectorIds(currentConnectorIds().filter(id => id !== item.id));
       renderConnectors($id('cpSearch').value);
-      renderConnectorChips();
-    } catch (err) {
-      item.enabled = before;
-      btn.classList.toggle('on', before);
-      toast('连接失败：' + (err.message || '网络错误'));
-    } finally {
-      btn.disabled = false;
+      toast(`已从当前会话移除「${item.name}」`);
+      return;
     }
+    if (!item.enabled) {
+      // 第一次加入会话时先建立连接；连不上就不把标签加进去。
+      btn.disabled = true;
+      try {
+        const res = await fetch(`${PREFIX}/connectors/${encodeURIComponent(item.id)}/connect`, {method: 'POST'});
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+        item.enabled = true;
+        item.tools = data.tools || 0;
+        item.error = '';
+      } catch (err) {
+        toast('连接失败：' + (err.message || '网络错误'));
+        btn.disabled = false;
+        return;
+      } finally {
+        btn.disabled = false;
+      }
+    }
+    setConnectorIds([...currentConnectorIds(), item.id]);
+    renderConnectors($id('cpSearch').value);
+    renderConnectorChips();
+    toast(`已加入当前会话「${item.name}」`);
   }
 
   $id('cpSearch').addEventListener('input', e => renderConnectors(e.target.value));
   $id('cpClose').onclick = closeConnectorPanel;
   $id('cpManage').onclick = () => { closeConnectorPanel(); openHub('connector'); };
+
+  window.WB_CONNECTOR_CURRENT = currentConnectorIds;
+  window.WB_CONNECTOR_CLEAR_DRAFT = () => { draftConnectorIds = []; renderConnectorChips(); };
+  window.WB_CONNECTOR_REFRESH = () => {
+    renderConnectorChips();
+    if (!$id('connectorPop').hidden) renderConnectors($id('cpSearch').value);
+  };
+  window.WB_CONNECTOR_RESET = resetConnectorSelection;
 
   /* ---------- 模型选择 ---------- */
   const MODEL_LABELS = {

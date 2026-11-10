@@ -226,6 +226,7 @@ class SessionMessageRequest(StrictBody):
                             pattern=r'^[A-Za-z0-9_.:-]+$')
     message: str = Field(min_length=1, max_length=10000)
     target_task_id: str | None = Field(default=None, max_length=64)
+    connector_ids: list[str] = Field(default_factory=list, max_length=100)
 
 
 class PlatformContextRequest(StrictBody):
@@ -1414,7 +1415,8 @@ async def post_session_message(session_id: str, payload: SessionMessageRequest,
     try:
         result = await hub.accept_session_message(
             session_id, request_id=payload.request_id, message=payload.message,
-            target_task_id=payload.target_task_id or '', principal=principal)
+            target_task_id=payload.target_task_id or '', principal=principal,
+            connector_ids=payload.connector_ids)
     except TurnRequestConflict:
         raise HTTPException(status_code=409,
                             detail='该 request_id 已用于不同内容的请求') from None
