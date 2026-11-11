@@ -260,11 +260,7 @@ a{color:var(--brand);text-decoration:none}
 
 
 /* 连接器 Hub：MCP 卡片 */
-.hub-mcp{padding:10px 0 24px}
-.hub-mcp-head{display:flex;align-items:flex-start;gap:12px;margin:4px 0 14px}
-.hub-mcp-title{font-size:15px;font-weight:600;color:var(--ink)}
-.hub-mcp-sub{font-size:11.5px;color:var(--muted);margin-top:4px}
-.hub-mcp-manage{margin-left:auto;height:32px;font-size:12px}
+.hub-mcp{padding:8px 0 24px}
 .hub-mcp-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px}
 @media (max-width:1100px){.hub-mcp-grid{grid-template-columns:repeat(3,minmax(0,1fr))}}
 @media (max-width:760px){.hub-mcp-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
@@ -807,7 +803,8 @@ body {
 .hub-head { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
 .hub-title { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: -.2px; }
 .hub-tabs { display: flex; gap: 18px; margin-left: 4px; }
-.hub-tab { position: relative; height: 34px; padding: 0 2px; border: 0; background: none; color: var(--muted); font-size: 13.5px; cursor: pointer; }
+.hub-tab { position: relative; display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 2px; border: 0; background: none; color: var(--muted); font-size: 13.5px; cursor: pointer; }
+.hub-tab .ic { width: 14px; height: 14px; }
 .hub-tab.active { color: var(--ink); font-weight: 600; }
 .hub-tab.active::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px; border-radius: 2px; background: var(--brand); }
 .hub-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
@@ -1325,11 +1322,10 @@ body {
     <section class="hub-view" id="hubView" hidden aria-label="技能与连接器">
       <div class="hub-wrap">
         <div class="hub-head">
-          <h2 class="hub-title">专家</h2>
           <div class="hub-tabs" role="tablist">
-            <button class="hub-tab active" data-kind="expert">专家</button>
-            <button class="hub-tab" data-kind="skill">技能</button>
-            <button class="hub-tab" data-kind="connector">连接器</button>
+            <button class="hub-tab active" data-kind="expert"><svg class="ic sm"><use href="#i-spark"/></svg>专家</button>
+            <button class="hub-tab" data-kind="skill"><svg class="ic sm"><use href="#i-slash"/></svg>技能</button>
+            <button class="hub-tab" data-kind="connector"><svg class="ic sm"><use href="#i-plug"/></svg>连接器</button>
           </div>
           <div class="hub-actions">
             <div class="hub-search">
@@ -1345,13 +1341,6 @@ body {
 
         <div id="hubSkillsView">
         <div class="hub-mcp" id="hubMcpPanel" hidden>
-          <div class="hub-mcp-head">
-            <div>
-              <div class="hub-mcp-title">MCP 服务</div>
-              <div class="hub-mcp-sub">添加服务时完成账号授权；对话里只选择已经连接的服务。</div>
-            </div>
-            <button class="ghost hub-mcp-manage" id="hubMcpManage">管理配置</button>
-          </div>
           <div class="hub-mcp-grid" id="hubMcpGrid"></div>
         </div>
         <div class="hub-featured">
@@ -5142,7 +5131,8 @@ setInterval(async () => {
       const res = checkAuth(await fetch(PREFIX + '/connectors', {cache: 'no-store'}));
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
-      hubMcpItems = data.items || [];
+      // 只展示中台真的已经配置的 MCP；目录里未配置的通用连接器不在这里充数。
+      hubMcpItems = (data.items || []).filter(x => x.configured);
       renderHubMcp();
     } catch (err) {
       grid.innerHTML = `<div class="hub-empty">读取失败：${esc(err.message || '网络错误')}</div>`;
@@ -5154,7 +5144,7 @@ setInterval(async () => {
     const q = hubMcpQuery.trim().toLowerCase();
     const items = q ? hubMcpItems.filter(x => (x.name || x.id || '').toLowerCase().includes(q)) : hubMcpItems;
     if (!items.length) {
-      grid.innerHTML = '<div class="hub-empty">没有匹配的 MCP 服务。</div>';
+      grid.innerHTML = '<div class="hub-empty">中台还没有已配置的 MCP 服务。点「添加连接器」开始。</div>';
       return;
     }
     grid.replaceChildren(...items.map(item => {
@@ -5242,10 +5232,8 @@ setInterval(async () => {
     $id('hubExpertsView').hidden = !expert;
     $id('hubSkillsView').hidden = expert;
     $id('hubMcpPanel').hidden = !connector;
-    document.querySelector('.hub-title').hidden = connector;
-    document.querySelector('.hub-title').textContent = '专家';
     $id('hubSearch').placeholder = connector ? '搜索连接器' : '搜索技能';
-    $id('hubAddBtn').textContent = connector ? '＋ 自定义连接器' : '＋ 添加技能';
+    $id('hubAddBtn').textContent = connector ? '＋ 添加连接器' : '＋ 添加技能';
     $id('hubInstalledBtn').hidden = connector;
     const hideSkillBits = connector;
     document.querySelector('.hub-featured').hidden = hideSkillBits;
@@ -5443,7 +5431,6 @@ setInterval(async () => {
     $id('hubInstalledBtn').classList.toggle('on', state.installed);
     loadHub();
   };
-  $id('hubMcpManage').onclick = () => openMcpManager();
   $id('hubAddBtn').onclick = () => {
     if (state.kind === 'connector') { openMcpManager(); return; }
     const sel = $id('addSkillCategory');
