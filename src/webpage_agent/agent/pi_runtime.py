@@ -255,6 +255,55 @@ def _high_risk_tool(tool) -> bool:
     return any(part in name for part in _HIGH_RISK_NAME_PARTS)
 
 
+def _extract_tool_urls(value, limit: int = 12) -> list[str]:
+    """从工具结果里收集 http(s) 链接，供前端结果侧栏展示。"""
+    found: list[str] = []
+
+    def walk(item):
+        if len(found) >= limit:
+            return
+        if isinstance(item, str):
+            text = item.strip()
+            if text.startswith(('http://', 'https://')) and text not in found:
+                found.append(text[:2000])
+        elif isinstance(item, dict):
+            for key, val in item.items():
+                if str(key).lower() in {'token', 'authorization', 'cookie', 'secret', 'api_key'}:
+                    continue
+                walk(val)
+        elif isinstance(item, (list, tuple)):
+            for val in item:
+                walk(val)
+
+    walk(value)
+    return found
+
+
+def _tool_make_visible(value) -> bool:
+    if isinstance(value, dict):
+        for key, val in value.items():
+            if str(key) in ('makeVisible', 'make_visible') and val is True:
+                return True
+            if _tool_make_visible(val):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(_tool_make_visible(item) for item in value)
+    return False
+
+
+async def _emit_tool_result(tool_name: str, content) -> None:
+    try:
+        await emit_async({
+            'type': 'tool_result',
+            'name': str(tool_name),
+            'ok': True,
+            'urls': _extract_tool_urls(content),
+            'make_visible': _tool_make_visible(content),
+        })
+    except Exception:                              # noqa: BLE001
+        logger.debug('tool_result 事件发送失败', exc_info=True)
+
+
 def _tool_event_args(args) -> dict:
     """工具参数的事件摘要：保留 query 等可读字段，屏蔽凭据。"""
     if not isinstance(args, dict):
@@ -797,6 +846,8 @@ class PiRuntime:
             )
             await bridge.send(reply)
             if ok:
+                await _emit_tool_result(tool_name, result)
+            if ok:
                 pi_product.note_repeat(self._repeat_counts, fingerprint)
                 self._call_trace.append({'tool': tool_name, 'step_id': call_id, 'args': {}})
             return
@@ -940,6 +991,7 @@ class PiRuntime:
             if receipt.updates:
                 for key, value in receipt.updates.items():
                     state[key] = value
+            await _emit_tool_result(tool_name, receipt.content)
             reply = proto.make_message(
                 bridge.execution_id,
                 "tool_result",

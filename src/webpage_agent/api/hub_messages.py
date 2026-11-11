@@ -494,6 +494,10 @@ class HubSessionMessageMixin:
         lines.append('涉及删除、导出、生成/提交、发布、扣费等高风险工具，'
                      '执行前必须先向用户说明影响或费用，并等待用户明确回复“确认”；'
                      '未确认时不要直接调用。')
+        lines.append('当用户要求创建画布/节点、生成图片/视频、查看作品或继续创作时，'
+                     '必须先调用本轮已注入的连接器工具，不要只给步骤或建议；'
+                     '工具返回的 projectId、canvas URL、node ID、图片/视频 URL 要原样保留，'
+                     '并在回答中明确展示。')
         return '\n'.join(lines)
 
     async def _run_pi_chat(self, claimed: dict) -> str | None:

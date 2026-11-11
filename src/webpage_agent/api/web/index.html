@@ -556,6 +556,25 @@ a{color:var(--brand);text-decoration:none}
   font-size:12.5px;text-align:left;cursor:pointer}
 .cd-example:hover{background:var(--soft)}
 
+
+/* 工具结果侧栏 */
+.result-panel{position:fixed;top:0;right:0;bottom:0;width:min(390px,100%);z-index:86;
+  display:flex;flex-direction:column;background:#fff;border-left:1px solid var(--line-2);
+  box-shadow:-18px 0 50px rgba(16,24,40,.14)}
+.result-panel[hidden]{display:none}
+.rp-head{display:flex;align-items:center;gap:8px;padding:14px 16px;border-bottom:1px solid var(--line)}
+.rp-head b{font-size:13px;color:var(--ink)}
+.rp-head button{margin-left:auto;border:0;background:none;font-size:22px;color:var(--muted);cursor:pointer}
+.rp-body{flex:1;overflow:auto;padding:14px 16px 24px}
+.rp-note{font-size:11.5px;color:var(--muted-2);line-height:1.6;margin-bottom:10px}
+.rp-image{width:100%;border-radius:10px;border:1px solid var(--line);margin:6px 0 12px;background:var(--soft)}
+.rp-link{display:flex;flex-direction:column;gap:5px;padding:11px 12px;margin-bottom:8px;
+  border:1px solid var(--line);border-radius:10px;background:#fafbfc;text-decoration:none}
+.rp-link b{font-size:12px;color:var(--ink);font-weight:500}
+.rp-link span{font-size:10.5px;color:var(--muted-2);word-break:break-all}
+.rp-open{display:inline-flex;align-items:center;justify-content:center;height:34px;margin-top:6px;
+  padding:0 14px;border-radius:9px;background:var(--ink);color:#fff;font-size:12px;text-decoration:none}
+
 /* 登录（平台账号密码） */
 .auth-card{width:min(400px,100%)}
 .auth-form{display:flex;flex-direction:column;gap:9px;margin-top:12px}
@@ -1644,6 +1663,14 @@ body {
   </div>
 </div>
 
+<div class="result-panel" id="resultPanel" hidden>
+  <div class="rp-head">
+    <b>结果预览</b>
+    <button id="rpClose" aria-label="关闭">×</button>
+  </div>
+  <div class="rp-body" id="rpBody"></div>
+</div>
+
 <div class="modal" id="connectorDetailModal" style="display:none">
   <div class="modal-card connector-detail-card">
     <button class="cd-close" id="cdClose" aria-label="关闭">×</button>
@@ -1762,6 +1789,9 @@ body {
       <button class="ghost" id="loginClose">关闭</button>
     </div>
     <form class="auth-form" id="loginForm" autocomplete="on">
+      <label id="loginPlatformField" style="display:none">登录平台
+        <select id="loginPlatform"></select>
+      </label>
       <label>账号
         <input id="loginUser" name="username" type="text" autocomplete="username"
                placeholder="BeeFTV 用户名" required>
@@ -2746,6 +2776,44 @@ function chatTurnDone(status) {
 
 // 轮询 timeline，直到该 turn 执行出终态（第十一阶段第 7 点 / A 组第 4 点）。
 // 会话 turn 的独立 SSE：cursor 由服务端自增 id/Last-Event-ID 维护。
+function isImageUrl(url) {
+  return /\.(png|jpe?g|webp|gif)(?:\?|$)/i.test(String(url || ''));
+}
+
+function showToolResult(data) {
+  const urls = (data.urls || []).filter(Boolean).slice(0, 8);
+  const wanted = data.make_visible || urls.some(u => /liblib\.tv/i.test(u) || isImageUrl(u));
+  if (!urls.length || !wanted) return;
+  const body = $id('rpBody');
+  body.replaceChildren();
+  const note = document.createElement('div');
+  note.className = 'rp-note';
+  note.textContent = data.name ? `工具 ${data.name} 返回的结果` : '工具返回的结果';
+  body.appendChild(note);
+  urls.forEach(url => {
+    if (isImageUrl(url)) {
+      const img = document.createElement('img');
+      img.className = 'rp-image';
+      img.src = url;
+      img.loading = 'lazy';
+      img.referrerPolicy = 'no-referrer';
+      body.appendChild(img);
+    }
+    const a = document.createElement('a');
+    a.className = 'rp-link';
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    const title = document.createElement('b');
+    title.textContent = /liblib\.tv/i.test(url) ? '打开 LibTV 查看结果' : '打开外部结果';
+    const sub = document.createElement('span');
+    sub.textContent = url;
+    a.append(title, sub);
+    body.appendChild(a);
+  });
+  $id('resultPanel').hidden = false;
+}
+
 function streamChatTurn(turnId, sessionId) {
   if (S.chatES) { S.chatES.close(); S.chatES = null; }
   resetChatProcess();
@@ -2768,6 +2836,8 @@ function streamChatTurn(turnId, sessionId) {
       addChatStep(data.name || '工具', data.args || {});
     } else if (data.type === 'tool_confirmation_required') {
       addChatConfirmation(data.name || '工具', data.args || {});
+    } else if (data.type === 'tool_result') {
+      showToolResult(data);
     } else if (data.type === 'answer_delta') {
       const state = ensureChatProcess();
       for (const row of state.steps) {
@@ -4608,6 +4678,7 @@ setInterval(async () => {
   // 游客只摆「登录中台」，登录后才摆「切换账号 / 退出登录」。之前两种状态都摆着
   // 退出登录，游客点下去服务端也只会回 {revoked:false}，页面自然"退不出去"。
   const auth = { ready: false, authed: false, info: null, platformLogin: null,
+                 platforms: [],
                  off: false, required: true,
                  // ?switch=1：刚点过「切换账号」，身份问清后自动弹登录框
                  switchPending: new URLSearchParams(location.search).has('switch'),
@@ -4692,8 +4763,28 @@ setInterval(async () => {
   loadIdentity();
   fetch(API_PREFIX + '/auth/platform-login/status', { cache: 'no-store' })
     .then(r => (r.ok ? r.json() : null))
-    .then(d => { auth.platformLogin = !!(d && d.enabled); applyAuth(); maybeAutoLogin(); autoLoginForNext(); })
+    .then(d => {
+      auth.platformLogin = !!(d && d.enabled);
+      auth.platforms = (d && d.platforms) || [];
+      applyPlatformChoices();
+      applyAuth(); maybeAutoLogin(); autoLoginForNext();
+    })
     .catch(() => { auth.platformLogin = false; autoLoginForNext(); });
+
+  // 只有一个平台时不摆选择框：多一个下拉只会让人犹豫"我该选哪个"。
+  // 有多个时默认选中后端给的默认平台，用户能改。
+  function applyPlatformChoices() {
+    const field = $('loginPlatformField');
+    const select = $('loginPlatform');
+    if (!field || !select) return;
+    const items = auth.platforms || [];
+    field.style.display = items.length > 1 ? '' : 'none';
+    if (items.length <= 1) { select.innerHTML = ''; return; }
+    const previous = select.value;
+    select.innerHTML = items.map((p) => `<option value="${p.platform_id}">${
+      (p.display_name || p.platform_id).replace(/[<>&"]/g, '')}</option>`).join('');
+    if (previous && items.some((p) => p.platform_id === previous)) select.value = previous;
+  }
 
   /* ---------- 9b. 登录 / 退出 ---------- */
   function openLogin() {
@@ -4725,6 +4816,8 @@ setInterval(async () => {
     event.preventDefault();
     const username = $('loginUser').value.trim();
     const password = $('loginPass').value;
+    const platformSelect = $('loginPlatform');
+    const platform = platformSelect && platformSelect.value ? platformSelect.value : '';
     const err = $('loginErr');
     if (!username || !password) { err.textContent = '请输入账号和密码'; return; }
     const btn = $('loginSubmit');
@@ -4734,7 +4827,7 @@ setInterval(async () => {
       const res = await fetch(API_PREFIX + '/auth/platform-login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
+        body: JSON.stringify({ username, password, platform }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
@@ -5381,6 +5474,7 @@ setInterval(async () => {
     ta.setSelectionRange(ta.value.length, ta.value.length);
   }
 
+  $id('rpClose').onclick = () => { $id('resultPanel').hidden = true; };
   $id('cdClose').onclick = () => { $id('connectorDetailModal').style.display = 'none'; };
   $id('connectorDetailModal').addEventListener('click', e => {
     if (e.target === $id('connectorDetailModal')) $id('connectorDetailModal').style.display = 'none';
