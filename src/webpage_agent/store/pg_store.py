@@ -98,17 +98,25 @@ from webpage_agent.store.pg_runs import PgRuns
 from webpage_agent.store.pg_budget import PgBudget
 from webpage_agent.store.pg_actions import PgActions
 from webpage_agent.store.pg_jobs import PgJobs
+from webpage_agent.store.pg_schedules import PgSchedules
+from webpage_agent.store.pg_addons import PgAddons
 from webpage_agent.store.pg_governance import PgGovernance
+from webpage_agent.store.pg_admin import PgAdmin
+from webpage_agent.store.pg_platforms import PgPlatforms
 
 
 class PostgresStore(
     PgConnection,
     PgAuth,
+    PgAdmin,
+    PgPlatforms,
     PgTasks,
     PgRuns,
     PgBudget,
     PgActions,
     PgJobs,
+    PgSchedules,
+    PgAddons,
     PgGovernance,
     GovernanceStore,
 ):

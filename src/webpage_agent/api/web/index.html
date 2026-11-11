@@ -590,6 +590,17 @@ a{color:var(--brand);text-decoration:none}
 .auth-alt a:hover{text-decoration:underline}
 .auth-err{min-height:16px;margin-top:2px;font-size:11.5px;color:var(--danger)}
 
+/* 短信验证码登录滑块 */
+.sms-captcha-box{margin-top:6px;border:1px solid var(--line-2);border-radius:9px;overflow:hidden}
+.sms-captcha-box canvas{display:block;background:#f0f1f3}
+.sms-captcha-bar{position:relative;height:40px;background:#f7f8fa;border-top:1px solid var(--line-2)}
+.sms-captcha-track{position:absolute;inset:0}
+.sms-captcha-thumb{position:absolute;left:0;top:0;width:40px;height:40px;display:flex;align-items:center;
+  justify-content:center;background:var(--ink);color:#fff;font-size:16px;cursor:grab;user-select:none;
+  border-radius:0 9px 9px 0}
+.sms-captcha-thumb:active{cursor:grabbing}
+.sms-captcha-hint{margin-top:4px;font-size:11px;color:var(--muted)}
+
 #adminPanel{position:fixed;inset:0;z-index:55;display:flex;align-items:center;justify-content:center;
   padding:20px;background:rgba(17,21,27,.36);backdrop-filter:blur(2px)}
 #adminPanel[hidden]{display:none}
@@ -1184,6 +1195,61 @@ body {
   .model-menu { right: 14px; width: min(264px, calc(100% - 28px)); }
   .ws-picker { left: 14px; right: 14px; width: auto; }
 }
+
+/* ===== 定时任务（docs/scheduled-tasks.md） ===== */
+.sched-banner { margin: 0 0 14px; padding: 10px 12px; border-radius: 10px;
+  background: #fff8e6; color: #8a5a00; font-size: 12px; line-height: 1.6; }
+.sched-list { display: flex; flex-direction: column; gap: 10px; }
+.sched-card { display: flex; gap: 14px; align-items: center; padding: 14px 16px;
+  border: 1px solid var(--line-2); border-radius: 12px; background: #fff;
+  transition: border-color .15s, box-shadow .15s; }
+.sched-card:hover { border-color: #d5d9e0; box-shadow: 0 6px 18px rgba(16, 24, 40, .06); }
+.sched-card-main { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 6px; }
+.sched-card-title { display: flex; align-items: center; gap: 8px; font-size: 13.5px;
+  font-weight: 600; color: var(--ink); }
+.sched-card-title .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  max-width: 460px; }
+.sched-badge { height: 18px; line-height: 18px; padding: 0 7px; border-radius: 9px;
+  font-size: 10px; font-weight: 500; white-space: nowrap; }
+.sched-badge.on { background: var(--brand-soft); color: var(--brand-hover); }
+.sched-badge.off { background: var(--soft); color: var(--muted); }
+.sched-badge.warn { background: #fff3e8; color: #c26a1b; }
+.sched-card-desc { font-size: 11.5px; color: var(--muted); line-height: 1.55;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.sched-card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  font-size: 11px; color: var(--muted-2); }
+.sched-card-meta .dot { width: 2px; height: 2px; border-radius: 50%;
+  background: var(--muted-2); }
+.sched-card-actions { display: flex; align-items: center; gap: 6px; flex: none; }
+.sched-card-actions .ghost { height: 28px; padding: 0 10px; font-size: 11.5px; }
+.sched-card-actions .danger { color: var(--danger); border-color: #f6cfc9; }
+.sched-switch { position: relative; display: inline-flex; width: 34px; height: 19px;
+  flex: none; cursor: pointer; }
+.sched-switch input { opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.sched-switch span { position: absolute; inset: 0; border-radius: 10px;
+  background: #d8dbe0; transition: background .15s; pointer-events: none; }
+.sched-switch span::after { content: ""; position: absolute; top: 2px; left: 2px;
+  width: 15px; height: 15px; border-radius: 50%; background: #fff;
+  transition: transform .15s; }
+.sched-switch input:checked + span { background: var(--brand); }
+.sched-switch input:checked + span::after { transform: translateX(15px); }
+.sched-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.sched-chip { height: 26px; padding: 0 9px; border: 1px solid var(--line-2);
+  border-radius: 13px; background: #fff; font-size: 11.5px; color: var(--muted);
+  cursor: pointer; }
+.sched-chip.on { background: var(--ink); color: #fff; border-color: var(--ink); }
+.sched-hint { font-size: 11px; color: var(--muted-2); line-height: 1.6; }
+.sched-runs { display: flex; flex-direction: column; gap: 8px; max-height: 56vh;
+  overflow: auto; margin-top: 8px; }
+.sched-runs .hub-empty { padding: 24px 0; }
+.sched-run { border: 1px solid var(--line-2); border-radius: 10px; padding: 10px 12px;
+  display: flex; flex-direction: column; gap: 5px; }
+.sched-run-head { display: flex; align-items: center; gap: 8px; font-size: 12.5px;
+  color: var(--ink); font-weight: 500; flex-wrap: wrap; }
+.sched-run-sub { font-size: 11px; color: var(--muted); font-weight: 400;
+  display: flex; gap: 8px; flex-wrap: wrap; }
+.sched-run-summary { font-size: 12px; color: var(--ink-2); line-height: 1.65;
+  white-space: pre-wrap; word-break: break-word; }
 </style>
 </head>
 <body>
@@ -1216,6 +1282,7 @@ body {
   <symbol id="i-folder" viewBox="0 0 24 24"><path d="M4 7.4A1.9 1.9 0 0 1 5.9 5.5h3.3l1.9 2.3h7A1.9 1.9 0 0 1 20 9.7v6.9a1.9 1.9 0 0 1-1.9 1.9H5.9A1.9 1.9 0 0 1 4 16.6z"/></symbol>
   <symbol id="i-caret" viewBox="0 0 24 24"><path d="M9.5 6l6 6-6 6"/></symbol>
   <symbol id="i-move" viewBox="0 0 24 24"><path d="M4 7.5h7l1.8 2H20"/><path d="M4 7.5v9.4a1.6 1.6 0 0 0 1.6 1.6h12.8a1.6 1.6 0 0 0 1.6-1.6v-7"/><path d="M15.4 3.4l2.8 2.8-2.8 2.8"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.4"/><path d="M12 7.6V12l3 1.9"/></symbol>
 </defs></svg>
 
 <div class="app" id="app">
@@ -1267,6 +1334,9 @@ body {
       <button class="nav-item" id="navExpert">
         <svg class="ic"><use href="#i-plug"/></svg><span>专家·技能·连接器</span>
       </button>
+      <button class="nav-item" id="navSchedule">
+        <svg class="ic"><use href="#i-clock"/></svg><span>定时任务</span>
+      </button>
       <button class="nav-item" id="profileBtn">
         <svg class="ic"><use href="#i-spark"/></svg><span>我的画像</span>
       </button>
@@ -1275,7 +1345,7 @@ body {
       </button>
       <div id="adminCard" hidden>
         <button class="nav-item" id="adminOpen" aria-expanded="false" aria-controls="adminPanel">
-          <svg class="ic"><use href="#i-users"/></svg><span>用户管理</span>
+          <svg class="ic"><use href="#i-users"/></svg><span>管理控制台</span>
         </button>
       </div>
       <div class="nav-more-wrap">
@@ -1417,6 +1487,28 @@ body {
       </div>
     </section>
 
+    <section class="hub-view" id="scheduleView" hidden aria-label="定时任务">
+      <div class="hub-wrap">
+        <div class="hub-head">
+          <div class="hub-tabs" role="tablist" id="schedTabs">
+            <button class="hub-tab active" data-filter="all">全部</button>
+            <button class="hub-tab" data-filter="active">已启用</button>
+            <button class="hub-tab" data-filter="paused">已停用</button>
+          </div>
+          <div class="hub-actions">
+            <div class="hub-search">
+              <svg class="ic sm"><use href="#i-search"/></svg>
+              <input id="schedSearch" placeholder="搜索任务" autocomplete="off">
+            </div>
+            <button class="hub-add" id="schedAddBtn">＋ 新建任务</button>
+          </div>
+        </div>
+        <div class="sched-banner" id="schedBanner" hidden></div>
+        <div class="sched-list" id="schedList"></div>
+        <div class="hub-empty" id="schedEmpty" hidden>还没有定时任务，点右上角「新建任务」开始。</div>
+      </div>
+    </section>
+
     <div class="portalbar" id="portal" hidden>
       <svg class="ic sm"><use href="#i-shield"/></svg>
       <span id="portalStatus" role="status">正在检查登录状态…</span>
@@ -1505,6 +1597,9 @@ body {
             <button class="cbtn" id="plusBtn" title="添加文件、技能、专家或连接器" aria-haspopup="menu">
               <svg class="ic"><use href="#i-plus"/></svg>
             </button>
+            <!-- 当前会话的专家与技能胶囊：选中项写进 sessions.addon_selection，
+                 点胶囊可以换专家/取消技能。连接器沿用右边的 connectorChips。 -->
+            <div class="connector-chips" id="addonChips" aria-label="当前会话的专家与技能"></div>
             <div class="connector-chips" id="connectorChips" aria-label="已连接连接器"></div>
             <button class="cbtn pill" id="wsPill" aria-expanded="false" aria-controls="workspace">
               <svg class="ic"><use href="#i-grid"/></svg>
@@ -1806,7 +1901,34 @@ body {
     <div class="auth-alt">
       <span>或使用统一身份登录</span>
       <a id="loginSso" href="/api/auth/oidc/login">SSO 登录</a>
+      <button class="ghost" id="loginSmsSwitch" type="button" style="margin-left:8px">短信验证码登录</button>
     </div>
+
+    <!-- 短信验证码登录（方案 A：手机号独立身份源） -->
+    <form class="auth-form" id="smsLoginForm" autocomplete="off" style="display:none">
+      <label>手机号
+        <input id="smsMobile" type="tel" inputmode="numeric" maxlength="11"
+               placeholder="请输入 11 位手机号" required>
+      </label>
+      <div id="smsCaptchaArea" style="display:none">
+        <div class="sms-captcha-box">
+          <canvas id="smsCaptchaCanvas" width="310" height="155"></canvas>
+          <div class="sms-captcha-bar">
+            <div class="sms-captcha-track" id="smsCaptchaTrack">
+              <div class="sms-captcha-thumb" id="smsCaptchaThumb">→</div>
+            </div>
+          </div>
+        </div>
+        <div class="sms-captcha-hint" id="smsCaptchaHint">拖动滑块完成拼图</div>
+      </div>
+      <label>验证码
+        <input id="smsCode" type="text" inputmode="numeric" maxlength="6"
+               placeholder="6 位短信验证码" required>
+      </label>
+      <button class="primary" id="smsGetCode" type="button">获取验证码</button>
+      <button class="primary" id="smsLoginSubmit" type="submit" style="display:none">登录</button>
+      <div class="auth-err" id="smsLoginErr" role="alert"></div>
+    </form>
   </div>
 </div>
 
@@ -1950,6 +2072,14 @@ async function openSession(id, options = {}) {
     // 还在跑的那一轮不在这里回放（事件流会从 seq 0 全量补发，避免重复）
     const liveTask = data.live_task_id || '';
     renderHistory((data.turns || []).filter(t => t.task_id !== liveTask));
+    // 这个会话里还有在跑的聊天 turn：把事件流接回去。
+    // 后端不随浏览器断开而停（turn 由 Worker 领取执行），停的只是"转播"；
+    // 不接回来的话，用户切走再切回看到的只是"上一条消息卡住了"。
+    const liveTurn = (data.chat_turns || []).find(
+      t => t.status === 'accepted' || t.status === 'running');
+    if (liveTurn && liveTurn.turn_id && !liveTask) {
+      streamChatTurn(liveTurn.turn_id, id, {resume: true});
+    }
     if (liveTask) {
       S.taskId = liveTask;
       // 正在跑的那一轮也要拿到 run_id：否则切回来之后再发一句，前端不知道
@@ -2154,7 +2284,27 @@ function addChatConfirmation(name, args) {
   row.innerHTML = `<span class="cp-step-ico">⚠️</span>`
     + `<span class="cp-step-text"></span><span class="cp-step-meta">待确认</span>`;
   row.querySelector('.cp-step-text').textContent =
-    `需要你确认：${tool}（高风险或付费操作，回复“确认”后执行）`;
+    `需要你确认：${tool}（会改动平台数据或产生费用，回复“确认”后执行）`;
+  state.el.querySelector('.cp-steps').appendChild(row);
+  state.steps.push(row);
+  return row;
+}
+
+function addChatConnectorWarning(detail) {
+  // 连接器工具没注入：在"处理过程"里留一条警告，别让模型自己解释成
+  // "连接器只提供了三个工具"。detail 是 {连接器id: 失败原因}。
+  const parts = [];
+  for (const [id, reason] of Object.entries(detail || {})) {
+    if (reason) parts.push(`${id}：${reason}`);
+  }
+  if (!parts.length) return null;
+  const state = ensureChatProcess();
+  const row = document.createElement('div');
+  row.className = 'cp-step warn';
+  row.innerHTML = `<span class="cp-step-ico">🔌</span>`
+    + `<span class="cp-step-text"></span><span class="cp-step-meta">连接器</span>`;
+  row.querySelector('.cp-step-text').textContent =
+    `连接器工具没有注入：${parts.join('；')}`;
   state.el.querySelector('.cp-steps').appendChild(row);
   state.steps.push(row);
   return row;
@@ -2750,12 +2900,16 @@ async function postTask(text, key) {
 // 会话消息入口（第十一阶段）：普通输入统一提交到这里，服务端路由成聊天/查询/
 // 控制。requestId 复用原 ID 重试，服务端返回原 turn 而不是重复接纳。
 async function postSessionMessage(text, requestId, targetTaskId, sessionId) {
+  // 会话级选择（专家/技能/连接器）跟着消息一起走：新会话还没有会话行，先
+  // PATCH /addons 会 404；服务端把这份补丁与 turn 同事务落库（docs/addons.md）。
+  const addonPatch = (window.WB_ADDONS_PENDING ? window.WB_ADDONS_PENDING() : null);
   const options = {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({request_id: requestId, message: text,
                           connector_ids: (window.WB_CONNECTOR_CURRENT
                             ? window.WB_CONNECTOR_CURRENT() : []),
+                          ...(addonPatch ? {addon_selection: addonPatch} : {}),
                           ...(targetTaskId ? {target_task_id: targetTaskId} : {})}),
   };
   const sid = validSessionId(sessionId) ? sessionId : ensureSessionId();
@@ -2814,10 +2968,11 @@ function showToolResult(data) {
   $id('resultPanel').hidden = false;
 }
 
-function streamChatTurn(turnId, sessionId) {
+function streamChatTurn(turnId, sessionId, options = {}) {
   if (S.chatES) { S.chatES.close(); S.chatES = null; }
   resetChatProcess();
   S.streamBubble = null;
+  const resumed = !!options.resume;
   const url = `${API_PREFIX}/sessions/${encodeURIComponent(sessionId)}`
     + `/turns/${encodeURIComponent(turnId)}/events`;
   let fellBack = false;
@@ -2836,6 +2991,8 @@ function streamChatTurn(turnId, sessionId) {
       addChatStep(data.name || '工具', data.args || {});
     } else if (data.type === 'tool_confirmation_required') {
       addChatConfirmation(data.name || '工具', data.args || {});
+    } else if (data.type === 'connector_warning') {
+      addChatConnectorWarning(data.detail || {});
     } else if (data.type === 'tool_result') {
       showToolResult(data);
     } else if (data.type === 'answer_delta') {
@@ -2856,6 +3013,13 @@ function streamChatTurn(turnId, sessionId) {
     let data = {};
     try { data = JSON.parse(ev.data || '{}'); } catch (e) { /* 忽略 */ }
     finishChatProcess(data.status || 'succeeded');
+    if (resumed) {
+      // 中途接回来的流：前端不知道之前渲染过什么，以库里的会话内容为准重放一遍，
+      // 避免同一个答复出现两个气泡。openSession 是幂等的。
+      if (S.sessionId === sessionId) openSession(sessionId, {keepWorkspace: true});
+      loadSessions();
+      return;
+    }
     if (S.sessionId === sessionId) {
       clearPending();
       if (!S.streamBubble && data.answer) addMessage('assistant', data.answer);
@@ -3744,7 +3908,14 @@ async function updateAdminUser(id, status) {
   }
 }
 
-$('adminOpen').onclick = () => {
+$('adminOpen').onclick = async () => {
+  // 超管走独立控制台（跨租户、能管登录平台），旧的内嵌面板只给遗留 operator 用。
+  let role = '';
+  try {
+    const r = await fetch(API_PREFIX + '/me', { cache: 'no-store' });
+    if (r.ok) role = (await r.json()).role || '';
+  } catch (e) { /* 问不到就按旧面板处理 */ }
+  if (role === 'platform_admin') { location.assign('/admin'); return; }
   const panel = $('adminPanel');
   panel.hidden = !panel.hidden;
   $('adminOpen').setAttribute('aria-expanded', String(!panel.hidden));
@@ -3784,7 +3955,8 @@ async function initializePortal() {
       $('portalLogin').hidden = false;
       return;
     }
-    $('adminCard').hidden = identity.role !== 'operator';
+    $('adminCard').hidden =
+      !(identity.role === 'operator' || identity.role === 'platform_admin');
     const launch = await fetch(API_PREFIX + '/beeftv/status', {cache: 'no-store'});
     if (!launch.ok) throw new Error('入口状态不可用');
     const enabled = (await launch.json()).enabled;
@@ -4678,7 +4850,7 @@ setInterval(async () => {
   // 游客只摆「登录中台」，登录后才摆「切换账号 / 退出登录」。之前两种状态都摆着
   // 退出登录，游客点下去服务端也只会回 {revoked:false}，页面自然"退不出去"。
   const auth = { ready: false, authed: false, info: null, platformLogin: null,
-                 platforms: [],
+                 platforms: [], smsLogin: false,
                  off: false, required: true,
                  // ?switch=1：刚点过「切换账号」，身份问清后自动弹登录框
                  switchPending: new URLSearchParams(location.search).has('switch'),
@@ -4771,6 +4943,16 @@ setInterval(async () => {
     })
     .catch(() => { auth.platformLogin = false; autoLoginForNext(); });
 
+  // 短信登录入口：后端开关 + 凭据齐全时才显示「短信验证码登录」切换按钮。
+  fetch(API_PREFIX + '/auth/sms-login/status', { cache: 'no-store' })
+    .then(r => (r.ok ? r.json() : null))
+    .then(d => {
+      auth.smsLogin = !!(d && d.enabled);
+      const sw = $('loginSmsSwitch');
+      if (sw) sw.style.display = auth.smsLogin ? '' : 'none';
+    })
+    .catch(() => { auth.smsLogin = false; });
+
   // 只有一个平台时不摆选择框：多一个下拉只会让人犹豫"我该选哪个"。
   // 有多个时默认选中后端给的默认平台，用户能改。
   function applyPlatformChoices() {
@@ -4810,6 +4992,263 @@ setInterval(async () => {
   function closeLogin() {
     $('loginModal').style.display = 'none';
     $('loginPass').value = '';
+    resetSmsLogin();
+  }
+
+  /* ---------- 9c. 短信验证码登录 ---------- */
+  // 方案 A：手机号独立身份源。流程 = 点「获取验证码」→ 加载滑块 → 拖拽拼图 →
+  // 校验滑块拿票据 → 自动发码 → 提交验证码登录。
+  const sms = { token: '', secretKey: '', captchaVerification: '',
+                bg: '', jpeg: '', bgImg: null, jpegImg: null,
+                dragging: false, counting: null };
+
+  function resetSmsLogin() {
+    sms.token = ''; sms.secretKey = ''; sms.captchaVerification = '';
+    sms.bg = ''; sms.jpeg = ''; sms.bgImg = null; sms.jpegImg = null;
+    sms.dragging = false;
+    if (sms.counting) { clearInterval(sms.counting); sms.counting = null; }
+    if ($('smsCaptchaArea')) $('smsCaptchaArea').style.display = 'none';
+    if ($('smsLoginSubmit')) $('smsLoginSubmit').style.display = 'none';
+    const gb = $('smsGetCode');
+    if (gb) { gb.style.display = ''; gb.disabled = false; gb.textContent = '获取验证码'; }
+    if ($('smsCode')) $('smsCode').value = '';
+    if ($('smsCaptchaHint')) $('smsCaptchaHint').textContent = '拖动滑块完成拼图';
+    if ($('smsCaptchaThumb')) $('smsCaptchaThumb').style.left = '0px';
+    const cv = $('smsCaptchaCanvas');
+    if (cv) cv.getContext('2d').clearRect(0, 0, cv.width, cv.height);
+  }
+
+  function showSmsLogin() {
+    $('loginForm').style.display = 'none';
+    $('smsLoginForm').style.display = '';
+    $('loginErr').textContent = '';
+    $('smsLoginErr').textContent = '';
+    resetSmsLogin();
+    setTimeout(() => { try { $('smsMobile').focus(); } catch (e) { /* 忽略 */ } }, 30);
+  }
+
+  function showPasswordLogin() {
+    $('smsLoginForm').style.display = 'none';
+    $('loginForm').style.display = '';
+    resetSmsLogin();
+  }
+
+  // 坐标加密（AES-ECB）已移到后端完成：浏览器原生 Web Crypto 不支持 ECB，
+  // 前端只把拖动距离 x 与 secretKey 透传给中台代理，由后端用 cryptography 加密。
+
+  // 画滑块：背景图 + 拼图块（拼图块跟随滑块水平移动，y 固定 0，全高 155px）。
+  function smsDrawCaptcha() {
+    const cv = $('smsCaptchaCanvas');
+    if (!cv) return;
+    const ctx = cv.getContext('2d');
+    if (!sms.bg || !sms.jpeg) return;
+    // 背景图（JPEG/PNG）铺满 310×155
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    ctx.drawImage(sms.bgImg, 0, 0, 310, 155);
+    // 拼图块跟随滑块：x = 滑块当前 left（换算成图片坐标），y = 0
+    const thumb = $('smsCaptchaThumb');
+    const scale = 310 / cv.clientWidth;
+    const jx = (parseFloat(thumb.style.left) || 0) * scale;
+    ctx.drawImage(sms.jpegImg, jx, 0, 47, 155);
+  }
+
+  async function smsLoadCaptcha() {
+    const mobile = $('smsMobile').value.trim();
+    if (!/^1[3-9]\d{9}$/.test(mobile)) {
+      $('smsLoginErr').textContent = '请输入正确的 11 位手机号';
+      return false;
+    }
+    const err = $('smsLoginErr');
+    err.textContent = '';
+    $('smsCaptchaArea').style.display = '';
+    $('smsCaptchaHint').textContent = '加载拼图中…';
+    try {
+      const r = await fetch(API_PREFIX + '/auth/sms-login/captcha/get', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '获取滑块失败');
+      sms.token = d.token; sms.secretKey = d.secretKey;
+      const bgType = d.originalImageType || 'image/jpeg';
+      const jigType = d.jigsawImageType || 'image/png';
+      sms.bg = 'data:' + bgType + ';base64,' + d.originalImageBase64;
+      sms.jpeg = 'data:' + jigType + ';base64,' + d.jigsawImageBase64;
+      // 预加载两张图，加载完成后再渲染
+      const bgImg = new Image();
+      const jigImg = new Image();
+      let loaded = 0;
+      const onload = () => { if (++loaded === 2) { sms.bgImg = bgImg; sms.jpegImg = jigImg; smsDrawCaptcha(); } };
+      bgImg.onload = onload; jigImg.onload = onload;
+      bgImg.src = sms.bg; jigImg.src = sms.jpeg;
+      $('smsCaptchaHint').textContent = '拖动滑块完成拼图';
+      return true;
+    } catch (e) {
+      err.textContent = e.message || '获取滑块失败';
+      // 加载失败保留滑块区，提示用户重试，而不是整个消失
+      $('smsCaptchaHint').textContent = '加载失败，点击「获取验证码」重试';
+      return false;
+    }
+  }
+
+  function smsBindDrag() {
+    const thumb = $('smsCaptchaThumb');
+    const track = $('smsCaptchaTrack');
+    let startX = 0;
+    const move = (clientX) => {
+      const max = track.clientWidth - thumb.clientWidth;
+      const left = Math.max(0, Math.min(max, clientX - startX));
+      thumb.style.left = left + 'px';
+      smsDrawCaptcha();  // 实时重绘拼图块位置
+    };
+    thumb.addEventListener('mousedown', e => {
+      sms.dragging = true; startX = e.clientX - thumb.offsetLeft;
+      e.preventDefault();
+    });
+    thumb.addEventListener('touchstart', e => {
+      sms.dragging = true; startX = e.touches[0].clientX - thumb.offsetLeft;
+    }, { passive: true });
+    document.addEventListener('mousemove', e => { if (sms.dragging) move(e.clientX); });
+    document.addEventListener('touchmove', e => {
+      if (sms.dragging) move(e.touches[0].clientX);
+    }, { passive: true });
+    const finish = () => { if (sms.dragging) { sms.dragging = false; smsCheckCaptcha(); } };
+    document.addEventListener('mouseup', finish);
+    document.addEventListener('touchend', finish);
+  }
+
+  async function smsCheckCaptcha() {
+    const mobile = $('smsMobile').value.trim();
+    const thumb = $('smsCaptchaThumb');
+    const track = $('smsCaptchaTrack');
+    const canvas = $('smsCaptchaCanvas');
+    // 坐标基准：拼图块在 310px 宽底图上的 x 位置。
+    // 轨道宽度 == canvas 显示宽度，滑块 left 即拼图块移动的像素；
+    // 若 canvas 被 CSS 缩放，按 canvas 实际渲染宽度与内部宽度(310)的比例换算。
+    const scale = canvas ? (310 / canvas.clientWidth) : 1;
+    const x = Math.round((parseFloat(thumb.style.left) || 0) * scale);
+    const err = $('smsLoginErr');
+    err.textContent = '';
+    $('smsCaptchaHint').textContent = '校验中…';
+    try {
+      const r = await fetch(API_PREFIX + '/auth/sms-login/captcha/check', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ captchaType: 'blockPuzzle', token: sms.token,
+          secretKey: sms.secretKey, x: x, mobile }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '滑块校验失败');
+      sms.captchaVerification = d.captchaVerification;
+      $('smsCaptchaHint').textContent = '拼图完成 ✓，正在发送验证码…';
+      // 校验通过后自动发码
+      await smsSendCode();
+    } catch (e) {
+      err.textContent = e.message || '滑块校验失败，请重试';
+      $('smsCaptchaHint').textContent = '拖动滑块重试';
+      // 失败：重置滑块位置，等待重新拖动（不再自动重新请求挑战，避免闪烁）
+      thumb.style.left = '0px';
+      sms.captchaVerification = '';
+    }
+  }
+
+  async function smsSendCode() {
+    const mobile = $('smsMobile').value.trim();
+    if (!/^1[3-9]\d{9}$/.test(mobile)) {
+      $('smsLoginErr').textContent = '请输入正确的 11 位手机号';
+      return;
+    }
+    if (!sms.captchaVerification) {
+      $('smsLoginErr').textContent = '请先完成滑块拼图';
+      return;
+    }
+    const btn = $('smsGetCode');
+    const err = $('smsLoginErr');
+    btn.disabled = true; err.textContent = '';
+    try {
+      const r = await fetch(API_PREFIX + '/auth/sms-login/send-code', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mobile, captchaVerification: sms.captchaVerification }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '发送失败');
+      // 发码成功：隐藏滑块，显示验证码输入与登录按钮
+      $('smsCaptchaArea').style.display = 'none';
+      $('smsLoginSubmit').style.display = '';
+      // 启动重发倒计时（服务端返回 resendIntervalSeconds）
+      const sec = Math.max(1, parseInt(d.resendIntervalSeconds || '60', 10));
+      let left = sec;
+      btn.textContent = '重新发送(' + left + 's)';
+      if (sms.counting) clearInterval(sms.counting);
+      sms.counting = setInterval(() => {
+        left -= 1;
+        if (left <= 0) { clearInterval(sms.counting); sms.counting = null;
+          btn.textContent = '获取验证码'; btn.disabled = false; }
+        else btn.textContent = '重新发送(' + left + 's)';
+      }, 1000);
+      err.textContent = '验证码已发送';
+    } catch (e) {
+      err.textContent = e.message || '发送失败';
+      btn.disabled = false;
+    }
+  }
+
+  // 点「获取验证码」：票据是一次性的，发码成功后消费掉；再次点击需重新走滑块。
+  async function smsGetCodeClicked() {
+    const mobile = $('smsMobile').value.trim();
+    if (!/^1[3-9]\d{9}$/.test(mobile)) {
+      $('smsLoginErr').textContent = '请输入正确的 11 位手机号';
+      return;
+    }
+    // 已发过码（验证码输入框可见）：票据已消费，重发必须重新完成滑块
+    if ($('smsLoginSubmit').style.display !== 'none') {
+      sms.captchaVerification = '';
+      $('smsCaptchaArea').style.display = '';
+      $('smsCaptchaHint').textContent = '加载拼图中…';
+    }
+    if (sms.captchaVerification) {
+      await smsSendCode();
+    } else {
+      await smsLoadCaptcha();
+    }
+  }
+
+  // 超管/运维登录后直接落在控制台：这个身份本来就该看管理后台，
+  // 把他先摆在聊天界面里、再让人自己去找 /admin，是之前"登录了还是普通界面"的来源。
+  function isConsoleRole(role) {
+    return role === 'platform_admin' || role === 'operator';
+  }
+
+  async function submitSmsLogin(event) {
+    event.preventDefault();
+    const mobile = $('smsMobile').value.trim();
+    const code = $('smsCode').value.trim();
+    const err = $('smsLoginErr');
+    if (!/^1[3-9]\d{9}$/.test(mobile)) { err.textContent = '请输入正确的 11 位手机号'; return; }
+    if (!/^\d{6}$/.test(code)) { err.textContent = '请输入 6 位验证码'; return; }
+    const btn = $('smsLoginSubmit');
+    btn.disabled = true; err.textContent = '';
+    try {
+      const r = await fetch(API_PREFIX + '/auth/sms-login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mobile, code }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : '登录失败');
+      try {
+        sessionStorage.setItem('wb.login.flash', d.first_login
+          ? '首次登录：已通过短信创建中台账号'
+          : '登录成功');
+      } catch (e) { /* 忽略 */ }
+      location.replace(auth.nextTarget
+        || (isConsoleRole(d.role) ? '/admin' : location.pathname));
+    } catch (e) {
+      err.textContent = e.message || '登录失败，请重试';
+      btn.disabled = false;
+    }
   }
 
   async function submitLogin(event) {
@@ -4839,8 +5278,10 @@ setInterval(async () => {
           ? '首次登录：已自动创建中台账号并完成绑定'
           : '登录成功');
       } catch (e) { /* 忽略 */ }
-      // 管理控制台会用 /?next=/admin 把人送来登录，登录完按原路送回去。
-      location.replace(auth.nextTarget || location.pathname);
+      // 管理控制台会用 /?next=/admin 把人送来登录，登录完按原路送回去；
+      // 超管自己登录则直接进控制台，别先停在聊天界面。
+      location.replace(auth.nextTarget
+        || (isConsoleRole(data.role) ? '/admin' : location.pathname));
     } catch (e) {
       err.textContent = e.message || '登录失败，请重试';
     } finally {
@@ -4854,6 +5295,11 @@ setInterval(async () => {
     if (e.target === $('loginModal')) closeLogin();
   });
   $('loginSso').href = API_PREFIX + '/auth/oidc/login';
+  // 短信登录切换与流程
+  $('loginSmsSwitch').onclick = showSmsLogin;
+  $('smsLoginForm').addEventListener('submit', submitSmsLogin);
+  $('smsGetCode').onclick = smsGetCodeClicked;
+  smsBindDrag();
   $('umLogin').onclick = openLogin;
   $('menuLogin').onclick = openLogin;
   $('portalLoginAccount').onclick = openLogin;
@@ -5018,11 +5464,19 @@ setInterval(async () => {
   // ?switch=1 的收尾：等身份和"账号密码入口是否可用"都问清了再弹，别抢跑。
   function maybeAutoLogin() {
     if (!auth.switchPending || !auth.ready) return;
+    if (auth.platformLogin === null && !auth.off) return;
     auth.switchPending = false;
-    try { history.replaceState(null, '', location.pathname); } catch (e) { /* 忽略 */ }
-    if (auth.authed) return;                      // 还带着会话（撤销失败），别硬弹
+    // 只清掉 switch，保留 next——从控制台被送过来切账号的，登录完还要回去。
+    try {
+      history.replaceState(null, '', location.pathname +
+        (auth.nextTarget ? '?next=' + encodeURIComponent(auth.nextTarget) : ''));
+    } catch (e) { /* 忽略 */ }
+    // 已经登录也要弹：旧会话还在时直接 return，页面会停在原来那个账号上，
+    // 人点了"换个账号"却什么都没发生，看起来就像"登录不进去"。
     if (auth.platformLogin) { openLogin(); return; }
-    if (!auth.off) location.href = API_PREFIX + '/auth/oidc/login?prompt=login';
+    if (!auth.off && !auth.authed) {
+      location.href = API_PREFIX + '/auth/oidc/login?prompt=login';
+    }
   }
   $('menuStatus').onclick = checkStatus;
   $('umStatus').onclick = checkStatus;
@@ -5111,6 +5565,87 @@ setInterval(async () => {
   });
 })();
 </script>
+
+<div class="modal" id="schedEditorModal" style="display:none">
+  <div class="modal-card" style="width:min(580px,100%)">
+    <div class="modal-head">
+      <b id="schedEditorTitle">新建定时任务</b>
+      <span class="hint">后台自动执行，关掉页面也会跑</span>
+      <button class="ghost" id="schedEditorClose">关闭</button>
+    </div>
+    <form class="hub-form" id="schedForm">
+      <label>任务名称<input id="schedName" maxlength="60" required
+        placeholder="例如：每日 AI 新闻推送"></label>
+      <label>提示词<textarea id="schedPrompt" maxlength="10000" required
+        placeholder="到点后让助手做什么，例如：关注当天 AI 领域的重要动态，整理成 5 条要点"></textarea></label>
+      <div class="row">
+        <label>重复
+          <select id="schedFreq">
+            <option value="hourly">每小时</option>
+            <option value="daily" selected>每天</option>
+            <option value="weekly">每周</option>
+            <option value="monthly">每月</option>
+            <option value="yearly">每年</option>
+            <option value="once">一次性</option>
+          </select>
+        </label>
+        <label id="schedIntervalLabel">间隔<input id="schedInterval" type="number"
+          min="1" max="366" value="1"></label>
+      </div>
+      <div data-for="weekly" hidden>
+        <label>星期</label>
+        <div class="sched-chips" id="schedDays"></div>
+      </div>
+      <div class="row">
+        <label data-for="time">时间<input id="schedTime" type="time" value="09:00"></label>
+        <label data-for="monthday">每月几日<input id="schedMonthDay" type="number"
+          min="1" max="31" value="1"></label>
+        <label data-for="month">月份<select id="schedMonth"></select></label>
+      </div>
+      <div data-for="once" hidden>
+        <label>执行时间<input id="schedOnce" type="datetime-local"></label>
+      </div>
+      <div class="row">
+        <label>有效期
+          <select id="schedUntilMode">
+            <option value="long">长期有效</option>
+            <option value="date">截止日期</option>
+          </select>
+        </label>
+        <label data-for="until" hidden>截止日期<input id="schedUntil" type="date"></label>
+      </div>
+      <div class="row">
+        <label>消息推送
+          <select id="schedChannel">
+            <option value="">不推送</option>
+            <option value="wecom">企业微信群机器人</option>
+            <option value="feishu">飞书自定义机器人</option>
+            <option value="webhook">通用 Webhook</option>
+          </select>
+        </label>
+        <label data-for="push" hidden>推送地址<input id="schedUrl"
+          placeholder="https://…（留空则沿用已保存的地址）"></label>
+      </div>
+      <div class="sched-hint" id="schedWorkspace">工作空间：跟随当前工作空间</div>
+      <div class="sched-hint">提示：任务以你的身份在后台执行；需要审批的工具会停下并推送「待确认」。</div>
+      <div class="form-actions">
+        <button type="button" class="ghost" id="schedTestBtn" hidden>测试推送</button>
+        <button type="button" class="ghost" id="schedCancel">取消</button>
+        <button type="submit" class="primary">保存</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="modal" id="schedRunsModal" style="display:none">
+  <div class="modal-card" style="width:min(640px,100%)">
+    <div class="modal-head">
+      <b id="schedRunsTitle">运行记录</b>
+      <button class="ghost" id="schedRunsClose">关闭</button>
+    </div>
+    <div class="sched-runs" id="schedRunsBody"></div>
+  </div>
+</div>
 
 <div class="modal" id="skillDetailModal" style="display:none">
   <div class="modal-card skill-detail">
@@ -5954,8 +6489,16 @@ setInterval(async () => {
       connectorHoverOpen = false;
       openConnectorPanel(true, $id('plusMenu'));
     }
-    else if (act === 'expert') openHub('expert');
-    else if (act === 'skill') openHub('skill');
+    // 专家/技能：先在当前会话里选（写 sessions.addon_selection），
+    // 技能中心负责"安装"，两件事分开——选不等于装。
+    else if (act === 'expert') {
+      if (window.WB_ADDONS_OPEN_EXPERT) window.WB_ADDONS_OPEN_EXPERT();
+      else openHub('expert');
+    }
+    else if (act === 'skill') {
+      if (window.WB_ADDONS_OPEN_SKILL) window.WB_ADDONS_OPEN_SKILL();
+      else openHub('skill');
+    }
     else toast('这个入口暂未接入，可以先看「技能」或「连接器」。');
   });
 
@@ -6240,6 +6783,9 @@ setInterval(async () => {
     if (!$id('connectorPop').hidden) renderConnectors($id('cpSearch').value);
   };
   window.WB_CONNECTOR_RESET = resetConnectorSelection;
+  // 技能中心整页的入口。openHub 在本闭包里定义，外部（addons 胶囊里的
+  // 「去技能中心」）必须经这个导出调用，否则 window.openHub 永远是 undefined。
+  window.WB_OPEN_HUB = openHub;
 
   /* ---------- 模型选择 ---------- */
   const MODEL_LABELS = {
@@ -6321,6 +6867,985 @@ setInterval(async () => {
     closeConnectorPanel();
     closeModelMenu();
   });
+})();
+</script>
+
+<script>
+/* 定时任务页（docs/scheduled-tasks.md）。独立 IIFE：不依赖 SkillHub 那份的状态，
+   只用全局的 #toast 容器与 API 前缀，避免改到既有脚本。 */
+(() => {
+  const $id = id => document.getElementById(id);
+  const PREFIX = (document.body.dataset.apiPrefix || '/api').replace(/\/$/, '');
+  const WEEK = [['MO', '一'], ['TU', '二'], ['WE', '三'], ['TH', '四'],
+                ['FR', '五'], ['SA', '六'], ['SU', '日']];
+  const STATUS_LABEL = {queued: '排队中', running: '执行中', succeeded: '已完成',
+                        failed: '失败', skipped: '已跳过', deferred: '已延后',
+                        paused: '待确认'};
+  const DELIVERY_LABEL = {sent: '已推送', failed: '推送失败', queued: '待推送'};
+  const state = {items: [], filter: 'all', q: '', editing: null,
+                 days: new Set(['MO'])};
+
+  const pad = n => String(n).padStart(2, '0');
+  const esc = s => String(s ?? '').replace(/[&<>"]/g,
+    c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+
+  function toast(msg) {
+    const box = $id('toast');
+    if (!box) return;
+    const el = document.createElement('div');
+    el.className = 'toast-item';
+    el.textContent = msg;
+    box.appendChild(el);
+    box.classList.add('show');
+    setTimeout(() => {
+      el.remove();
+      if (!box.children.length) box.classList.remove('show');
+    }, 2400);
+  }
+
+  async function api(path, options = {}) {
+    const res = await fetch(PREFIX + path,
+      {cache: 'no-store', credentials: 'same-origin', ...options});
+    if (res.status === 401 && typeof window.handleUnauthorized === 'function') {
+      window.handleUnauthorized();
+      throw new Error('请先登录');
+    }
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const data = await res.json();
+        detail = typeof data.detail === 'string'
+          ? data.detail : JSON.stringify(data.detail || '');
+      } catch (_) { /* 非 JSON 错误体 */ }
+      throw new Error(detail || ('请求失败 ' + res.status));
+    }
+    return res.json();
+  }
+
+  function fmtTs(ts) {
+    if (!ts) return '—';
+    const d = new Date(Number(ts) * 1000);
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ` +
+           `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  function relTs(ts) {
+    if (!ts) return '从未';
+    const diff = Date.now() / 1000 - Number(ts);
+    if (diff < 60) return '刚刚';
+    if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+    return `${Math.floor(diff / 86400)} 天前`;
+  }
+
+  /* ---------- 列表 ---------- */
+
+  async function load() {
+    try {
+      const data = await api('/schedules?status=' + encodeURIComponent(state.filter));
+      state.items = data.tasks || [];
+      const banner = $id('schedBanner');
+      banner.hidden = !!data.enabled;
+      if (!data.enabled) {
+        banner.textContent = '定时任务总开关未开启（SCHEDULED_TASKS_ENABLED）。'
+          + '任务可以保存，但不会被触发；开开关后需重启 Worker 生效。';
+      }
+      render();
+    } catch (err) {
+      toast('加载定时任务失败：' + err.message);
+    }
+  }
+
+  function visibleItems() {
+    const q = state.q.trim().toLowerCase();
+    return state.items.filter(item => {
+      if (state.filter === 'active' && !item.enabled) return false;
+      if (state.filter === 'paused' && item.enabled) return false;
+      if (!q) return true;
+      return `${item.name} ${item.prompt}`.toLowerCase().includes(q);
+    });
+  }
+
+  function render() {
+    const rows = visibleItems();
+    $id('schedEmpty').hidden = rows.length > 0;
+    $id('schedList').replaceChildren(...rows.map(card));
+  }
+
+  function card(item) {
+    const el = document.createElement('div');
+    el.className = 'sched-card';
+    const status = item.last_status ? (STATUS_LABEL[item.last_status] || item.last_status) : '';
+    let badge = '<span class="sched-badge off">已停用</span>';
+    if (item.enabled) {
+      badge = item.consecutive_failures
+        ? `<span class="sched-badge warn">连续失败 ${item.consecutive_failures} 次</span>`
+        : '<span class="sched-badge on">已启用</span>';
+    }
+    const parts = [`<span>${esc(item.schedule_desc || '')}</span>`,
+                   '<span class="dot"></span>',
+                   `<span>下次 ${item.enabled ? fmtTs(item.next_run_at) : '—'}</span>`];
+    if (item.last_run_at) {
+      parts.push('<span class="dot"></span>',
+                 `<span>上次 ${relTs(item.last_run_at)}${status ? ' · ' + esc(status) : ''}</span>`);
+    }
+    if (item.delivery && item.delivery.channel) {
+      parts.push('<span class="dot"></span>',
+                 `<span>推送 ${esc(item.delivery.channel)}</span>`);
+    }
+    el.innerHTML = `
+      <div class="sched-card-main">
+        <div class="sched-card-title"><span class="nm">${esc(item.name)}</span>${badge}</div>
+        <div class="sched-card-desc">${esc(item.prompt)}</div>
+        <div class="sched-card-meta">${parts.join('')}</div>
+      </div>
+      <div class="sched-card-actions">
+        <label class="sched-switch" title="${item.enabled ? '停用' : '启用'}">
+          <input type="checkbox" ${item.enabled ? 'checked' : ''}><span></span>
+        </label>
+        <button class="ghost" data-act="run">立即运行</button>
+        <button class="ghost" data-act="runs">运行记录</button>
+        <button class="ghost" data-act="edit">编辑</button>
+        <button class="ghost danger" data-act="del">删除</button>
+      </div>`;
+    el.querySelector('.sched-switch input').onchange =
+      e => toggle(item, e.target.checked);
+    const actions = {run: () => runNow(item), runs: () => openRuns(item),
+                     edit: () => openEditor(item), del: () => removeItem(item)};
+    el.querySelectorAll('[data-act]').forEach(btn => {
+      btn.onclick = () => actions[btn.dataset.act]();
+    });
+    return el;
+  }
+
+  async function toggle(item, enabled) {
+    try {
+      await api('/schedules/' + item.schedule_id, {
+        method: 'PATCH', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({enabled})});
+      toast(enabled ? '已启用' : '已停用');
+    } catch (err) {
+      toast('操作失败：' + err.message);
+    }
+    await load();
+  }
+
+  async function runNow(item) {
+    try {
+      const res = await api('/schedules/' + item.schedule_id + '/trigger',
+                            {method: 'POST'});
+      toast(res.run_id ? '已提交执行' : '已提交');
+      await load();
+      openRuns(item);
+    } catch (err) {
+      toast('触发失败：' + err.message);
+    }
+  }
+
+  async function removeItem(item) {
+    if (!confirm(`删除定时任务「${item.name}」？运行记录会一并删除。`)) return;
+    try {
+      await api('/schedules/' + item.schedule_id, {method: 'DELETE'});
+      toast('已删除');
+      await load();
+    } catch (err) {
+      toast('删除失败：' + err.message);
+    }
+  }
+
+  /* ---------- 编辑器 ---------- */
+
+  function initMonths() {
+    const box = $id('schedMonth');
+    if (box.children.length) return;
+    for (let index = 1; index <= 12; index += 1) {
+      const option = document.createElement('option');
+      option.value = String(index);
+      option.textContent = `${index} 月`;
+      box.appendChild(option);
+    }
+  }
+
+  function renderDays() {
+    const box = $id('schedDays');
+    box.replaceChildren();
+    WEEK.forEach(([code, label]) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'sched-chip' + (state.days.has(code) ? ' on' : '');
+      btn.textContent = '周' + label;
+      btn.onclick = () => {
+        if (state.days.has(code)) state.days.delete(code);
+        else state.days.add(code);
+        renderDays();
+      };
+      box.appendChild(btn);
+    });
+  }
+
+  function showOnly(name, visible) {
+    document.querySelectorAll(`#schedForm [data-for="${name}"]`).forEach(el => {
+      el.hidden = !visible;
+    });
+  }
+
+  function syncForm() {
+    const freq = $id('schedFreq').value;
+    showOnly('weekly', freq === 'weekly');
+    showOnly('time', freq !== 'hourly' && freq !== 'once');
+    showOnly('monthday', freq === 'monthly' || freq === 'yearly');
+    showOnly('month', freq === 'yearly');
+    showOnly('once', freq === 'once');
+    showOnly('until', $id('schedUntilMode').value === 'date');
+    showOnly('push', !!$id('schedChannel').value);
+    $id('schedIntervalLabel').hidden = freq === 'once';
+    // 测试推送发的是**已保存**的配置：新任务或没选渠道时没有意义，直接不显示。
+    $id('schedTestBtn').hidden = !state.editing || !$id('schedChannel').value;
+  }
+
+  function parseRule(text) {
+    const map = {HOURLY: 'hourly', DAILY: 'daily', WEEKLY: 'weekly',
+                 MONTHLY: 'monthly', YEARLY: 'yearly'};
+    const fields = {};
+    String(text || '').split(';').forEach(chunk => {
+      const index = chunk.indexOf('=');
+      if (index > 0) fields[chunk.slice(0, index).trim().toUpperCase()] =
+        chunk.slice(index + 1).trim();
+    });
+    const out = {freq: 'daily', interval: 1, days: [], monthDay: 1, month: 0,
+                 time: '09:00'};
+    if (fields.FREQ) out.freq = map[fields.FREQ] || 'daily';
+    if (fields.INTERVAL) out.interval = Math.max(1, parseInt(fields.INTERVAL, 10) || 1);
+    if (fields.BYDAY) {
+      out.days = fields.BYDAY.split(',')
+        .map(item => item.trim().toUpperCase())
+        .filter(item => /^(MO|TU|WE|TH|FR|SA|SU)$/.test(item));
+    }
+    if (fields.BYMONTHDAY) out.monthDay = parseInt(fields.BYMONTHDAY.split(',')[0], 10) || 1;
+    if (fields.BYMONTH) out.month = parseInt(fields.BYMONTH.split(',')[0], 10) || 0;
+    if (fields.BYHOUR !== undefined) {
+      const hour = parseInt(fields.BYHOUR.split(',')[0], 10) || 0;
+      const minute = parseInt((fields.BYMINUTE || '0').split(',')[0], 10) || 0;
+      out.time = `${pad(hour)}:${pad(minute)}`;
+    }
+    return out;
+  }
+
+  function buildRule(freq) {
+    const interval = Math.max(1, parseInt($id('schedInterval').value || '1', 10) || 1);
+    const [hour, minute] = ($id('schedTime').value || '09:00').split(':').map(Number);
+    const parts = ['FREQ=' + freq.toUpperCase()];
+    if (interval > 1) parts.push('INTERVAL=' + interval);
+    if (freq === 'weekly') {
+      const days = WEEK.map(([code]) => code).filter(code => state.days.has(code));
+      if (!days.length) throw new Error('请至少选择一个星期');
+      parts.push('BYDAY=' + days.join(','));
+    }
+    if (freq === 'monthly' || freq === 'yearly') {
+      const day = Math.min(31, Math.max(1, parseInt($id('schedMonthDay').value || '1', 10) || 1));
+      parts.push('BYMONTHDAY=' + day);
+    }
+    if (freq === 'yearly') parts.push('BYMONTH=' + $id('schedMonth').value);
+    if (freq !== 'hourly') {
+      parts.push('BYHOUR=' + (Number.isFinite(hour) ? hour : 9));
+      parts.push('BYMINUTE=' + (Number.isFinite(minute) ? minute : 0));
+    }
+    return parts.join(';');
+  }
+
+  function toLocalInput(iso) {
+    if (!iso) return '';
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}` +
+           `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+
+  async function loadWorkspaceHint() {
+    const box = $id('schedWorkspace');
+    try {
+      const data = await api('/workspace');
+      box.textContent = `工作空间：${data.path || '跟随当前工作空间'}`
+        + '（执行时按该账号当前工作空间）';
+    } catch (_) {
+      box.textContent = '工作空间：跟随当前工作空间';
+    }
+  }
+
+  function openEditor(item) {
+    state.editing = item || null;
+    initMonths();
+    $id('schedEditorTitle').textContent = item ? '编辑定时任务' : '新建定时任务';
+    const parsed = parseRule(item && item.type === 'recurring' ? item.rrule : '');
+    $id('schedName').value = item ? item.name : '';
+    $id('schedPrompt').value = item ? item.prompt : '';
+    $id('schedFreq').value = item && item.type === 'once' ? 'once' : parsed.freq;
+    $id('schedInterval').value = parsed.interval;
+    state.days = new Set(parsed.days.length ? parsed.days : ['MO']);
+    $id('schedTime').value = parsed.time || '09:00';
+    $id('schedMonthDay').value = parsed.monthDay;
+    $id('schedMonth').value = String(parsed.month || (new Date().getMonth() + 1));
+    $id('schedOnce').value = item && item.scheduled_at
+      ? toLocalInput(item.scheduled_at) : '';
+    $id('schedUntilMode').value = item && item.valid_until ? 'date' : 'long';
+    $id('schedUntil').value = item && item.valid_until
+      ? String(item.valid_until).slice(0, 10) : '';
+    const delivery = (item && item.delivery) || {};
+    $id('schedChannel').value = delivery.channel || '';
+    $id('schedUrl').value = '';
+    $id('schedUrl').placeholder = delivery.channel
+      ? '留空则沿用已保存的地址' : 'https://…';
+    renderDays();
+    syncForm();   // 表单可见性统一由它决定（含「测试推送」按钮）
+
+    loadWorkspaceHint();
+    $id('schedEditorModal').style.display = 'flex';
+    setTimeout(() => $id('schedName').focus(), 30);
+  }
+
+  async function save(event) {
+    event.preventDefault();
+    const freq = $id('schedFreq').value;
+    const name = $id('schedName').value.trim();
+    const prompt = $id('schedPrompt').value.trim();
+    if (!name) { toast('请填写任务名称'); return; }
+    if (!prompt) { toast('请填写提示词'); return; }
+    const payload = {name, prompt};
+    if (freq === 'once') {
+      if (!$id('schedOnce').value) { toast('请选择执行时间'); return; }
+      payload.type = 'once';
+      payload.scheduled_at = $id('schedOnce').value;
+      payload.rrule = '';
+    } else {
+      payload.type = 'recurring';
+      payload.scheduled_at = '';
+      try {
+        payload.rrule = buildRule(freq);
+      } catch (err) {
+        toast(err.message);
+        return;
+      }
+    }
+    payload.valid_until = ($id('schedUntilMode').value === 'date'
+      && $id('schedUntil').value)
+      ? new Date($id('schedUntil').value + 'T23:59:59').toISOString() : '';
+    payload.valid_from = '';
+    const channel = $id('schedChannel').value;
+    const url = $id('schedUrl').value.trim();
+    const current = (state.editing && state.editing.delivery) || {};
+    if (!channel) {
+      payload.delivery = {channel: '', webhook_url: '', events: null};
+    } else if (url || channel !== (current.channel || '')) {
+      payload.delivery = {channel, webhook_url: url, events: null};
+    }   // 渠道没变且没填新地址：不带 delivery，沿用库里已保存的地址
+    const options = {
+      method: state.editing ? 'PATCH' : 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    };
+    const path = state.editing
+      ? '/schedules/' + state.editing.schedule_id : '/schedules';
+    try {
+      await api(path, options);
+      toast(state.editing ? '已保存' : '已创建');
+      $id('schedEditorModal').style.display = 'none';
+      await load();
+    } catch (err) {
+      toast('保存失败：' + err.message);
+    }
+  }
+
+  /* ---------- 运行记录 ---------- */
+
+  async function openRuns(item) {
+    $id('schedRunsTitle').textContent = `运行记录 · ${item.name}`;
+    const body = $id('schedRunsBody');
+    body.innerHTML = '<div class="hub-empty">加载中…</div>';
+    $id('schedRunsModal').style.display = 'flex';
+    try {
+      const data = await api('/schedules/' + item.schedule_id + '/runs?limit=30');
+      const runs = data.runs || [];
+      body.replaceChildren();
+      if (!runs.length) {
+        body.innerHTML = '<div class="hub-empty">还没有运行记录。</div>';
+        return;
+      }
+      runs.forEach(run => body.appendChild(runRow(run)));
+    } catch (err) {
+      body.innerHTML = `<div class="hub-empty">加载失败：${esc(err.message)}</div>`;
+    }
+  }
+
+  function runRow(run) {
+    const el = document.createElement('div');
+    el.className = 'sched-run';
+    const label = STATUS_LABEL[run.status] || run.status;
+    const delivery = DELIVERY_LABEL[run.delivery_status] || '';
+    const meta = [`计划 ${fmtTs(run.due_at)}`];
+    if (run.finished_at) meta.push(`完成 ${fmtTs(run.finished_at)}`);
+    if (delivery) meta.push(delivery);
+    if (run.delivery_attempts > 1) meta.push(`尝试 ${run.delivery_attempts} 次`);
+    el.innerHTML = `
+      <div class="sched-run-head">${esc(label)}
+        <span class="sched-run-sub">${esc(meta.join(' · '))}</span>
+      </div>
+      ${run.summary ? `<div class="sched-run-summary">${esc(run.summary)}</div>` : ''}
+      ${run.error_code ? `<div class="sched-run-sub">${esc(run.error_code)}${
+        run.error_message ? '：' + esc(run.error_message) : ''}</div>` : ''}`;
+    return el;
+  }
+
+  /* ---------- 页面切换 ---------- */
+
+  function openSchedules() {
+    document.querySelector('.main').classList.add('hub-mode');
+    $id('scheduleView').hidden = false;
+    $id('hubView').hidden = true;
+    $id('navSchedule').classList.add('active');
+    $id('navChat').classList.remove('active');
+    $id('navExpert').classList.remove('active');
+    $id('crumbTitle').textContent = '定时任务';
+    load();
+  }
+
+  function closeSchedules() {
+    if ($id('scheduleView').hidden) return;
+    $id('scheduleView').hidden = true;
+    $id('navSchedule').classList.remove('active');
+  }
+
+  $id('navSchedule').onclick = openSchedules;
+  // 点别的导航/会话/空间时收起本页。用捕获阶段：既有的 closeHub 注册在前，
+  // 它负责撤 hub-mode 与切回聊天，我们只负责把自己的视图藏起来。
+  document.addEventListener('click', event => {
+    if (event.target.closest('#navChat, #navExpert, #newSession, #moreBtn, #profileBtn, '
+        + '#memoryBtn, #adminOpen, #sessionList .session-item, .space-task')) {
+      closeSchedules();
+    }
+  }, true);
+
+  document.querySelectorAll('#schedTabs .hub-tab').forEach(tab => {
+    tab.onclick = () => {
+      document.querySelectorAll('#schedTabs .hub-tab').forEach(
+        other => other.classList.toggle('active', other === tab));
+      state.filter = tab.dataset.filter;
+      load();
+    };
+  });
+  $id('schedSearch').oninput = event => {
+    state.q = event.target.value;
+    render();
+  };
+  $id('schedAddBtn').onclick = () => openEditor(null);
+  $id('schedFreq').onchange = syncForm;
+  $id('schedUntilMode').onchange = syncForm;
+  $id('schedChannel').onchange = syncForm;
+  $id('schedForm').onsubmit = save;
+  $id('schedCancel').onclick = () => { $id('schedEditorModal').style.display = 'none'; };
+  $id('schedEditorClose').onclick = $id('schedCancel').onclick;
+  $id('schedRunsClose').onclick = () => { $id('schedRunsModal').style.display = 'none'; };
+  $id('schedEditorModal').addEventListener('click', event => {
+    if (event.target === $id('schedEditorModal')) $id('schedEditorModal').style.display = 'none';
+  });
+  $id('schedRunsModal').addEventListener('click', event => {
+    if (event.target === $id('schedRunsModal')) $id('schedRunsModal').style.display = 'none';
+  });
+  $id('schedTestBtn').onclick = async () => {
+    if (!state.editing) return;
+    try {
+      await api('/schedules/' + state.editing.schedule_id + '/delivery/test',
+                {method: 'POST'});
+      toast('测试消息已发送（按已保存的配置）');
+    } catch (err) {
+      toast('测试推送失败：' + err.message);
+    }
+  };
+  document.addEventListener('keydown', event => {
+    if (event.key !== 'Escape') return;
+    if ($id('schedEditorModal').style.display === 'flex') {
+      $id('schedEditorModal').style.display = 'none';
+    } else if ($id('schedRunsModal').style.display === 'flex') {
+      $id('schedRunsModal').style.display = 'none';
+    }
+  });
+})();
+</script>
+
+<!-- 专家 / 技能选择弹层：会话级资源选择（docs/addons.md）。
+     内容由页面底部 wb-addons 脚本渲染，这里只留容器与关闭按钮。 -->
+<div class="modal" id="expertPickerModal" style="display:none">
+  <div class="modal-card addon-card">
+    <div class="modal-head">
+      <b>选择专家</b>
+      <span class="hint">专家决定语气与默认技能，随时可换</span>
+      <button class="ghost" id="epClose">关闭</button>
+    </div>
+    <p class="hint">选中后写入当前会话，下一轮开始生效；专家预设的技能/连接器可以被你的勾选覆盖。</p>
+    <div class="addon-list" id="epList"></div>
+    <div class="modal-actions">
+      <button class="ghost" id="epClear">不用专家</button>
+      <button class="ghost" id="epManage">在技能中心看专家</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal" id="skillPickerModal" style="display:none">
+  <div class="modal-card addon-card">
+    <div class="modal-head">
+      <b>选择技能</b>
+      <span class="hint">只勾本轮要用的，正文按需读取</span>
+      <button class="ghost" id="spClose">关闭</button>
+    </div>
+    <p class="hint">勾选写进当前会话。技能正文不会预先塞进上下文，模型需要时自己读 SKILL.md。</p>
+    <div class="addon-search">
+      <svg class="ic sm"><use href="#i-search"/></svg>
+      <input id="spSearch" placeholder="搜索已安装技能" autocomplete="off">
+    </div>
+    <div class="addon-list" id="spList"></div>
+    <div class="modal-actions">
+      <span class="hint" id="spNote"></span>
+      <button class="ghost" id="spPreset">用专家预设</button>
+      <button class="ghost" id="spManage">去技能中心安装</button>
+    </div>
+  </div>
+</div>
+
+<style id="wb-addons-style">
+  /* 会话级资源选择：专家/技能胶囊与两个选择弹层（docs/addons.md） */
+  .addon-chip { max-width: 210px; }
+  .addon-chip .ac-txt { max-width: 168px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .addon-card { width: min(600px, 100%); }
+  .addon-list { display: flex; flex-direction: column; gap: 8px; overflow: auto;
+    max-height: min(54vh, 520px); padding: 2px; margin: 10px 0; }
+  .addon-row { display: flex; gap: 10px; align-items: flex-start; width: 100%;
+    padding: 10px 12px; border: 1px solid var(--line-2, #e6e8ec); border-radius: 12px;
+    background: #fff; cursor: pointer; text-align: left; font: inherit; }
+  .addon-row:hover { border-color: #c9d0d8; }
+  .addon-row.on { border-color: #7fd0b6; background: #f2fbf7; }
+  .addon-row .ar-ico { font-size: 18px; line-height: 1.3; }
+  .addon-row .ar-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .addon-row .ar-name { font-size: 13px; font-weight: 600; color: #2c2c2a; }
+  .addon-row .ar-tag { font-size: 11px; color: #8a8a84; font-weight: 400; margin-left: 6px; }
+  .addon-row .ar-desc { font-size: 12px; color: #6b6b66; line-height: 1.55; }
+  .addon-row .ar-state { font-size: 11px; color: #1d9e75; white-space: nowrap; }
+  .addon-search { display: flex; align-items: center; gap: 6px; padding: 7px 10px;
+    border: 1px solid var(--line-2, #e6e8ec); border-radius: 10px; }
+  .addon-search input { border: 0; outline: 0; flex: 1; font: inherit; background: transparent; }
+  .addon-empty { padding: 18px 10px; text-align: center; color: #8a8a84; font-size: 12px; line-height: 1.7; }
+</style>
+
+<script id="wb-addons-js">
+/* 专家 · 技能 · 连接器的会话级选择（迁移自 WorkBuddy 的 addonSelection 模型）。
+ *
+ * 一句话：**会话是选择单元，不是消息**。这里勾的东西写进
+ * `sessions.addon_selection`（PATCH /api/sessions/{id}/addons），下一轮由服务端
+ * 解析层翻译成"专家人设 + 技能目录 + MCP server 集合"。消息里的选择只是兜底。
+ *
+ * 三条约束（都是踩过的）：
+ * 1. 新会话还没有会话行，PATCH 会 404 —— 选择先攒在 `pending`，随第一条消息
+ *    以 `addon_selection` 发出，服务端与 turn 同事务落库；
+ * 2. "没选"≠"选了空"：点「恢复专家预设」发 `skill_ids: null`（删掉显式键），
+ *    不是发 `[]`；
+ * 3. 连接器的勾选仍是客户端 localStorage 那套（历史实现），这里只在用户动作后
+ *    读一次当前选择回写服务端，不重写那套 UI。
+ */
+(function () {
+  'use strict';
+
+  const PREFIX = (typeof API_PREFIX === 'string' ? API_PREFIX : '/api');
+  const esc = value => String(value == null ? '' : value).replace(/[&<>"']/g, ch => (
+    {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch]));
+
+  const state = {
+    sessionId: '',
+    expert: null,
+    skills: [],          // 生效技能（服务端物化清单）
+    requested: [],       // 用户显式请求的技能 id
+    skillsExplicit: false,
+    expertId: '',
+    catalog: [],         // 已安装且有 SKILL.md 的技能目录
+    experts: [],
+    pending: {},         // 还没落库的选择（新会话）
+    catalogAt: 0,
+    expertsAt: 0,
+  };
+
+  function currentSessionId() {
+    try { return (typeof S !== 'undefined' && S && S.sessionId) || ''; } catch (err) { return ''; }
+  }
+
+  async function api(path, options) {
+    const res = await fetch(PREFIX + path, Object.assign({cache: 'no-store'}, options || {}));
+    let data = {};
+    try { data = await res.json(); } catch (err) { data = {}; }
+    if (!res.ok) {
+      const error = new Error((data && data.detail) || ('HTTP ' + res.status));
+      error.status = res.status;
+      throw error;
+    }
+    return data;
+  }
+
+  function toast(text) {
+    if (!text) return;
+    const box = document.getElementById('toast');
+    if (!box) return;
+    const el = document.createElement('div');
+    el.className = 'toast-item';
+    el.textContent = text;
+    box.appendChild(el);
+    box.classList.add('show');
+    setTimeout(() => {
+      el.remove();
+      if (!box.children.length) box.classList.remove('show');
+    }, 2400);
+  }
+
+  function has(obj, key) { return Object.prototype.hasOwnProperty.call(obj, key); }
+
+  /* ---------------- 视图 ---------------- */
+
+  function draftView() {
+    const expertId = (has(state.pending, 'expert_id')
+      ? (state.pending.expert_id || '') : '');
+    const expert = state.experts.find(item => item.id === expertId) || null;
+    const preset = expert ? (expert.skill_ids || []) : [];
+    const ids = has(state.pending, 'skill_ids')
+      ? (state.pending.skill_ids || []) : preset;
+    const skills = ids
+      .map(id => state.catalog.find(item => item.id === id))
+      .filter(Boolean);
+    return {expert, skills};
+  }
+
+  function currentView() {
+    if (currentSessionId()) return {expert: state.expert, skills: state.skills};
+    return draftView();
+  }
+
+  function chip({icon, label, title, onClick}) {
+    const el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'connector-chip addon-chip';
+    el.title = title;
+    el.innerHTML = `<span class="cc-ico">${esc(icon)}</span>`
+      + `<span class="ac-txt">${esc(label)}</span><span class="cc-x">×</span>`;
+    el.addEventListener('click', event => { event.stopPropagation(); onClick(); });
+    return el;
+  }
+
+  function renderChips() {
+    const box = document.getElementById('addonChips');
+    if (!box) return;
+    const view = currentView();
+    const chips = [];
+    if (view.expert) {
+      chips.push(chip({
+        icon: view.expert.icon || '🧭',
+        label: view.expert.name || '专家',
+        title: `当前专家：${view.expert.name || ''}（点击更换）`,
+        onClick: openExpertPicker,
+      }));
+    }
+    view.skills.forEach(skill => {
+      chips.push(chip({
+        icon: '📚',
+        label: skill.name || skill.id,
+        title: `技能：${skill.name || skill.id}（点击从当前会话移除）`,
+        onClick: () => toggleSkill(skill.id, false),
+      }));
+    });
+    box.replaceChildren(...chips);
+  }
+
+  /* ---------------- 数据 ---------------- */
+
+  async function ensureCatalog(force) {
+    if (!force && state.catalog.length && Date.now() - state.catalogAt < 30000) return;
+    try {
+      const data = await api('/skills?kind=skill');
+      state.catalog = (data.items || []).filter(item => item.on_disk && item.enabled !== false);
+      state.catalogAt = Date.now();
+    } catch (err) { /* 技能中心不可用时保持空列表，不 block 聊天 */ }
+  }
+
+  async function ensureExperts(force) {
+    if (!force && state.experts.length && Date.now() - state.expertsAt < 30000) return;
+    try {
+      const data = await api('/experts');
+      state.experts = data.items || [];
+      state.expertsAt = Date.now();
+    } catch (err) { /* 同上 */ }
+  }
+
+  function applyView(data) {
+    state.sessionId = data.session_id || currentSessionId();
+    state.expert = data.expert || null;
+    state.expertId = data.expert_id || '';
+    state.skills = data.skills || [];
+    state.requested = data.requested_skill_ids || [];
+    state.skillsExplicit = !!data.skills_explicit;
+  }
+
+  async function refresh() {
+    const sessionId = currentSessionId();
+    if (!sessionId) {
+      state.sessionId = '';
+      state.expert = null;
+      state.skills = [];
+      await Promise.all([ensureCatalog(), ensureExperts()]);
+      renderChips();
+      return;
+    }
+    try {
+      const data = await api('/sessions/' + encodeURIComponent(sessionId) + '/addons');
+      applyView(data);
+      state.pending = {};
+    } catch (err) {
+      // 404：会话刚建还没落库；其它错误保留现有胶囊，不打断用户
+    }
+    renderChips();
+    syncConnectors();
+  }
+
+  async function patchAddons(patch, okText) {
+    const sessionId = currentSessionId();
+    if (!sessionId) {
+      // 草稿态：null = "删掉这个显式选择"（恢复预设），不是"选了空"。
+      // 直接 Object.assign 会把 null 留在 pending 里，draftView 再当成 []，
+      // 于是点「恢复专家预设」反而把技能清空了。
+      Object.keys(patch).forEach(key => {
+        if (patch[key] === null || patch[key] === undefined) delete state.pending[key];
+        else state.pending[key] = patch[key];
+      });
+      await Promise.all([ensureCatalog(), ensureExperts()]);
+      renderChips();
+      if (okText) toast(okText);
+      return;
+    }
+    try {
+      const data = await api('/sessions/' + encodeURIComponent(sessionId) + '/addons', {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(patch),
+      });
+      applyView(data);
+      renderChips();
+      if (data.notice) toast(data.notice);
+      else if (okText) toast(okText);
+    } catch (err) {
+      toast('保存选择失败：' + (err.message || '网络错误'));
+    }
+  }
+
+  /* ---------------- 专家选择 ---------------- */
+
+  async function openExpertPicker() {
+    await ensureExperts(true);
+    const list = document.getElementById('epList');
+    if (!list) return;
+    const view = currentView();
+    const currentId = view.expert ? view.expert.id : '';
+    list.replaceChildren();
+    if (!state.experts.length) {
+      const empty = document.createElement('div');
+      empty.className = 'addon-empty';
+      empty.textContent = '还没有可用的专家。';
+      list.appendChild(empty);
+    }
+    state.experts.forEach(item => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'addon-row' + (item.id === currentId ? ' on' : '');
+      const preset = (item.skill_ids || []).join('、');
+      row.innerHTML = `<span class="ar-ico">${esc(item.icon || '🧭')}</span>`
+        + `<span class="ar-main"><span class="ar-name">${esc(item.name)}`
+        + `${item.builtin ? '' : '<span class="ar-tag">自定义</span>'}</span>`
+        + `<span class="ar-desc">${esc(item.description || '')}</span>`
+        + (preset ? `<span class="ar-desc">预设技能：${esc(preset)}</span>` : '')
+        + `</span><span class="ar-state">${item.id === currentId ? '使用中' : ''}</span>`;
+      row.addEventListener('click', async () => {
+        closePickers();
+        await patchAddons({expert_id: item.id}, '已切换专家：' + item.name);
+      });
+      list.appendChild(row);
+    });
+    openModal('expertPickerModal');
+  }
+
+  /* ---------------- 技能选择 ---------------- */
+
+  async function openSkillPicker() {
+    await Promise.all([ensureCatalog(true), ensureExperts()]);
+    renderSkillPicker();
+    openModal('skillPickerModal');
+    const input = document.getElementById('spSearch');
+    if (input) { input.value = ''; input.focus(); }
+  }
+
+  function renderSkillPicker() {
+    const list = document.getElementById('spList');
+    const note = document.getElementById('spNote');
+    if (!list) return;
+    const query = (document.getElementById('spSearch')?.value || '').trim().toLowerCase();
+    const view = currentView();
+    const selected = new Set(view.skills.map(item => item.id));
+    const rows = state.catalog.filter(item => {
+      if (!query) return true;
+      return String(item.name || '').toLowerCase().includes(query)
+        || String(item.description || '').toLowerCase().includes(query);
+    });
+    list.replaceChildren();
+    if (note) {
+      note.textContent = state.catalog.length
+        ? `已安装 ${state.catalog.length} 个技能`
+        : '还没有已安装的技能';
+    }
+    if (!rows.length) {
+      const empty = document.createElement('div');
+      empty.className = 'addon-empty';
+      empty.textContent = state.catalog.length
+        ? '没有匹配的技能'
+        : '还没有装技能。去「技能中心」安装，或上传一个带 SKILL.md 的技能包。';
+      list.appendChild(empty);
+      return;
+    }
+    rows.forEach(item => {
+      const on = selected.has(item.id);
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'addon-row' + (on ? ' on' : '');
+      row.innerHTML = `<span class="ar-ico">📚</span>`
+        + `<span class="ar-main"><span class="ar-name">${esc(item.name || item.id)}`
+        + `${item.version ? `<span class="ar-tag">v${esc(item.version)}</span>` : ''}</span>`
+        + `<span class="ar-desc">${esc(item.description || '')}</span></span>`
+        + `<span class="ar-state">${on ? '已选' : ''}</span>`;
+      row.addEventListener('click', async () => {
+        await toggleSkill(item.id, !on);
+        renderSkillPicker();
+      });
+      list.appendChild(row);
+    });
+  }
+
+  async function toggleSkill(skillId, wanted) {
+    const view = currentView();
+    const ids = view.skills.map(item => item.id).filter(id => id !== skillId);
+    if (wanted) ids.push(skillId);
+    await patchAddons({skill_ids: ids},
+      wanted ? '已加入当前会话' : '已从当前会话移除');
+  }
+
+  /* ---------------- 连接器：只回写，不重写那套 UI ---------------- */
+
+  let lastConnectors = null;
+  function syncConnectors() {
+    if (!window.WB_CONNECTOR_CURRENT) return;
+    let ids = [];
+    try { ids = window.WB_CONNECTOR_CURRENT() || []; } catch (err) { return; }
+    const key = JSON.stringify(ids);
+    if (key === lastConnectors) return;
+    lastConnectors = key;
+    patchAddons({connector_ids: ids});
+  }
+
+  document.addEventListener('click', event => {
+    if (!event.target.closest) return;
+    if (event.target.closest('#connectorPop') || event.target.closest('#connectorChips')) {
+      // 原有 UI 在 click 处理里改 localStorage，下一拍再读当前选择。
+      setTimeout(syncConnectors, 0);
+    }
+  }, true);
+
+  /* ---------------- 弹层与接线 ---------------- */
+
+  function openModal(id) {
+    const modal = document.getElementById(id);
+    if (modal) modal.style.display = 'flex';
+  }
+
+  function closePickers() {
+    ['expertPickerModal', 'skillPickerModal'].forEach(id => {
+      const modal = document.getElementById(id);
+      if (modal) modal.style.display = 'none';
+    });
+  }
+
+  function wire() {
+    const epClose = document.getElementById('epClose');
+    if (epClose) epClose.onclick = closePickers;
+    const epClear = document.getElementById('epClear');
+    if (epClear) epClear.onclick = async () => {
+      closePickers();
+      await patchAddons({expert_id: null}, '已取消专家');
+    };
+    const epManage = document.getElementById('epManage');
+    if (epManage) epManage.onclick = () => {
+      closePickers();
+      if (window.WB_OPEN_HUB) window.WB_OPEN_HUB('expert');
+    };
+    const spClose = document.getElementById('spClose');
+    if (spClose) spClose.onclick = closePickers;
+    const spManage = document.getElementById('spManage');
+    if (spManage) spManage.onclick = () => {
+      closePickers();
+      if (window.WB_OPEN_HUB) window.WB_OPEN_HUB('skill');
+    };
+    const spPreset = document.getElementById('spPreset');
+    if (spPreset) spPreset.onclick = async () => {
+      closePickers();
+      await patchAddons({skill_ids: null}, '已恢复专家预设技能');
+    };
+    const spSearch = document.getElementById('spSearch');
+    if (spSearch) spSearch.addEventListener('input', renderSkillPicker);
+    ['expertPickerModal', 'skillPickerModal'].forEach(id => {
+      const modal = document.getElementById(id);
+      if (modal) modal.addEventListener('click', event => {
+        if (event.target === modal) closePickers();
+      });
+    });
+    document.addEventListener('keydown', event => {
+      if (event.key === 'Escape') closePickers();
+    });
+  }
+
+  window.WB_ADDONS_OPEN_EXPERT = openExpertPicker;
+  window.WB_ADDONS_OPEN_SKILL = openSkillPicker;
+  window.WB_ADDONS_REFRESH = refresh;
+  // 随第一条消息带出去的选择（服务端与 turn 同事务落库）
+  window.WB_ADDONS_PENDING = () => {
+    const patch = {};
+    ['expert_id', 'skill_ids', 'connector_ids', 'model'].forEach(key => {
+      if (has(state.pending, key)) patch[key] = state.pending[key];
+    });
+    return Object.keys(patch).length ? patch : null;
+  };
+
+  // 会话切换：用服务端状态覆盖本地草稿。这几个函数是经典脚本里的全局函数，
+  // 包装返回值而不是改写它们，避免把历史的会话恢复逻辑搅乱。
+  function wrap(name, after) {
+    const original = window[name];
+    if (typeof original !== 'function') return;
+    window[name] = function (...args) {
+      const result = original.apply(this, args);
+      Promise.resolve(result).then(after, after);
+      return result;
+    };
+  }
+  wrap('openSession', () => { state.pending = {}; refresh(); });
+  wrap('newSession', () => {
+    state.pending = {};
+    state.sessionId = '';
+    state.expert = null;
+    state.skills = [];
+    renderChips();
+  });
+  wrap('postSessionMessage', () => { state.pending = {}; refresh(); });
+
+  wire();
+  renderChips();
+  // 首屏把两份目录取回来：草稿态下选专家需要预设技能的名字。
+  Promise.all([ensureCatalog(), ensureExperts()]).then(renderChips);
 })();
 </script>
 

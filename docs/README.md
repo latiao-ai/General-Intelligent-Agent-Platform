@@ -375,6 +375,11 @@ python -m scripts.migrate
 | 异步 | `external_tasks` | 远端任务查询与恢复 |
 | 迁移 | `schema_migrations` | 有序迁移版本，已应用版本不重复执行 |
 | 生产治理 | `api_rate_windows` / `tenant_usage_days` / `provider_charges` | 跨进程限流、租户日预算、provider 请求费用台账 |
+| 专家 | `experts` + `sessions.addon_selection` | 自定义专家（提示词 + 预设技能/连接器/模型）与会话级资源选择 |
+
+> 技能**不进库**：`SKILLS_DIR/<id>/SKILL.md` 是唯一事实来源，每轮只把会话选中的
+> 技能物化进工作目录，模型按需读取。设计与优先级见
+> [专家 · 技能 · 连接器](addons.md)。
 
 ### 内存与磁盘的分工
 

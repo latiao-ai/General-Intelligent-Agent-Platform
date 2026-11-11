@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -159,6 +160,80 @@ class PgConnection:
                 row = await self._one(conn, sql)
                 out[name] = int(row['n'] if row else 0)
         return out
+
+    # ---------- 服务心跳 ----------
+    # API 与 Worker 是两个进程，"API 活着"不等于"有人在干活"。Worker 每次
+    # 心跳写一行，接纳层与监控据此判断执行器是否在线。
+
+    async def beat(self, service: str, instance_id: str, *,
+                   host: str = '', pid: int = 0, meta: str = '{}') -> None:
+        """写/续一次心跳。同一 instance_id 只保留一行，不堆积历史。"""
+        stamp = time.time()
+        async with self._lease() as conn:
+            await self._run(conn,
+                'INSERT INTO service_heartbeats '
+                '(service, instance_id, beat_at, started_at, host, pid, meta_json) '
+                'VALUES (%s,%s,%s,%s,%s,%s,%s) '
+                'ON CONFLICT (service, instance_id) DO UPDATE SET '
+                'beat_at=EXCLUDED.beat_at, host=EXCLUDED.host, '
+                'pid=EXCLUDED.pid, meta_json=EXCLUDED.meta_json',
+                (service, instance_id, stamp, stamp, host, int(pid), meta))
+            await conn.commit()
+
+    async def live_instances(self, service: str,
+                             max_age_seconds: float) -> list[dict]:
+        """还活着（最后一次心跳在 max_age 之内）的实例。"""
+        cutoff = time.time() - float(max_age_seconds)
+        async with self._lease() as conn:
+            rows = await self._all(conn,
+                'SELECT instance_id, beat_at, started_at, host, pid, meta_json '
+                'FROM service_heartbeats WHERE service=%s AND beat_at >= %s '
+                'ORDER BY beat_at DESC', (service, cutoff))
+        return [dict(r) for r in rows]
+
+    async def live_count(self, service: str, max_age_seconds: float) -> int:
+        cutoff = time.time() - float(max_age_seconds)
+        async with self._lease() as conn:
+            row = await self._one(conn,
+                'SELECT COUNT(*) AS n FROM service_heartbeats '
+                'WHERE service=%s AND beat_at >= %s', (service, cutoff))
+        return int((row or {}).get('n') or 0)
+
+    async def purge_heartbeats(self, max_age_seconds: float) -> int:
+        """清掉早已失联的实例行。不能留着：否则"看着有人"会变成一种假象。"""
+        cutoff = time.time() - float(max_age_seconds)
+        async with self._lease() as conn:
+            cur = await self._run(conn,
+                'DELETE FROM service_heartbeats WHERE beat_at < %s', (cutoff,))
+            await conn.commit()
+            return int(cur.rowcount or 0)
+
+    async def turn_backlog(self) -> dict:
+        """turn 积压态势：等多久了、卡在哪。
+
+        `oldest_accepted_age` 是接纳后一直没人领的最长等待秒数——它是
+        "消息发出去没回复"最直接的量化指标。
+        """
+        async with self._lease() as conn:
+            accepted = await self._one(conn,
+                "SELECT COUNT(*) AS n FROM session_turns "
+                "WHERE status IN ('accepted','retry')")
+            running = await self._one(conn,
+                "SELECT COUNT(*) AS n FROM session_turns WHERE status='running'")
+            oldest = await self._one(conn,
+                "SELECT created_at FROM session_turns "
+                "WHERE status IN ('accepted','retry') "
+                'ORDER BY created_at LIMIT 1')
+        age = 0.0
+        raw = (oldest or {}).get('created_at')
+        if raw:
+            try:
+                age = max(0.0, time.time() - datetime.fromisoformat(raw).timestamp())
+            except (TypeError, ValueError):
+                age = 0.0
+        return {'turns_accepted': int((accepted or {}).get('n') or 0),
+                'turns_running': int((running or {}).get('n') or 0),
+                'oldest_accepted_age': round(age, 1)}
 
     async def _recover_orphans(self) -> int:
         """只把**没有活租约**的遗留 running 任务标记为 interrupted。

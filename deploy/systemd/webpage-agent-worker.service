@@ -1,0 +1,31 @@
+[Unit]
+Description=网页智能体中台 Worker（执行聊天/查询/业务运行）
+Documentation=file:///opt/webpage-agent/docs/production-deployment.md
+After=network-online.target postgresql.service webpage-agent-api.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=agent
+Group=agent
+WorkingDirectory=/opt/webpage-agent
+EnvironmentFile=/etc/webpage-agent/production.env
+ExecStart=/opt/webpage-agent/.venv/bin/python -m scripts.run_worker
+# **必须 always**：这个进程死了不只是"变慢"，而是所有聊天都不会有回复。
+# 它每 WORKER_HEARTBEAT_SECONDS（默认 5 秒）写一次心跳；心跳断了 20 秒，
+# API 就会拒收新消息（503）并让监控告警，而不是继续收下没人执行的消息。
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/var/lib/webpage-agent
+
+[Install]
+WantedBy=multi-user.target

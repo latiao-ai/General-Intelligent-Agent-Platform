@@ -1,0 +1,1417 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>管理控制台</title>
+<style>
+:root{
+  --bg:#f7f7f5; --panel:#ffffff; --line:#e3e2dd; --line-soft:#eeece7;
+  --ink:#2c2c2a; --ink-2:#5f5e5a; --ink-3:#8b8a84;
+  --accent:#185fa5; --accent-soft:#e6f1fb; --accent-line:#b5d4f4;
+  --ok:#0f6e56; --ok-soft:#e1f5ee; --warn:#854f0b; --warn-soft:#faeeda;
+  --bad:#a32d2d; --bad-soft:#fcebeb;
+  --radius:12px;
+}
+*{box-sizing:border-box}
+/* 这里的布局类大量用 display:flex，会盖掉 UA 对 [hidden] 的 display:none，
+   于是 hidden="true" 的元素照样显示（登录框旁边多出一个"去登录"就是这么来的）。 */
+[hidden]{display:none!important}
+html,body{margin:0;padding:0}
+body{
+  background:var(--bg); color:var(--ink);
+  font:14px/1.6 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif;
+  -webkit-font-smoothing:antialiased;
+}
+a{color:var(--accent);text-decoration:none}
+button{font:inherit;cursor:pointer}
+code,.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+
+header.top{
+  position:sticky;top:0;z-index:20;background:rgba(247,247,245,.92);
+  backdrop-filter:saturate(1.2) blur(8px);border-bottom:1px solid var(--line);
+}
+.top-in{max-width:1180px;margin:0 auto;padding:14px 24px;display:flex;align-items:center;gap:16px}
+.brand{display:flex;align-items:baseline;gap:10px;margin-right:auto}
+.brand h1{font-size:16px;font-weight:500;margin:0;letter-spacing:.2px}
+.brand span{font-size:12px;color:var(--ink-3)}
+/* 超管登录后直接落在这里，得留一条回聊天界面的路，否则只能改地址栏。 */
+.brand-link{font-size:12px;color:var(--accent);white-space:nowrap;margin-left:4px}
+.brand-link:hover{text-decoration:underline}
+.who{display:flex;align-items:center;gap:8px;font-size:12.5px;color:var(--ink-2)}
+.pill{
+  display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;
+  font-size:12px;line-height:1.5;white-space:nowrap;border:1px solid var(--line);
+  background:var(--panel);color:var(--ink-2);
+}
+.pill.all{background:var(--accent-soft);border-color:var(--accent-line);color:var(--accent)}
+.pill.tenant{background:var(--warn-soft);border-color:#f0d9a8;color:var(--warn)}
+.pill.on{background:var(--ok-soft);border-color:#bfe6d8;color:var(--ok)}
+.pill.off{background:var(--bad-soft);border-color:#f0c9c9;color:var(--bad)}
+
+nav.tabs{max-width:1180px;margin:0 auto;padding:0 24px;display:flex;gap:4px}
+nav.tabs button{
+  border:0;background:transparent;padding:10px 14px;border-radius:8px 8px 0 0;
+  color:var(--ink-2);border-bottom:2px solid transparent;margin-bottom:-1px;
+}
+nav.tabs button[aria-selected="true"]{color:var(--accent);border-bottom-color:var(--accent);font-weight:500}
+nav.tabs button:hover{background:#eeece7}
+
+main{max-width:1180px;margin:0 auto;padding:22px 24px 64px}
+section[hidden]{display:none}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:14px 16px}
+.card .k{font-size:12px;color:var(--ink-3);margin-bottom:6px}
+.card .v{font-size:24px;font-weight:500;letter-spacing:-.4px;font-variant-numeric:tabular-nums}
+.card .s{font-size:12px;color:var(--ink-3);margin-top:4px}
+
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);margin-bottom:16px;overflow:hidden}
+.panel-h{display:flex;align-items:center;gap:10px;padding:13px 16px;border-bottom:1px solid var(--line-soft)}
+.panel-h h2{font-size:13.5px;font-weight:500;margin:0}
+.panel-h .hint{font-size:12px;color:var(--ink-3);margin-left:auto}
+.panel-b{padding:16px;overflow-x:auto}
+
+.toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
+input[type=search],input[type=text],input[type=url],input[type=password],select{
+  font:inherit;font-size:13px;padding:7px 10px;border:1px solid var(--line);
+  border-radius:8px;background:var(--panel);color:var(--ink);outline:none;
+}
+input[type=search]:focus,input[type=text]:focus,input[type=url]:focus,
+input[type=password]:focus,select:focus{border-color:var(--accent-line);box-shadow:0 0 0 3px var(--accent-soft)}
+input[type=search]{min-width:220px}
+input[type=text],input[type=url],input[type=password]{width:100%}
+
+/* 登录平台表单：两列网格，窄屏一列。字段说明放在 label 下面一行小字。 */
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px 14px;margin-bottom:4px}
+.form-grid .span2{grid-column:1 / -1}
+.field label{display:block;font-size:12px;color:var(--ink-3);margin-bottom:5px}
+.field .note{font-size:11.5px;color:var(--ink-3);margin-top:4px;line-height:1.5}
+.field.inline{display:flex;align-items:center;gap:8px}
+.field.inline label{margin:0}
+@media (max-width:720px){.form-grid{grid-template-columns:1fr}}
+.form-actions{display:flex;gap:8px;align-items:center;margin:14px 0 2px}
+.form-actions .muted{font-size:12px}
+details.advanced{margin-top:12px;border:1px solid var(--line);border-radius:10px;padding:0 12px}
+details.advanced summary{cursor:pointer;font-size:12.5px;padding:10px 0;color:var(--ink-2)}
+details.advanced .form-grid{margin:6px 0 14px}
+.test-result{font-size:12.5px;line-height:1.6;padding:9px 11px;border-radius:8px;
+  border:1px solid var(--line);background:#faf9f6;margin-top:10px;word-break:break-all}
+.test-result.ok{border-color:#bfe6d8;background:var(--ok-soft);color:var(--ok)}
+.test-result.bad{border-color:#f0c9c9;background:var(--bad-soft);color:var(--bad)}
+.btn{
+  font-size:13px;padding:7px 12px;border-radius:8px;border:1px solid var(--line);
+  background:var(--panel);color:var(--ink);
+}
+.btn:hover{background:#f2f0eb}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:#14528f}
+.btn.danger{color:var(--bad);border-color:#f0c9c9}
+.btn.danger:hover{background:var(--bad-soft)}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+a.btn{display:inline-flex;align-items:center;text-decoration:none}
+.denied .actions{margin-top:14px;display:flex;gap:8px;align-items:center}
+/* 危险操作单独划一块：别让它混在普通按钮里被顺手点掉 */
+.danger-zone{
+  display:flex;gap:14px;align-items:center;justify-content:space-between;
+  padding:12px 14px;border:1px solid #f0c9c9;border-radius:10px;background:var(--bad-soft);
+  font-size:13px;
+}
+.danger-zone .muted{font-size:12px;margin-top:3px;line-height:1.5}
+.danger-zone .btn{flex:none}
+
+table{width:100%;border-collapse:collapse;font-size:13px}
+/* 宽表在窄屏上横向滚动，而不是把单元格挤成竖排文字 */
+table.wide{min-width:940px}
+td .btn{white-space:nowrap}
+th{
+  text-align:left;font-weight:500;font-size:12px;color:var(--ink-3);
+  padding:9px 12px;border-bottom:1px solid var(--line);white-space:nowrap;
+}
+td{padding:10px 12px;border-bottom:1px solid var(--line-soft);vertical-align:middle}
+tr:last-child td{border-bottom:0}
+tbody tr:hover{background:#fbfaf7}
+td.num{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+th.num{text-align:right}
+.muted{color:var(--ink-3)}
+.tag{
+  display:inline-block;padding:1px 7px;border-radius:6px;font-size:11.5px;white-space:nowrap;
+  background:#f2f0eb;border:1px solid var(--line);color:var(--ink-2);margin-right:4px;
+}
+.role{font-size:11.5px;padding:1px 7px;border-radius:6px;border:1px solid var(--line)}
+.role.platform_admin{background:var(--accent-soft);border-color:var(--accent-line);color:var(--accent)}
+.role.operator{background:var(--warn-soft);border-color:#f0d9a8;color:var(--warn)}
+.role.member{background:#f2f0eb;color:var(--ink-2)}
+
+.chart{width:100%;display:block}
+.chart .axis{stroke:var(--line);stroke-width:1}
+.chart text{fill:var(--ink-3);font-size:10.5px}
+/* 抽屉里空间窄，按固定高度铺满，否则 viewBox 比例会把它压成一条线 */
+.detail-chart{height:112px;margin-bottom:2px}
+.detail-chart svg{width:100%;height:100%;display:block}
+
+.empty{padding:40px 16px;text-align:center;color:var(--ink-3);font-size:13px}
+.denied{max-width:560px;margin:60px auto;background:var(--panel);border:1px solid var(--line);
+  border-radius:var(--radius);padding:28px}
+.denied h2{margin:0 0 10px;font-size:16px;font-weight:500}
+.denied p{margin:0 0 10px;color:var(--ink-2);font-size:13.5px}
+.denied code{background:#f2f0eb;padding:2px 6px;border-radius:5px}
+/* 账号不够权限时直接在这里换人：跳去首页切换会撞上"整站共用一份 cookie"，
+   结果落在首页还带着旧账号，人就被卡在门外了。 */
+.switch-form{display:flex;flex-direction:column;gap:10px;margin-top:16px;padding-top:16px;
+  border-top:1px solid var(--line-soft)}
+.switch-form label{display:flex;flex-direction:column;gap:5px;font-size:12.5px;color:var(--ink-3)}
+.switch-form input,.switch-form select{
+  font:inherit;font-size:13px;padding:8px 10px;border:1px solid var(--line);
+  border-radius:8px;background:var(--panel);color:var(--ink);outline:none;width:100%;
+}
+.switch-form input:focus,.switch-form select:focus{
+  border-color:var(--accent-line);box-shadow:0 0 0 3px var(--accent-soft);
+}
+.switch-form .row{display:flex;gap:8px;align-items:center}
+.auth-err{color:var(--bad);font-size:12.5px;min-height:0}
+.auth-err:empty{display:none}
+
+.drawer-mask{position:fixed;inset:0;background:rgba(44,44,42,.28);display:none;z-index:40}
+.drawer-mask.open{display:block}
+.drawer{
+  position:fixed;top:0;right:0;height:100%;width:min(520px,94vw);background:var(--panel);
+  border-left:1px solid var(--line);z-index:41;transform:translateX(100%);
+  transition:transform .18s ease;display:flex;flex-direction:column;
+}
+.drawer.open{transform:translateX(0)}
+.drawer-h{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--line)}
+.drawer-h h3{margin:0;font-size:14px;font-weight:500;flex:1}
+.drawer-b{overflow:auto;padding:16px 18px 40px}
+.kv{display:grid;grid-template-columns:110px 1fr;gap:6px 12px;font-size:13px;margin-bottom:18px}
+.kv dt{color:var(--ink-3)}
+.kv dd{margin:0;word-break:break-all}
+.sub{font-size:12px;color:var(--ink-3);margin:18px 0 8px;letter-spacing:.3px}
+.toast{
+  position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(8px);
+  background:#2c2c2a;color:#fff;padding:9px 16px;border-radius:10px;font-size:13px;
+  opacity:0;pointer-events:none;transition:.18s;z-index:60;
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+
+.only-mobile{display:none}
+
+/* 手机（≤640px）：页头本来是一行 flex，窄屏下标题会被压成一字一行；
+   身份信息也不该跟标题抢宽度。这里让它换行、标签横向滚动。 */
+@media (max-width:640px){
+  .top-in{flex-wrap:wrap;row-gap:8px;padding:10px 12px}
+  .brand{width:100%;margin-right:0}
+  .brand h1{font-size:15px;white-space:nowrap}
+  .brand span{display:none}
+  .who{width:100%;gap:6px;font-size:11.5px;overflow:hidden}
+  .who .mono{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .who .muted{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pill{font-size:11px;padding:2px 7px}
+  nav.tabs{padding:0 8px;overflow-x:auto;scrollbar-width:none}
+  nav.tabs::-webkit-scrollbar{display:none}
+  nav.tabs button{flex:0 0 auto;white-space:nowrap;padding:9px 11px;font-size:13px}
+  main{padding:14px 10px 48px}
+  .cards{grid-template-columns:1fr 1fr;gap:8px}
+  .card{padding:11px 12px}
+  .card .v{font-size:19px}
+  .card .k,.card .s{font-size:11px}
+  .panel-h{padding:11px 12px;flex-wrap:wrap;row-gap:2px}
+  .panel-h .hint{margin-left:auto;width:auto;white-space:nowrap;overflow:hidden;
+    text-overflow:ellipsis;max-width:62%}
+  .panel-b{padding:12px}
+  .kv{grid-template-columns:78px 1fr;gap:5px 10px;font-size:12.5px}
+  .toolbar{gap:6px}
+  .toolbar input[type=search]{min-width:0;flex:1 1 140px}
+  .toolbar select{flex:1 1 auto;min-width:0}
+  .danger-zone{flex-direction:column;align-items:stretch;gap:10px}
+  .denied{margin:20px 0;padding:18px}
+  .drawer{width:100%}
+  .drawer-h{padding:12px 14px}
+  .drawer-b{padding:14px 14px 32px}
+  .sub{margin-top:14px}
+  .only-mobile{display:inline}
+}
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="top-in">
+    <div class="brand">
+      <h1>管理控制台</h1>
+      <span>智能体中台</span>
+      <a class="brand-link" href="/">去对话界面 →</a>
+    </div>
+    <div class="who" id="who">
+      <span class="muted">读取身份…</span>
+    </div>
+  </div>
+  <nav class="tabs" role="tablist" id="tabs">
+    <button role="tab" data-tab="overview" aria-selected="true">概览</button>
+    <button role="tab" data-tab="users" aria-selected="false">用户</button>
+    <button role="tab" data-tab="login" aria-selected="false">登录系统</button>
+    <button role="tab" data-tab="connect" aria-selected="false">连接器与技能</button>
+    <button role="tab" data-tab="audit" aria-selected="false">审计</button>
+  </nav>
+</header>
+
+<main>
+  <div id="denied" class="denied" hidden>
+    <h2 id="deniedTitle">没有管理权限</h2>
+    <div id="deniedBody">
+      <p>当前账号的角色不足以进入控制台。</p>
+      <p>控制台需要 <code>platform_admin</code>（跨租户超管）角色。
+         用超管账号在下面登录，登录成功会直接回到这里。</p>
+    </div>
+    <p class="muted" id="deniedDetail"></p>
+    <form class="switch-form" id="switchForm" hidden autocomplete="on">
+      <label id="switchPlatformWrap" hidden>登录平台
+        <select id="switchPlatform"></select>
+      </label>
+      <label>账号<input type="text" id="switchUser" autocomplete="username" required></label>
+      <label>密码<input type="password" id="switchPass" autocomplete="current-password" required></label>
+      <div class="auth-err" id="switchErr" role="alert"></div>
+      <div class="row">
+        <button class="btn primary" type="submit" id="switchSubmit">登录</button>
+        <span class="muted">密码交给平台校验，中台不保存</span>
+      </div>
+    </form>
+    <div class="actions" id="deniedActions" hidden>
+      <a class="btn primary" id="deniedLogin" href="/?next=%2Fadmin">去登录</a>
+      <span class="muted" id="deniedHint">登录后会自动回到这里</span>
+    </div>
+  </div>
+
+  <section id="tab-overview">
+    <div class="cards" id="overviewCards"></div>
+    <div class="panel">
+      <div class="panel-h"><h2>每天的消息量</h2><span class="hint" id="rangeHint"></span></div>
+      <div class="panel-b"><div id="chartMessages"><div class="empty">载入中…</div></div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-h"><h2>每天的活跃用户</h2><span class="hint">按会话最后更新时间去重</span></div>
+      <div class="panel-b"><div id="chartUsers"><div class="empty">载入中…</div></div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-h"><h2>租户分布</h2><span class="hint">按已绑定身份统计</span></div>
+      <div class="panel-b" id="tenantTable"><div class="empty">载入中…</div></div>
+    </div>
+  </section>
+
+  <section id="tab-users" hidden>
+    <div class="panel">
+      <div class="panel-h">
+        <h2>用户</h2>
+        <span class="hint only-mobile">左右滑动看全部列</span>
+        <span class="hint" id="userCount"></span>
+      </div>
+      <div class="panel-b">
+        <div class="toolbar">
+          <input type="search" id="userQuery" placeholder="搜用户 ID / 昵称 / 邮箱">
+          <select id="userStatus">
+            <option value="">全部状态</option>
+            <option value="active">正常</option>
+            <option value="disabled">已停用</option>
+          </select>
+          <select id="userTenant"><option value="">全部租户</option></select>
+          <button class="btn" id="userRefresh">查询</button>
+        </div>
+        <div id="userTable"><div class="empty">载入中…</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-login" hidden>
+    <div class="panel">
+      <div class="panel-h">
+        <h2>登录平台</h2>
+        <span class="hint">决定"拿哪个平台的账号能登录中台"</span>
+      </div>
+      <div class="panel-b">
+        <div class="toolbar">
+          <button class="btn primary" id="platformNew">新增平台</button>
+          <button class="btn" id="platformRefresh">刷新</button>
+          <span class="muted" id="platformHint"></span>
+        </div>
+        <div id="platformBody"><div class="empty">载入中…</div></div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-h"><h2>这套机制怎么工作</h2></div>
+      <div class="panel-b">
+        <div class="kv">
+          <dt>验证方式</dt>
+          <dd>中台把账号密码转给平台自己的登录接口校验，<strong>不保存也不校验密码</strong>。
+              校验通过后按平台返回的用户标识绑定身份、发中台会话。</dd>
+          <dt>身份源</dt>
+          <dd>同一个身份源下的多个入口，登录后落到同一个中台账号。想让两个平台
+              共用账号，把「身份源」填成一样。</dd>
+          <dt>租户</dt>
+          <dd>从这个平台首次登录的人，默认落在这个租户里。已有绑定的人不受影响。</dd>
+          <dt>票据 / OIDC</dt>
+          <dd>这两种接入方式还不在这里管：它们要公钥或客户端密钥，目前仍走
+              <code>AUTH_CONNECTIONS</code> / <code>OIDC_*</code> 配置。</dd>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-connect" hidden>
+    <div class="panel">
+      <div class="panel-h"><h2>连接器</h2><span class="hint">按租户分组的 MCP 服务端绑定</span></div>
+      <div class="panel-b" id="connectorBody"><div class="empty">载入中…</div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-h"><h2>技能与工具政策</h2><span class="hint">暂停某个工具不需要改代码</span></div>
+      <div class="panel-b" id="policyBody"><div class="empty">载入中…</div></div>
+    </div>
+  </section>
+
+  <section id="tab-audit" hidden>
+    <div class="panel">
+      <div class="panel-h"><h2>管理动作审计</h2><span class="hint" id="auditHint"></span></div>
+      <div class="panel-b" id="auditBody"><div class="empty">载入中…</div></div>
+    </div>
+  </section>
+</main>
+
+<div class="drawer-mask" id="mask"></div>
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-h">
+    <h3 id="drawerTitle">用户详情</h3>
+    <button class="btn" id="drawerClose">关闭</button>
+  </div>
+  <div class="drawer-b" id="drawerBody"></div>
+</aside>
+
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+
+const state = { me: null, users: [], tenants: [], scope: '', days: 14,
+                platforms: [], tab: 'overview' };
+
+/* ---------- 小工具 ---------- */
+
+const $ = (id) => document.getElementById(id);
+
+function esc(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function num(value) {
+  const n = Number(value || 0);
+  return n.toLocaleString('zh-CN');
+}
+
+function compact(value) {
+  const n = Number(value || 0);
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e4) return (n / 1e3).toFixed(1) + 'k';
+  return num(n);
+}
+
+/* charged_micros 是百万分之一元。小于一分钱时不要显示成 ¥0.00，那看起来像没花钱。 */
+function money(micros) {
+  const yuan = Number(micros || 0) / 1e6;
+  if (yuan === 0) return '¥0';
+  if (yuan < 0.01) return '¥' + yuan.toFixed(4);
+  if (yuan < 1) return '¥' + yuan.toFixed(3);
+  return '¥' + yuan.toFixed(2);
+}
+
+function when(iso) {
+  if (!iso) return '<span class="muted">—</span>';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return esc(String(iso).slice(0, 19).replace('T', ' '));
+  const diff = (Date.now() - d.getTime()) / 1000;
+  if (diff < 60) return '刚刚';
+  if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
+  if (diff < 86400) return Math.floor(diff / 3600) + ' 小时前';
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getMonth() + 1}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+// 绝对时间。审计要的是"哪一刻"，"3 小时前"没法拿去和日志对。
+function shortTime(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return String(iso).slice(0, 19).replace('T', ' ');
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} `
+    + `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+const auditLabel = {
+  console_user_role: '角色变更',
+  console_user_status: '账号状态',
+  console_user_delete: '删除账号',
+  console_policy_toggle: '工具政策',
+  console_platform_create: '新增登录平台',
+  console_platform_update: '修改登录平台',
+  console_platform_delete: '删除登录平台',
+  admin_user_status: '账号状态（旧）',
+};
+
+function auditDetail(e) {
+  if (e.type === 'console_platform_delete') {
+    return `删除（保留 ${num(e.retained_accounts)} 个已绑定账号）`;
+  }
+  if (e.type === 'console_platform_create') {
+    return `${e.display_name || e.platform_id} · ${e.base_url || ''}`;
+  }
+  if (e.type === 'console_platform_update') {
+    const fields = (e.fields || []).join('/');
+    const after = e.after || {};
+    const enabled = after.enabled;
+    const tail = enabled === undefined ? '' : (enabled ? '（启用）' : '（停用）');
+    return `${fields || '未改字段'}${tail}`;
+  }
+  if (e.type === 'console_user_delete') {
+    const kept = e.retained || {};
+    return `删除（保留 ${num(kept.sessions)} 会话 / ${num(kept.messages)} 消息）`;
+  }
+  if (e.type === 'console_user_role') {
+    const before = (e.previous || []).map((p) => p.role).filter(Boolean);
+    const from = [...new Set(before)].join('/') || '—';
+    return `${from} → ${e.role}${e.reason ? '（' + e.reason + '）' : ''}`;
+  }
+  if (e.previous_status !== undefined) {
+    return `${e.previous_status} → ${e.status}`;
+  }
+  if (e.enabled !== undefined) return e.enabled ? '恢复' : '暂停';
+  return '';
+}
+
+let toastTimer = null;
+function toast(text) {
+  const el = $('toast');
+  el.textContent = text;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 2400);
+}
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    credentials: 'same-origin',
+    headers: Object.assign({ 'Accept': 'application/json' },
+      options.body ? { 'Content-Type': 'application/json' } : {}),
+    ...options,
+  });
+  let payload = null;
+  try { payload = await res.json(); } catch (e) { /* 非 JSON：下面按状态码报错 */ }
+  if (!res.ok) {
+    const detail = (payload && payload.detail) || ('请求失败（HTTP ' + res.status + '）');
+    const error = new Error(typeof detail === 'string' ? detail : JSON.stringify(detail));
+    error.status = res.status;
+    // 会话可能在别的标签页被换掉（同一个 cookie 名，谁后登录算谁的）：
+    // 页头是开屏时渲染的，此时还挂着旧身份，光在面板里报"需要管理员权限"会误导。
+    // 统一回问一次"我是谁"，把页头和准入状态刷到真实值。
+    if (res.status === 401) showLogin(error.message);
+    else if (res.status === 403) refreshIdentity();
+    throw error;
+  }
+  return payload;
+}
+
+/* ---------- 图表 ---------- */
+
+function barChart(rows, field, color, opts = {}) {
+  if (!rows.length) return '<div class="empty">这段时间没有数据</div>';
+  // 宽度可配：抽屉只有 500px 左右，沿用 1040 的 viewBox 会被整体缩到 1/2，
+  // 轴标签会小到看不清。按容器宽度生成，字号才是"所见即所写"。
+  const W = opts.width || 1040, H = opts.height || 130;
+  const padL = 36, padB = 22, padT = 10;
+  const plotW = W - padL - 10, plotH = H - padT - padB;
+  const max = Math.max(1, ...rows.map((r) => Number(r[field] || 0)));
+  const step = plotW / rows.length;
+  const barW = Math.max(2, Math.min(28, step - 3));
+  // 每个标签按 36px 预算排（"10-29" 在 10.5px 字号下约 26px，留 10px 间隙），
+  // 排不下就隔几天标一次——固定"最多 14 个"在宽屏上太稀、在抽屉里又全挤在一起。
+  const labelEvery = Math.max(1, Math.ceil(rows.length / Math.max(2, Math.floor(plotW / 36))));
+  let bars = '';
+  rows.forEach((row, i) => {
+    const value = Number(row[field] || 0);
+    const h = value === 0 ? 0 : Math.max(2, (value / max) * plotH);
+    const x = padL + i * step + (step - barW) / 2;
+    const y = padT + plotH - h;
+    const label = row.day.slice(5);
+    bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}"
+      height="${h.toFixed(1)}" rx="2" fill="${color}"><title>${label}：${num(value)}</title></rect>`;
+    if (i % labelEvery === 0) {
+      bars += `<text x="${(x + barW / 2).toFixed(1)}" y="${H - 6}" text-anchor="middle">${label}</text>`;
+    }
+  });
+  const grid = [0, 0.5, 1].map((f) => {
+    const y = padT + plotH * (1 - f);
+    return `<line class="axis" x1="${padL}" y1="${y}" x2="${W - 10}" y2="${y}"></line>
+      <text x="${padL - 6}" y="${y + 3}" text-anchor="end">${compact(max * f)}</text>`;
+  }).join('');
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img">
+    ${grid}${bars}</svg>`;
+}
+
+/* ---------- 概览 ---------- */
+
+async function loadOverview() {
+  let data;
+  try {
+    data = await api('/api/console/overview?days=' + state.days);
+  } catch (error) {
+    $('overviewCards').innerHTML =
+      `<div class="card"><div class="k">无法读取</div><div class="s">${esc(error.message)}</div></div>`;
+    return;
+  }
+  const totals = data.totals || {};
+  const trend = data.trend || [];
+  const today = trend[trend.length - 1] || {};
+  const sum = (field) => trend.reduce((acc, row) => acc + Number(row[field] || 0), 0);
+
+  $('rangeHint').textContent = `近 ${data.days} 天`;
+  $('overviewCards').innerHTML = [
+    ['用户总数', num(totals.total), `正常 ${num(totals.active)} · 停用 ${num(totals.disabled)}`],
+    ['今日活跃', num(today.active_users), `会话 ${num(today.sessions)} 个`],
+    ['消息量', num(sum('messages')), `近 ${data.days} 天累计`],
+    ['模型调用', num(sum('requests')), `花费 ${money(sum('charged_micros'))}`],
+  ].map(([k, v, s]) => `<div class="card"><div class="k">${k}</div>
+      <div class="v">${v}</div><div class="s">${s}</div></div>`).join('');
+
+  // 按容器真实宽度画：viewBox 宽度和渲染宽度不一致时（手机、抽屉），
+  // 配合 width:100% 会把整张图等比压扁，柱子和日期都挤成一条线。
+  const chartW = Math.max(280, Math.floor($('chartMessages').clientWidth || 1040));
+  $('chartMessages').innerHTML = barChart(trend, 'messages', '#378add', { width: chartW });
+  $('chartUsers').innerHTML = barChart(trend, 'active_users', '#1d9e75', { width: chartW });
+
+  const tenants = data.tenants || [];
+  state.tenants = tenants;
+  $('tenantTable').innerHTML = tenants.length ? `<table>
+    <thead><tr><th>租户</th><th class="num">用户数</th></tr></thead>
+    <tbody>${tenants.map((t) => `<tr><td><code>${esc(t.tenant_id)}</code></td>
+      <td class="num">${num(t.users)}</td></tr>`).join('')}</tbody></table>`
+    : '<div class="empty">还没有租户绑定记录</div>';
+
+  const select = $('userTenant');
+  const current = select.value;
+  select.innerHTML = '<option value="">全部租户</option>' +
+    tenants.map((t) => `<option value="${esc(t.tenant_id)}">${esc(t.tenant_id)}</option>`).join('');
+  select.value = current;
+}
+
+/* ---------- 用户 ---------- */
+
+async function loadUsers() {
+  const params = new URLSearchParams({ limit: '100' });
+  const q = $('userQuery').value.trim();
+  if (q) params.set('q', q);
+  if ($('userStatus').value) params.set('status', $('userStatus').value);
+  if ($('userTenant').value) params.set('tenant', $('userTenant').value);
+
+  let data;
+  try {
+    data = await api('/api/console/users?' + params.toString());
+  } catch (error) {
+    $('userTable').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+    return;
+  }
+  state.users = data.users || [];
+  $('userCount').textContent = '共 ' + num(data.total) + ' 人';
+
+  if (!state.users.length) {
+    $('userTable').innerHTML = '<div class="empty">没有匹配的用户</div>';
+    return;
+  }
+  const canGrantAdmin = state.scope === 'all';
+  const rows = state.users.map((u) => {
+    const active = u.status === 'active';
+    // 只有两档可选。存量里的 operator（历史角色）不在选项里，就补一个禁用项把它
+    // 显示出来——否则下拉会静默显示成 member，看起来像权限已经被改了。
+    const choices = ['member'].concat(canGrantAdmin ? ['platform_admin'] : []);
+    const options = choices.map((role) =>
+      `<option value="${role}"${role === u.role ? ' selected' : ''}>${role}</option>`);
+    if (!choices.includes(u.role)) {
+      options.unshift(
+        `<option value="${esc(u.role)}" selected>${esc(u.role)}（历史）</option>`);
+    }
+    const roleOptions = options.join('');
+    return `<tr>
+      <td>
+        ${u.display_name
+          ? `<div>${esc(u.display_name)}</div><div class="muted mono">${esc(u.user_id)}</div>`
+          : `<div class="mono">${esc(u.user_id)}</div>`}
+      </td>
+      <td>${(u.tenants || []).map((t) => `<span class="tag">${esc(t)}</span>`).join('') || '<span class="muted">—</span>'}</td>
+      <td>${(u.platforms || []).map((p) => `<span class="tag">${esc(p)}</span>`).join('') || '<span class="muted">—</span>'}</td>
+      <td><select data-role="${esc(u.user_id)}">${roleOptions}</select></td>
+      <td><span class="pill ${active ? 'on' : 'off'}">${active ? '正常' : '已停用'}</span></td>
+      <td>${when(u.last_active_at)}${u.last_active_source === 'login'
+        ? ' <span class="muted" title="只登录过，没开过会话">登录</span>' : ''}</td>
+      <td class="num">${num(u.sessions)}</td>
+      <td class="num">${num(u.messages)}</td>
+      <td class="num">${num(u.tasks)}${u.failed_tasks ? `<span class="muted"> / ${num(u.failed_tasks)}</span>` : ''}</td>
+      <td class="num">${compact(u.input_tokens + u.output_tokens)}</td>
+      <td class="num">${money(u.charged_micros)}</td>
+      <td>
+        <button class="btn" data-detail="${esc(u.user_id)}">详情</button>
+        <button class="btn ${active ? 'danger' : ''}" data-status="${esc(u.user_id)}"
+          data-next="${active ? 'disabled' : 'active'}">${active ? '停用' : '启用'}</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  $('userTable').innerHTML = `<table class="wide">
+    <thead><tr>
+      <th>用户</th><th>租户</th><th>子平台</th><th>角色</th><th>状态</th><th>最近活跃</th>
+      <th class="num">会话</th><th class="num">消息</th><th class="num">任务</th>
+      <th class="num">Token</th><th class="num">花费</th><th></th>
+    </tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+
+  $('userTable').querySelectorAll('[data-detail]').forEach((btn) => {
+    btn.addEventListener('click', () => openDetail(btn.dataset.detail));
+  });
+  $('userTable').querySelectorAll('[data-status]').forEach((btn) => {
+    btn.addEventListener('click', () => changeStatus(btn.dataset.status, btn.dataset.next));
+  });
+  $('userTable').querySelectorAll('[data-role]').forEach((select) => {
+    select.addEventListener('change', () => changeRole(select.dataset.role, select.value, select));
+  });
+}
+
+async function changeRole(userId, role, select) {
+  const previous = (state.users.find((u) => u.user_id === userId) || {}).role || 'member';
+  if (!confirm(`把 ${userId} 的角色改成 ${role}？\n\n角色每次请求现读，立即生效。`)) {
+    select.value = previous;
+    return;
+  }
+  try {
+    const result = await api(`/api/console/users/${encodeURIComponent(userId)}/role`, {
+      method: 'PATCH',
+      body: JSON.stringify({ role, reason: '控制台手动调整' }),
+    });
+    toast(`已设为 ${result.role}（影响 ${result.updated} 条身份）`);
+    await loadUsers();
+  } catch (error) {
+    select.value = previous;
+    toast(error.message);
+  }
+}
+
+async function changeStatus(userId, next) {
+  if (!confirm(`确定要${next === 'disabled' ? '停用' : '启用'} ${userId}？` +
+    (next === 'disabled' ? '\n\n停用会立即撤销对方所有登录会话。' : ''))) return;
+  try {
+    const result = await api(`/api/console/users/${encodeURIComponent(userId)}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status: next }),
+    });
+    toast(next === 'disabled'
+      ? `已停用，撤销 ${result.revoked_sessions} 个会话`
+      : '已启用');
+    await loadUsers();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function openDetail(userId) {
+  $('drawerTitle').textContent = userId;
+  $('drawerBody').innerHTML = '<div class="empty">载入中…</div>';
+  $('mask').classList.add('open');
+  $('drawer').classList.add('open');
+  $('drawer').setAttribute('aria-hidden', 'false');
+  let data;
+  try {
+    data = await api('/api/console/users/' + encodeURIComponent(userId) + '?days=14');
+  } catch (error) {
+    $('drawerBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+    return;
+  }
+  const user = data.user || {};
+  const identities = (data.identities || []).map((i) => `<tr>
+      <td><span class="tag">${esc(i.identity_provider_id || i.provider || '—')}</span></td>
+      <td><code>${esc(i.tenant_id)}</code></td>
+      <td><span class="role ${esc(i.role)}">${esc(i.role)}</span></td>
+      <td class="muted mono">${esc((i.subject || '').slice(0, 16))}</td>
+      <td>${when(i.last_seen_at)}</td>
+    </tr>`).join('');
+  const tasks = (data.tasks || []).map((t) => `<tr>
+      <td class="mono">${esc((t.task_id || '').slice(0, 14))}</td>
+      <td>${esc(t.status)}</td>
+      <td class="muted">${esc((t.message || '').slice(0, 40))}</td>
+      <td>${when(t.created_at)}</td>
+    </tr>`).join('');
+  const activity = data.activity || [];
+  const audit = (data.audit || []).map((e) => `<tr>
+      <td class="muted">${when(e.created_at)}</td>
+      <td>${esc(auditLabel[e.type] || e.type || '未知')}</td>
+      <td class="mono">${esc(e.operator_id || '—')}</td>
+      <td class="muted">${esc(auditDetail(e))}</td>
+    </tr>`).join('');
+  const msgTotal = activity.reduce((acc, row) => acc + Number(row.messages || 0), 0);
+  const taskTotal = activity.reduce((acc, row) => acc + Number(row.tasks || 0), 0);
+
+  $('drawerBody').innerHTML = `
+    <dl class="kv">
+      <dt>昵称</dt><dd>${esc(user.display_name || '—')}</dd>
+      <dt>邮箱</dt><dd>${esc(user.email || '—')}</dd>
+      <dt>状态</dt><dd>${user.status === 'active' ? '正常' : '已停用'}</dd>
+      <dt>创建时间</dt><dd>${esc(shortTime(user.created_at))}</dd>
+      <dt>在线登录</dt><dd>${num(data.active_logins)} 个未撤销会话</dd>
+      <dt>最近登录</dt><dd>${data.last_login_at ? esc(shortTime(data.last_login_at)) : '—'}</dd>
+      <dt>会话数</dt><dd>${num((data.sessions || []).length)}（最近 20 条）</dd>
+    </dl>
+    <div class="sub">活跃度 · 近 14 天 ${num(msgTotal)} 条消息 / ${num(taskTotal)} 个任务</div>
+    <div class="detail-chart">${barChart(activity, 'messages', '#378add',
+      { width: Math.max(280, Math.min(470, window.innerWidth - 72)), height: 112 })}</div>
+    <div class="sub">身份绑定（子平台）</div>
+    ${identities ? `<table><thead><tr><th>子平台</th><th>租户</th><th>角色</th>
+        <th>外部标识</th><th>最近登录</th></tr></thead><tbody>${identities}</tbody></table>`
+      : '<div class="empty">没有绑定身份</div>'}
+    <div class="sub">最近任务</div>
+    ${tasks ? `<table><thead><tr><th>任务</th><th>状态</th><th>内容</th><th>时间</th></tr></thead>
+      <tbody>${tasks}</tbody></table>` : '<div class="empty">还没有任务</div>'}
+    <div class="sub">管理动作（针对此人）</div>
+    ${audit ? `<table><thead><tr><th>时间</th><th>动作</th><th>操作人</th><th>内容</th></tr></thead>
+      <tbody>${audit}</tbody></table>` : '<div class="empty">还没有针对此人的管理动作</div>'}
+    ${state.scope === 'all' ? `<div class="sub">危险操作</div>
+    <div class="danger-zone">
+      <div>
+        <div>删除账号</div>
+        <div class="muted">撤销登录、解绑所有子平台身份、删除账号本身。
+          历史会话与消息会保留，但不再归属到任何人。</div>
+      </div>
+      <button class="btn danger" id="deleteUser">删除账号</button>
+    </div>` : ''}
+  `;
+
+  const del = $('deleteUser');
+  if (del) del.addEventListener('click', () => deleteUser(userId, user.display_name));
+}
+
+async function deleteUser(userId, displayName) {
+  // 用输入 user_id 代替"确定/取消"：删账号不可撤销，而表格里相邻行长得很像，
+  // 一个手滑的 confirm() 点下去就是永久错误。
+  const typed = prompt(
+    '删除后不可恢复。会清除：账号本身、所有登录会话、在所有子平台的身份绑定。\n'
+    + '历史会话与消息会保留，但不再归属到任何人，也不会计入活跃统计。\n\n'
+    + `确认删除 ${displayName ? displayName + '（' + userId + '）' : userId} 吗？\n`
+    + '请输入完整 user_id 继续：');
+  if (typed === null) return;
+  if (typed.trim() !== userId) {
+    toast('输入与 user_id 不一致，已取消');
+    return;
+  }
+  try {
+    const result = await api('/api/console/users/' + encodeURIComponent(userId), {
+      method: 'DELETE',
+      body: JSON.stringify({ confirm: userId, reason: '控制台手动删除' }),
+    });
+    closeDrawer();
+    toast(`已删除，撤销 ${result.revoked_sessions} 个会话`);
+    await loadUsers();
+    await loadOverview();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function closeDrawer() {
+  $('mask').classList.remove('open');
+  $('drawer').classList.remove('open');
+  $('drawer').setAttribute('aria-hidden', 'true');
+}
+
+/* ---------- 连接器与技能 ---------- */
+
+async function loadConnect() {
+  let conns, policies;
+  try {
+    [conns, policies] = await Promise.all([
+      api('/api/console/connectors'),
+      api('/api/console/policies'),
+    ]);
+  } catch (error) {
+    $('connectorBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+    $('policyBody').innerHTML = '';
+    return;
+  }
+
+  const tenants = conns.tenants || [];
+  $('connectorBody').innerHTML = tenants.length ? tenants.map((group) => `
+    <div class="sub">${esc(group.tenant_id)}</div>
+    <table>
+      <thead><tr><th>连接器</th><th>传输</th><th>开关</th><th>凭据</th><th class="num">版本</th></tr></thead>
+      <tbody>${group.bindings.map((b) => `<tr>
+        <td><code>${esc(b.server_id)}</code></td>
+        <td class="muted">${esc(b.transport)}</td>
+        <td><span class="pill ${b.enabled ? 'on' : 'off'}">${b.enabled ? '已连接' : '已断开'}</span></td>
+        <td>${b.credentialed ? '<span class="pill on">已配置</span>' : '<span class="muted">未配置</span>'}</td>
+        <td class="num">${num(b.revision)}</td>
+      </tr>`).join('')}</tbody>
+    </table>`).join('') : '<div class="empty">还没有服务端绑定</div>';
+
+  const policyGroups = policies.tenants || [];
+  $('policyBody').innerHTML = policyGroups.length ? policyGroups.map((group) => `
+    <div class="sub">${esc(group.tenant_id)}</div>
+    <table>
+      <thead><tr><th>工具</th><th>作用域</th><th>效果</th><th>批准方式</th><th>开关</th><th></th></tr></thead>
+      <tbody>${group.policies.map((p) => `<tr>
+        <td><code>${esc(p.tool_key || '（未限定）')}</code></td>
+        <td class="muted">${esc([p.role, p.user_id].filter(Boolean).join(' / ') || '全租户')}</td>
+        <td>${esc(p.effect)}</td>
+        <td class="muted">${esc(p.approval_mode)}</td>
+        <td><span class="pill ${p.enabled ? 'on' : 'off'}">${p.enabled ? '生效' : '暂停'}</span></td>
+        <td><button class="btn" data-policy="${esc(p.policy_id)}"
+          data-next="${p.enabled ? 'false' : 'true'}">${p.enabled ? '暂停' : '恢复'}</button></td>
+      </tr>`).join('')}</tbody>
+    </table>`).join('') : '<div class="empty">还没有工具政策记录</div>';
+
+  $('policyBody').querySelectorAll('[data-policy]').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      try {
+        await api('/api/console/policies/' + encodeURIComponent(btn.dataset.policy),
+          { method: 'PATCH', body: JSON.stringify({ enabled: btn.dataset.next === 'true' }) });
+        toast('已更新');
+        loadConnect();
+      } catch (error) {
+        toast(error.message);
+      }
+    });
+  });
+}
+
+/* ---------- 登录平台 ---------- */
+
+const DEFAULT_PLATFORM_CONFIG = {
+  login_path: '/auth/login',
+  username_field: 'username',
+  password_field: 'password',
+  subject_path: 'data.user.id',
+  display_name_path: 'data.user.username',
+  status_path: 'data.user.status',
+  role_path: 'data.user.role',
+  timeout_seconds: 10,
+};
+
+async function loadPlatforms() {
+  let data;
+  try {
+    data = await api('/api/console/platforms');
+  } catch (error) {
+    $('platformBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+    return;
+  }
+  const items = data.platforms || [];
+  state.platforms = items;
+  $('platformHint').textContent = items.length
+    ? `共 ${items.length} 个，其中 ${items.filter((p) => p.enabled).length} 个启用`
+    : '还没有登记任何平台';
+  if (!items.length) {
+    $('platformBody').innerHTML =
+      '<div class="empty">还没有平台。登录入口现在靠环境变量（BEEFTV_API_BASE）撑着，'
+      + '新增一个平台就可以把它废掉</div>';
+    return;
+  }
+  $('platformBody').innerHTML = `<table class="wide">
+    <thead><tr><th>平台</th><th>方式</th><th>接口地址</th><th>租户 / 身份源</th>
+      <th class="num">已绑定账号</th><th>最近登录</th><th>状态</th><th></th></tr></thead>
+    <tbody>${items.map((p) => `<tr>
+      <td>
+        <div>${esc(p.display_name || p.platform_id)}
+          ${p.is_default ? '<span class="tag">默认</span>' : ''}</div>
+        <div class="muted mono" style="font-size:11.5px">${esc(p.platform_id)}</div>
+      </td>
+      <td><span class="tag">${esc(p.login_mode === 'password_http' ? '账号密码' : p.login_mode)}</span></td>
+      <td class="mono muted" style="font-size:12px">${esc(p.base_url || '—')}</td>
+      <td><code>${esc(p.tenant_id)}</code>
+        <div class="muted mono" style="font-size:11.5px">${esc(p.identity_provider_id)}</div></td>
+      <td class="num">${num(p.accounts)}</td>
+      <td>${when(p.last_login_at)}</td>
+      <td><span class="pill ${p.enabled ? 'on' : 'off'}">${p.enabled ? '启用' : '已停用'}</span></td>
+      <td>
+        <button class="btn" data-edit="${esc(p.platform_id)}">编辑</button>
+        <button class="btn" data-toggle="${esc(p.platform_id)}"
+          data-next="${p.enabled ? '0' : '1'}">${p.enabled ? '停用' : '启用'}</button>
+      </td>
+    </tr>`).join('')}</tbody></table>`;
+
+  $('platformBody').querySelectorAll('[data-edit]').forEach((btn) => {
+    btn.addEventListener('click', () => openPlatformForm(btn.dataset.edit));
+  });
+  $('platformBody').querySelectorAll('[data-toggle]').forEach((btn) => {
+    btn.addEventListener('click', () => togglePlatform(btn.dataset.toggle,
+      btn.dataset.next === '1', btn));
+  });
+}
+
+function openPlatformForm(platformId) {
+  const existing = platformId
+    ? (state.platforms || []).find((p) => p.platform_id === platformId)
+    : null;
+  const config = Object.assign({}, DEFAULT_PLATFORM_CONFIG, (existing && existing.config) || {});
+  const isNew = !existing;
+
+  $('drawerTitle').textContent = isNew ? '新增登录平台' : '编辑平台 · ' + platformId;
+  $('mask').classList.add('open');
+  $('drawer').classList.add('open');
+  $('drawer').setAttribute('aria-hidden', 'false');
+
+  const field = (id, label, value, note, span2, type) => `
+    <div class="field${span2 ? ' span2' : ''}">
+      <label for="${id}">${label}</label>
+      <input type="${type || 'text'}" id="${id}" value="${esc(value || '')}">
+      ${note ? `<div class="note">${note}</div>` : ''}
+    </div>`;
+
+  $('drawerBody').innerHTML = `
+    <div class="form-grid">
+      ${field('pfId', '平台标识', existing ? existing.platform_id : '',
+        isNew ? '小写字母开头，用于审计与身份记录，建好后不能改' : '建好后不能改', false, 'text')}
+      ${field('pfName', '显示名', existing && existing.display_name,
+        '登录页上给人看的名字')}
+      ${field('pfBase', '平台接口根地址', existing && existing.base_url,
+        '例如 http://127.0.0.1:8004/api —— 中台会在这里拼登录路径', true, 'url')}
+      ${field('pfTenant', '租户', (existing && existing.tenant_id) || 'default',
+        '首次从这个平台登录的人落在哪个租户')}
+      ${field('pfIdp', '身份源', existing && existing.identity_provider_id,
+        '两个平台填同一个值 = 共用账号；留空则等于平台标识')}
+      ${field('pfNote', '备注', existing && existing.note, '', true)}
+    </div>
+    <div class="field inline">
+      <input type="checkbox" id="pfDefault" ${existing && existing.is_default ? 'checked' : ''}>
+      <label for="pfDefault">设为默认平台${isNew ? '（第一个平台自动成为默认）' : ''}</label>
+    </div>
+
+    <details class="advanced">
+      <summary>字段映射（平台返回的结构和 beeftv 不一样时才需要改）</summary>
+      <div class="form-grid">
+        ${field('cfLoginPath', '登录路径', config.login_path, '拼在根地址后面')}
+        ${field('cfTimeout', '超时（秒）', config.timeout_seconds, '1-30')}
+        ${field('cfUserField', '请求里的账号字段', config.username_field)}
+        ${field('cfPassField', '请求里的密码字段', config.password_field)}
+        ${field('cfSubject', '用户标识取值路径', config.subject_path, '点路径，如 data.user.id')}
+        ${field('cfName', '昵称取值路径', config.display_name_path)}
+        ${field('cfStatus', '状态取值路径', config.status_path, '取到的值不是 active 就拒绝登录')}
+        ${field('cfRole', '角色取值路径', config.role_path, 'admin/owner/operator → operator，其余 member')}
+      </div>
+    </details>
+
+    <div class="form-actions">
+      <button class="btn primary" id="pfSave">${isNew ? '创建' : '保存'}</button>
+      <button class="btn" id="pfTest">用账号密码试一次</button>
+      <span class="muted" id="pfState"></span>
+    </div>
+    <div class="form-grid" id="pfTestBox" hidden>
+      ${field('pfTestUser', '测试账号', '', '只用于这次校验，不落库、不建账号')}
+      ${field('pfTestPass', '测试密码', '', '', false, 'password')}
+    </div>
+    <div id="pfTestResult"></div>
+
+    ${isNew ? '' : `
+    <div class="sub" style="margin-top:22px">危险操作</div>
+    <div class="danger-zone">
+      <div>
+        <div>删除这个平台</div>
+        <div class="muted">删掉后这个入口就登不进来了。已经建立的账号和历史会话都还在，
+          只是不能再从这里登录。</div>
+      </div>
+      <button class="btn danger" id="pfDelete">删除</button>
+    </div>`}
+  `;
+
+  if (!isNew) {
+    // 标识是审计与 identities 里的历史值，改它等于把过去和现在切开
+    $('pfId').readOnly = true;
+    $('pfId').style.background = '#f2f0eb';
+  }
+  $('pfSave').addEventListener('click', () => savePlatform(existing, isNew));
+  $('pfTest').addEventListener('click', () => {
+    const box = $('pfTestBox');
+    box.hidden = !box.hidden;
+    if (!box.hidden) $('pfTestUser').focus();
+  });
+  $('pfTestUser').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') runPlatformTest(existing, isNew);
+  });
+  $('pfTestPass').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') runPlatformTest(existing, isNew);
+  });
+  if (!isNew) $('pfDelete').addEventListener('click', () => deletePlatform(existing));
+  if (isNew) $('pfId').focus();
+}
+
+function platformFormValues() {
+  return {
+    platform_id: $('pfId').value.trim(),
+    display_name: $('pfName').value.trim(),
+    base_url: $('pfBase').value.trim(),
+    tenant_id: $('pfTenant').value.trim() || 'default',
+    identity_provider_id: $('pfIdp').value.trim(),
+    note: $('pfNote').value.trim(),
+    is_default: $('pfDefault').checked,
+    config: {
+      login_path: $('cfLoginPath').value.trim(),
+      timeout_seconds: Number($('cfTimeout').value || 10),
+      username_field: $('cfUserField').value.trim(),
+      password_field: $('cfPassField').value.trim(),
+      subject_path: $('cfSubject').value.trim(),
+      display_name_path: $('cfName').value.trim(),
+      status_path: $('cfStatus').value.trim(),
+      role_path: $('cfRole').value.trim(),
+    },
+  };
+}
+
+async function savePlatform(existing, isNew) {
+  const values = platformFormValues();
+  const button = $('pfSave');
+  button.disabled = true;
+  $('pfState').textContent = '保存中…';
+  try {
+    if (isNew) {
+      await api('/api/console/platforms', { method: 'POST', body: JSON.stringify(values) });
+      toast('平台已创建');
+    } else {
+      const patch = Object.assign({}, values);
+      delete patch.platform_id;
+      await api('/api/console/platforms/' + encodeURIComponent(existing.platform_id),
+        { method: 'PATCH', body: JSON.stringify(patch) });
+      toast('已保存');
+    }
+    closeDrawer();
+    await loadPlatforms();
+  } catch (error) {
+    $('pfState').textContent = '';
+    $('pfTestResult').innerHTML =
+      `<div class="test-result bad">${esc(error.message)}</div>`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function runPlatformTest(existing, isNew) {
+  if (isNew) {
+    $('pfTestResult').innerHTML =
+      '<div class="test-result">先创建平台，再试登录。测试要读已保存的配置。</div>';
+    return;
+  }
+  const username = $('pfTestUser').value.trim();
+  const password = $('pfTestPass').value;
+  $('pfTestResult').innerHTML = '<div class="test-result">校验中…</div>';
+  try {
+    const result = await api(
+      '/api/console/platforms/' + encodeURIComponent(existing.platform_id) + '/test',
+      { method: 'POST', body: JSON.stringify({ username, password }) });
+    if (result.ok) {
+      $('pfTestResult').innerHTML = `<div class="test-result ok">
+        校验通过：<b>${esc(result.display_name)}</b>
+        （标识 ${esc(result.subject)}，角色 ${esc(result.role)}，
+        身份源 ${esc(result.identity_provider_id)}，${num(result.elapsed_ms)}ms）</div>`;
+    } else {
+      $('pfTestResult').innerHTML = `<div class="test-result bad">
+        校验失败：${esc(result.detail)}（${num(result.elapsed_ms)}ms）</div>`;
+    }
+  } catch (error) {
+    $('pfTestResult').innerHTML = `<div class="test-result bad">${esc(error.message)}</div>`;
+  }
+}
+
+async function togglePlatform(platformId, enabled, button) {
+  button.disabled = true;
+  try {
+    await api('/api/console/platforms/' + encodeURIComponent(platformId),
+      { method: 'PATCH', body: JSON.stringify({ enabled }) });
+    toast(enabled ? '已启用' : '已停用');
+    await loadPlatforms();
+  } catch (error) {
+    toast(error.message);
+    button.disabled = false;
+  }
+}
+
+async function deletePlatform(existing) {
+  const typed = window.prompt(
+    `删除「${existing.display_name || existing.platform_id}」不可撤销。\n`
+    + `输入平台标识 ${existing.platform_id} 确认：`);
+  if (typed === null) return;
+  if (typed.trim() !== existing.platform_id) {
+    toast('输入不一致，已取消');
+    return;
+  }
+  try {
+    await api('/api/console/platforms/' + encodeURIComponent(existing.platform_id),
+      { method: 'DELETE' });
+    toast('已删除');
+    closeDrawer();
+    await loadPlatforms();
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+/* ---------- 审计 ---------- */
+
+async function loadAudit() {
+  let data;
+  try {
+    data = await api('/api/console/audit?limit=200');
+  } catch (error) {
+    $('auditHint').textContent = '';
+    $('auditBody').innerHTML = `<div class="empty">${esc(error.message)}</div>`;
+    return;
+  }
+  const events = data.events || [];
+  $('auditHint').textContent = '最近 ' + events.length + ' 条';
+  if (!events.length) {
+    $('auditBody').innerHTML = '<div class="empty">还没有管理动作记录</div>';
+    return;
+  }
+  const label = auditLabel;
+  $('auditBody').innerHTML = `<table>
+    <thead><tr><th>时间</th><th>动作</th><th>操作人</th><th>对象</th><th>内容</th></tr></thead>
+    <tbody>${events.map((e) => {
+      const target = e.user_id || e.policy_id || e.tool_key || e.platform_id || '';
+      return `<tr>
+        <td class="muted" title="${esc(shortTime(e.created_at))}">${when(e.created_at)}</td>
+        <td>${esc(label[e.type] || e.type || '未知')}</td>
+        <td class="mono">${esc(e.operator_id || '—')}</td>
+        <td class="mono">${esc(target)}</td>
+        <td class="muted">${esc(auditDetail(e))}</td>
+      </tr>`;
+    }).join('')}</tbody></table>`;
+}
+
+/* ---------- 启动 ---------- */
+
+// 没登录和没权限是两件事：前者要引导去登录，后者要说明怎么授权。
+// 混在一起一律显示"角色不足"，明明只是 cookie 过期，用户却会去翻权限配置。
+function showDenied(message) {
+  $('denied').hidden = false;
+  document.querySelectorAll('main > section').forEach((s) => { s.hidden = true; });
+  $('deniedDetail').textContent = message || '';
+  $('deniedActions').hidden = true;
+  $('switchForm').hidden = true;
+  $('switchErr').textContent = '';
+}
+
+function showLogin(message) {
+  showDenied(message);
+  $('deniedTitle').textContent = '需要登录';
+  $('deniedBody').innerHTML =
+    '<p>控制台依赖中台登录会话，当前这个浏览器上没有有效会话。</p>'
+    + '<p>用平台账号在下面登录，登录成功会直接回到控制台。</p>';
+  // "未登录"和标题重复，没必要再显示一遍；"登录已过期""账号已停用"这类要留着。
+  $('deniedDetail').textContent = message && message !== '未登录' ? message : '';
+  showSwitchForm();
+}
+
+// 已登录但角色不够：直接在这里换人。
+// 以前是跳去首页再切账号，但整站共用一份 agent_session，跳过去往往还带着旧账号，
+// 又没人强制弹登录框，人就卡在门外了——所以改成控制台自带登录框。
+let authPlatforms = [];
+let authFormReady = null;
+
+function loadAuthForm() {
+  if (!authFormReady) {
+    authFormReady = fetch('/api/auth/platform-login/status', {
+      credentials: 'same-origin', headers: { 'Accept': 'application/json' },
+    })
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => (data && data.enabled ? data : null))
+      .catch(() => null);
+  }
+  return authFormReady;
+}
+
+function showSwitchAction() {
+  $('deniedLogin').href = '/?next=%2Fadmin';
+  $('deniedLogin').textContent = '去主界面登录';
+  $('deniedHint').textContent = '登录后会自动回到这里';
+  $('deniedActions').hidden = false;
+}
+
+// 账号密码入口可用时就把登录框摆出来，不可用才退回"去主界面登录"的链接。
+async function showSwitchForm() {
+  const data = await loadAuthForm();
+  if (!data) { showSwitchAction(); return; }
+  authPlatforms = data.platforms || [];
+  const sel = $('switchPlatform');
+  if (authPlatforms.length > 1) {
+    sel.innerHTML = authPlatforms
+      .map((p) => `<option value="${esc(p.platform_id)}">${esc(p.display_name || p.platform_id)}</option>`)
+      .join('');
+    $('switchPlatformWrap').hidden = false;
+  } else {
+    $('switchPlatformWrap').hidden = true;
+  }
+  $('deniedActions').hidden = true;
+  $('switchForm').hidden = false;
+  $('switchUser').focus();
+}
+
+async function submitSwitch(event) {
+  event.preventDefault();
+  const btn = $('switchSubmit');
+  const err = $('switchErr');
+  const username = $('switchUser').value.trim();
+  const password = $('switchPass').value;
+  const platform = authPlatforms.length > 1 ? $('switchPlatform').value : '';
+  err.textContent = '';
+  if (!username || !password) { err.textContent = '账号和密码都要填'; return; }
+  btn.disabled = true;
+  btn.textContent = '登录中…';
+  try {
+    const res = await fetch('/api/auth/platform-login', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ username, password, platform: platform || undefined }),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      err.textContent = (payload && payload.detail) || ('登录失败（HTTP ' + res.status + '）');
+      return;
+    }
+    // 换上的不是超管：留在原地把原因说清，否则刷新后又被推回来，看起来像"登不进去"。
+    if (payload.role !== 'platform_admin' && payload.role !== 'operator') {
+      err.textContent = '已登录 ' + (payload.user_id || '') + '（角色 ' + (payload.role || 'unknown')
+        + '），这个账号进不了控制台，请换超管账号。';
+      return;
+    }
+    location.replace(location.pathname + (location.hash || ''));
+  } catch (error) {
+    err.textContent = '登录请求没发出去，检查服务是否还在跑';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '登录';
+  }
+}
+
+const TABS = ['overview', 'users', 'login', 'connect', 'audit'];
+
+function renderWho(me) {
+  state.me = me;
+  state.scope = me.scope;
+  state.role = me.role;
+  // 以前只按 scope 判，member 的 scope 是空的，也被贴成"本企业运维"，看着像有权限。
+  const badged = me.scope === 'all';
+  const operator = me.role === 'operator';
+  const label = badged ? '跨租户超管' : (operator ? '本企业运维' : '普通用户');
+  $('who').innerHTML = `
+    <span class="mono">${esc(me.user_id)}</span>
+    <span class="pill ${badged ? 'all' : (operator ? 'tenant' : 'off')}">${label}</span>
+    <span class="muted">租户 ${esc(me.tenant_id)}</span>`;
+}
+
+// 只在权限类错误时调用：把页头从"旧身份"刷成当前真实身份，
+// 顺便决定要不要把整页切成准入提示。直接用 fetch，避免和 api() 互相递归。
+async function refreshIdentity() {
+  let res;
+  try {
+    res = await fetch('/api/console/me', {
+      credentials: 'same-origin', headers: { 'Accept': 'application/json' },
+    });
+  } catch (e) {
+    return;
+  }
+  if (res.status === 401) { showLogin('登录已过期'); return; }
+  if (!res.ok) { return; }
+  let me;
+  try { me = await res.json(); } catch (e) { return; }
+  renderWho(me);
+  if (!me.allowed) {
+    showDenied('当前角色：' + me.role + '（' + me.user_id + '）');
+    showSwitchForm();
+  }
+}
+
+function selectTab(name, updateHash) {
+  state.tab = name;
+  document.querySelectorAll('#tabs button').forEach((btn) => {
+    btn.setAttribute('aria-selected', String(btn.dataset.tab === name));
+  });
+  document.querySelectorAll('main > section').forEach((section) => {
+    section.hidden = section.id !== 'tab-' + name;
+  });
+  // 地址栏跟着标签走：刷新不丢位置，也能把某个视图直接发给同事。
+  if (updateHash !== false && history.replaceState) {
+    history.replaceState(null, '', '#' + name);
+  }
+  if (name === 'overview') loadOverview();
+  if (name === 'users') loadUsers();
+  if (name === 'login') loadPlatforms();
+  if (name === 'connect') loadConnect();
+  if (name === 'audit') loadAudit();
+}
+
+async function boot() {
+  document.querySelectorAll('#tabs button').forEach((btn) => {
+    btn.addEventListener('click', () => selectTab(btn.dataset.tab));
+  });
+  $('userRefresh').addEventListener('click', loadUsers);
+  $('platformNew').addEventListener('click', () => openPlatformForm(''));
+  $('platformRefresh').addEventListener('click', loadPlatforms);
+  $('switchForm').addEventListener('submit', submitSwitch);
+  $('userQuery').addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') loadUsers();
+  });
+  $('userStatus').addEventListener('change', loadUsers);
+  $('userTenant').addEventListener('change', loadUsers);
+  $('mask').addEventListener('click', closeDrawer);
+  $('drawerClose').addEventListener('click', closeDrawer);
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeDrawer(); });
+
+  // 转屏/改窗口宽度后重画图表：viewBox 是按旧宽度生成的，不重画就会变形。
+  let resizeTimer = 0;
+  window.addEventListener('resize', () => {
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      if (state.tab === 'overview') loadOverview();
+    }, 250);
+  });
+
+  let me;
+  try {
+    me = await api('/api/console/me');
+  } catch (error) {
+    $('who').innerHTML = '<span class="pill off">未登录</span>';
+    // 401 = 没有会话或会话过期；其余按权限不足处理。
+    // （api() 里已经按状态码刷过一次页面状态，这里只补页头）
+    if (error.status === 401) {
+      showLogin(error.message);
+    } else {
+      showDenied(error.message);
+      showSwitchForm();
+    }
+    return;
+  }
+  renderWho(me);
+
+  if (!me.allowed) {
+    showDenied('当前角色：' + me.role + '（' + me.user_id + '）');
+    showSwitchForm();
+    return;
+  }
+  if (me.role === 'member' && me.auth_mode === 'off') {
+    toast('开发模式：认证已关闭，按超管放行');
+  }
+  // 先按默认视图拉一次概览，让租户下拉有选项；再切到地址栏指定的标签。
+  await loadOverview();
+  await loadUsers();
+  const initial = (location.hash || '').replace('#', '');
+  selectTab(TABS.indexOf(initial) >= 0 ? initial : 'overview');
+  // /admin?user=<id>：直接把某个人的详情抽屉打开，方便把链接发给同事定位问题。
+  const focus = new URLSearchParams(location.search).get('user');
+  if (focus) openDetail(focus);
+}
+
+boot();
+</script>
+</body>
+</html>

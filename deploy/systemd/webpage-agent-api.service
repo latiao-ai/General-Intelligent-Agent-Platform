@@ -1,0 +1,37 @@
+[Unit]
+Description=网页智能体中台 API（只接纳，不执行）
+Documentation=file:///opt/webpage-agent/docs/production-deployment.md
+# Worker 与 API 必须是**两个独立服务**：API 把消息写成 accepted 后立刻返 202，
+# 真正的模型调用由 webpage-agent-worker 领走执行。曾经把 Worker 挂在某个终端
+# 会话下启动，会话结束进程被回收，API 还活着，于是消息永久停在 accepted——
+# 客户看到的就是"发出去没回复"。任何一方挂掉都必须被拉起来。
+After=network-online.target postgresql.service
+Wants=network-online.target
+# 不限重启次数：客户在用的服务宁可多试几次，也不要停在 failed 等人发现。
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=agent
+Group=agent
+WorkingDirectory=/opt/webpage-agent
+EnvironmentFile=/etc/webpage-agent/production.env
+# 迁移只在这里跑：advisory lock 保证幂等，但没必要让每个服务都试一遍。
+# 生产要求 DB_AUTO_MIGRATE=false，所以这一步不能省。
+ExecStartPre=/opt/webpage-agent/.venv/bin/python -m scripts.migrate
+ExecStart=/opt/webpage-agent/.venv/bin/python -m scripts.serve_api --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+KillSignal=SIGTERM
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=read-only
+# 运行数据目录（ARTIFACT_DIR / PROFILE_PATH）必须可写，其余保持只读。
+ReadWritePaths=/var/lib/webpage-agent
+
+[Install]
+WantedBy=multi-user.target

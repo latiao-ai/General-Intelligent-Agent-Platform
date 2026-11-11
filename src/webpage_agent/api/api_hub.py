@@ -483,6 +483,8 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
             scope_token = sandbox.use_scope(record.tenant_id, record.owner_user_id)
             workspace_token = sandbox.use_workspace(stored)
             from webpage_agent.agent import connector_scope
+            from webpage_agent.addons import resolver as addons_resolver
+            from webpage_agent.addons import scope as addons_scope
             session_row = await self.store.session(record.session_id) or {}
             raw_connectors = session_row.get('connector_ids_json')
             if raw_connectors in (None, ''):
@@ -492,7 +494,28 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
                     selected_connectors = json.loads(raw_connectors)
                 except (TypeError, ValueError):
                     selected_connectors = []
+            # 会话级选择（专家 / 技能 / 连接器）：业务 run 与聊天走同一套解析层，
+            # 否则"定时任务/后台任务里没有专家人设、读不到技能"就会变成两套行为。
+            addons: dict = {}
+            try:
+                addons = await addons_resolver.resolve(
+                    self.store, session_id=record.session_id,
+                    tenant_id=record.tenant_id, owner_user_id=record.owner_user_id,
+                    workspace_dir=stored)
+                addons = {'model': addons.get('model') or '',
+                          'prompt_block': addons.get('prompt_block') or '',
+                          'connectors_decided': addons.get('connectors_decided'),
+                          'connector_ids': list(addons.get('connector_ids') or [])}
+            except Exception:                       # noqa: BLE001
+                logger.warning('解析会话 addon 失败（业务 run），按无 addon 继续 '
+                               'session=%s', record.session_id, exc_info=True)
+                addons = {}
+            if addons.get('connectors_decided'):
+                selected_connectors = list(addons.get('connector_ids') or [])
             connector_token = connector_scope.use(selected_connectors)
+            # 用 ContextVar 传 addons：`run_task` 的签名被大量测试替身固定过，
+            # 加关键字参数会让那些替身直接 TypeError（踩过）。
+            addon_token = addons_scope.use(addons)
             try:
                 return await run_task(
                     record.message, on_event=relay,
@@ -502,6 +525,7 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
                     resume_plan=plan_hint,
                 )
             finally:
+                addons_scope.reset(addon_token)
                 connector_scope.reset(connector_token)
                 sandbox.reset_workspace(workspace_token)
                 sandbox.reset_scope(scope_token)

@@ -295,6 +295,33 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_identities_scope
     ON identities(tenant_id, identity_provider_id, subject)
     WHERE identity_provider_id <> '';
 
+-- ---------- 登录平台：控制台可增删的"外部身份源入口"（api/platform_login.py） ----------
+-- 一行 = 一个可以被用来登录中台的平台。曾经这些只能写在环境变量里
+-- （BEEFTV_API_BASE），加一个平台要改配置重启，所以搬进库。
+--
+-- 两个字段容易混：
+-- - `platform_id` 是"从哪个平台登录进来"，只写进审计和会话，换掉不影响账号归属；
+-- - `identity_provider_id` 才是"身份属于谁"。同一 IdP 下的两个平台必须填同一个值，
+--   否则同一个人在两个入口会变成两个中台账号——identities 的唯一键就是它。
+CREATE TABLE IF NOT EXISTS auth_platforms (
+    platform_id  TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL DEFAULT '',
+    login_mode   TEXT NOT NULL DEFAULT 'password_http',
+    enabled      BOOLEAN NOT NULL DEFAULT true,
+    is_default   BOOLEAN NOT NULL DEFAULT false,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    identity_provider_id TEXT NOT NULL DEFAULT '',
+    base_url     TEXT NOT NULL DEFAULT '',
+    -- JSON：登录路径与响应取值路径。各平台形状不一样，写死列会变成一堆空字段。
+    config       TEXT NOT NULL DEFAULT '{}',
+    note         TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    created_by   TEXT NOT NULL DEFAULT '',
+    updated_by   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_auth_platforms_enabled ON auth_platforms(enabled);
+
 -- 票据兑换记录：(issuer, jti) 唯一 → 同一张票据在多实例并发下也只能成功一次
 CREATE TABLE IF NOT EXISTS ticket_redemptions (
     issuer      TEXT NOT NULL,
@@ -728,6 +755,122 @@ CREATE INDEX IF NOT EXISTS idx_session_turns_session
     ON session_turns(session_id, turn_seq);
 CREATE INDEX IF NOT EXISTS idx_session_turns_claim
     ON session_turns(status, lease_expires_at);
+
+-- ---------- 定时任务（docs/scheduled-tasks.md） ----------
+-- 两张表：`scheduled_tasks` 是"定义 + 下一次触发时间"（调度器的主索引），
+-- `scheduled_task_runs` 是每次触发的 occurrence 记录（含摘要与投递状态）。
+-- 到期时间用 **Unix 秒**（与 background_jobs.due_at 同口径），不是 TIMESTAMPTZ。
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    schedule_id        TEXT PRIMARY KEY,
+    tenant_id          TEXT NOT NULL DEFAULT 'default',
+    owner_user_id      TEXT NOT NULL DEFAULT 'default',
+    owner_role         TEXT NOT NULL DEFAULT 'member',
+    platform_id        TEXT NOT NULL DEFAULT '',
+    platform_subject   TEXT NOT NULL DEFAULT '',
+    name               TEXT NOT NULL,
+    prompt             TEXT NOT NULL,
+    enabled            BOOLEAN NOT NULL DEFAULT true,
+    schedule_type      TEXT NOT NULL DEFAULT 'recurring',
+    rrule              TEXT NOT NULL DEFAULT '',
+    scheduled_at       TEXT,
+    valid_from         TEXT,
+    valid_until        TEXT,
+    next_run_at        DOUBLE PRECISION,
+    next_attempt_at    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    last_run_at        DOUBLE PRECISION,
+    last_status        TEXT NOT NULL DEFAULT '',
+    last_error_code    TEXT NOT NULL DEFAULT '',
+    last_error_message TEXT NOT NULL DEFAULT '',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    deferred_count     INTEGER NOT NULL DEFAULT 0,
+    connector_ids_json TEXT NOT NULL DEFAULT '[]',
+    delivery_json      TEXT NOT NULL DEFAULT '{}',
+    lease_owner        TEXT NOT NULL DEFAULT '',
+    lease_expires_at   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    lease_epoch        BIGINT NOT NULL DEFAULT 0,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due
+    ON scheduled_tasks(enabled, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_owner
+    ON scheduled_tasks(tenant_id, owner_user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS scheduled_task_runs (
+    occurrence_id  TEXT PRIMARY KEY,
+    schedule_id    TEXT NOT NULL,
+    tenant_id      TEXT NOT NULL DEFAULT 'default',
+    owner_user_id  TEXT NOT NULL DEFAULT 'default',
+    due_at         DOUBLE PRECISION NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'queued',
+    task_id        TEXT NOT NULL DEFAULT '',
+    run_id         TEXT NOT NULL DEFAULT '',
+    session_id     TEXT NOT NULL DEFAULT '',
+    error_code     TEXT NOT NULL DEFAULT '',
+    error_message  TEXT NOT NULL DEFAULT '',
+    summary        TEXT NOT NULL DEFAULT '',
+    delivery_status TEXT NOT NULL DEFAULT '',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    started_at     DOUBLE PRECISION,
+    finished_at    DOUBLE PRECISION,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_task_runs_due
+    ON scheduled_task_runs(schedule_id, due_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_schedule
+    ON scheduled_task_runs(schedule_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_open
+    ON scheduled_task_runs(schedule_id) WHERE status IN ('queued','running');
+CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_session
+    ON scheduled_task_runs(session_id);
+
+-- 服务心跳：谁在干活，最后一次说话是什么时候。
+-- 为什么需要它：API 与 Worker 是两个进程，API 只能"接纳"，真正调模型的是
+-- Worker。过去没有任何证据能说明"Worker 还活着"，于是 Worker 挂掉之后 API
+-- 照样 202，消息永久停在 accepted，用户看到的就是"发出去没回复"。
+-- 有了这张表，接纳层才能当场拒绝、运维才知道该告警，而不是等客户投诉。
+-- beat_at / started_at 用 **Unix 秒**，与 runs.lease_expires_at 同口径。
+CREATE TABLE IF NOT EXISTS service_heartbeats (
+    service     TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    beat_at     DOUBLE PRECISION NOT NULL,
+    started_at  DOUBLE PRECISION NOT NULL,
+    host        TEXT NOT NULL DEFAULT '',
+    pid         BIGINT NOT NULL DEFAULT 0,
+    meta_json   TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (service, instance_id)
+);
+CREATE INDEX IF NOT EXISTS idx_service_heartbeats_beat
+    ON service_heartbeats(service, beat_at);
+
+-- ---------- 专家 · 技能 · 连接器（docs/addons.md） ----------
+-- 会话级的资源选择：对应 WorkBuddy 的 `sessions.addon_selection`。
+-- `{}` 表示"没选任何东西"（沿用旧行为），不是"选了空"——两者的区别由
+-- `addons/resolver.py` 解释：缺键 = 没选，显式 [] = 明确不要。
+-- 技能只落磁盘（`SKILLS_DIR`），这里没有技能表：磁盘是唯一事实来源。
+ALTER TABLE sessions
+    ADD COLUMN IF NOT EXISTS addon_selection TEXT NOT NULL DEFAULT '{}';
+-- 自定义专家：内置专家是代码目录（addons/catalog.py），不进库。
+CREATE TABLE IF NOT EXISTS experts (
+    expert_id          TEXT PRIMARY KEY,
+    tenant_id          TEXT NOT NULL DEFAULT 'default',
+    owner_user_id      TEXT NOT NULL DEFAULT 'default',
+    name               TEXT NOT NULL,
+    description        TEXT NOT NULL DEFAULT '',
+    system_prompt      TEXT NOT NULL DEFAULT '',
+    skill_ids_json     TEXT NOT NULL DEFAULT '[]',
+    connector_ids_json TEXT NOT NULL DEFAULT '[]',
+    model              TEXT NOT NULL DEFAULT '',
+    icon               TEXT NOT NULL DEFAULT '🧩',
+    color              TEXT NOT NULL DEFAULT '#eef4ff',
+    tag                TEXT NOT NULL DEFAULT '自定义',
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_experts_owner
+    ON experts(tenant_id, owner_user_id, created_at);
+
 """
 # 时间单位约定：
 # `background_jobs.due_at` / `lease_expires_at` 与 `external_tasks.*_at` 一律用

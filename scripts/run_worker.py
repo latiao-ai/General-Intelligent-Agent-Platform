@@ -15,9 +15,12 @@ lease_epoch）保证"同一运行只有一个有效执行者"。
 """
 import argparse
 import asyncio
+import contextlib
+import json
 import logging
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -132,6 +135,9 @@ async def drain_jobs(hub: Hub, worker_id: str, limit: int = 5) -> int:
                     await memory_module.compact(hub.store, session_id)
                 finally:
                     governance.unbind(token)
+            elif job['kind'] == 'schedule_delivery':
+                from webpage_agent.scheduler import delivery as scheduler_delivery
+                await scheduler_delivery.deliver_job(hub, job)
             else:
                 raise RuntimeError(f'未知后台作业 {job["kind"]}')
             await hub.store.finish_job(job['job_id'])
@@ -145,6 +151,33 @@ async def drain_jobs(hub: Hub, worker_id: str, limit: int = 5) -> int:
                            job['job_id'], attempts,
                            '稍后重试' if retry else '不再重试', exc_info=True)
     return done
+
+
+async def heartbeat_loop(hub: Hub, worker_id: str) -> None:
+    """定期写心跳：让 API 和监控看得见"执行器还活着"。
+
+    为什么必须有：API 只会把消息写成 `accepted` 然后返回 202，真正干活的
+    是本进程。没有心跳时，本进程挂掉对 API 完全不可见——客户看到的是
+    "发出去没回复"，运维看到的是"服务正常"。心跳把这种"假活"变成可检测
+    的事实：超过 `worker_alive_window_seconds` 没有心跳即视为离线，
+    接纳层据此拒收，监控据此告警。
+
+    心跳写失败不退出主循环：数据库短暂抖动时，执行比心跳重要。
+    """
+    host = os.uname().nodename
+    pid = os.getpid()
+    meta = json.dumps({'jobs_only': False,
+                       'interval': settings.worker_heartbeat_seconds},
+                      ensure_ascii=False)
+    while True:
+        try:
+            await hub.store.beat('worker', worker_id, host=host, pid=pid,
+                                 meta=meta)
+        except asyncio.CancelledError:
+            raise
+        except Exception:                          # noqa: BLE001
+            logger.warning('心跳写入失败（不影响执行）', exc_info=True)
+        await asyncio.sleep(settings.worker_heartbeat_seconds)
 
 
 async def drain_chat_turns(hub: Hub, worker_id: str, limit: int) -> list[asyncio.Task]:
@@ -239,6 +272,9 @@ async def main_loop(hub: Hub, worker_id: str, once: bool,
     # 聊天数 < session_chat_concurrency 才继续领，否则本轮跳过（定点修复 1）。
     inflight: set[asyncio.Task] = set()
     chat_inflight: set[asyncio.Task] = set()
+    # 定时任务的下一次 tick（单调时钟）。**不要**用 `await asyncio.sleep(30)`：
+    # 这个主循环同时负责领取业务 run，睡 30s 会一起拖慢。
+    next_schedule_tick = time.monotonic()
 
     while True:
         # 1. 后台作业（session_summary 等，快速领取执行）
@@ -252,6 +288,18 @@ async def main_loop(hub: Hub, worker_id: str, once: bool,
                     hub.store, worker_id=worker_id)
             except Exception:                      # noqa: BLE001
                 logger.exception('外部任务轮询失败')
+
+        # 2b. 定时任务：到点才跑（认领 → 派发 → 收敛），单次失败不影响主循环。
+        if settings.scheduled_tasks_enabled and time.monotonic() >= next_schedule_tick:
+            next_schedule_tick = time.monotonic() + settings.scheduler_tick_seconds
+            try:
+                from webpage_agent.scheduler import tick as scheduler_tick
+                stats = await scheduler_tick.tick(hub, worker_id)
+                if any(stats.values()):
+                    logger.info('定时任务 tick：%s', stats)
+                    worked += 1
+            except Exception:                      # noqa: BLE001
+                logger.exception('定时任务 tick 失败')
 
         # 3. 聊天 turn 与业务 run：各自领取 + 派发，不等待完成
         if not jobs_only:
@@ -304,9 +352,31 @@ async def run_worker(worker_id: str, once: bool, jobs_only: bool,
     也没做成），退出码还可能是非零。
     """
     hub = Hub(owner_id=worker_id)
+    background: list[asyncio.Task] = []
     try:
+        ready = getattr(hub.store, 'ready', None)
+        if callable(ready):
+            await ready()          # 连不上库就在启动阶段失败
+        # 心跳 + 看门狗：
+        # - 心跳让 API 与监控看得见"执行器还在"（--once 是一次性排障模式，
+        #   不写心跳，避免短暂冒充"有人值守"）；
+        # - 看门狗在只部署了 Worker、没有 API 的拓扑下也能兜住卡住的 turn，
+        #   多副本并发由 advisory lock 拦住。
+        from webpage_agent.core.config import settings as _settings
+        from webpage_agent.observe import watchdog
+        if not once:
+            background.append(asyncio.create_task(
+                heartbeat_loop(hub, worker_id), name='heartbeat'))
+        if _settings.turn_watchdog_enabled:
+            background.append(asyncio.create_task(
+                watchdog.loop(hub.store), name='watchdog'))
         await main_loop(hub, worker_id, once, jobs_only, interval)
     finally:
+        for task in background:
+            task.cancel()
+        for task in background:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         from webpage_agent.integrations.mcp_adapter import close_stdio_sessions
         await close_stdio_sessions()
         await hub.store.close()

@@ -51,12 +51,18 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
     on_event(event)                  节点内部的细粒度事件（搜索了什么、命中多少），可以是协程
     history                          多轮对话历史，供解析阶段还原指代型追加要求
     on_start(task_id)                任务创建后立刻回调（可以是协程），便于外部记录任务 ID
+
+    会话级选择（专家人设 / 技能索引 / 模型）不在这里收参数，而是从
+    `addons.scope` 的 ContextVar 取：`run_task` 的签名被大量测试替身按关键字
+    固定过，加参数会让它们全部 TypeError。调用方见 `api_hub.execute_round`。
     """
     check_runtime_keys()
     if not text.strip():
         raise ValueError('请输入主题或 URL')
     if len(text) > 10000:
         raise ValueError('首版输入限制为 10000 字符')
+    from webpage_agent.addons import scope as addons_scope
+    addon_state = addons_scope.current()
     task_id = uuid.uuid4().hex
     if tenant_id == 'default' and owner_user_id == 'default':
         tenant_id, owner_user_id = sandbox.current_scope()
@@ -64,7 +70,8 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         workspace_dir = sandbox.current_workspace()
     scope_token = sandbox.use_scope(tenant_id, owner_user_id)
     model_token = model_choice.bind(
-        owner_user_id, getattr(settings, 'llm_model', '') or '')
+        owner_user_id,
+        str(addon_state.get('model') or '') or getattr(settings, 'llm_model', '') or '')
     folder = sandbox.task_dir(task_id, tenant_id, owner_user_id)
     folder.mkdir(parents=True, exist_ok=True)
     if workspace_dir and sandbox.stored_path_ok(
@@ -112,6 +119,9 @@ async def run_task(text: str, progress=None, on_event=None, history=None,
         'artifact_dir': str(folder),
         'step_index': 0, 'status': 'created',
         'timings': [], 'history': list(history or []),
+        # 会话级选择里的专家人设 + 技能索引。PiRuntime 在发 start 时把它拼到
+        # 系统提示后面（`_compose_prompt`）；业务 run 与聊天因此共用一套选择。
+        'system_prompt_extra': str(addon_state.get('prompt_block') or ''),
         # 更早对话的压缩结果；context 装配时注入 system 与规划 payload
         'session_memory': dict(memory or {}),
         # 上一轮的产物与正文：让"部署到服务器""把上面内容整理成 HTML"这类

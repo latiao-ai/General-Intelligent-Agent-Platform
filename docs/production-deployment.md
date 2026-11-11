@@ -38,7 +38,7 @@ python -m scripts.run_worker
 
 ## 迁移与升级
 
-`python -m scripts.migrate` 使用数据库事务级 advisory lock 串行升级。第一版将既有幂等 DDL 作为基线应用一次，然后按顺序执行新的版本；DDL 与版本登记同事务提交，失败回滚。当前版本为 `v3_run_trace`，合计 38 张表。以后改表必须新增迁移，不能只修改基线。
+`python -m scripts.migrate` 使用数据库事务级 advisory lock 串行升级。第一版将既有幂等 DDL 作为基线应用一次，然后按顺序执行新的版本；DDL 与版本登记同事务提交，失败回滚。当前版本为 `v21_service_heartbeats`，合计 43 张表。以后改表必须新增迁移，不能只修改基线。
 
 开发模式默认自动迁移；生产 `DB_AUTO_MIGRATE=false`，API/Worker 启动仅检查版本，旧库拒绝启动并提示运行迁移命令。生产数据库应用账号仍需业务表的 DML 权限；条件允许时，迁移作业使用单独的 DDL 账号。升级前备份数据库和共享卷。迁移回滚不能自动撤回已发生的外部业务操作。
 
@@ -59,6 +59,33 @@ API 和 Worker 都使用 PostgreSQL 领取运行与租约 fencing。每个进程
 所有事件，包括 draft 与 answer_delta，先持久化后 NOTIFY；各副本按 seq 读取，通知失联时约 15 秒补读。跨进程结束事件会关闭 SSE；被动副本查询任务时重新读取数据库，不长期展示旧内存状态。客户端仍应在断线后携带 `Last-Event-ID` 或 `after`。逐条增量落库增加数据库写入量，实际容量需按自己的模型吞吐压测。
 
 多副本部署须将 `ARTIFACT_DIR` 和 `PROFILE_PATH` 指向各副本可见的共享存储，并保持相同绝对挂载路径（旧产物仍可能包含绝对引用）。当前没有 S3 后端，不应把各主机各自的本地目录当成共享存储。
+
+## 执行器可用性：消息不能"发出去没人回"
+
+聊天与查询都是**接纳与执行分离**的：`POST /api/sessions/{id}/messages` 只把用户消息与一条 `accepted` 的 turn 写进库并返 202，真正的模型调用由 Worker 领取执行。这个设计换来了解耦，也带来一个必须显式处理的风险：
+
+> Worker 进程不在了，API 依然 200、页面依然能打开、消息也确实进了库——但没有任何进程去领它。用户看到的是"发出去没回复"，运维看到的是"服务正常"。
+
+本项目已经真实发生过一次（Worker 随启动它的终端会话被回收，两条消息在库里躺了半小时）。现在有三道防线，任何一道单独都足以避免"永久静默"。
+
+**第一道：进程守护。** API 与 Worker 必须是两个受管服务，`Restart=always`。`deploy/systemd/` 下是可直接安装的单元与说明；容器部署等价物是 `restart: always` 加两个独立服务。不要把 Worker 挂在一个交互终端、`nohup` 或某个会话的子进程里——那正是上一次事故的成因。
+
+**第二道：接单门禁。** Worker 每 `WORKER_HEARTBEAT_SECONDS`（默认 5）写一行心跳到 `service_heartbeats`；超过 `WORKER_ALIVE_WINDOW_SECONDS`（默认 20）没有任何心跳即视为离线。此时 `REQUIRE_LIVE_WORKER`（生产默认 `true`）会让消息入口直接返回 **503 + `Retry-After`**，前端显示"提交失败：执行器暂时不可用…"并把原文退回输入框。宁可当场说清楚，也不收下一条没人执行的消息。
+
+**第三道：看门狗。** `observe/watchdog.py` 每 `TURN_WATCHDOG_INTERVAL_SECONDS`（默认 15）扫一轮，把两类 turn 结算成失败**并写入一条用户可见的答复**：
+
+- 接纳后一直没人领：无活 Worker 时容忍 `TURN_ACCEPT_GRACE_SECONDS`（默认 120）秒；有活 Worker 时用 `TURN_QUEUE_WAIT_MAX_SECONDS`（默认 600）秒，因为同会话串行、并发额度满导致的排队是正常现象；同会话还有 `running` 的 turn 时一律跳过。
+- 领取后租约过期超过 `TURN_LOST_GRACE_SECONDS`（默认 60）秒：执行者已经不在了，如实说明"结果未知、未自动重试"，避免重复副作用。
+
+结算与正常答复共用去重键 `turn-answer:{turn_id}`，多扫几轮也只会有一条答复。多副本并发由 advisory lock + `FOR UPDATE SKIP LOCKED` 收口。
+
+**怎么确认它真的在工作**
+
+- `/api/health` 的 `workers.alive` 与 `turns.oldest_accepted_age`；`/api/ops/metrics` 里同名指标是 `worker_alive` / `turns_accepted` / `oldest_accepted_age`。
+- 告警建议：`worker_alive == 0` 持续 1 分钟；`oldest_accepted_age > 60` 持续 1 分钟；`workers.alive == 0` 同时 `turns_accepted > 0` 属于必然事故。
+- 排障顺序：先看 Worker 是否在跑（`systemctl status webpage-agent-worker` / `pgrep -f scripts.run_worker`），再看 `service_heartbeats` 里最后心跳时间，最后看 `session_turns` 里卡住的行及其 `error`（`E_WORKER_OFFLINE` / `E_WORKER_LOST`）。
+
+**不要**用 `REQUIRE_LIVE_WORKER=false` 去"解决"503：那只是把明确的报错换回静默等待。`TURN_WATCHDOG_ENABLED=false` 同理，等于放弃最后一道兜底。
 
 ## 清理和监控
 

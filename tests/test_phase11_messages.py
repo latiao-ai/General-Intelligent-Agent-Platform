@@ -7,7 +7,8 @@
 """
 import unittest
 
-from webpage_agent.api.hub_messages import route_message, request_hash
+from webpage_agent.api.hub_messages import (route_message, request_hash,
+                                            turn_answer)
 from tests.exec_env import PG_DSN, new_store, reset_db, valid_test_dsn
 
 
@@ -37,6 +38,17 @@ class RouteMessageTests(unittest.TestCase):
         self.assertEqual(route_message('建个页面', active_tasks=[])['kind'],
                          'control')
 
+    def test_control_verb_with_connectors_is_chat_not_task(self):
+        """连了画布 MCP 说"新建一个节点"：是让工具干活，不是再起一个后台任务。"""
+        self.assertEqual(route_message('在画布里新建一个节点', active_tasks=[],
+                                       connectors=['beeftv'])['kind'], 'chat')
+
+    def test_control_verb_with_connectors_still_targets_active_task(self):
+        route = route_message('把它的标题改掉', active_tasks=[
+            {'task_id': 't1', 'run_id': 'r1'}], connectors=['beeftv'])
+        self.assertEqual(route['kind'], 'control')
+        self.assertEqual(route['target_task_id'], 't1')
+
     def test_explicit_target_wins(self):
         route = route_message('补充一下', active_tasks=[
             {'task_id': 't1', 'run_id': 'r1'}, {'task_id': 't2', 'run_id': 'r2'}],
@@ -48,6 +60,19 @@ class RouteMessageTests(unittest.TestCase):
         # "你好" 不含控制动词，也不含查询词 → chat，绝不更新 intent_version
         self.assertEqual(route_message('你好', active_tasks=[
             {'task_id': 't1', 'run_id': 'r1'}])['kind'], 'chat')
+
+    def test_waiting_turn_returns_its_question_not_an_apology(self):
+        """模型选择"先问人"时，本轮没有正文答复——问题在 failure 里，必须展示。"""
+        state = {'pi_outcome': 'waiting', 'status': 'waiting_input',
+                 'failure': '你想在哪个画布上建节点？'}
+        self.assertEqual(turn_answer(state), '你想在哪个画布上建节点？')
+
+    def test_normal_answer_wins(self):
+        self.assertEqual(turn_answer({'answer': '29 个', 'failure': 'x'}), '29 个')
+
+    def test_nothing_to_show_returns_empty(self):
+        self.assertEqual(turn_answer({'pi_outcome': 'failed'}), '')
+        self.assertEqual(turn_answer({'pi_outcome': 'waiting'}), '')
 
     def test_request_hash_stable_and_distinct(self):
         self.assertEqual(request_hash('a', 't'), request_hash('a', 't'))

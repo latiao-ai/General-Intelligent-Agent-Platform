@@ -7,10 +7,18 @@
 - 有绑定：用这把钥匙，不再读进程级 `MCP_BEARER_TOKEN`。
 - 没有绑定且 `TOOL_POLICY_ENFORCED`：拒绝，远端调用数为 0。
 - 没有绑定且未强制：返回 None，调用方沿用服务端配置里的 token（本地 Demo）。
+
+例外是 `auth == 'oauth'` 的连接器：它**根本没有静态 token**，所以钥匙必须按
+主体解析，与是否强制执行无关。`token_for()` 是给所有调用点用的统一入口，
+`bearer_for_current()` 仍是其中"有执行主体"那条分支的实现。
 """
+import logging
+
 from webpage_agent.core import credentials as credentials_module
 from webpage_agent.tools import tool_policy as policy_module
 from webpage_agent.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def server_id_of(tool_key: str) -> str:
@@ -125,6 +133,66 @@ async def bearer_for_current(server) -> str | None:
     return await bearer_for(
         store, tenant_id=tenant_id, user_id=user_id, server_id=server.id,
         platform_id=platform_id)
+
+
+async def token_for(server, *, tenant_id: str = '', user_id: str = '') -> str | None:
+    """这次 MCP 调用用哪把钥匙。**发现工具与执行调用共用这一条解析。**
+
+    和 `bearer_for_current` 只差一处：`auth == 'oauth'` 的服务端没有静态
+    token，钥匙只能按主体解析。以前这条解析只挂在"强制执行"分支上，本地单用户
+    模式（`TOOL_POLICY_ENFORCED=false`）于是永远裸连——OAuth 连接器每次发现都
+    401，再被上层静默降级成"只有本地三个只读工具"。表现就是：连接器面板显示
+    授权成功、70 个工具都在，会话里的模型却说自己只拿到 list_dir/read_file/
+    web_search（真实事故）。
+
+    解析顺序：
+
+    1. 强制执行模式：完全沿用绑定表，生产语义不变；
+    2. 有执行主体（业务 run）：仍优先走绑定表（凭据轮换、撤销都靠它）；
+    3. 没有执行主体（聊天 turn、连接器面板、CLI 探测）：用调用方显式给的
+       `(tenant_id, user_id)` 直接读本机凭据文件；
+    4. 都没有：抛 `CredentialMissing`，让上层把原因写进日志与提示词，
+       **不静默降级**。
+    """
+    if server is None:
+        return await bearer_for_current(server)
+    server_id = str(getattr(server, 'id', '') or '')
+    if str(getattr(server, 'auth', '') or '').strip().lower() != 'oauth':
+        # 静态 token 的连接器：语义与以前完全一致（强制模式下走绑定表）。
+        return await bearer_for_current(server)
+
+    if policy_module.enforcement_enabled():
+        return await bearer_for_current(server)
+
+    subject = None
+    try:
+        subject = await current_subject()
+    except Exception:                                # noqa: BLE001
+        logger.debug('取 MCP 执行主体失败，改用显式主体', exc_info=True)
+    if subject is not None:
+        store, run_tenant, run_user, platform_id = subject
+        try:
+            token = await bearer_for(
+                store, tenant_id=run_tenant, user_id=run_user,
+                server_id=server_id, platform_id=platform_id)
+        except credentials_module.CredentialMissing:
+            token = None
+        except Exception:                            # noqa: BLE001
+            logger.debug('按绑定表解析 OAuth 钥匙失败，改用本机凭据', exc_info=True)
+            token = None
+        if token:
+            return token
+        tenant_id = tenant_id or run_tenant
+        user_id = user_id or run_user
+
+    if not (tenant_id and user_id):
+        raise credentials_module.CredentialMissing(
+            f'连接器 {server_id} 需要用户授权，但这次调用没有登录主体，拿不到凭据')
+
+    from webpage_agent.core import oauth_store
+    return await oauth_store.ensure_access_token(
+        server=server, server_id=server_id,
+        tenant_id=tenant_id, user_id=user_id)
 
 
 async def inner_allowlist_for_current(server) -> list[str] | None:

@@ -7,6 +7,9 @@ jsonschema>=4,<5
 httpx>=0.27,<1
 # FastAPI + SSE 服务（src/webpage_agent/api/routes.py），随 mcp 已带入 uvicorn / sse-starlette
 fastapi>=0.115,<1
+# 技能上传（POST /api/skills/upload）走 multipart/form-data；没有它 FastAPI 会在
+# 定义 File(...) 时直接报 "Form data requires python-multipart"。
+python-multipart>=0.0.9,<1
 # 正式部署用 PostgreSQL（DATABASE_URL 以 postgresql:// 开头时启用）。
 # psycopg-pool 提供连接池：一个进程按 DB_POOL_SIZE 借连接，不再"单连接 + 全局锁"。
 psycopg[binary]>=3.2,<4

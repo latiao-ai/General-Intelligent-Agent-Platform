@@ -119,6 +119,10 @@ async def loop(store):
             result = await run_once(store)
             await store.purge_request_keys()
             await store.purge_auth_sessions()
+            # 失联十分钟以上的实例行清掉：留着会让"看着有人"变成假象。
+            # 存活判定本身按 WORKER_ALIVE_WINDOW_SECONDS 过滤，这里只是让表里
+            # 只留"最近说过话"的实例，方便运维一眼看清谁在跑。
+            result['heartbeats'] = await store.purge_heartbeats(600)
             logger.info('maintenance %s', result)
         except Exception:
             logger.exception('maintenance_failed')

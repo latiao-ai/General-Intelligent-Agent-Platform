@@ -70,6 +70,19 @@ def _save(principal, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def _reset_tool_cache() -> None:
+    """连接/授权状态变了，让下一轮工具发现立刻重来。
+
+    缓存 TTL 是 300s：不主动失效的话，刚授完权、刚点完连接，会话里仍然拿的是
+    上一次"这个服务端 0 个工具"的目录，用户会以为授权没生效。
+    """
+    try:
+        from webpage_agent.tools import core as tools_core
+        tools_core.reset_cache()
+    except Exception:                                # noqa: BLE001
+        pass
+
+
 def _server_view(server, state: dict, *, tenant: str = '', user: str = '') -> dict:
     row = state.get(server.id) or {}
     auth_mode = str(getattr(server, 'auth', '') or '')
@@ -77,6 +90,15 @@ def _server_view(server, state: dict, *, tenant: str = '', user: str = '') -> di
     if auth_mode == 'oauth' and tenant:
         oauth_ready = oauth_store.has_token(tenant_id=tenant, user_id=user,
                                             server_id=server.id)
+    # 面板上"连接过"不等于"这轮真拿到工具"：把最近一次工具发现的失败原因
+    # 也带出来，否则用户只能看到"已连接"和一个只会用三个本地工具的模型。
+    runtime_error = ''
+    try:
+        from webpage_agent.tools import core as tools_core
+        runtime_error = str(
+            (tools_core.discovery_errors() or {}).get(server.id) or '')
+    except Exception:                                # noqa: BLE001
+        runtime_error = ''
     return {
         'id': server.id,
         'name': server.title or server.id,
@@ -88,7 +110,7 @@ def _server_view(server, state: dict, *, tenant: str = '', user: str = '') -> di
         'enabled': bool(row.get('enabled')),
         'tools': int(row.get('tools') or 0),
         'tool_names': list(row.get('tool_names') or []),
-        'error': str(row.get('error') or ''),
+        'error': str(row.get('error') or runtime_error),
         'at': str(row.get('at') or ''),
     }
 
@@ -348,6 +370,8 @@ async def oauth_callback(connector_id: str, request: Request,
                      f'凭据已保存，登记凭据绑定时出错：{type(exc).__name__}',
                      ok=False)
 
+    # 授权完成 = 钥匙换了：下一轮必须重新发现，不能还吃 300s 的旧目录。
+    _reset_tool_cache()
     return _page('授权完成', '可以关闭此页面，回到对话继续。', ok=True,
                  server_id=server.id)
 
@@ -381,6 +405,7 @@ async def oauth_revoke(connector_id: str, request: Request,
                         status='inactive',
                         binding_id=str(row.get('binding_id') or ''))
     credentials_module.invalidate_cache()
+    _reset_tool_cache()
     return {'id': connector_id, 'authorized': False}
 
 
@@ -416,11 +441,13 @@ async def connect_connector(connector_id: str,
         state[connector_id] = {'enabled': False, 'tools': 0, 'tool_names': [],
                                'error': message, 'at': time.strftime('%Y-%m-%dT%H:%M:%S')}
         _save(principal, state)
+        _reset_tool_cache()
         raise HTTPException(status_code=502, detail=f'连接失败：{message}') from None
     names = [tool.get('name') for tool in tools[:80]]
     state[connector_id] = {'enabled': True, 'tools': len(tools), 'tool_names': names,
                            'error': '', 'at': time.strftime('%Y-%m-%dT%H:%M:%S')}
     _save(principal, state)
+    _reset_tool_cache()
     return {'id': connector_id, 'enabled': True, 'tools': len(tools),
             'tool_names': names, 'name': server.title or server.id}
 
@@ -435,6 +462,7 @@ async def disconnect_connector(connector_id: str,
     state[connector_id] = {**previous, 'enabled': False, 'error': '',
                            'at': time.strftime('%Y-%m-%dT%H:%M:%S')}
     _save(principal, state)
+    _reset_tool_cache()
     return {'id': connector_id, 'enabled': False}
 
 

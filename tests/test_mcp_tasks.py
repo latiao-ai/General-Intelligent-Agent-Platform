@@ -169,7 +169,7 @@ class RunnerChannelSwitchTests(unittest.IsolatedAsyncioTestCase):
         mcp_adapter.call_tool = spy.call_tool
         mcp_adapter.call_tool_as_task = spy.call_tool_as_task
 
-        async def no_subject(server):
+        async def no_subject(server, tenant_id='', user_id=''):
             return None
 
         tools._subject_token = no_subject

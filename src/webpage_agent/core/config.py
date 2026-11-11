@@ -84,6 +84,31 @@ class Settings:
     llm_output_price_micros_per_million: int = int(os.getenv('LLM_OUTPUT_PRICE_MICROS_PER_MILLION', '0'))
     search_request_cost_micros: int = int(os.getenv('SEARCH_REQUEST_COST_MICROS', '0'))
     maintenance_interval_seconds: float = max(10.0, float(os.getenv('MAINTENANCE_INTERVAL_SECONDS', '3600')))
+    # ---------- 执行器存活（防止「消息发出去没人回复」） ----------
+    # Worker 默认每 5 秒写一次心跳；超过 20 秒没有任何心跳就认为执行器离线。
+    worker_heartbeat_seconds: float = max(1.0, float(os.getenv('WORKER_HEARTBEAT_SECONDS', '5')))
+    worker_alive_window_seconds: float = max(5.0, float(os.getenv('WORKER_ALIVE_WINDOW_SECONDS', '20')))
+    # 生产环境默认开启「没有活 Worker 就拒收消息」：宁可当场 503 说清楚，
+    # 也不要 202 之后让客户干等。开发/测试默认关闭，否则没起 Worker 的单测
+    # 全部会被门禁挡住。
+    require_live_worker: bool = _env_flag('REQUIRE_LIVE_WORKER',
+        'true' if os.getenv('APP_ENV', '').strip().lower() == 'production' else 'false')
+    # 僵尸 turn 看门狗：接纳后一直没人领的、或领取后租约过期没续的 turn，
+    # 结算成失败并写一条用户可见的答复。这是「就算全挂了也要有句话」的底线。
+    turn_watchdog_enabled: bool = _env_flag('TURN_WATCHDOG_ENABLED', 'true')
+    turn_watchdog_interval_seconds: float = max(
+        5.0, float(os.getenv('TURN_WATCHDOG_INTERVAL_SECONDS', '15')))
+    # 接纳后多久还没被领走算卡死（要大于 Worker 正常轮询间隔，别误杀排队中的）
+    turn_accept_grace_seconds: float = max(
+        30.0, float(os.getenv('TURN_ACCEPT_GRACE_SECONDS', '120')))
+    # running 的租约过期后再宽限多久才判失联（给续租抖动留余量）
+    turn_lost_grace_seconds: float = max(
+        0.0, float(os.getenv('TURN_LOST_GRACE_SECONDS', '60')))
+    # 有活 Worker 时，一条 turn 在队列里等多久才算异常。必须显著大于
+    # 无 Worker 时的容忍度：Worker 活着但排队（同会话串行、并发额度满）
+    # 是正常现象，不能当成"卡死"误杀。
+    turn_queue_wait_max_seconds: float = max(
+        60.0, float(os.getenv('TURN_QUEUE_WAIT_MAX_SECONDS', '600')))
     prompt_timezone: str = os.getenv('PROMPT_TIMEZONE', 'Asia/Shanghai').strip() or 'Asia/Shanghai'
     # Pi 系统提示。默认是画布停手/少重复检索规则；PI_SYSTEM_PROMPT 可覆盖。
     pi_system_prompt: str = pi_system_prompt_from_env()
@@ -140,6 +165,13 @@ class Settings:
     artifact_dir: Path = PROJECT_ROOT / os.getenv('ARTIFACT_DIR', 'artifacts')
     # 每用户私有工作目录的根。ticket 模式按租户/用户自动分配，不接受任意服务器路径。
     workspace_root: Path = PROJECT_ROOT / os.getenv('WORKSPACE_ROOT', 'workspaces')
+    # 技能库根：一个技能一个目录（SKILL.md + references/ + scripts/）。
+    # 磁盘是唯一事实来源，库里不建技能索引表——避免"目录在、表里没有"这类双写
+    # 不一致；列表接口每次直接扫目录，几十个技能的扫描代价可以忽略。
+    skills_dir: Path = PROJECT_ROOT / os.getenv('SKILLS_DIR', 'profile/skills')
+    # 会话级技能物化目录名（相对当前工作目录）。每轮只把**本会话选中的技能**
+    # 拷进 `.agent-skills/<session>/`，模型用 read_file 按需读取，不整体塞上下文。
+    skills_workspace_dirname: str = os.getenv('SKILLS_WORKSPACE_DIRNAME', '.agent-skills')
     # ---------- 连接器 OAuth ----------
     # 授权凭据落盘目录：一个主体一个文件（0600）。不进库，与
     # `credential_ref = file:` 的约定一致；库里只留绑定元信息。
@@ -274,6 +306,18 @@ class Settings:
     # 本地 http 调试时浏览器会拒收 secure cookie，此时设 false；线上必须 true
     auth_cookie_secure: bool = (
         os.getenv('AUTH_COOKIE_SECURE', 'true').strip().lower() == 'true')
+    # ---------- 短信验证码登录（内部短信平台开放接口） ----------
+    # 服务根地址 / AK / SK 由短信平台维护方分配，禁止写入前端或日志。
+    # 未配置时短信登录入口不展示（接口返回 disabled）。
+    sms_base_url: str = os.getenv('SMS_BASE_URL', '').strip().rstrip('/')
+    sms_app_key: str = os.getenv('SMS_APP_KEY', '').strip()
+    sms_app_secret: str = os.getenv('SMS_APP_SECRET', '').strip()
+    # 短信登录功能总开关（默认关）。打开且凭据齐全时，前端才显示短信入口。
+    sms_login_enabled: bool = _env_flag('SMS_LOGIN_ENABLED')
+    # 短信平台请求超时（秒）。滑块/发码是同步请求，卡住就是用户卡住。
+    sms_timeout_seconds: float = max(1.0, float(os.getenv('SMS_TIMEOUT_SECONDS', '10')))
+    # 短信登录身份源标识。方案 A：手机号作为独立身份源，subject = 手机号。
+    sms_identity_provider_id: str = os.getenv('SMS_IDENTITY_PROVIDER_ID', 'sms').strip() or 'sms'
     # ---------- 对象权限 ----------
     # owner_user_id='default' 的存量数据是否对所有登录用户可见。
     # 单用户升级期必须为 true；有第二个真实用户后必须改成 false。
@@ -351,6 +395,39 @@ class Settings:
     # 对账：扫描孤儿运行的间隔（秒）。
     reconcile_interval_seconds: float = max(30.0, float(
         os.getenv('RECONCILE_INTERVAL_SECONDS', '300')))
+    # ---------- 定时任务（docs/scheduled-tasks.md） ----------
+    # 总开关**默认关**：定时任务等于"无人值守、以用户身份跑 prompt"，还要真花 token。
+    # 注意不要用 governance_enabled() 包它——那个函数在 ticket 模式会自动为 True，
+    # 生产一升级就会自己开始跑。
+    scheduled_tasks_enabled: bool = _env_flag('SCHEDULED_TASKS_ENABLED')
+    # tick 的节拍。用单调时钟到点才跑，不阻塞 Worker 主循环领 run。
+    scheduler_tick_seconds: float = max(5.0, float(
+        os.getenv('SCHEDULER_TICK_SECONDS', '30')))
+    # 认领租约：必须长于一次 tick 的处理时间（含 hub.start 建任务）。
+    scheduled_claim_lease_seconds: float = max(30.0, float(
+        os.getenv('SCHEDULED_CLAIM_LEASE_SECONDS', '120')))
+    # 错过窗口：超过这么久没跑上的 occurrence 不补跑（只记 skipped）。
+    scheduled_missed_window_seconds: float = max(60.0, float(
+        os.getenv('SCHEDULED_MISSED_WINDOW_SECONDS', '86400')))
+    # 上一轮还没结束时最多延几次；超过就记 skipped 并推进下一次。
+    scheduled_max_deferrals: int = max(1, int(
+        os.getenv('SCHEDULED_MAX_DEFERRALS', '5')))
+    scheduled_defer_backoff_seconds: float = max(5.0, float(
+        os.getenv('SCHEDULED_DEFER_BACKOFF_SECONDS', '60')))
+    # 一次 tick 最多处理几个到期任务。
+    scheduled_batch_limit: int = max(1, int(
+        os.getenv('SCHEDULED_BATCH_LIMIT', '20')))
+    # 峰值抖动窗口（秒）：0 = 关闭。>0 时按 (任务, occurrence) 确定性散开。
+    scheduled_jitter_seconds: float = max(0.0, float(
+        os.getenv('SCHEDULED_JITTER_SECONDS', '0')))
+    # 出站投递（企业微信/飞书/通用 webhook）。
+    webhook_timeout_seconds: float = max(1.0, float(
+        os.getenv('WEBHOOK_TIMEOUT_SECONDS', '10')))
+    # 是否读 HTTP(S)_PROXY。容器直连部署要显式关掉，否则"本机能发、容器不能发"。
+    webhook_trust_env: bool = os.getenv('WEBHOOK_TRUST_ENV', 'true').strip().lower() != 'false'
+    # 全局默认推送地址；任务自己没配时用它，两边都空就只写运行记录。
+    scheduled_default_webhook: str = os.getenv('SCHEDULED_DEFAULT_WEBHOOK', '').strip()
+
     # 指标输出格式：json（默认）或 prometheus。
     metrics_format: str = (os.getenv('METRICS_FORMAT', 'json')
                            .strip().lower() or 'json')

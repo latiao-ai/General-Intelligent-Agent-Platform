@@ -18,13 +18,16 @@
   返回 `E_NO_LEDGER`、绝不落到真实调用。不存在"无账本直接执行"的兼容旁路——
 - **成功结算前不向 Pi 发成功回执**：结算失败就停止后续模型执行；
 - **结果归一**：工具内部返回的 `status="searched"` 是阶段小结，不是业务终态；
-  回执保留来源 ID / 标题 / URL / 限长正文摘录，正文经 sources 存储读取，
-  不把整份 state 发给 Node；
+  检索类结果保留来源 ID / 标题 / URL / 限长正文摘录，正文经 sources 存储读取，
+  不把整份 state 发给 Node；MCP 工具返回的是**平台对象**，经 `mcp_results`
+  原样带回（超长截断并标注 truncated/total_chars），不能只按 documents 归一；
+
 - **增量合并**：真实调用成功后，把工具返回的认可增量（documents / usage /
   结果引用）合并回宿主 state，不让任意结果覆盖身份、租约等宿主字段。
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -119,6 +122,42 @@ def _effective_write_keys() -> set[str]:
     return enabled
 
 
+def tool_allowed(tool, *, connector_ids: list | tuple | None = None) -> bool:
+    """执行口是否放行这个 `Tool`——**唯一**判定，目录装配与确认门禁共用。
+
+    三条放行理由，互不替代：
+
+    1. 只读工具且键在 `PI_READ_TOOL_KEYS`（部署级的全局只读白名单）；
+    2. 键在生效的写白名单里（`PI_WRITE_TOOLS_ENABLED=true` + 逐个点名）；
+    3. 属于**用户在本轮显式选中的连接器**——读、写都放行。
+
+    第 3 条是产品约定：用户把某个 MCP server 连进会话，就是授权智能体使用它的
+    工具。用户说"我连了 beeftv"，问画布数量就该找到 `canvas.search`，要建节点、
+    出图就该找到 `canvas.nodes.create` / `canvas.generation.submit`——不能出现
+    "看得见、点不动"。安全边界不在"能不能调"，而在**调用前必须让用户确认**：
+    写/破坏性工具由 `pi_runtime` 的确认门禁拦一道，用户明确回复"确认"后才执行。
+
+    反过来说：这里的放行**只解决"找得到、调得动"**，不是"调了就生效"。
+    执行前确认、执行后回读核验、失败不谎报成功，都在别的层，不能被这层绕过。
+
+    注意 `connector_ids` 必须由调用方显式传入：`connector_scope` 那个 ContextVar
+    只在装配目录时有效，执行工具时早已被 reset。
+    """
+    key = str(getattr(tool, 'tool_key', '') or getattr(tool, 'name', '') or '')
+    effect = str(getattr(tool, 'effect', '') or 'unknown')
+    if effect == 'read' and key in _effective_read_keys():
+        return True
+    if key in _effective_write_keys():
+        return True
+    if connector_ids:
+        prefix = _tool_server_prefix(key)
+        selected = {f'mcp:{str(item).strip()}:' for item in connector_ids
+                    if str(item).strip()}
+        if prefix and prefix in selected:
+            return True
+    return False
+
+
 def request_input_decl() -> dict:
     """缺参时让模型停下来问人的宿主工具声明。"""
     return {
@@ -145,6 +184,13 @@ SNIPPET_MAX_CHARS = 400
 
 # 一次回执最多带回多少个来源。
 MAX_SOURCES = 8
+
+# 一次回执最多带回几次 MCP 调用的结果，以及单次结果给模型的字符上限。
+# MCP 工具（画布、素材、任务查询）返回的是平台对象，不是"来源文档"，回执不能
+# 只按 documents 归一——真踩过：canvas.search 返回了 29 个画布，回执却只剩
+# `sources: []`，模型据此回答"你账号下有 0 个画布"。
+MAX_MCP_CALLS = 4
+MAX_MCP_RESULT_CHARS = 12000
 
 # 合并回宿主 state 时允许写入的**认可字段**（白名单）。工具返回的增量里只有这些
 # 键会被合并，其余（status、phase 等内部字段）一律丢弃，避免任意结果覆盖身份、
@@ -249,9 +295,11 @@ def _receipt_content(updates: dict, tool_name: str) -> dict:
     """
     documents = updates.get('documents') or []
     errors = updates.get('errors') or []
+    mcp_calls = updates.get('mcp_calls') or []
     result = {
         'tool': tool_name,
-        'status': str(updates.get('status') or 'searched'),
+        # MCP 调用没有"检索阶段"这回事：状态写 ok，别拿 searched 冒充。
+        'status': str(updates.get('status') or ('ok' if mcp_calls else 'searched')),
         'sources': [_source_excerpt(d) for d in documents[:MAX_SOURCES]
                     if isinstance(d, dict)],
         'total_sources': len(documents),
@@ -259,6 +307,13 @@ def _receipt_content(updates: dict, tool_name: str) -> dict:
     if errors:
         result['errors'] = [{'stage': e.get('stage'), 'type': e.get('type')}
                             for e in errors if isinstance(e, dict)]
+    # MCP 工具返回的是**平台对象**（画布、素材、任务…），不是检索来源。以前这里
+    # 只归一 documents，于是 canvas.search 明明拿回 29 个画布，模型看到的却是
+    # `sources: [] / total_sources: 0`，据此回答"你账号下有 0 个画布"。
+    # 这里把每次调用的 payload 原样带给模型（超限截断并标注，不静默丢）。
+    for item in mcp_calls[:MAX_MCP_CALLS]:
+        if isinstance(item, dict):
+            result.setdefault('mcp_results', []).append(_mcp_result_excerpt(item))
     # 第十阶段第 7 点：写工具（如 update_object）的回执带对象 ID / 操作 ID /
     # revision / 修改字段，必须原样保留给模型，供回读核验与恢复（不丢字段）。
     for key in ('object_id', 'operation_id', 'new_revision', 'revision',
@@ -267,6 +322,31 @@ def _receipt_content(updates: dict, tool_name: str) -> dict:
         if key in updates:
             result[key] = updates[key]
     return result
+
+
+def _mcp_result_excerpt(call: dict) -> dict:
+    """一次 MCP 调用的结果摘要：工具名 + 服务端 + payload（超长截断）。
+
+    截断必须**说出来**：带上 truncated / total_chars / hint，模型才会去分页或
+    缩小查询，而不是拿半截数据下结论。
+    """
+    payload = call.get('payload')
+    try:
+        text = json.dumps(payload, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = str(payload)
+    item = {
+        'tool': str(call.get('tool') or ''),
+        'server': str(call.get('server') or ''),
+    }
+    if len(text) > MAX_MCP_RESULT_CHARS:
+        item['result'] = text[:MAX_MCP_RESULT_CHARS]
+        item['truncated'] = True
+        item['total_chars'] = len(text)
+        item['hint'] = '结果过长已截断；需要完整内容时缩小查询范围（分页/筛选），不要拿半截数据下结论'
+    else:
+        item['result'] = payload
+    return item
 
 
 def _stable_step_id(tool_key: str, args: dict) -> str:
@@ -469,7 +549,8 @@ class HostToolCaller:
     """
 
     def __init__(self, registry: PiCallRegistry | None = None,
-                 executor=None, tools_catalog: list | None = None) -> None:
+                 executor=None, tools_catalog: list | None = None,
+                 connector_ids: list | tuple | None = None) -> None:
         self._registry = registry or PiCallRegistry()
         # 可注入的工具执行器（测试用）：覆盖真实 tool.run，但仍走完整的受治理
         # 结算链路，用于无网络/无外部依赖下验证恢复不变量。
@@ -477,6 +558,11 @@ class HostToolCaller:
         # 工具目录（第十阶段）：一组 Tool 对象，供按**请求工具名唯一匹配**。
         # None 表示回退到「只读白名单里的默认工具」（本地能力包 registry）。
         self._tools_catalog = tools_catalog
+        # 本轮用户**显式选中**的连接器。这个值必须由调用方显式传进来：
+        # `connector_scope` 这个 ContextVar 只在装配工具目录的那一小段里有效，
+        # 到真正执行工具时早就被 reset 了（见 hub_messages._run_pi_chat）。
+        self._connector_ids = tuple(
+            str(item) for item in (connector_ids or ()) if str(item).strip())
 
     @property
     def registry(self) -> PiCallRegistry:
@@ -485,9 +571,8 @@ class HostToolCaller:
     def resolve_tool(self, tool_name: str):
         """按请求工具名**唯一匹配**一个 Tool（第十阶段）。
 
-        纪律：不能取「白名单首项」。工具目录里按 name 精确匹配，且必须落在
-        读/写白名单内；读工具校验 effect=read，写工具校验 effect != read 且
-        键在 WRITE_TOOL_KEYS 里。匹配不到或不在白名单 → 返回 None（拒绝）。
+        纪律：不能取「白名单首项」。工具目录里按 name 精确匹配，且必须
+        `tool_allowed()` 放行；匹配不到或不放行 → 返回 None（拒绝）。
 
         无显式目录时回退到本地能力包 registry（只读白名单）。
         """
@@ -495,19 +580,12 @@ class HostToolCaller:
         if catalog is None:
             from webpage_agent.capabilities import registry as _reg
             catalog = list(_reg.load())
-        allowed_read = _effective_read_keys()
-        allowed_write = _effective_write_keys()
         for tool in catalog:
             if getattr(tool, 'name', '') != tool_name:
                 continue
-            key = getattr(tool, 'tool_key', '') or tool_name
-            effect = str(getattr(tool, 'effect', '') or 'unknown')
-            if key in allowed_read and effect == 'read':
-                return tool
-            if key in allowed_write:
-                return tool
-            # 名字匹配但不在白名单 → 拒绝（不返回，交给上层报「未开放」）
-            return None
+            # 名字匹配但未放行 → 拒绝（不返回，交给上层报「未开放」）
+            return (tool if tool_allowed(tool, connector_ids=self._connector_ids)
+                    else None)
         return None
 
     def _find_readback_tool(self, write_tool):

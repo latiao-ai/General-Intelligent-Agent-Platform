@@ -49,6 +49,52 @@ class CapabilityDisabled(RuntimeError):
         super().__init__(reason or f'{kind} 能力未开放')
 
 
+class NoWorkerAvailable(RuntimeError):
+    """没有任何存活的 Worker：此刻收下消息只会变成"永远没有回复"。
+
+    API 只负责接纳，执行靠 Worker。Worker 全部离线时如果照旧返 202，用户会
+    一直等一个不会来的答复（真实事故：Worker 被回收，两条消息在库里躺了
+    半小时）。所以宁可当场 503 说清楚"执行器暂不可用、稍后重试"，也不收下
+    一个没人执行的消息。
+
+    只在 `REQUIRE_LIVE_WORKER` 打开时生效（生产默认开，开发/测试默认关）。
+    """
+
+    def __init__(self, detail: str = ''):
+        super().__init__(detail or '执行器暂时不可用（没有存活的 Worker），消息未受理')
+
+
+# 存活判定缓存：每条消息都查一次库没必要，但也不能缓存太久——门禁的意义
+# 就在于 Worker 挂掉的几秒内就能拒绝。
+_ALIVE_CACHE: dict[str, tuple[float, bool]] = {}
+_ALIVE_TTL_SECONDS = 2.0
+
+
+async def worker_alive(store) -> bool:
+    """是否至少有一个存活 Worker（结果缓存 2 秒）。
+
+    数不出来时**放行**：门禁的目的是拦住"确定没人执行"的情况，不是把
+    仓储实现的差异变成用户侧的故障。取不到心跳数（旧实现/测试替身）时
+    宁可按老行为收下消息，由看门狗兜底。
+    """
+    key = 'worker_alive'
+    cached = _ALIVE_CACHE.get(key)
+    now_ts = time.time()
+    if cached is not None and now_ts - cached[0] < _ALIVE_TTL_SECONDS:
+        return bool(cached[1])
+    counter = getattr(store, 'live_count', None)
+    if not callable(counter):
+        return True
+    alive = bool(await counter('worker', settings.worker_alive_window_seconds))
+    _ALIVE_CACHE[key] = (now_ts, alive)
+    return alive
+
+
+def reset_alive_cache() -> None:
+    """清掉存活缓存（测试与运维用例用）。"""
+    _ALIVE_CACHE.clear()
+
+
 def kind_enabled(kind: str) -> bool:
     """统一的能力开关判断（A 组第 5 点）：API 接纳、Worker 调度、执行入口共用。
 
@@ -83,19 +129,27 @@ _QUERY_HINTS = ('天气', '几度', '温度', '下雨', '多少', '几点', '现
 
 
 def route_message(message: str, *, active_tasks: list[dict] | None = None,
-                  target_task_id: str = '') -> dict:
+                  target_task_id: str = '', connectors: list[str] | None = None) -> dict:
     """把一句话路由到 turn 的 kind（纯逻辑，可单测）。
 
     `active_tasks`：该会话下未结束的任务列表（每项含 task_id / message / status）。
     `target_task_id`：请求里**显式**指定的目标（可选，客户端带上的才可信）。
+    `connectors`：本会话选中的 MCP 连接器。
 
     规则（第十一阶段第 6 点）：
     - 显式目标 → 若属于本会话的活动任务则 `control`（目标明确），否则仍归
       `chat`（目标不存在/越权由执行层拒绝）；
     - 命中控制动词 + 恰好一个活动任务 → `control`；
     - 命中控制动词 + 多个活动任务 → `ambiguous`（追问，不自动投递）；
+    - 命中控制动词 + **没有活动任务** + 选了连接器 → `chat`（用连接器工具干活）；
+    - 命中控制动词 + 没有活动任务 + 没选连接器 → `control`（建任务/说明未开放）；
     - 只读查询（缺控制动词）→ `query`；
     - 其余 → `chat`。
+
+    为什么"有连接器就不算建任务"：用户连了画布 MCP，说"新建一个节点"指的是在
+    画布上建，不是让中台再起一个后台研究任务。按控制动词一律吞成 control，结果
+    是 `SESSION_TASK_CREATE_ENABLED=false` 时直接回一句"能力未开放"——用户明明
+    连了工具、工具也放行了，却连试都没试。写操作该走工具 + 执行前确认。
     """
     text = ' '.join(str(message or '').split())
     active = [t for t in (active_tasks or []) if isinstance(t, dict)]
@@ -131,14 +185,37 @@ def route_message(message: str, *, active_tasks: list[dict] | None = None,
             return {'kind': 'ambiguous', 'target_task_id': '',
                     'target_run_id': '',
                     'candidates': [str(t.get('task_id') or '') for t in active]}
-        # 有控制动词但无活动任务：可能想新建任务（"建个页面"）→ 交给 control，
-        # 执行层据能力开关决定建任务或说明能力未开放。
+        # 有控制动词但无活动任务：可能想新建任务（"建个页面"）。但会话里选了
+        # 连接器时，这句话更可能是"用工具干活"（在画布上建节点）——交给 chat，
+        # 让模型调工具、执行前向用户确认；否则才交给 control 建任务/说明未开放。
+        if connectors:
+            return {'kind': 'chat', 'target_task_id': '', 'target_run_id': ''}
         return {'kind': 'control', 'target_task_id': '', 'target_run_id': ''}
 
     # 命中查询意图 → query（用只读工具）；否则 chat（纯闲聊答复）。
     if any(hint in text for hint in _QUERY_HINTS):
         return {'kind': 'query', 'target_task_id': '', 'target_run_id': ''}
     return {'kind': 'chat', 'target_task_id': '', 'target_run_id': ''}
+
+
+def turn_answer(state: dict) -> str:
+    """从 Pi 的 state 里取本轮答复；"先问人"的那一轮把问题当答复返回。
+
+    模型选择 `request_input`（缺参数、需要用户拍板）时，Node 发的是
+    `finished(outcome=waiting, wait_reason=input)`，本轮**没有正文答复**：
+    问题在 `state['failure']`（`_mark_waiting_input` 写的），正文是空的。
+    以前这里只看 `answer`，于是把问题吞掉、回一句"抱歉，我暂时无法回答这个问题"——
+    用户看到的就是"它明明想问，却只会道歉"。
+
+    返回空串表示这一轮确实没有可展示的内容（调用方按失败处理）。
+    """
+    answer = str(state.get('answer') or '').strip()
+    if answer:
+        return answer
+    if str(state.get('pi_outcome') or '') == 'waiting':
+        return (str(state.get('clarification') or '').strip()
+                or str(state.get('failure') or '').strip())
+    return ''
 
 
 class HubSessionMessageMixin:
@@ -152,11 +229,16 @@ class HubSessionMessageMixin:
             self, session_id: str, *, request_id: str, message: str,
             target_task_id: str = '', principal=None,
             connector_ids: list[str] | None = None,
+            addon_selection: dict | None = None,
             platform_subject: str | None = None) -> dict:
         """接纳一条会话消息，返回 202 形状（不等待模型完成）。
 
         同一 request_id 同载荷重放返回原 turn；不同载荷抛 `TurnRequestConflict`。
         用户消息、待执行 turn、接纳事件同事务提交（`store.create_turn`）。
+
+        `addon_selection` 是"第一条消息就带着选择"的场景（新会话还没落库，
+        先 PATCH 会 404）。它会与库里已有选择合并后随 turn 同事务写入，
+        保证 Worker 领到这一轮时读到的是最新选择。
         """
         tenant = getattr(principal, 'tenant_id', 'default')
         owner = getattr(principal, 'user_id', 'default')
@@ -167,7 +249,8 @@ class HubSessionMessageMixin:
         active = [t for t in active if outcome_module.normalize_status(
             t.get('status') or '') not in outcome_module.TERMINAL_RUN_STATUSES]
         route = route_message(message, active_tasks=active,
-                              target_task_id=target_task_id)
+                              target_task_id=target_task_id,
+                              connectors=connector_ids)
 
         # 继续澄清（第十一阶段第 6 点）：存在等待澄清的歧义 turn 时，把「编号/
         # 候选名」回复映射回候选任务，让下一条回答能继续澄清，而不是新建一次歧义。
@@ -206,7 +289,18 @@ class HubSessionMessageMixin:
         if route_kind in ('chat', 'query') and not kind_enabled(route_kind):
             raise CapabilityDisabled(route_kind)
 
+        # 接单门禁：没有活 Worker 时不收。这一条是"发出去没回复"最直接的
+        # 拦口——收下一条没人能执行的消息，对用户来说就是静默丢消息。
+        if settings.require_live_worker and not await worker_alive(self.store):
+            raise NoWorkerAvailable()
+
         try:
+            merged_addons = None
+            if addon_selection is not None:
+                from webpage_agent.addons import resolver as addons_resolver
+                current_addons = await self.store.session_addons(session_id)
+                merged_addons = addons_resolver.merge_selection(
+                    current_addons, addon_selection)
             result = await self.store.create_turn(
                 turn_id, session_id, request_id=request_id,
                 request_hash=fingerprint, message=message,
@@ -219,6 +313,7 @@ class HubSessionMessageMixin:
                 candidates=candidates, clarification=clarification,
                 source_turn_id=source_turn_id,
                 connector_ids=connector_ids,
+                addon_selection=merged_addons,
                 platform_subject=platform_subject)
         except TurnRequestConflict:
             raise
@@ -439,8 +534,14 @@ class HubSessionMessageMixin:
         api_key = settings.llm_key or None
         return model, api_key
 
-    def _build_pi_runtime(self, *, tools=None, tool_objects=None, system_prompt=None):
-        """构造 PiRuntime：受控模型脚本（测试）经环境变量注入，正式链路走真实模型。"""
+    def _build_pi_runtime(self, *, tools=None, tool_objects=None, system_prompt=None,
+                          connector_ids=None):
+        """构造 PiRuntime：受控模型脚本（测试）经环境变量注入，正式链路走真实模型。
+
+        `connector_ids` 必须一路带到 `HostToolCaller`：执行工具时 `connector_scope`
+        那个 ContextVar 已经被 reset，只能靠显式传参告诉执行口"用户选了谁"，
+        否则注入给模型的工具会在执行时被白名单全部拒掉。
+        """
         from webpage_agent.agent.pi_runtime import PiRuntime
         model, api_key = self._pi_model_config()
         mock_script = None
@@ -456,7 +557,8 @@ class HubSessionMessageMixin:
                          mock_script=mock_script,
                          system_prompt=system_prompt,
                          tools=tools if tools is not None else [],
-                         tool_objects=tool_objects)
+                         tool_objects=tool_objects,
+                         connector_ids=connector_ids)
 
     async def _chat_history(self, session_id: str, exclude_turn_id: str,
                             after_id: int = 0) -> list:
@@ -464,11 +566,18 @@ class HubSessionMessageMixin:
         return await self.store.chat_history(session_id, exclude_turn_id,
                                              after_id=after_id)
 
-    def _connector_context(self, connector_ids, tool_objects=None) -> str:
+    def _connector_context(self, connector_ids, tool_objects=None,
+                           errors=None) -> str:
         """把本轮已选连接器写进系统提示。
 
         模型看不到宿主状态，只会根据提示词和工具声明判断。用户在输入框选了连接器，
         这里必须明确告诉它“连了哪些 MCP server”，否则它会回答“没有暴露服务器清单”。
+
+        措辞必须**分得清两类工具**：`tool_objects` 里既有连接器工具（`mcp:...`），
+        也有本地只读工具（web_search / list_dir / read_file）。以前这里一锅端写成
+        “已注入的工具”，于是发现失败、只回退到三个本地工具时，模型会认真地说
+        “我拿到了 LibTV 连接器的 3 个工具”，然后去 list_dir 找平台项目、去
+        web_search 查平台 API——不是它在编，是被这句话带偏了。
         """
         ids = [str(x) for x in (connector_ids or []) if str(x).strip()]
         if not ids:
@@ -480,24 +589,55 @@ class HubSessionMessageMixin:
         for connector_id in ids:
             server = mcp_servers.by_id(connector_id)
             names.append(f'{connector_id}（{getattr(server, "title", "") or connector_id}）')
-        tool_names = [str(getattr(tool, 'name', '') or '') for tool in (tool_objects or [])]
-        tool_names = [name for name in tool_names if name][:40]
+        objects = [tool for tool in (tool_objects or []) if tool is not None]
+        remote_names = [str(getattr(tool, 'name', '') or '') for tool in objects
+                        if str(getattr(tool, 'tool_key', '') or '').startswith('mcp:')]
+        local_names = [str(getattr(tool, 'name', '') or '') for tool in objects
+                       if not str(getattr(tool, 'tool_key', '') or '').startswith('mcp:')]
+        remote_names = [name for name in remote_names if name][:60]
+        local_names = [name for name in local_names if name][:20]
         lines = [
             '\n\n【本轮连接器】用户在当前会话选择了以下 MCP 连接器：',
             '、'.join(names),
         ]
-        if tool_names:
-            lines.append('已注入的工具：' + '、'.join(tool_names))
+        if remote_names:
+            lines.append('已注入的连接器工具：' + '、'.join(remote_names))
         else:
-            lines.append('本轮暂未注入可调用工具（可能未配置/授权失败），不要因此编造调用结果。')
+            lines.append('本轮**没有**注入任何连接器工具。')
+        if local_names:
+            lines.append('另外还有几个本地只读工具（工作区文件与联网搜索，'
+                         '**不属于连接器、读不到平台数据**）：' + '、'.join(local_names))
+        reasons = [(connector_id, str((errors or {}).get(connector_id) or ''))
+                   for connector_id in ids]
+        reasons = [(connector_id, reason) for connector_id, reason in reasons if reason]
+        if reasons and not remote_names:
+            detail = '；'.join(f'{connector_id}：{reason}'
+                               for connector_id, reason in reasons)
+            lines.append(f'连接器工具发现失败（{detail}）。'
+                         '这说明是授权/网络/配置问题，**不是连接器没有这个能力**。'
+                         '如实告诉用户失败原因并请其在连接器面板重新授权或检查配置；'
+                         '不要拿本地工具去凑，也不要断言平台没有列表接口。')
+        elif reasons:
+            detail = '；'.join(f'{connector_id}：{reason}'
+                               for connector_id, reason in reasons)
+            lines.append(f'注意：以下连接器的部分工具本轮没拿到（{detail}），'
+                         '相关能力缺失时如实说明，不要编造调用。')
         lines.append('当用户问“连接了哪些 MCP server”时，以本清单为准，不要说没有暴露。')
-        lines.append('涉及删除、导出、生成/提交、发布、扣费等高风险工具，'
-                     '执行前必须先向用户说明影响或费用，并等待用户明确回复“确认”；'
-                     '未确认时不要直接调用。')
-        lines.append('当用户要求创建画布/节点、生成图片/视频、查看作品或继续创作时，'
-                     '必须先调用本轮已注入的连接器工具，不要只给步骤或建议；'
-                     '工具返回的 projectId、canvas URL、node ID、图片/视频 URL 要原样保留，'
-                     '并在回答中明确展示。')
+        lines.append('凡是会改动平台数据的工具（建画布/节点、改提示词、删、导出、'
+                     '生成/提交、发布、扣费等），执行前必须先向用户说明要做什么、'
+                     '影响或费用，并等待用户明确回复“确认”；未确认时不要直接调用。')
+        lines.append('用户回复“确认”之后，直接重新调用刚才那个工具把操作做完：'
+                     '不要再复述一遍计划，也不要用文字代替调用。'
+                     '用户说的是别的意思（改需求、问问题）时，按新意思走，不要当成确认。')
+        if remote_names:
+            lines.append('工具名和用户的说法常常对不上：平台里的"画布"可能对应 projects，'
+                         '创建画布可能就是一个创建项目的接口（如 business_post_projects）。'
+                         '先用检索类工具核对，再调用最接近的那个——不要因为名字里没有 '
+                         'canvas.create 就断言没有创建接口。写操作会被宿主要求确认，直接调用即可。')
+            lines.append('当用户要求创建画布/节点、生成图片/视频、查看作品或继续创作时，'
+                         '必须先调用本轮已注入的连接器工具，不要只给步骤或建议；'
+                         '工具返回的 projectId、canvas URL、node ID、图片/视频 URL 要原样保留，'
+                         '并在回答中明确展示。')
         return '\n'.join(lines)
 
     async def _run_pi_chat(self, claimed: dict) -> str | None:
@@ -535,10 +675,31 @@ class HubSessionMessageMixin:
         # 如果当前会话选了连接器，再把对应 MCP 工具注入进来。
         from webpage_agent.agent import connector_scope
         from webpage_agent.agent.pi_runtime import default_tool_catalog, pi_tool_catalog
+        from webpage_agent.addons import resolver as addons_resolver
 
         session_row = await self.store.session(session_id) or {}
         platform_subject = str(session_row.get('platform_subject') or '')
         subject_token = connector_scope.use_subject(platform_subject) if platform_subject else None
+
+        # 工作目录要在解析 addons 之前算好：技能要物化进这个目录，
+        # 模型随后用 read_file 的相对路径读取。
+        private = sandbox.provision(tenant_id, owner_user_id)
+        stored = await self.store.get_workspace(
+            tenant_id=tenant_id, owner_user_id=owner_user_id)
+        if not sandbox.stored_path_ok(stored, private):
+            stored = str(private)
+
+        # 会话级选择（专家 / 技能 / 连接器）→ 本轮资源（docs/addons.md）。
+        # 解析只读库与磁盘，不发网络请求；MCP 连接仍由后面的工具目录复用。
+        try:
+            addons = await addons_resolver.resolve_turn(
+                self.store, claimed, session_row, stored)
+        except Exception:                          # noqa: BLE001
+            # 解析失败不应让整轮聊天失败：退化成"没有专家/技能"，连接器按旧字段走。
+            logger.warning('解析会话 addon 失败 session=%s', session_id, exc_info=True)
+            addons = {'connector_ids': [], 'prompt_block': '', 'model': '',
+                      'connectors_explicit': False, 'connectors_decided': False}
+
         raw_connectors = claimed.get('connector_ids_json')
         if raw_connectors is None:
             raw_connectors = session_row.get('connector_ids_json')
@@ -548,28 +709,34 @@ class HubSessionMessageMixin:
             connector_ids = []
         if not isinstance(connector_ids, list):
             connector_ids = []
+        # 会话显式选择（或专家预设）优先于消息里的旧字段：迁移期两套都在写，以会话为准。
+        if addons.get('connectors_decided'):
+            connector_ids = [str(x) for x in (addons.get('connector_ids') or [])]
 
         tools: list = default_tool_catalog()
         tool_objects = None
+        connector_errors: dict[str, str] = {}
         if connector_ids:
+            from webpage_agent.tools import core as tools_core
             scope_token = connector_scope.use(connector_ids)
             try:
-                decls, objects = await pi_tool_catalog()
+                # 主体必须显式传：聊天 turn 没有业务 run，OAuth 连接器的钥匙
+                # 只能按 (tenant, user) 从本机凭据取；不传就是裸连 401。
+                decls, objects = await pi_tool_catalog(
+                    tenant_id=tenant_id, owner_user_id=owner_user_id)
                 if decls:
                     tools = decls
                     tool_objects = objects
             except Exception:                          # noqa: BLE001
                 # 连不上连接器时仍保留 web_search/list_dir/read_file，
                 # 并在系统提示里如实说明“未注入工具”，不能编造调用。
-                pass
+                logger.warning('本轮连接器工具注入失败', exc_info=True)
             finally:
                 connector_scope.reset(scope_token)
+            connector_errors = {server_id: reason for server_id, reason
+                                in (tools_core.discovery_errors() or {}).items()
+                                if reason and server_id in connector_ids}
 
-        private = sandbox.provision(tenant_id, owner_user_id)
-        stored = await self.store.get_workspace(
-            tenant_id=tenant_id, owner_user_id=owner_user_id)
-        if not sandbox.stored_path_ok(stored, private):
-            stored = str(private)
         try:
             user_rows = await self.store.recall('user', owner_user_id)
             workspace_rows = await self.store.recall('workspace', stored)
@@ -583,14 +750,18 @@ class HubSessionMessageMixin:
         system_prompt = ((settings.pi_system_prompt or '')
                          + ('\n\n' + session_block if session_block else '')
                          + ('\n\n' + memory_block if memory_block else '')
-                         + self._connector_context(connector_ids, tool_objects))
+                         + str(addons.get('prompt_block') or '')
+                         + self._connector_context(connector_ids, tool_objects,
+                                                   connector_errors))
 
         model_token = model_choice.bind(
-            owner_user_id, getattr(settings, 'llm_model', '') or '')
+            owner_user_id,
+            str(addons.get('model') or '') or getattr(settings, 'llm_model', '') or '')
         try:
             runtime = self._build_pi_runtime(
                 tools=tools, tool_objects=tool_objects,
-                system_prompt=system_prompt or None)
+                system_prompt=system_prompt or None,
+                connector_ids=connector_ids)
         except Exception:
             model_choice.reset(model_token)
             if subject_token is not None:
@@ -687,8 +858,17 @@ class HubSessionMessageMixin:
                     turn_id, {'type': 'started', 'at': time.time()})
             except Exception:                      # noqa: BLE001
                 logger.debug('写入 turn started 失败', exc_info=True)
+            if connector_errors:
+                # 连接器没进工具，用户必须在会话里看得见：以前这种情况界面上
+                # 一个字都没有，只剩模型自己解释"我只有三个工具"。
+                try:
+                    await self.store.append_turn_event(turn_id, {
+                        'type': 'connector_warning',
+                        'detail': connector_errors, 'at': time.time()})
+                except Exception:                  # noqa: BLE001
+                    logger.debug('写入 turn connector_warning 失败', exc_info=True)
             state = await runtime.run(state, on_event=on_event)
-            answer = str(state.get('answer') or '').strip()
+            answer = turn_answer(state)
             if not answer:
                 # 无有效答复：如实说明，不落空答复冒充成功
                 return '抱歉，我暂时无法回答这个问题。'

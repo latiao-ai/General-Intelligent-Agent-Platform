@@ -28,7 +28,6 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response, StreamingResponse)
-import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
 from webpage_agent.store import idempotency
@@ -38,6 +37,10 @@ from webpage_agent.observe import runtime_check
 from webpage_agent.agent import scene_context as scene_context_module
 from webpage_agent.observe import task_notify
 from webpage_agent.api import auth
+# 平台账号登录的校验链（读平台配置、发请求、摊平响应）。命名加 `_service`
+# 是因为下面还有个同名的路由函数 `platform_login`。
+from webpage_agent.api import platform_login as platform_login_service
+from webpage_agent.api import sms_login as sms_login_service
 from webpage_agent.governance import policies
 from webpage_agent.core import profile
 from webpage_agent.core import sandbox
@@ -96,18 +99,33 @@ async def lifespan(app: FastAPI):
     stats = await hub.reconcile(owner=hub.owner_id)
     app.state.recovery = stats
     purged = await hub.store.purge_request_keys()
+    # 存量部署里"支持哪些平台"只写在 `.env` 的 BEEFTV_API_BASE 上。表是新的，
+    # 第一次启动时把它登记进来，否则控制台会显示"没有平台"，而登录明明是通的
+    # ——那种不一致排查起来比重写一遍还费劲。
+    try:
+        seeded = await platform_login_service.seed_from_env(hub.store)
+        if seeded:
+            logger.info('已把环境变量里的登录平台登记入库：%s', seeded)
+    except Exception:                                   # noqa: BLE001
+        logger.warning('登记环境变量登录平台失败（不影响登录）', exc_info=True)
     logger.info('API 启动完成，对账结果 %s，清理过期幂等键 %s 条', stats, purged)
     task_notify.start(settings.database_url)
     from webpage_agent.observe import maintenance
     maintenance_task = asyncio.create_task(maintenance.loop(hub.store), name='maintenance')
+    # 看门狗与维护分开：维护是一小时一轮的清理，看门狗的职责是十几秒内发现
+    # 「消息没人执行」，两者时间尺度差三个数量级，合成一个循环等于没有兜底。
+    from webpage_agent.observe import watchdog
+    watchdog_task = asyncio.create_task(watchdog.loop(hub.store), name='watchdog')
     try:
         yield
     finally:
+        watchdog_task.cancel()
         maintenance_task.cancel()
-        try:
-            await maintenance_task
-        except asyncio.CancelledError:
-            pass
+        for task in (watchdog_task, maintenance_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await task_notify.stop()
         await hub.close()
         from webpage_agent.integrations.mcp_adapter import close_stdio_sessions
@@ -131,12 +149,24 @@ from webpage_agent.api.skillhub_registry_api import router as registry_api_route
 from webpage_agent.api.connectors_api import router as connectors_router
 from webpage_agent.api.mcp_manager_api import router as mcp_manager_router
 from webpage_agent.api.models_api import router as models_router
+# 专家 · 技能 · 连接器：会话级选择 + 专家 CRUD（docs/addons.md）。
+# 技能的安装/删除仍在 /api/skills，连接器的连接/授权仍在 /api/connectors。
+from webpage_agent.api.addons_api import router as addons_router
 app.include_router(skillhub_router)
 app.include_router(registry_router)
 app.include_router(registry_api_router, prefix='/api/skillhub')
 app.include_router(connectors_router)
 app.include_router(mcp_manager_router)
 app.include_router(models_router)
+app.include_router(addons_router)
+# 定时任务（docs/scheduled-tasks.md）：定义/启停/立即运行/运行记录。
+# 真正的触发在 Worker 的调度 tick 里，接口只负责读写定义。
+from webpage_agent.api.schedules_api import router as schedules_router
+app.include_router(schedules_router)
+# 管理控制台：跨租户视角，准入在 console_api.console_access 里判。
+# 与上面 `/api/admin/*`（租户运维）是两套语义，不要合并。
+from webpage_agent.api.console_api import router as console_router
+app.include_router(console_router)
 
 
 @app.middleware('http')
@@ -228,12 +258,17 @@ class SessionMessageRequest(StrictBody):
     （不重复建 turn）；同一 ID 不同载荷返回 409。
     `target_task_id` 是**显式目标**：给了才视为「明确目标」，否则由服务端按
     活动任务数判断（单个活动任务 + 控制动词 → 明确；多个 → 追问）。
+
+    `addon_selection` 是会话级选择（专家/技能/连接器）的随消息补丁：新会话的
+    第一句话没有会话行，先 `PATCH /addons` 会 404；带上它就能随 turn 同事务
+    落库，避免"第一条消息里的技能不生效"的竞态。
     """
     request_id: str = Field(min_length=1, max_length=64,
                             pattern=r'^[A-Za-z0-9_.:-]+$')
     message: str = Field(min_length=1, max_length=10000)
     target_task_id: str | None = Field(default=None, max_length=64)
     connector_ids: list[str] | None = Field(default=None, max_length=100)
+    addon_selection: dict | None = None
 
 
 class PlatformContextRequest(StrictBody):
@@ -633,45 +668,29 @@ async def drop_session(request: Request, response: Response):
 # 给"只想用平台账号进中台"的场景兜一条路：密码交给**平台自己的登录接口**校验，
 # 中台不保存、不校验密码；校验通过后按 platform 用户标识绑定身份、发中台会话。
 # 首次登录自动建号，之后复用同一个中台账号（与 OIDC 登录共用一套 identities）。
-# 未配置 `BEEFTV_API_BASE` 时整体关闭——默认不开放这条入口。
+#
+# 从 v19 起，"支持哪些平台"是 `auth_platforms` 表里的数据（控制台可增删），
+# 不再是 `BEEFTV_API_BASE` 一个环境变量。只配了环境变量的旧部署仍然能用：
+# `platform_login.resolve()` 在库里查不到时会退回环境变量。
 
 class PlatformLoginRequest(StrictBody):
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=256)
-
-
-def _platform_api_base() -> str | None:
-    """平台 API 根地址（只允许 http/https、无 query/fragment）。"""
-    raw = os.getenv('BEEFTV_API_BASE', '').strip().rstrip('/')
-    if not raw:
-        return None
-    try:
-        parsed = urlsplit(raw)
-        if parsed.query or parsed.fragment or not parsed.path:
-            return None
-        if runtime_check.transport_issue(
-                raw, allow_loopback=settings.app_env != 'production'):
-            return None
-    except ValueError:
-        return None
-    return raw
-
-
-def _platform_login_tenant() -> str:
-    return (os.getenv('PLATFORM_LOGIN_TENANT', '').strip()
-            or policies.DEFAULT_TENANT)
-
-
-def _platform_identity_provider() -> str:
-    """账号密码登录使用的身份源。与票据连接的 identity_provider_id 对齐后才会复用同一账号。"""
-    return (os.getenv('PLATFORM_LOGIN_IDP', 'beeftv').strip() or 'beeftv')[:80]
+    # 多个平台时要指明是哪一个；留空 = 默认平台（登录页只有一个入口时前端不传）。
+    platform: str = Field(default='', max_length=48)
 
 
 @app.get('/api/auth/platform-login/status')
-async def platform_login_status():
-    """前端据此决定要不要显示"账号密码登录"。"""
-    return JSONResponse({'enabled': _platform_api_base() is not None
-                         and settings.auth_mode != 'off'},
+async def platform_login_status(request: Request):
+    """前端据此决定要不要显示"账号密码登录"、以及要不要给平台选择框。
+
+    只暴露 `platform_id` 与显示名：未登录的人不需要知道平台接口地址。
+    """
+    store = getattr(request.app.state, 'store', None)
+    platforms = await platform_login_service.available(store)
+    return JSONResponse({'enabled': bool(platforms) and settings.auth_mode != 'off',
+                         'platforms': platforms,
+                         'default': platforms[0]['platform_id'] if platforms else ''},
                         headers={'Cache-Control': 'no-store'})
 
 
@@ -681,49 +700,25 @@ async def platform_login(payload: PlatformLoginRequest, request: Request,
     """平台账号密码 → 中台会话。首次登录自动创建账号并绑定身份。"""
     if settings.auth_mode == 'off':
         raise HTTPException(status_code=400, detail='AUTH_MODE=off，未启用认证')
-    base = _platform_api_base()
-    if not base:
-        raise HTTPException(status_code=404, detail='平台账号登录未启用')
     store = getattr(request.app.state, 'store', None)
     if store is None:
         raise HTTPException(status_code=503, detail='身份仓储未就绪')
 
     try:
-        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
-            upstream = await client.post(base + '/auth/login',
-                                         json={'username': payload.username,
-                                               'password': payload.password})
-    except Exception:                                   # noqa: BLE001
-        logger.warning('平台登录校验不可用', exc_info=True)
-        raise HTTPException(status_code=503, detail='平台身份服务不可用') from None
-    if upstream.status_code in (401, 403):
-        raise HTTPException(status_code=401, detail='账号或密码不正确')
-    if upstream.status_code == 429:
-        raise HTTPException(status_code=429, detail='尝试过于频繁，请稍后再试')
-    if upstream.status_code >= 400:
-        raise HTTPException(status_code=502, detail='平台身份服务返回异常')
-
-    try:
-        body = upstream.json() or {}
-    except ValueError:
-        raise HTTPException(status_code=502, detail='平台身份服务返回异常') from None
-    platform_user = (body.get('data') or {}).get('user') or {}
-    subject = str(platform_user.get('id') or '').strip()
-    if not subject:
-        raise HTTPException(status_code=502, detail='平台未返回用户标识')
-    if str(platform_user.get('status') or 'active') != 'active':
-        raise HTTPException(status_code=403, detail='平台账号已停用')
-    role = ('operator' if str(platform_user.get('role') or '').lower()
-            in ('admin', 'owner', 'operator') else 'member')
+        identity = await platform_login_service.sign_in(
+            store, platform_id=payload.platform.strip(),
+            username=payload.username, password=payload.password)
+    except platform_login_service.PlatformLoginError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from None
 
     token = auth.new_session_token()
-    provider = _platform_identity_provider()
     try:
         row = await store.login_platform_identity(
-            platform_id='beeftv', provider=provider, subject=subject,
-            display_name=str(platform_user.get('username') or payload.username),
-            role=role, tenant_id=_platform_login_tenant(),
-            identity_provider_id=provider,
+            platform_id=identity['platform_id'],
+            provider=identity['identity_provider_id'], subject=identity['subject'],
+            display_name=identity['display_name'], role=identity['role'],
+            tenant_id=identity['tenant_id'],
+            identity_provider_id=identity['identity_provider_id'],
             session_id='as_' + secrets.token_hex(12),
             session_digest=auth.digest_of(token),
             session_expires_at=time.time() + settings.auth_session_ttl,
@@ -740,10 +735,157 @@ async def platform_login(payload: PlatformLoginRequest, request: Request,
     except Exception:                                   # noqa: BLE001
         logger.warning('登录后分配私有目录失败', exc_info=True)
     _set_session_cookie(response, token, settings.auth_session_ttl)
-    logger.info('平台账号登录 user=%s platform=beeftv first=%s',
-                row['user_id'], row['created'])
+    logger.info('平台账号登录 user=%s platform=%s first=%s',
+                row['user_id'], identity['platform_id'], row['created'])
     return {'user_id': row['user_id'], 'tenant_id': row['tenant_id'],
-            'role': row['role'], 'platform_id': 'beeftv',
+            'role': row['role'], 'platform_id': identity['platform_id'],
+            'first_login': row['created'],
+            'auth_session_id': row['auth_session_id']}
+
+
+# ---------- 短信验证码登录 ----------
+# 第三种登录方式：手机号验证码（滑块 → 发码 → 校验）→ 中台会话。
+# 方案 A：短信登录是独立身份源（identity_provider_id = sms），subject = 手机号。
+# 所有代理请求由后端发往内部短信平台，浏览器不接触 AK/SK，也不直连短信平台。
+# 用户真实 IP 由后端解析，浏览器提交的同名头不直接透传。
+
+def _client_ip(request: Request) -> str:
+    """解析真实用户地址（用于 X-User-IP）。
+
+    只信任回环代理写入的转发头（与短信平台侧的约定一致），不直接采信浏览器可
+    伪造的 X-Forwarded-For。这里保守处理：优先取 request.client.host（连接来源），
+    仅当存在可信代理头时才用其最左端地址。
+    """
+    forwarded = request.headers.get('x-forwarded-for', '')
+    if forwarded:
+        # 最左端是原始客户端地址；后面的可能是中间代理。取第一段。
+        first = forwarded.split(',')[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else ''
+
+
+class SmsSendRequest(StrictBody):
+    mobile: str = Field(min_length=1, max_length=16)
+    captchaVerification: str = Field(min_length=1, max_length=128)
+
+
+class SmsCheckRequest(StrictBody):
+    captchaType: str = Field(default='blockPuzzle', max_length=32)
+    token: str = Field(min_length=1, max_length=128)
+    secretKey: str = Field(min_length=1, max_length=128)
+    x: int = Field(ge=0, le=310)
+    mobile: str = Field(min_length=1, max_length=16)
+
+
+class SmsVerifyRequest(StrictBody):
+    mobile: str = Field(min_length=1, max_length=16)
+    code: str = Field(min_length=1, max_length=8)
+
+
+@app.get('/api/auth/sms-login/status')
+async def sms_login_status(request: Request):
+    """前端据此决定是否显示短信登录入口。不泄露 AK/SK 或服务地址。"""
+    return JSONResponse({
+        'enabled': (settings.auth_mode != 'off'
+                    and settings.sms_login_enabled
+                    and sms_login_service.is_configured()),
+    }, headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/api/auth/sms-login/captcha/get')
+async def sms_captcha_get(request: Request):
+    """获取滑块：返回纯 Base64 图片 + token + secretKey（前端负责拼前缀与加密坐标）。"""
+    try:
+        data = await sms_login_service.get_captcha(_client_ip(request))
+    except sms_login_service.SmsLoginError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+    except Exception:                                   # noqa: BLE001
+        logger.exception('获取短信滑块失败')
+        raise HTTPException(status_code=502, detail='获取滑块失败，请重试') from None
+    return data
+
+
+@app.post('/api/auth/sms-login/captcha/check')
+async def sms_captcha_check(payload: SmsCheckRequest, request: Request):
+    """校验滑块，返回服务端票据 captchaVerification。坐标加密在后端完成。"""
+    try:
+        ticket = await sms_login_service.check_captcha(
+            payload.token, payload.secretKey, payload.x, payload.mobile,
+            _client_ip(request))
+    except sms_login_service.SmsLoginError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+    except Exception:                                   # noqa: BLE001
+        logger.exception('校验短信滑块失败')
+        raise HTTPException(status_code=502, detail='滑块校验失败，请重试') from None
+    return {'captchaVerification': ticket}
+
+
+@app.post('/api/auth/sms-login/send-code')
+async def sms_send_code(payload: SmsSendRequest, request: Request):
+    """发送短信验证码。成功仅代表已受理，不代表送达。"""
+    try:
+        result = await sms_login_service.send_code(
+            payload.mobile, payload.captchaVerification, _client_ip(request))
+    except sms_login_service.SmsLoginError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+    except Exception:                                   # noqa: BLE001
+        logger.exception('发送短信验证码失败')
+        raise HTTPException(status_code=502, detail='发送失败，请重试') from None
+    return result
+
+
+@app.post('/api/auth/sms-login')
+async def sms_login(payload: SmsVerifyRequest, request: Request, response: Response):
+    """短信验证码 → 中台会话。校验通过（data.valid 严格为 True）后建号并绑定身份。"""
+    if settings.auth_mode == 'off':
+        raise HTTPException(status_code=400, detail='AUTH_MODE=off，未启用认证')
+    if not (settings.sms_login_enabled and sms_login_service.is_configured()):
+        raise HTTPException(status_code=404, detail='短信登录未启用')
+    store = getattr(request.app.state, 'store', None)
+    if store is None:
+        raise HTTPException(status_code=503, detail='身份仓储未就绪')
+
+    try:
+        ok = await sms_login_service.verify_code(
+            payload.mobile, payload.code, _client_ip(request))
+    except sms_login_service.SmsLoginError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+    except Exception:                                   # noqa: BLE001
+        logger.exception('校验短信验证码失败')
+        raise HTTPException(status_code=502, detail='校验失败，请重试') from None
+    if not ok:
+        raise HTTPException(status_code=401, detail='验证码错误或已失效')
+
+    mobile = sms_login_service.normalize_mobile(payload.mobile)
+    idp = settings.sms_identity_provider_id
+    token = auth.new_session_token()
+    try:
+        row = await store.login_platform_identity(
+            platform_id='sms',
+            provider=idp, subject=mobile,
+            display_name=mobile, role='member',
+            tenant_id='default',
+            identity_provider_id=idp,
+            session_id='as_' + secrets.token_hex(12),
+            session_digest=auth.digest_of(token),
+            session_expires_at=time.time() + settings.auth_session_ttl,
+            user_agent=request.headers.get('user-agent', ''),
+            remote_addr=(request.client.host if request.client else ''))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail='账号已停用') from exc
+    except Exception:                                   # noqa: BLE001
+        logger.exception('短信登录建会话失败')
+        raise HTTPException(status_code=503, detail='登录失败，请重试') from None
+
+    try:
+        await _ensure_private_workspace(row['tenant_id'], row['user_id'])
+    except Exception:                                   # noqa: BLE001
+        logger.warning('短信登录后分配私有目录失败', exc_info=True)
+    _set_session_cookie(response, token, settings.auth_session_ttl)
+    logger.info('短信登录 user=%s first=%s', row['user_id'], row['created'])
+    return {'user_id': row['user_id'], 'tenant_id': row['tenant_id'],
+            'role': row['role'], 'platform_id': 'sms',
             'first_login': row['created'],
             'auth_session_id': row['auth_session_id']}
 
@@ -830,6 +972,18 @@ async def index():
     # 页面是内联 JS 的单文件，一旦被浏览器缓存就会出现"代码改了但界面还是旧的"，
     # 排查时极易被误导。这里明确不缓存。
     return HTMLResponse((WEB_DIR / 'index.html').read_text(encoding='utf-8'),
+                        headers={'Cache-Control': 'no-store, must-revalidate'})
+
+
+@app.get('/admin', response_class=HTMLResponse, include_in_schema=False)
+async def admin_page():
+    """管理控制台页面。
+
+    **页面本身不做鉴权**：它只是静态 HTML，必须在数据接口层挡住（`/api/console/*`
+    每次请求都验）。把鉴权放在这里等于只防住了"肉眼看到页面"，防不住任何人直接
+    调接口——那种安全感是假的。
+    """
+    return HTMLResponse((WEB_DIR / 'admin.html').read_text(encoding='utf-8'),
                         headers={'Cache-Control': 'no-store, must-revalidate'})
 
 
@@ -1288,6 +1442,35 @@ async def recovery_status(principal=Depends(policies.current_principal)):
     return getattr(app.state, 'recovery', {})
 
 
+async def _live_workers(store) -> int | None:
+    """存活的 Worker 数。取不到就返回 None，不让健康检查因此 500。
+
+    为什么要容错：健康检查本身是排障入口，它挂了会把人挡在门外；而
+    "数不出 Worker"和"Worker 全死了"是两回事，不能混成一个错误码。
+    `None` 表示未知，监控按"未知"处理，不要当成 0 去误告警。
+    """
+    counter = getattr(store, 'live_count', None)
+    if not callable(counter):
+        return None
+    try:
+        return int(await counter('worker', settings.worker_alive_window_seconds))
+    except Exception:                            # noqa: BLE001
+        logger.warning('读取 Worker 心跳数失败', exc_info=True)
+        return None
+
+
+async def _turn_backlog(store) -> dict:
+    """turn 积压态势。同理：取不到就返回空字典，不阻断健康检查。"""
+    reader = getattr(store, 'turn_backlog', None)
+    if not callable(reader):
+        return {}
+    try:
+        return await reader()
+    except Exception:                            # noqa: BLE001
+        logger.warning('读取 turn 积压失败', exc_info=True)
+        return {}
+
+
 @app.get('/api/health')
 async def health(principal=Depends(policies.current_principal)):
     """存活与态势：队列积压、待核实动作、失败作业都能看到。
@@ -1304,6 +1487,13 @@ async def health(principal=Depends(policies.current_principal)):
     body = {'ok': True, 'owner': hub.owner_id,
             'recovery': getattr(app.state, 'recovery', {}),
             'mcp': tool_module.mcp_status(),
+            # 执行器存活：API 活着 ≠ 有人在干活。这两个字段是判断
+            # 「消息发出去有没有人执行」的唯一直接依据，监控应对
+            # `workers.alive == 0` 告警。
+            'workers': {'alive': await _live_workers(hub.store),
+                        'window_seconds': settings.worker_alive_window_seconds,
+                        'required': settings.require_live_worker},
+            'turns': await _turn_backlog(hub.store),
             'governance': {
                 'auth_mode': settings.auth_mode,
                 'dev_compat': settings.auth_dev_compat,
@@ -1471,16 +1661,22 @@ async def post_session_message(session_id: str, payload: SessionMessageRequest,
     返回 409。路由成聊天/查询/控制，闲聊不建任务、不更新任何 intent_version。
     """
     from webpage_agent.store.pg_store import TurnRequestConflict
-    from webpage_agent.api.hub_messages import CapabilityDisabled
+    from webpage_agent.api.hub_messages import CapabilityDisabled, NoWorkerAvailable
     try:
         result = await hub.accept_session_message(
             session_id, request_id=payload.request_id, message=payload.message,
             target_task_id=payload.target_task_id or '', principal=principal,
             connector_ids=payload.connector_ids,
+            addon_selection=payload.addon_selection,
             platform_subject=str(getattr(principal, 'subject', '') or ''))
     except TurnRequestConflict:
         raise HTTPException(status_code=409,
                             detail='该 request_id 已用于不同内容的请求') from None
+    except NoWorkerAvailable as exc:
+        # 503 而不是 202：没有执行器时收下消息，用户只会等到超时。
+        # Retry-After 让前端/客户端知道"过一会儿重试有意义"。
+        raise HTTPException(status_code=503, detail=str(exc),
+                            headers={'Retry-After': '30'}) from None
     except PermissionError:
         raise HTTPException(status_code=404, detail='会话不存在') from None
     except CapabilityDisabled as exc:
@@ -1833,6 +2029,12 @@ async def ops_metrics(principal=Depends(policies.current_principal)):
         raise HTTPException(status_code=503,
                             detail=f'数据库不可用（{type(exc).__name__}）') from None
     stats.update(await hub.store.billing_stats())
+    # 执行器存活与 turn 积压：这两组是"回复延迟/无回复"的先行指标，
+    # 比 runs_queued 更贴近用户体感（聊天 turn 不走 runs 表）。
+    alive = await _live_workers(hub.store)
+    if alive is not None:
+        stats['worker_alive'] = alive
+    stats.update(await _turn_backlog(hub.store))
     stats['max_concurrent_runs'] = settings.max_concurrent_runs
     stats['db_pool_max_size'] = settings.db_pool_size
     # 实时池态势并进来：available 逼近 0 的次数才是该不该继续加并发的依据，

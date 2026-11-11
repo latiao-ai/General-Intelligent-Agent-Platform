@@ -97,6 +97,19 @@ def _tool_decl(tool) -> dict[str, Any]:
     }
 
 
+def _compose_prompt(base: str | None, state: dict) -> str | None:
+    """拼上宿主临时注入的提示（专家人设 + 本轮技能索引）。
+
+    为什么走 state 而不是构造参数：业务 run（`run_task`）的运行时由
+    `get_runtime()` 工厂统一创建，加构造参数就要在工厂里多穿一层会话上下文；
+    而 `state` 本来就是"宿主准备好的执行输入"，把这轮才成立的提示放进去，
+    与 task_id / workspace_dir 同一性质。空值返回 None，保持"显式不注入"的语义。
+    """
+    extra = str((state or {}).get('system_prompt_extra') or '').strip()
+    text = '\n\n'.join(part for part in (str(base or '').strip(), extra) if part)
+    return text or None
+
+
 # 模型端点对函数名的要求：1~128 个 ASCII 字母/数字/下划线/连字符。MCP 工具名
 # 常带点（如 BeeFTV 的 canvas.get），原样下发会让**整次请求** 400，一个工具都
 # 调不了。这里只改「对模型暴露的名字」，Tool 的 run 闭包仍绑定真实 MCP 工具。
@@ -153,7 +166,8 @@ def default_tool_catalog() -> list[dict[str, Any]]:
     return kept
 
 
-async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
+async def pi_tool_catalog(*, tenant_id: str = '',
+                          owner_user_id: str = '') -> tuple[list[dict[str, Any]], list]:
     """第十阶段：Pi 的完整工具目录 = 本地只读白名单 + MCP 平台工具。
 
     返回 `(decls, tool_objects)`：
@@ -165,6 +179,10 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
     `WRITE_TOOL_KEYS`；MCP 工具经 `tools/core.mcp_tools()` 发现（真实 transport）。
     默认不开放写工具（`WRITE_TOOL_KEYS` 空）；第十阶段测试显式配置写白名单后
     才启用受控平台的 update_object。
+
+    `tenant_id` / `owner_user_id` 是连接器凭据主体：OAuth 连接器的工具要靠
+    这个主体的钥匙才拉得到。聊天 turn 没有业务 run，必须由调用方显式传；
+    不传时退回账本主体（业务 run 的旧行为不变）。
     """
     from webpage_agent.agent import pi_host_tools
     from webpage_agent.tools import core as tools_core
@@ -183,9 +201,17 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
 
     # MCP 工具（读/写白名单按 tool_key = mcp:<server>:<name> 匹配）
     try:
-        mcp = await tools_core.mcp_tools()
-    except Exception:                                # noqa: BLE001
+        mcp = await tools_core.mcp_tools(tenant_id=tenant_id,
+                                         user_id=owner_user_id)
+    except Exception as exc:                          # noqa: BLE001
+        # 整体失败（配置读不出来、目录构建异常）时仍然退到本地工具，但必须
+        # 留下痕迹：以前这里静默 `pass`，界面上看不出"连接器一个工具都没进来"。
+        logger.warning('MCP 工具目录整体不可用：%s', type(exc).__name__,
+                       exc_info=True)
         mcp = []
+    for server_id, reason in (tools_core.discovery_errors() or {}).items():
+        if reason:
+            logger.warning('连接器 %s 本轮没有工具：%s', server_id, reason)
     from webpage_agent.agent import connector_scope
     allowed_connectors = connector_scope.current()
     if allowed_connectors is not None:
@@ -200,11 +226,11 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
         effect = str(getattr(tool, 'effect', '') or 'unknown')
         parts = key.split(':', 2)
         server_id = parts[1] if len(parts) >= 3 else ''
-        # 用户在当前会话显式选中了连接器：该服务端的只读工具全部注入，
-        # 不再要求每个工具都出现在全局 PI_READ_TOOL_KEYS 里。
-        # 写工具仍受 PI_WRITE_TOOLS_ENABLED / PI_WRITE_TOOL_KEYS 门禁。
-        # 用户选中连接器后默认暴露它的全部工具；高风险/付费工具在执行处
-        # 由 _high_risk_tool 拦下并要求用户确认，而不是在目录里隐藏。
+        # 用户在当前会话显式选中了连接器：该服务端的工具**全部**注入（含写工具），
+        # 不再要求每个工具都出现在全局白名单里。执行口用同一把尺子放行
+        # （pi_host_tools.tool_allowed），写操作由 _needs_confirmation 在执行前
+        # 拦住并要求用户确认，而不是在目录里隐藏。
+        # 没选连接器时才退回全局白名单（PI_READ_TOOL_KEYS / PI_WRITE_TOOL_KEYS）。
         if selected is not None and server_id in selected:
             tool_objects.append(tool)
         elif key in write_keys:
@@ -236,10 +262,26 @@ _HIGH_RISK_NAME_PARTS = (
 _CONFIRM_RE = re.compile(
     r'(确认|确定|同意|批准|允许|可以执行|继续执行|执行吧|继续|yes|confirm|approve)',
     re.IGNORECASE)
+# 确认只认短句：长句里的"确认"多半是"确认一下……"这种请求，不是授权。
+_MAX_CONFIRM_CHARS = 10
 
 
 def _is_confirmation(text: str) -> bool:
-    return bool(_CONFIRM_RE.search(str(text or '')))
+    """用户这句话是不是「确认执行」。
+
+    只认**短句**、且不含问号：'确认'、'好的，执行吧'、'yes'。
+
+    以前是纯子串匹配，于是「确认一下我的画布有几个？」也会被当成授权。写操作
+    现在真的会执行，这种误判的后果就是"没问我就改了画布"——授权口令必须收紧，
+    宁可多问一次，不可少问一次。
+    """
+    raw = str(text or '').strip()
+    if not raw or '?' in raw or '？' in raw:
+        return False
+    normalized = re.sub(r'[\s，。,.!！~、；;：:]', '', raw)
+    if not normalized or len(normalized) > _MAX_CONFIRM_CHARS:
+        return False
+    return bool(_CONFIRM_RE.search(normalized))
 
 
 def _high_risk_tool(tool) -> bool:
@@ -253,6 +295,19 @@ def _high_risk_tool(tool) -> bool:
     if effect == 'unknown':
         return True
     return any(part in name for part in _HIGH_RISK_NAME_PARTS)
+
+
+def _needs_confirmation(tool) -> bool:
+    """交互式聊天里，执行前必须让用户确认的工具。
+
+    产品约定是"写操作一律先确认"，不是"只有名字里带 delete/generate 的才确认"：
+    `canvas.node.update` 改的是用户的画布，`canvas.nodes.create` 会落到平台资源上，
+    它们按名字都不算"高危"，但都不是只读。只按名字判定会漏掉一大片写操作，
+    用户看到的就是"没问我就改了画布"。
+
+    只读工具（effect=read）不打断对话——查画布、搜素材、看任务状态都直接执行。
+    """
+    return str(getattr(tool, 'effect', '') or 'unknown').lower() != 'read'
 
 
 def _extract_tool_urls(value, limit: int = 12) -> list[str]:
@@ -353,6 +408,7 @@ class PiRuntime:
         mock_script: list[dict[str, Any]] | None = None,
         tool_runner: ToolExecutor | None = None,
         tool_objects: list | None = None,
+        connector_ids: list | tuple | None = None,
     ) -> None:
         self._bridge = bridge
         # tool_executor 是测试注入的假工具替身；host_caller 是真实受治理调用对象
@@ -372,6 +428,12 @@ class PiRuntime:
         # 第十阶段：Tool 对象目录（含执行器），供 HostToolCaller 按请求工具名
         # 唯一匹配（读/写白名单）。None 时 HostToolCaller 回退到本地能力 registry。
         self._tool_objects = tool_objects
+        # 本轮用户显式选中的连接器。显式传进来而不是读 connector_scope 的
+        # ContextVar：那个作用域在装配目录后就被 reset 了，执行工具时是空的。
+        # 没传（业务 run 那条路）就退回到 run() 里趁作用域还在时抓一次，见下面。
+        self._connector_ids_explicit = connector_ids is not None
+        self._connector_ids = tuple(
+            str(item) for item in (connector_ids or ()) if str(item).strip())
         self._model = model or {
             "id": "deepseek-v4-1-flash",
             "base_url": "https://www.hi-x.cn/v1",
@@ -533,9 +595,20 @@ class PiRuntime:
         if not self._tools_explicit and self._tool_objects is None and (
                 _os.environ.get('PI_WRITE_TOOL_KEYS')
                 or _os.environ.get('PI_READ_TOOL_KEYS')):
-            decls, tool_objects = await pi_tool_catalog()
+            decls, tool_objects = await pi_tool_catalog(
+                tenant_id=str(state.get('tenant_id') or ''),
+                owner_user_id=str(state.get('owner_user_id') or ''))
             self._tools = decls
             self._tool_objects = tool_objects
+
+        # 业务 run 那条路：调用方（api_hub.execute_round）把选中的连接器放在
+        # ContextVar 里，作用域覆盖整个 run。这里趁它还在，抓一份存到实例上——
+        # 工具执行发生在更深处，届时不能再指望 ContextVar 还活着。
+        if not self._connector_ids_explicit:
+            from webpage_agent.agent import connector_scope as _conn_scope
+            self._connector_ids = tuple(
+                str(item) for item in (_conn_scope.current() or ())
+                if str(item).strip())
 
         try:
             await bridge.start()
@@ -626,7 +699,7 @@ class PiRuntime:
                 bridge.execution_id,
                 "start",
                 user_input=user_input,
-                system_prompt=self._system_prompt,
+                system_prompt=_compose_prompt(self._system_prompt, state),
                 history=history,
                 tools=self._tools,
                 model=self._model,
@@ -813,7 +886,18 @@ class PiRuntime:
         tool_obj = next((item for item in (self._tool_objects or [])
                          if getattr(item, 'name', '') == tool_name), None)
         if (self._interactive_chat and tool_obj is not None
-                and _high_risk_tool(tool_obj) and not self._high_risk_approved):
+                and _needs_confirmation(tool_obj) and not self._high_risk_approved):
+            # 顺序不能反：先问"这个工具到底能不能执行"，再问"要不要用户确认"。
+            # 反了就会演成假动作——弹确认、用户点"确认"、执行口照样拒绝，
+            # 用户白点一次、模型再道歉一次。不可执行就直说，别让确认背锅。
+            if not pi_host_tools.tool_allowed(tool_obj,
+                                              connector_ids=self._connector_ids):
+                await self._send_tool_error(
+                    bridge, call_id,
+                    f'TOOL_NOT_ENABLED：{tool_name} 在当前部署未开放，'
+                    '本次没有执行。请如实说明该操作未启用，不要重试，'
+                    '也不要让用户“回复确认”来绕过。')
+                return
             try:
                 await emit_async({
                     'type': 'tool_confirmation_required',
@@ -870,7 +954,8 @@ class PiRuntime:
                     return result if isinstance(result, dict) else {}
             self._host_caller = HostToolCaller(
                 PiCallRegistry(self._snapshot), executor=executor,
-                tools_catalog=self._tool_objects)
+                tools_catalog=self._tool_objects,
+                connector_ids=self._connector_ids)
 
         # 第七阶段：把本次动作的恢复事实（已提交工具结果引用）与 settle_action
         # 同一事务写进快照。build_snapshot 在网关结算前被调用，返回序列化的

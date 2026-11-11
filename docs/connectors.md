@@ -56,7 +56,11 @@ ima             [连接]
 - 连接器面板 `#connectorPop`：搜索、列表、开关、管理连接器；
 - 打开开关调用 `POST /api/connectors/{id}/connect`，关闭调用 `disconnect`；
 - 未配置的连接器显示「配置」，提示去 `.env` 的 `MCP_SERVERS` 添加；
-- 「管理连接器」跳到技能中心的连接器 tab。
+- 「管理连接器」跳到技能中心的连接器 tab；
+- 「本轮选哪些连接器」仍由面板/胶囊控制（客户端 localStorage），用户动作后会
+  回写 `PATCH /api/sessions/{id}/addons {connector_ids}`，与专家/技能同一份会话选择
+  （见 [addons.md](addons.md)）。服务端解析层以会话选择为准，消息里带的
+  `connector_ids` 只作迁移兜底。
 
 ### 2.2 后端
 

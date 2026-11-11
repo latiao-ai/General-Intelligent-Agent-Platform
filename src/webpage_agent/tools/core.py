@@ -225,18 +225,22 @@ def _signature() -> tuple:
     return (settings.deploy_enabled, hashlib.sha256(body.encode()).hexdigest())
 
 
-async def _subject_token(server):
-    """当前主体在这个服务端上的钥匙。None = 沿用服务端配置。"""
+async def _subject_token(server, tenant_id: str = '', user_id: str = ''):
+    """当前主体在这个服务端上的钥匙。None = 沿用服务端配置。
+
+    OAuth 连接器必须在这里拿到钥匙：拿不到就抛 `CredentialMissing`，由
+    `_discover` 记成"这个服务端发现失败"并透给上层。不能退回去裸连——那只会
+    换来一个 401 和一次静默降级（模型看到的是"只有本地三个工具"）。
+    """
     from webpage_agent.core import mcp_connections
-    return await mcp_connections.bearer_for_current(server)
+    return await mcp_connections.token_for(
+        server, tenant_id=tenant_id, user_id=user_id)
 
 
-async def _discover(server) -> tuple[list[dict], str]:
+async def _discover(server, tenant_id: str = '', user_id: str = '') -> tuple[list[dict], str]:
     """发现单个服务端的工具。**失败只影响它自己**，不拖垮其他服务端。"""
     try:
-        token = None
-        if getattr(settings, 'tool_policy_enforced', False):
-            token = await _subject_token(server)
+        token = await _subject_token(server, tenant_id, user_id)
         if token is None:
             return await mcp_adapter.list_server_tools(server), ''
         return await mcp_adapter.list_server_tools(server, token=token), ''
@@ -401,7 +405,8 @@ def _capability_line(capabilities: dict, limit: int = 26,
     return line if len(line) <= max_chars else line[:max_chars] + '…'
 
 
-async def mcp_tools(force: bool = False) -> list[Tool]:
+async def mcp_tools(force: bool = False, *, tenant_id: str = '',
+                    user_id: str = '') -> list[Tool]:
     """发现所有 MCP 服务端的工具，包装成可编排的 Tool。
 
     - 并发发现，单个服务端超时/掉线不影响其他服务端；
@@ -410,10 +415,18 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
       自动填充——模型只需要给出其余业务参数；
     - **部署工具也在这里注册**：它由服务端声明、身份是 `mcp:<server>:<tool>`，
       只是多挂了一个由 publishing 能力包提供的适配器（闸门 + 回执归一）。
+
+    `tenant_id` / `user_id` 是这次发现的**连接器凭据主体**。聊天 turn 里没有
+    业务 run（也就没有账本主体），OAuth 连接器的钥匙只能由调用方显式给出；
+    不传时退回账本主体（业务 run、CLI 的旧行为不变）。
     """
     now = time.monotonic()
     cache = _current_mcp_cache()
     signature = _signature()
+    if tenant_id or user_id:
+        # 目录里含"这个主体能看见哪些工具"，缓存就不能跨主体串用。
+        signature = (signature,
+                     hashlib.sha256(f'{tenant_id}:{user_id}'.encode()).hexdigest())
     servers = mcp_servers.servers()
     allowed_tools: dict[str, set[str]] = {}
     if getattr(settings, 'tool_policy_enforced', False):
@@ -425,9 +438,13 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
             # 凭据上的工具白名单在**发现期**就生效：模型看不到，就不会先试一次
             # 再被 `E_CREDENTIAL_SCOPE` 拒掉（通用服务尤其需要，它给的是全权限钥匙）。
             allowed_tools = _allowed_tool_keys(scope)
-            tokens = await asyncio.gather(*(_subject_token(s) for s in servers))
-            signature = (signature, scope, tuple(hashlib.sha256((token or '').encode()).hexdigest()
-                                          for token in tokens))
+            # 摘要里只放哈希。取钥匙失败**必须让整轮目录失败**：撤权之后还拿
+            # 上一次的目录继续跑，等于让模型去点一个已经没权限的按钮。
+            tokens = await asyncio.gather(
+                *(_subject_token(s, tenant_id, user_id) for s in servers))
+            signature = (signature, scope, tuple(
+                hashlib.sha256(token.encode()).hexdigest() if token else ''
+                for token in tokens))
         except Exception:
             cache.update(at=0.0, tools=[], capabilities={}, signature=())
             raise
@@ -436,7 +453,8 @@ async def mcp_tools(force: bool = False) -> list[Tool]:
     if cached and not force:
         return cache['tools']
 
-    discovered = await asyncio.gather(*(_discover(server) for server in servers)) \
+    discovered = await asyncio.gather(
+        *(_discover(server, tenant_id, user_id) for server in servers)) \
         if servers else []
     # 有"通用调用 + 内部工具名"设计的服务端，顺带把内部能力清单读回来：
     # 规划器要能看到真实名字，执行前也要能校验（见 _check_inner_name）
@@ -548,6 +566,29 @@ def unusable_reason(server_id: str) -> str:
 def known_inner_names(server_id: str) -> dict:
     """某个服务端上一次发现到的内部能力清单（没有就空）。"""
     return dict((_current_mcp_cache().get('capabilities') or {}).get(server_id) or {})
+
+
+def discovery_errors() -> dict[str, str]:
+    """上一次工具发现里每个服务端的失败原因（成功的为空串）。
+
+    以前这些原因只进日志：OAuth 凭据没被用上时，用户看到的是"模型只有三个
+    本地工具"，界面上一个字都没有，只能靠猜。现在会话提示词与连接器面板都从
+    这里取值，把真实原因原样透出去。
+    """
+    return dict(_current_mcp_cache().get('errors') or {})
+
+
+def reset_cache() -> None:
+    """连接器授权/连接状态变了：下一次 `mcp_tools()` 重新发现，不等 300s TTL。
+
+    授权回调、连接、断开、撤销四处都要调：否则刚授完权，缓存里仍然是
+    "这个服务端 0 个工具"，用户会以为授权没生效。
+    """
+    _MCP_CACHE.update(at=0.0, tools=[], errors={}, signature=(),
+                      capabilities={})
+    for cache in _SCOPED_MCP_CACHES.values():
+        cache.update(at=0.0, tools=[], errors={}, signature=(),
+                     capabilities={})
 
 
 def _allowed_tool_keys(scope) -> dict[str, set[str]]:
@@ -833,7 +874,13 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None,
                  else server_tool_name)
         emit(action('调用 MCP 工具', label, '🔧'))
         try:
-            token = await _subject_token(server)
+            # 执行主体与发现时同一把尺子：state 里带着本轮的可信租户/用户
+            # （聊天 turn 没有业务 run，账本主体取不到）。OAuth 连接器的钥匙
+            # 必须在这里解析出来，否则发出去就是个 401。
+            token = await _subject_token(
+                server,
+                str(state.get('tenant_id') or ''),
+                str(state.get('owner_user_id') or ''))
             # 不带 server 时保持旧调用形式：既兼容既有调用点，也让工具名自己
             # 带前缀时能走路由（mcp_servers.split_tool_name）。
             # token 为 None 时不把这个参数传进去：沿用服务端自己的钥匙。
@@ -854,6 +901,12 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None,
             # 按异常类名猜必然猜错（文档 §6.1）。
             certainty = mcp_adapter.certainty_of_error(leaf)
             phase = 'connect' if certainty == 'not_executed' else 'receive'
+            if isinstance(leaf, credentials_module.CredentialMissing):
+                # 没钥匙就**没发请求**：这是确定性的"未执行"，不能标成结果未定，
+                # 否则宿主会把它当成"可能已经生效"去核对/补偿。
+                raise ToolError(
+                    f'MCP 工具 {server_tool_name} 未执行：连接器凭据不可用'
+                    f'（{leaf}）', certainty='not_executed', phase='validate') from exc
             if isinstance(leaf, mcp_adapter.MCPToolFailure):
                 # 业务层失败（status: error / E_*）：必须当成失败停下，而且要把
                 # 服务端原话透出来，否则用户只看到"没有产出可用结果"。

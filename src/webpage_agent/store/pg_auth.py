@@ -139,13 +139,18 @@ class PgAuth:
                     'UPDATE identities SET last_seen_at=%s '
                     'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
                     (stamp, tenant_id, idp, subject))
-                # 只同步这条身份源自己的角色，不改别的身份源。
-                await self._run(
-                    conn,
-                    'UPDATE identities SET role=%s, email=%s '
-                    'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
-                    (role, email, tenant_id, idp, subject))
-                row = dict(row, role=role)
+                # 角色**不在这里同步**。平台角色只是首次建号时的初值，之后归中台自己管
+                # （控制台改角色 / scripts/grant_admin）。原先这里每次登录都按平台角色
+                # 重算，而平台 admin 只映射到 operator，于是控制台刚授出去的
+                # platform_admin 会在下一次登录时被悄悄改回去——页面上没有任何提示，
+                # 只是"突然变回本企业运维"，很难查。
+                # 平台侧要收回权限：停用账号（status 会在登录时拦下）或在控制台改角色。
+                if email:
+                    await self._run(
+                        conn,
+                        'UPDATE identities SET email=%s '
+                        'WHERE tenant_id=%s AND identity_provider_id=%s AND subject=%s',
+                        (email, tenant_id, idp, subject))
             user = await self._one(
                 conn, 'SELECT status, display_name FROM app_users WHERE user_id=%s FOR UPDATE',
                 (row['user_id'],))
@@ -449,6 +454,7 @@ class PgAuth:
                           candidates: list | None = None,
                           clarification: str = '',
                           connector_ids: list | None = None,
+                          addon_selection: dict | None = None,
                           platform_subject: str | None = None) -> dict:
         """用户消息 + 待执行 turn + 接纳事件同事务提交。
 
@@ -523,6 +529,13 @@ class PgAuth:
                 await self._run(conn,
                     'UPDATE sessions SET platform_subject=%s WHERE session_id=%s',
                     (str(platform_subject), session_id))
+            # 会话级选择（专家/技能/连接器）随同一条消息进来时，必须和 turn
+            # **同一事务**落库：先提交 turn 再单独 UPDATE 会有窗口，Worker 可能
+            # 抢先领走这一轮，结果"第一条消息里的技能不生效"。
+            if addon_selection is not None:
+                await self._run(conn,
+                    'UPDATE sessions SET addon_selection=%s WHERE session_id=%s',
+                    (json.dumps(addon_selection, ensure_ascii=False), session_id))
             await conn.commit()
         return {'turn_id': turn_id, 'message_id': int((msg_row or {}).get('id') or 0),
                 'status': 'accepted', 'replayed': False, 'kind': kind,
@@ -834,8 +847,15 @@ class PgAuth:
         `include_legacy` 决定要不要把 ``owner_user_id='default'`` 的存量会话
         也算进来——调用方必须传 ``policy_legacy_visible``，**不能在这里默认放行**：
         列表一旦放行、详情（`ensure_owner`）不放行，就会变成"看得见、点开 404"。
+
+        定时任务每次触发都会新建一个会话，它们**不进列表**：在
+        "定时任务 → 运行记录"里看。用 occurrence 表反连接而不是给 sessions 加标记列
+        ——标记列会让 `INSERT INTO sessions VALUES (...)` 这种按位置的旧写法多一列，
+        而反连接的语义本来就是"这条会话属于某个定时任务的一次触发"。
         """
-        where, params = [], []
+        where, params = [
+            'NOT EXISTS (SELECT 1 FROM scheduled_task_runs o '
+            'WHERE o.session_id=s.session_id)'], []
         if tenant_id:
             where.append('s.tenant_id=%s')
             params.append(tenant_id)

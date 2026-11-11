@@ -56,7 +56,7 @@ def _make_hub(observed, *, create_error=None):
         hub.store.create_turn_run.side_effect = create_error
 
     class Runtime:
-        async def run(inner, state):
+        async def run(inner, state, *, on_event=None):
             from webpage_agent.store import ledger as ledger_module
             book = ledger_module.current_ledger()
             observed.append({

@@ -62,7 +62,19 @@ SESSION_PLATFORM_SUBJECT = 'v16_session_platform_subject'
 TURN_DRAFT = 'v17_turn_draft'
 # 会话 turn 的独立事件流（SSE）：answer_delta 等按自增游标持久化。
 TURN_EVENTS = 'v18_turn_events'
-LATEST = TURN_EVENTS
+# 登录平台登记表：把"中台支持哪些平台的账号密码登录"从环境变量搬进库，控制台可增删。
+AUTH_PLATFORMS = 'v19_auth_platforms'
+# 定时任务：scheduled_tasks / scheduled_task_runs 两张表（docs/scheduled-tasks.md）。
+# 下一步是 v22：投递 supersede 与每任务日预算。
+SCHEDULED_TASKS = 'v20_scheduled_tasks'
+# 服务心跳：service_heartbeats 一张表。API 与 Worker 是两个进程，过去没有
+# 任何证据能说明 Worker 还活着，Worker 挂掉后消息永久停在 accepted，用户
+# 看到的是"发出去没回复"。这张表让接纳层能当场拒绝、让监控能告警。
+SERVICE_HEARTBEATS = 'v21_service_heartbeats'
+# 专家 · 技能 · 连接器：会话级选择列 + 自定义专家表（docs/addons.md）。
+# 技能不落库：磁盘（SKILLS_DIR）是唯一事实来源，建索引表只会带来双写不一致。
+ADDONS = 'v22_addons'
+LATEST = ADDONS
 LOCK_ID = 719284631
 UPGRADES = ((GOVERNANCE, '''
 CREATE TABLE api_rate_windows (
@@ -175,6 +187,127 @@ CREATE TABLE IF NOT EXISTS session_turn_events (
 );
 CREATE INDEX IF NOT EXISTS idx_session_turn_events_turn
     ON session_turn_events(turn_id, id);
+'''), (AUTH_PLATFORMS, '''
+CREATE TABLE IF NOT EXISTS auth_platforms (
+    platform_id  TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL DEFAULT '',
+    login_mode   TEXT NOT NULL DEFAULT 'password_http',
+    enabled      BOOLEAN NOT NULL DEFAULT true,
+    is_default   BOOLEAN NOT NULL DEFAULT false,
+    tenant_id    TEXT NOT NULL DEFAULT 'default',
+    identity_provider_id TEXT NOT NULL DEFAULT '',
+    base_url     TEXT NOT NULL DEFAULT '',
+    config       TEXT NOT NULL DEFAULT '{}',
+    note         TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    created_by   TEXT NOT NULL DEFAULT '',
+    updated_by   TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_auth_platforms_enabled ON auth_platforms(enabled);
+'''), (SCHEDULED_TASKS, '''
+-- 与 SCHEMA 快照里同名表逐字一致：新库由基线建，存量库靠这一条升级。
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    schedule_id        TEXT PRIMARY KEY,
+    tenant_id          TEXT NOT NULL DEFAULT 'default',
+    owner_user_id      TEXT NOT NULL DEFAULT 'default',
+    owner_role         TEXT NOT NULL DEFAULT 'member',
+    platform_id        TEXT NOT NULL DEFAULT '',
+    platform_subject   TEXT NOT NULL DEFAULT '',
+    name               TEXT NOT NULL,
+    prompt             TEXT NOT NULL,
+    enabled            BOOLEAN NOT NULL DEFAULT true,
+    schedule_type      TEXT NOT NULL DEFAULT 'recurring',
+    rrule              TEXT NOT NULL DEFAULT '',
+    scheduled_at       TEXT,
+    valid_from         TEXT,
+    valid_until        TEXT,
+    next_run_at        DOUBLE PRECISION,
+    next_attempt_at    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    last_run_at        DOUBLE PRECISION,
+    last_status        TEXT NOT NULL DEFAULT '',
+    last_error_code    TEXT NOT NULL DEFAULT '',
+    last_error_message TEXT NOT NULL DEFAULT '',
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    deferred_count     INTEGER NOT NULL DEFAULT 0,
+    connector_ids_json TEXT NOT NULL DEFAULT '[]',
+    delivery_json      TEXT NOT NULL DEFAULT '{}',
+    lease_owner        TEXT NOT NULL DEFAULT '',
+    lease_expires_at   DOUBLE PRECISION NOT NULL DEFAULT 0,
+    lease_epoch        BIGINT NOT NULL DEFAULT 0,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_due
+    ON scheduled_tasks(enabled, next_run_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_owner
+    ON scheduled_tasks(tenant_id, owner_user_id, created_at);
+CREATE TABLE IF NOT EXISTS scheduled_task_runs (
+    occurrence_id  TEXT PRIMARY KEY,
+    schedule_id    TEXT NOT NULL,
+    tenant_id      TEXT NOT NULL DEFAULT 'default',
+    owner_user_id  TEXT NOT NULL DEFAULT 'default',
+    due_at         DOUBLE PRECISION NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'queued',
+    task_id        TEXT NOT NULL DEFAULT '',
+    run_id         TEXT NOT NULL DEFAULT '',
+    session_id     TEXT NOT NULL DEFAULT '',
+    error_code     TEXT NOT NULL DEFAULT '',
+    error_message  TEXT NOT NULL DEFAULT '',
+    summary        TEXT NOT NULL DEFAULT '',
+    delivery_status TEXT NOT NULL DEFAULT '',
+    delivery_attempts INTEGER NOT NULL DEFAULT 0,
+    started_at     DOUBLE PRECISION,
+    finished_at    DOUBLE PRECISION,
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_scheduled_task_runs_due
+    ON scheduled_task_runs(schedule_id, due_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_schedule
+    ON scheduled_task_runs(schedule_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_open
+    ON scheduled_task_runs(schedule_id) WHERE status IN ('queued','running');
+CREATE INDEX IF NOT EXISTS idx_scheduled_task_runs_session
+    ON scheduled_task_runs(session_id);
+'''), (SERVICE_HEARTBEATS, '''
+-- 与 SCHEMA 快照里同名表逐字一致。存量库靠这一条建出来。
+CREATE TABLE IF NOT EXISTS service_heartbeats (
+    service     TEXT NOT NULL,
+    instance_id TEXT NOT NULL,
+    beat_at     DOUBLE PRECISION NOT NULL,
+    started_at  DOUBLE PRECISION NOT NULL,
+    host        TEXT NOT NULL DEFAULT '',
+    pid         BIGINT NOT NULL DEFAULT 0,
+    meta_json   TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (service, instance_id)
+);
+CREATE INDEX IF NOT EXISTS idx_service_heartbeats_beat
+    ON service_heartbeats(service, beat_at);
+'''), (ADDONS, '''
+-- 会话级选择：WorkBuddy 的 addon_selection 对应列。`{}` = 没选任何东西。
+ALTER TABLE sessions
+    ADD COLUMN IF NOT EXISTS addon_selection TEXT NOT NULL DEFAULT '{}';
+-- 自定义专家。内置专家是代码目录（addons/catalog.py），不进库：
+-- 往每张库里灌一批固定行会让升级时"用户改过的内置专家"无从判断。
+CREATE TABLE IF NOT EXISTS experts (
+    expert_id          TEXT PRIMARY KEY,
+    tenant_id          TEXT NOT NULL DEFAULT 'default',
+    owner_user_id      TEXT NOT NULL DEFAULT 'default',
+    name               TEXT NOT NULL,
+    description        TEXT NOT NULL DEFAULT '',
+    system_prompt      TEXT NOT NULL DEFAULT '',
+    skill_ids_json     TEXT NOT NULL DEFAULT '[]',
+    connector_ids_json TEXT NOT NULL DEFAULT '[]',
+    model              TEXT NOT NULL DEFAULT '',
+    icon               TEXT NOT NULL DEFAULT '🧩',
+    color              TEXT NOT NULL DEFAULT '#eef4ff',
+    tag                TEXT NOT NULL DEFAULT '自定义',
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_experts_owner
+    ON experts(tenant_id, owner_user_id, created_at);
 '''))
 
 

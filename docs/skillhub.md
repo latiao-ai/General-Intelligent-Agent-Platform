@@ -43,7 +43,8 @@
 | `src/webpage_agent/skillhub/catalog.py` | 本地种子目录：30 个技能 + 12 个连接器 |
 | `src/webpage_agent/skillhub/store.py` | 安装状态持久化：`profile/skillhub/<tenant>__<user>.json` |
 | `src/webpage_agent/skillhub/remote.py` | 远端目录拉取、5 分钟缓存、失败回退 |
-| `src/webpage_agent/api/skillhub_api.py` | 客户端 API：列表、详情、安装/卸载、自定义技能 |
+| `src/webpage_agent/api/skillhub_api.py` | 客户端 API：列表、详情、安装/上传/导入/启停/删除 |
+| `src/webpage_agent/addons/skills.py` | **磁盘技能库**：`SKILL.md` 校验、上传解包、启停、会话物化 |
 | `src/webpage_agent/api/skillhub_registry_api.py` | SkillHub 服务端 API：目录、详情、包下载 |
 | `src/webpage_agent/api/routes.py` | 挂载 `skillhub_router` / `registry_router` / `registry_api_router` |
 | `scripts/serve_api.py` | 未配置 `SKILLHUB_URL` 时注入本机默认地址 |
@@ -55,11 +56,15 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| GET | `/api/skills` | 目录；参数 `kind=skill\|connector`、`tab=recommend\|skillhub\|suite`、`category`、`q`、`sort=comprehensive\|usage\|installs\|latest`、`installed=0\|1` |
+| GET | `/api/skills` | 目录；参数 `kind=skill\|connector`、`tab=recommend\|skillhub\|suite`、`category`、`q`、`sort=comprehensive\|usage\|installs\|latest`、`installed=0\|1`。条目含 `installed / on_disk / enabled / files / root_path` |
 | GET | `/api/skills/{id}` | 单个技能/连接器详情 |
-| POST | `/api/skills/{id}/install` | 安装（幂等） |
-| DELETE | `/api/skills/{id}/install` | 卸载 |
-| POST | `/api/skills` | 新建自定义技能/连接器并自动安装 |
+| POST | `/api/skills/{id}/install` | 安装（幂等）：目录条目 → 生成 `SKILL.md` 落到 `SKILLS_DIR/<id>/` |
+| DELETE | `/api/skills/{id}/install` | 卸载（只摘"已安装"记录，不动磁盘） |
+| POST | `/api/skills/upload` | 上传技能包：`.zip/.tar.gz/.tgz/.md`（multipart `file`，校验 SKILL.md 与 description） |
+| POST | `/api/skills/import` | 把服务器上一个目录变成技能：`{path, name?}` |
+| POST | `/api/skills/{id}/enable?enabled=` | 启停软开关（写 `.state.json`，不删目录） |
+| DELETE | `/api/skills/{id}` | 删除磁盘技能并从"已安装"摘掉 |
+| POST | `/api/skills` | 新建自定义技能/连接器并自动安装（技能会落盘） |
 | GET | `/api/skillhub/v1/skills` | SkillHub 服务端目录（`page/page_size/kind/category/q/sort`） |
 | GET | `/api/skillhub/v1/skills/{id}` | 服务端详情（含 `package.url/sha256/bytes`） |
 | GET | `/api/skillhub/v1/skills/{id}/download` | 下载技能包 zip |
@@ -218,13 +223,21 @@ GET /api/v1/skills/{slug}?namespace=
 
 ## 5. 安装状态
 
-- 路径：`profile/skillhub/<tenant>__<user>.json`；
-- 结构：`{"installed": ["deep-research", ...], "custom": [ ... ]}`；
-- 写入用临时文件 + `os.replace`，避免半份 JSON；
-- 当前默认主体已预装 3 个：`deep-research`、`html-report`、`web-extract`；
-- 重置演示数据：
+两个层次，别混：
+
+1. **"已安装"记录**（本节的 JSON）：路径 `profile/skillhub/<tenant>__<user>.json`，
+   结构 `{"installed": ["deep-research", ...], "custom": [ ... ]}`；写入用临时文件 +
+   `os.replace`，避免半份 JSON。它只决定技能中心里的按钮状态。
+2. **磁盘技能包**（`SKILLS_DIR/<id>/SKILL.md`）：这才是会话里真正能用的东西。
+   安装目录条目时会生成一份最小 `SKILL.md`；上传/导入直接产生技能包。
+   `GET /api/skills` 会把磁盘上存在但目录里没有的技能也列出来（`source=user`），
+   并把磁盘元信息覆盖到条目上（`on_disk / enabled / files`）。
+
+**只留 id 不留文件的存量数据**：老版本安装只记了 id，`on_disk=false`，
+条目会带 `need_files=true`——重新点一次安装即可生成技能文件。
 
 ```bash
+# 重置演示数据（只清"已安装"记录，不删技能包）
 python - <<'PY'
 from types import SimpleNamespace
 from webpage_agent.skillhub import store
@@ -233,15 +246,22 @@ store.save(SimpleNamespace(tenant_id='default', user_id='default'),
 PY
 ```
 
+磁盘技能与会话选择（专家、胶囊、按需读取）见 [专家 · 技能 · 连接器](addons.md)。
+
 ## 6. 与原「专家」弹窗的关系
 
 原来的 `#expertModal`（专家/技能/连接器只读列表）保留在 DOM 里，但侧栏入口已改为整页技能中心。
 如果还想保留旧入口，可以在「更多」菜单里加一个「专家面板」按钮调用 `openExperts()`。
 
+输入框的「+ → 专家 / 技能」不再是技能中心整页，而是**当前会话的选择器**：
+选中的专家/技能写进 `sessions.addon_selection`，技能中心只负责安装与上传。
+
 ## 7. 边界与下一步
 
 - 目录已支持远端（native / workbuddy 两种形状），但远端安装依赖技能包地址；
-- 安装目前只记录状态，不会自动注册工具；下一步可把已安装技能注入系统提示或工具白名单；
+- 安装已落盘、可被会话按需读取（见 [addons.md](addons.md)）；技能里的 `scripts/`
+  不会自动执行，需要宿主具备对应能力；
+- 技能包只做结构校验（SKILL.md、frontmatter、路径穿越、体积），没有服务端安全扫描；
 - 单机 JSON 适合当前部署；多副本/多租户应换 PostgreSQL 表；
 - 需要 RBAC：普通用户只能安装，operator 才能上架/下架；
 - 付费技能目前只是标记，未接支付与授权；

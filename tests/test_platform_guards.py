@@ -383,9 +383,9 @@ class DiscoveryIsolationTests(unittest.IsolatedAsyncioTestCase):
         active = {'name': 'alice', 'revision': 1, 'token': 'alice-token'}
         async def scope(servers):
             return 'tenant', active['name'], active['revision']
-        async def token(server):
+        async def token(server, tenant_id='', user_id=''):
             return active['token']
-        async def discover(server):
+        async def discover(server, tenant_id='', user_id=''):
             return [{'name': active['name'], 'description': active['name'],
                      'inputSchema': {'type': 'object'}, 'effect_type': 'read'}], ''
         async def capabilities(server):

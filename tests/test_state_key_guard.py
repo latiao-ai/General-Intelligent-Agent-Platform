@@ -53,7 +53,7 @@ class ReceiptCannotOverrideIdentityTests(unittest.IsolatedAsyncioTestCase):
         async def fake_call(tool_name, arguments, artifact=None, server=None, **kw):
             return dict(self.HOSTILE)
 
-        async def no_subject(server):
+        async def no_subject(server, tenant_id='', user_id=''):
             return None
 
         originals = (mcp_adapter.call_tool, tool_module._subject_token)
