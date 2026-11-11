@@ -84,7 +84,29 @@ prompt-common/fragments/workspace-project-memory.md
 
 复用现有 `memories` / `memory_tombstones` 版本化事实表。
 
-### 3.2 注入
+### 3.2 聊天 turn 的压缩与注入
+
+聊天 turn 现在和任务 run 一样先压缩：
+
+```text
+_run_pi_chat
+  → memory_module.compact(session_id)
+  → 得到 summary / facts / upto
+  → chat_history 只取 id > upto 的消息（最多最近 6 条原文）
+  → 系统提示注入 <session_memory>
+```
+
+阈值：
+
+```text
+未摘要消息 > 12 条
+或估算 > 3000 tokens
+```
+
+压缩时保留最近 6 条原文，把更早消息和旧摘要合成新的
+`summary + facts`，写回 `session_memory`。
+
+### 3.3 提示注入
 
 `_run_pi_chat` 在系统提示里加入：
 
@@ -99,7 +121,18 @@ prompt-common/fragments/workspace-project-memory.md
 
 并明确：记忆是背景，当前用户输入和当前事实优先。
 
-### 3.3 自动提取
+短期压缩块形如：
+
+```text
+<session_memory>
+这是本会话更早对话的摘要；最近几轮原文仍然保留。
+摘要：用户正在规划鼓浪屿旅行……
+关键事实：
+- 目的地：鼓浪屿
+</session_memory>
+```
+
+### 3.4 自动提取
 
 用户消息命中长期记忆线索时：
 
@@ -116,7 +149,7 @@ prompt-common/fragments/workspace-project-memory.md
 
 过滤一次性请求、天气、工具报错、搜索结果、密码/Token。
 
-### 3.4 管理界面
+### 3.5 管理界面
 
 「记忆与进化」分三块：
 
@@ -137,6 +170,14 @@ DELETE /api/memory?scope=user|workspace
 ![记忆与进化](assets/workbuddy/memory-ui.png)
 
 ## 4. 实测
+
+会话摘要注入：
+
+```text
+PUT 会话记忆：目的地=鼓浪屿，出行时间=2026年11月
+→ 下一轮问“根据会话摘要，我的目的地和出行时间是什么？”
+→ 回答：目的地：鼓浪屿；出行时间：2026年11月
+```
 
 写入：
 

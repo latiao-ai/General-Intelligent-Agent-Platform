@@ -175,3 +175,19 @@ async def extract_user_memory(store, *, scope_id: str, tenant_id: str,
         if saved:
             count += 1
     return count
+
+
+def render_session_memory(summary: str, facts: dict, max_chars: int = 2400) -> str:
+    """把滚动摘要和会话事实拼成聊天提示里的短期记忆块。"""
+    summary = str(summary or '').strip()
+    facts = {str(k): str(v) for k, v in (facts or {}).items() if str(k).strip()}
+    if not summary and not facts:
+        return ''
+    parts = ['<session_memory>', '这是本会话更早对话的摘要；最近几轮原文仍然保留。']
+    if summary:
+        parts.append('摘要：' + summary)
+    if facts:
+        parts.append('关键事实：')
+        parts.extend(f'- {key}：{value}' for key, value in facts.items())
+    parts.append('</session_memory>')
+    return '\n'.join(parts)[:max_chars]

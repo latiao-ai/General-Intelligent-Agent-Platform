@@ -535,8 +535,9 @@ class PgAuth:
                                   (turn_id,))
         return dict(row) if row else None
 
-    async def chat_history(self, session_id: str, exclude_turn_id: str) -> list[dict]:
-        """聊天上下文：当前 turn 之前的 user/assistant 消息（按完成消息水位截断）。
+    async def chat_history(self, session_id: str, exclude_turn_id: str,
+                           after_id: int = 0) -> list[dict]:
+        """聊天上下文：当前 turn 之前、已摘要水位之后的 user/assistant 消息。
 
         第十一阶段 A 组第 3 点：只读当前 turn 用户消息**之前**已完成的消息，不读入
         **之后已接纳但尚未执行的用户输入**。以当前 turn 用户消息的 `id` 为上界
@@ -545,11 +546,11 @@ class PgAuth:
         """
         async with self._lease() as conn:
             rows = await self._all(conn,
-                'SELECT role, content FROM messages WHERE session_id=%s '
+                'SELECT role, content FROM messages WHERE session_id=%s AND id > %s '
                 'AND id < COALESCE((SELECT MIN(id) FROM messages '
                 '   WHERE session_id=%s AND dedupe_key=%s), 9223372036854775807) '
                 'ORDER BY id',
-                (session_id, session_id, f'turn:{exclude_turn_id}'))
+                (session_id, int(after_id or 0), session_id, f'turn:{exclude_turn_id}'))
         return [{'role': r['role'], 'content': r['content']} for r in rows
                 if r['role'] in ('user', 'assistant')]
 

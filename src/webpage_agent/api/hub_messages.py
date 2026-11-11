@@ -458,9 +458,11 @@ class HubSessionMessageMixin:
                          tools=tools if tools is not None else [],
                          tool_objects=tool_objects)
 
-    async def _chat_history(self, session_id: str, exclude_turn_id: str) -> list:
-        """聊天上下文：该 turn 之前的 user/assistant 消息（排除当前 turn 的 user 消息）。"""
-        return await self.store.chat_history(session_id, exclude_turn_id)
+    async def _chat_history(self, session_id: str, exclude_turn_id: str,
+                            after_id: int = 0) -> list:
+        """聊天上下文：该 turn 之前、已摘要水位之后的消息。"""
+        return await self.store.chat_history(session_id, exclude_turn_id,
+                                             after_id=after_id)
 
     def _connector_context(self, connector_ids, tool_objects=None) -> str:
         """把本轮已选连接器写进系统提示。
@@ -512,8 +514,18 @@ class HubSessionMessageMixin:
         if self.chat_responder is not None:
             return await self.chat_responder(message, kind)
 
-        # 会话历史（排除当前 turn 的 user 消息）
-        history = await self._chat_history(session_id, turn_id)
+        # 先压缩更早的聊天，再构造历史；压缩失败仍用完整历史。
+        session_memory = {}
+        try:
+            session_memory = await memory_module.compact(self.store, session_id)
+        except Exception:                          # noqa: BLE001
+            logger.debug('聊天上下文压缩失败', exc_info=True)
+            try:
+                session_memory = await self.store.memory(session_id)
+            except Exception:                      # noqa: BLE001
+                session_memory = {}
+        history = await self._chat_history(
+            session_id, turn_id, after_id=int(session_memory.get('upto') or 0))
 
         # 本轮工具：默认带本地只读工具（含 web_search），chat 也允许联网搜索；
         # 如果当前会话选了连接器，再把对应 MCP 工具注入进来。
@@ -562,7 +574,10 @@ class HubSessionMessageMixin:
             user_rows, workspace_rows = [], []
         memory_block = memory_module.render_long_term(user_rows, workspace_rows)
 
+        session_block = memory_module.render_session_memory(
+            session_memory.get('summary') or '', session_memory.get('facts') or {})
         system_prompt = ((settings.pi_system_prompt or '')
+                         + ('\n\n' + session_block if session_block else '')
                          + ('\n\n' + memory_block if memory_block else '')
                          + self._connector_context(connector_ids, tool_objects))
 
@@ -636,6 +651,7 @@ class HubSessionMessageMixin:
                 'workspace_dir': stored,
                 'documents': [], 'mcp_calls': [], 'errors': [], 'usage': [],
                 'status': 'created', 'interactive_chat': True,
+                'session_memory': session_memory,
             }
             draft_parts: list[str] = []
             draft_last = 0.0
