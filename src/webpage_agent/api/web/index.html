@@ -533,6 +533,29 @@ a{color:var(--brand);text-decoration:none}
 #mmText:focus{border-color:#cfd4db}
 .mcp-error{min-height:18px;margin-top:6px;font-size:11.5px;color:var(--danger)}
 
+
+/* 连接器详情（WorkBuddy 风格） */
+.connector-detail-card{width:min(720px,100%);align-items:center;text-align:center;position:relative;
+  padding:30px 34px 24px;overflow:auto}
+.cd-close{position:absolute;right:14px;top:14px;border:0;background:none;color:var(--muted);font-size:24px;cursor:pointer}
+.cd-logo{width:66px;height:66px;border-radius:18px;display:grid;place-items:center;background:#1f242b;
+  color:#fff;font-size:28px;margin:4px 0 12px}
+.cd-title{font-size:24px;font-weight:600;color:var(--ink)}
+.cd-desc{max-width:560px;margin:12px 0 8px;color:var(--muted);font-size:13px;line-height:1.8}
+.cd-status{font-size:11.5px;color:var(--muted-2);margin-bottom:14px}
+.cd-actions{display:flex;gap:8px;justify-content:center;margin:6px 0 22px}
+.cd-actions button{height:36px;padding:0 16px;border:1px solid var(--line-2);border-radius:9px;
+  background:#fff;color:var(--ink-2);font-size:12.5px;cursor:pointer}
+.cd-actions button:hover{background:var(--soft)}
+.cd-actions button.primary{background:var(--ink);border-color:var(--ink);color:#fff}
+.cd-actions button.warn{background:#fff6f5;border-color:#f6cfc9;color:var(--danger)}
+.cd-examples{width:100%;text-align:left}
+.cd-examples-title{font-size:13px;color:var(--ink);font-weight:600;margin:0 0 8px}
+.cd-example{display:flex;align-items:center;gap:8px;width:100%;padding:12px 14px;margin-bottom:8px;
+  border:1px solid var(--line);border-radius:11px;background:#f7f8f9;color:var(--ink-2);
+  font-size:12.5px;text-align:left;cursor:pointer}
+.cd-example:hover{background:var(--soft)}
+
 /* 登录（平台账号密码） */
 .auth-card{width:min(400px,100%)}
 .auth-form{display:flex;flex-direction:column;gap:9px;margin-top:12px}
@@ -1618,6 +1641,22 @@ body {
       <textarea id="mmText" spellcheck="false" aria-label="MCP JSON 配置"></textarea>
       <div class="mcp-error" id="mmError"></div>
     </div>
+  </div>
+</div>
+
+<div class="modal" id="connectorDetailModal" style="display:none">
+  <div class="modal-card connector-detail-card">
+    <button class="cd-close" id="cdClose" aria-label="关闭">×</button>
+    <div class="cd-logo" id="cdIcon">🔗</div>
+    <div class="cd-title" id="cdTitle">连接器</div>
+    <div class="cd-desc" id="cdDesc"></div>
+    <div class="cd-status" id="cdStatus"></div>
+    <div class="cd-actions">
+      <button class="primary" id="cdConnect">连接</button>
+      <button id="cdTry">去试试</button>
+      <button class="warn" id="cdUnbind">解绑</button>
+    </div>
+    <div class="cd-examples" id="cdExamples"></div>
   </div>
 </div>
 
@@ -5232,7 +5271,8 @@ setInterval(async () => {
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       // 只展示中台真的已经配置的 MCP；目录里未配置的通用连接器不在这里充数。
-      hubMcpItems = (data.items || []).filter(x => x.configured);
+      hubMcpItems = dedupeConnectorItems(
+        (data.items || []).filter(x => x.configured));
       renderHubMcp();
     } catch (err) {
       grid.innerHTML = `<div class="hub-empty">读取失败：${esc(err.message || '网络错误')}</div>`;
@@ -5265,19 +5305,19 @@ setInterval(async () => {
         : '未配置，点 + 添加自定义 MCP';
       const status = document.createElement('div');
       status.className = 'hub-mcp-status';
-      status.textContent = item.enabled ? '已连接'
-        : (item.need_authorize ? '待授权' : (item.configured ? '未连接' : '未添加'));
+      status.textContent = item.need_authorize ? '待授权'
+        : (item.enabled ? '已连接' : (item.configured ? '未连接' : '未添加'));
       body.append(name, desc, status);
       const act = document.createElement('button');
       act.type = 'button';
-      if (item.enabled) {
-        act.className = 'hub-mcp-add done';
-        act.textContent = '✓';
-        act.title = '已连接';
-      } else if (item.need_authorize) {
+      if (item.need_authorize) {
         act.className = 'hub-mcp-add auth';
         act.textContent = '授权';
         act.onclick = e => { e.stopPropagation(); startConnectorAuth(item); };
+      } else if (item.enabled) {
+        act.className = 'hub-mcp-add done';
+        act.textContent = '✓';
+        act.title = '已连接';
       } else {
         act.className = 'hub-mcp-add';
         act.textContent = '+';
@@ -5285,9 +5325,96 @@ setInterval(async () => {
         act.onclick = e => { e.stopPropagation(); hubMcpConnect(item, act); };
       }
       card.append(icon, body, act);
+      card.onclick = () => openConnectorDetail(item);
       return card;
     }));
   }
+
+  let connectorDetailItem = null;
+  const CONNECTOR_EXAMPLES = {
+    libtv: [
+      '查看我在 LibTV 中的项目',
+      '用 LibTV 根据这张参考图制作一段产品视频',
+      '把我指定的 LibTV 画布中的已有作品整理成导演提案',
+      '根据剧本用 LibTV 出图、Blender 白模运镜，再转成实拍视频',
+    ],
+  };
+
+  function openConnectorDetail(item) {
+    connectorDetailItem = item;
+    const examples = CONNECTOR_EXAMPLES[item.id] || [];
+    $id('cdIcon').textContent = item.icon || (item.transport === 'stdio' ? '🗄️' : '🔗');
+    $id('cdTitle').textContent = item.id === 'libtv' ? 'LibTV' : (item.name || item.id);
+    $id('cdDesc').textContent = item.id === 'libtv'
+      ? '连接 LibTV 创作图片、视频与音频，管理画布，制作导演提案、Blender 白模实拍工作流与音乐驱动产品广告。'
+      : `${item.transport || 'MCP'} 连接器。连接后可把它的工具加入当前会话。`;
+    $id('cdStatus').textContent = `${item.transport || 'mcp'} · ${item.tools || 0} 个工具`
+      + (item.need_authorize ? ' · 待授权' : (item.enabled ? ' · 已连接' : ' · 未连接'));
+    const connect = $id('cdConnect');
+    connect.textContent = item.need_authorize ? '授权' : (item.enabled ? '重新连接' : '连接');
+    $id('cdUnbind').style.display = item.enabled && !item.need_authorize ? '' : 'none';
+    const box = $id('cdExamples');
+    box.replaceChildren();
+    if (examples.length) {
+      const title = document.createElement('div');
+      title.className = 'cd-examples-title';
+      title.textContent = '💡 试试这样用';
+      box.appendChild(title);
+      examples.forEach(text => {
+        const b = document.createElement('button');
+        b.type = 'button'; b.className = 'cd-example';
+        b.textContent = text;
+        b.onclick = () => useConnectorExample(text);
+        box.appendChild(b);
+      });
+    }
+    $id('connectorDetailModal').style.display = 'flex';
+  }
+
+  function useConnectorExample(text) {
+    $id('connectorDetailModal').style.display = 'none';
+    closeHub();
+    const ta = $id('msg');
+    ta.value = text;
+    ta.dispatchEvent(new Event('input'));
+    ta.focus();
+    ta.setSelectionRange(ta.value.length, ta.value.length);
+  }
+
+  $id('cdClose').onclick = () => { $id('connectorDetailModal').style.display = 'none'; };
+  $id('connectorDetailModal').addEventListener('click', e => {
+    if (e.target === $id('connectorDetailModal')) $id('connectorDetailModal').style.display = 'none';
+  });
+  $id('cdTry').onclick = () => {
+    const item = connectorDetailItem;
+    if (!item) return;
+    if (!item.enabled) {
+      if (item.need_authorize) startConnectorAuth(item);
+      else hubMcpConnect(item, $id('cdConnect'));
+      return;
+    }
+    useConnectorExample((CONNECTOR_EXAMPLES[item.id] || ['你好'])[0]);
+  };
+  $id('cdConnect').onclick = () => {
+    const item = connectorDetailItem;
+    if (!item) return;
+    if (item.need_authorize) startConnectorAuth(item);
+    else hubMcpConnect(item, $id('cdConnect'));
+  };
+  $id('cdUnbind').onclick = async () => {
+    const item = connectorDetailItem;
+    if (!item) return;
+    try {
+      const res = checkAuth(await fetch(`${PREFIX}/connectors/${encodeURIComponent(item.id)}/disconnect`, {method: 'POST'}));
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      $id('connectorDetailModal').style.display = 'none';
+      toast(`已解绑「${item.name || item.id}」`);
+      await loadHubMcp();
+      await loadConnectors();
+    } catch (err) {
+      toast('解绑失败：' + (err.message || '网络错误'));
+    }
+  };
 
   async function hubMcpConnect(item, btn) {
     if (!item.configured) {
@@ -5766,6 +5893,16 @@ setInterval(async () => {
     loadConnectors();
   }
 
+  // 同一个连接器的本机桥/远端实现只展示一个；LibTV 以远端 OAuth 为主。
+  const CONNECTOR_ALIASES = {'libtv-local': 'libtv'};
+  function dedupeConnectorItems(items) {
+    const ids = new Set((items || []).map(x => x.id));
+    return (items || []).filter(x => {
+      const canonical = CONNECTOR_ALIASES[x.id];
+      return !(canonical && ids.has(canonical));
+    });
+  }
+
   async function loadConnectors() {
     const list = $id('cpList');
     list.innerHTML = '<div class="cp-note" style="padding:14px 8px">读取中…</div>';
@@ -5773,7 +5910,8 @@ setInterval(async () => {
       const res = await fetch(PREFIX + '/connectors', {cache: 'no-store'});
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
-      connectorItems = data.items || [];
+      connectorItems = dedupeConnectorItems(
+        (data.items || []).filter(x => x.configured));
       renderConnectors('');
       renderConnectorChips();
     } catch (err) {
@@ -5893,7 +6031,7 @@ setInterval(async () => {
       $id('mmPath').textContent = '配置文件：' + (cfg.path || '');
       $id('mmEditorPath').textContent = '配置文件：' + (cfg.path || '');
       const tools = new Map((connectorItems || []).map(x => [x.id, x]));
-      const items = srv.items || [];
+      const items = dedupeConnectorItems(srv.items || []);
       if (!items.length) {
         $id('mmList').innerHTML = '<div class="mcp-empty">还没有 MCP 服务。点「添加 MCP」写入配置。</div>';
         return;

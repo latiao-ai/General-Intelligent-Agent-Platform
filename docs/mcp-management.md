@@ -284,3 +284,25 @@ canvas.project.export         高风险，先确认
 - 一次确认会在该轮放行高风险工具，仍建议前端后续做逐项审批；
 - 写工具仍受 MCP 服务端自身的权限/revision 校验；
 - LibTV 这类 OAuth 连接器未授权时仍会 401，需要先完成授权。
+
+
+## 7. 单一连接器身份与详情弹窗
+
+WorkBuddy 里 LibTV 是一张卡、一个连接身份；中台之前同时暴露了：
+
+```text
+libtv-local   本机 stdio 桥
+libtv         远端 OAuth
+```
+
+现在做连接器别名：
+
+- 存在 `libtv` 时隐藏 `libtv-local`；
+- 连接器页、输入框连接器面板、MCP 管理页都只显示一个 LibTV；
+- LibTV 默认走远端 OAuth，状态显示「待授权 / 授权」；
+- 点击 LibTV 卡片打开详情弹窗，展示说明、工具数、授权/重连、去试试、解绑和示例；
+- 输入框只显示已配置服务，不再混入企业微信、飞书、GitHub 等未配置目录项。
+
+![LibTV 详情](assets/workbuddy/libtv-detail.png)
+
+![干净连接器面板](assets/workbuddy/connector-drawer-clean.png)
