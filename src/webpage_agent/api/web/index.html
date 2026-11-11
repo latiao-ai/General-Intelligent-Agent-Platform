@@ -312,6 +312,8 @@ a{color:var(--brand);text-decoration:none}
 .cp-step .cp-step-text{min-width:0;overflow-wrap:anywhere}
 .cp-step .cp-step-meta{margin-left:auto;flex:none;font-size:10.5px;color:var(--muted-2)}
 .cp-step.done .cp-step-ico{color:var(--brand)}
+.cp-step.warn .cp-step-ico{color:#d97706}
+.cp-step.warn .cp-step-meta{color:#b45309}
 
 /* 等待答复的占位气泡 */
 #pendingReply .bubble{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:13px}
@@ -2060,6 +2062,20 @@ function addChatStep(name, args) {
   return row;
 }
 
+function addChatConfirmation(name, args) {
+  const state = ensureChatProcess();
+  const row = document.createElement('div');
+  row.className = 'cp-step warn';
+  const tool = String(name || '工具');
+  row.innerHTML = `<span class="cp-step-ico">⚠️</span>`
+    + `<span class="cp-step-text"></span><span class="cp-step-meta">待确认</span>`;
+  row.querySelector('.cp-step-text').textContent =
+    `需要你确认：${tool}（高风险或付费操作，回复“确认”后执行）`;
+  state.el.querySelector('.cp-steps').appendChild(row);
+  state.steps.push(row);
+  return row;
+}
+
 function finishChatProcess(status) {
   const state = S.chatProcess;
   if (!state) return;
@@ -2070,6 +2086,7 @@ function finishChatProcess(status) {
   if (title && !state.reasoning) title.textContent = '处理过程';
   else if (title) title.textContent = '深度思考';
   for (const row of state.steps) {
+    if (row.classList.contains('warn')) continue;
     row.classList.add('done');
     const meta = row.querySelector('.cp-step-meta');
     if (meta) meta.textContent = status === 'failed' ? '失败' : '完成';
@@ -2695,9 +2712,12 @@ function streamChatTurn(turnId, sessionId) {
       appendChatReasoning(data.text || '');
     } else if (data.type === 'tool_call') {
       addChatStep(data.name || '工具', data.args || {});
+    } else if (data.type === 'tool_confirmation_required') {
+      addChatConfirmation(data.name || '工具', data.args || {});
     } else if (data.type === 'answer_delta') {
       const state = ensureChatProcess();
       for (const row of state.steps) {
+        if (row.classList.contains('warn')) continue;
         row.classList.add('done');
         const meta = row.querySelector('.cp-step-meta');
         if (meta) meta.textContent = '完成';

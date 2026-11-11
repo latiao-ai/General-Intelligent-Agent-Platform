@@ -487,6 +487,9 @@ class HubSessionMessageMixin:
         else:
             lines.append('本轮暂未注入可调用工具（可能未配置/授权失败），不要因此编造调用结果。')
         lines.append('当用户问“连接了哪些 MCP server”时，以本清单为准，不要说没有暴露。')
+        lines.append('涉及删除、导出、生成/提交、发布、扣费等高风险工具，'
+                     '执行前必须先向用户说明影响或费用，并等待用户明确回复“确认”；'
+                     '未确认时不要直接调用。')
         return '\n'.join(lines)
 
     async def _run_pi_chat(self, claimed: dict) -> str | None:
@@ -621,7 +624,7 @@ class HubSessionMessageMixin:
                 'tenant_id': tenant_id,
                 'workspace_dir': stored,
                 'documents': [], 'mcp_calls': [], 'errors': [], 'usage': [],
-                'status': 'created',
+                'status': 'created', 'interactive_chat': True,
             }
             draft_parts: list[str] = []
             draft_last = 0.0
@@ -629,7 +632,8 @@ class HubSessionMessageMixin:
             async def on_event(event: dict) -> None:
                 nonlocal draft_last
                 event_type = str(event.get('type') or '')
-                if event_type in ('answer_delta', 'reasoning_delta', 'tool_call', 'tool_result'):
+                if event_type in ('answer_delta', 'reasoning_delta', 'tool_call', 'tool_result',
+                                  'tool_confirmation_required'):
                     try:
                         await self.store.append_turn_event(turn_id, event)
                     except Exception:              # noqa: BLE001

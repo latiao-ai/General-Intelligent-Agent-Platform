@@ -209,7 +209,9 @@ LibTV 视频/图片/音频创作 71 个工具
 - WorkBuddy 的 `McpTrustStore` 本地命令信任机制没有迁移，因为中台不接受 stdio。
 
 
-## 6. BeeFTV 为什么之前只看到一个工具
+## 6. 连接器工具策略（全量 + 高风险确认）
+
+### 6.1 选中即暴露全部工具
 
 BeeFTV 的 MCP 连接是真实的：
 
@@ -219,26 +221,66 @@ stdio: /Users/latiao/Desktop/BeefTV/.local/bin/beeftv-dev mcp serve
 annotations：87 个 read、129 个 write
 ```
 
-但 Pi 的工具目录之前只按全局 `PI_READ_TOOL_KEYS` 注入，而 BeeFTV 只有：
+以前只按全局 `PI_READ_TOOL_KEYS` 注入，而 BeeFTV 只有 `mcp:beeftv:canvas.get`，
+所以模型只能看到一个工具。
 
-```text
-mcp:beeftv:canvas.get
-```
+现在：
 
-所以模型只能看到 `canvas.get`，不是服务端只有这一个工具。
-
-现在改成：
-
-- 当前会话显式选中的连接器，**自动注入该服务端所有 read 工具**；
-- 写工具仍受 `PI_WRITE_TOOLS_ENABLED` / `PI_WRITE_TOOL_KEYS` 门禁；
-- 未选中连接器时不注入它的工具。
+- 用户在会话里显式选中某个 MCP 连接器后，**默认注入该服务端的全部工具**
+  （read + write + destructive + unknown）；
+- 不再要求每个工具出现在 `PI_READ_TOOL_KEYS` / `PI_WRITE_TOOL_KEYS`；
+- 未选中的连接器不注入。
 
 实测 BeeFTV 选中后：
 
 ```text
-MCP 工具 87 个（全部 read）
-总工具 90 个（含本地 web_search / 文件 / request_input）
+MCP 工具：216 个
+总工具：219 个（含本地 web_search / 文件 / request_input）
+工具声明 JSON：约 153 KB
 ```
 
-模型回答也从“只有 canvas_get”变成按类别列出画布、素材、媒体审查、模型/技能元信息、
-后台只读业务接口等真实能力。
+### 6.2 高风险/付费操作需要确认
+
+执行层新增 `_high_risk_tool` 判定：
+
+```text
+read                         → 直接执行
+write + create/update/move/  → 直接执行（低风险编辑）
+write + delete/remove/       → 先确认
+        export/submit/
+        generate/render/
+        publish/pay/...
+destructive                  → 先确认
+unknown                      → 先确认
+```
+
+典型结果：
+
+```text
+canvas.nodes.create           低风险，直接执行
+canvas.node.update            低风险，直接执行
+canvas.node.delete            高风险，先确认
+canvas.generation.submit      付费/高风险，先确认
+canvas.project.export         高风险，先确认
+```
+
+未确认时：
+
+- 工具调用不会真正发出；
+- 返回错误 `HIGH_RISK_CONFIRMATION_REQUIRED`，要求模型不要同一轮重试；
+- 会话 turn 增加 `tool_confirmation_required` 事件；
+- 前端过程卡显示：
+
+```text
+⚠️ 需要你确认：canvas_generation_submit
+   （高风险或付费操作，回复“确认”后执行）
+```
+
+用户回复“确认/同意/批准/允许/继续”后，下一轮才允许执行高风险工具。
+
+### 6.3 边界
+
+- 当前确认粒度是“本轮用户输入包含确认词”，不是逐工具按钮；
+- 一次确认会在该轮放行高风险工具，仍建议前端后续做逐项审批；
+- 写工具仍受 MCP 服务端自身的权限/revision 校验；
+- LibTV 这类 OAuth 连接器未授权时仍会 401，需要先完成授权。

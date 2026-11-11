@@ -203,7 +203,9 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
         # 用户在当前会话显式选中了连接器：该服务端的只读工具全部注入，
         # 不再要求每个工具都出现在全局 PI_READ_TOOL_KEYS 里。
         # 写工具仍受 PI_WRITE_TOOLS_ENABLED / PI_WRITE_TOOL_KEYS 门禁。
-        if selected is not None and server_id in selected and effect == 'read':
+        # 用户选中连接器后默认暴露它的全部工具；高风险/付费工具在执行处
+        # 由 _high_risk_tool 拦下并要求用户确认，而不是在目录里隐藏。
+        if selected is not None and server_id in selected:
             tool_objects.append(tool)
         elif key in write_keys:
             tool_objects.append(tool)
@@ -222,6 +224,35 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
         tool_objects = [tool for tool in tool_objects
                         if getattr(tool, 'name', '') not in dropped_names]
     return kept, tool_objects
+
+
+_HIGH_RISK_NAME_PARTS = (
+    'delete', 'remove', 'drop', 'destroy', 'revoke', 'reset', 'restore',
+    'export', 'publish', 'submit', 'generate', 'render', 'pay', 'charge',
+    'purchase', 'order', 'send', 'upload', 'commit', 'deploy', 'apply',
+    'replace', 'overwrite', 'cancel', 'stop', 'archive', 'import',
+    'install', 'uninstall',
+)
+_CONFIRM_RE = re.compile(
+    r'(确认|确定|同意|批准|允许|可以执行|继续执行|执行吧|继续|yes|confirm|approve)',
+    re.IGNORECASE)
+
+
+def _is_confirmation(text: str) -> bool:
+    return bool(_CONFIRM_RE.search(str(text or '')))
+
+
+def _high_risk_tool(tool) -> bool:
+    """高风险/付费工具：写工具按名称与 annotations 判定。"""
+    effect = str(getattr(tool, 'effect', '') or 'unknown').lower()
+    if effect == 'read':
+        return False
+    if effect == 'destructive':
+        return True
+    name = str(getattr(tool, 'name', '') or '').lower().replace('__', '_')
+    if effect == 'unknown':
+        return True
+    return any(part in name for part in _HIGH_RISK_NAME_PARTS)
 
 
 def _tool_event_args(args) -> dict:
@@ -287,6 +318,8 @@ class PiRuntime:
         # 只要环境里配了白名单，任何显式传入的目录都会在 run() 里被悄悄覆盖成
         # 真实工具目录——调用方的意图被环境变量劫持，且失败时表现为"工具不对"。
         self._tools_explicit = tools is not None
+        self._interactive_chat = False
+        self._high_risk_approved = False
         # 第十阶段：Tool 对象目录（含执行器），供 HostToolCaller 按请求工具名
         # 唯一匹配（读/写白名单）。None 时 HostToolCaller 回退到本地能力 registry。
         self._tool_objects = tool_objects
@@ -346,6 +379,8 @@ class PiRuntime:
             if folder.is_dir() and not folder.is_symlink():
                 bridge.cwd = str(folder.resolve())
         answer_parts: list[str] = []
+        self._interactive_chat = bool(state.get('interactive_chat'))
+        self._high_risk_approved = _is_confirmation(str(state.get('user_input') or ''))
         self._tool_calls = 0
         self._repeat_counts = {}
         self._call_trace = []
@@ -726,6 +761,26 @@ class PiRuntime:
         if blocked:
             await self._park_for_input(bridge, state, call_id, tool_name, blocked)
             return
+        tool_obj = next((item for item in (self._tool_objects or [])
+                         if getattr(item, 'name', '') == tool_name), None)
+        if (self._interactive_chat and tool_obj is not None
+                and _high_risk_tool(tool_obj) and not self._high_risk_approved):
+            try:
+                await emit_async({
+                    'type': 'tool_confirmation_required',
+                    'name': tool_name,
+                    'args': _tool_event_args(args),
+                    'reason': '高风险/付费操作，需要用户明确确认',
+                })
+            except Exception:                  # noqa: BLE001
+                logger.debug('确认事件发送失败', exc_info=True)
+            await self._send_tool_error(
+                bridge, call_id,
+                'HIGH_RISK_CONFIRMATION_REQUIRED：这是高风险/付费操作，尚未执行。'
+                '不要在同一轮重试；请先向用户说明操作内容、影响或费用，'
+                '等待用户明确回复“确认”后再调用。')
+            return
+
         self._tool_calls += 1
         await _emit_tool_call(tool_name, args)
 
