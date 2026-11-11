@@ -207,3 +207,38 @@ LibTV 视频/图片/音频创作 71 个工具
 - 编辑器以原文展示 headers，里面可能含密钥；接口已要求登录，文件权限 0600；
 - 保存后不会自动连接，需要到连接器面板打开开关；
 - WorkBuddy 的 `McpTrustStore` 本地命令信任机制没有迁移，因为中台不接受 stdio。
+
+
+## 6. BeeFTV 为什么之前只看到一个工具
+
+BeeFTV 的 MCP 连接是真实的：
+
+```text
+stdio: /Users/latiao/Desktop/BeefTV/.local/bin/beeftv-dev mcp serve
+发现工具：216 个
+annotations：87 个 read、129 个 write
+```
+
+但 Pi 的工具目录之前只按全局 `PI_READ_TOOL_KEYS` 注入，而 BeeFTV 只有：
+
+```text
+mcp:beeftv:canvas.get
+```
+
+所以模型只能看到 `canvas.get`，不是服务端只有这一个工具。
+
+现在改成：
+
+- 当前会话显式选中的连接器，**自动注入该服务端所有 read 工具**；
+- 写工具仍受 `PI_WRITE_TOOLS_ENABLED` / `PI_WRITE_TOOL_KEYS` 门禁；
+- 未选中连接器时不注入它的工具。
+
+实测 BeeFTV 选中后：
+
+```text
+MCP 工具 87 个（全部 read）
+总工具 90 个（含本地 web_search / 文件 / request_input）
+```
+
+模型回答也从“只有 canvas_get”变成按类别列出画布、素材、媒体审查、模型/技能元信息、
+后台只读业务接口等真实能力。

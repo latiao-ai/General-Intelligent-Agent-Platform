@@ -194,12 +194,20 @@ async def pi_tool_catalog() -> tuple[list[dict[str, Any]], list]:
             parts = str(getattr(tool, 'tool_key', '') or '').split(':', 2)
             return parts[1] if len(parts) >= 3 else ''
         mcp = [tool for tool in mcp if _mcp_server_id(tool) in allowed]
+    selected = set(allowed_connectors) if allowed_connectors is not None else None
     for tool in mcp:
         key = getattr(tool, 'tool_key', '') or ''
         effect = str(getattr(tool, 'effect', '') or 'unknown')
-        if key in read_keys and effect == 'read':
+        parts = key.split(':', 2)
+        server_id = parts[1] if len(parts) >= 3 else ''
+        # 用户在当前会话显式选中了连接器：该服务端的只读工具全部注入，
+        # 不再要求每个工具都出现在全局 PI_READ_TOOL_KEYS 里。
+        # 写工具仍受 PI_WRITE_TOOLS_ENABLED / PI_WRITE_TOOL_KEYS 门禁。
+        if selected is not None and server_id in selected and effect == 'read':
             tool_objects.append(tool)
         elif key in write_keys:
+            tool_objects.append(tool)
+        elif selected is None and key in read_keys and effect == 'read':
             tool_objects.append(tool)
 
     # 名字先收成供应商允许的字符集，声明与执行目录用同一份名字。
