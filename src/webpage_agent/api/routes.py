@@ -201,6 +201,11 @@ class MemoryRequest(StrictBody):
     facts: str = Field(default='', max_length=4000)
 
 
+class LongTermMemoryRequest(StrictBody):
+    scope: Literal['user', 'workspace'] = 'user'
+    facts: str = Field(default='', max_length=8000)
+
+
 class RunInputRequest(StrictBody):
     """给**当前任务**的补充要求。
 
@@ -1396,6 +1401,59 @@ async def delete_memory(session_id: str,
     await _owned_session(session_id, principal)
     await hub.store.clear_memory(session_id)
     return {'cleared': True}
+
+
+async def _long_term_scope(principal) -> tuple[str, str, str]:
+    tenant = str(getattr(principal, 'tenant_id', 'default') or 'default')
+    user = str(getattr(principal, 'user_id', 'default') or 'default')
+    stored = await hub.store.get_workspace(tenant_id=tenant, owner_user_id=user)
+    if not stored:
+        stored = str(sandbox.provision(tenant, user))
+    return tenant, user, stored
+
+
+def _memory_rows_text(rows: list[dict]) -> str:
+    return '\n'.join(f"{row.get('predicate', '')}：{row.get('value', '')}"
+                      for row in rows if row.get('predicate'))
+
+
+@app.get('/api/memory')
+async def get_long_term_memory(principal=Depends(policies.current_principal)):
+    """跨会话长期记忆：用户级 + 当前工作区。"""
+    tenant, user, workspace = await _long_term_scope(principal)
+    user_rows = await hub.store.recall('user', user)
+    ws_rows = await hub.store.recall('workspace', workspace)
+    return {
+        'user': {'facts_text': _memory_rows_text(user_rows),
+                 'items': [dict(row) for row in user_rows]},
+        'workspace': {'scope_id': workspace,
+                      'facts_text': _memory_rows_text(ws_rows),
+                      'items': [dict(row) for row in ws_rows]},
+    }
+
+
+@app.put('/api/memory')
+async def save_long_term_memory(payload: LongTermMemoryRequest,
+                                principal=Depends(policies.current_principal)):
+    tenant, user, workspace = await _long_term_scope(principal)
+    scope_type = 'user' if payload.scope == 'user' else 'workspace'
+    scope_id = user if scope_type == 'user' else workspace
+    facts = memory_module.parse_facts(payload.facts)
+    count = await hub.store.replace_memories(
+        scope_type=scope_type, scope_id=scope_id, facts=facts,
+        tenant_id=tenant, created_by=user)
+    return {'scope': scope_type, 'scope_id': scope_id,
+            'facts': facts, 'count': count}
+
+
+@app.delete('/api/memory')
+async def clear_long_term_memory(scope: Literal['user', 'workspace'] = 'user',
+                                 principal=Depends(policies.current_principal)):
+    tenant, user, workspace = await _long_term_scope(principal)
+    scope_type = 'user' if scope == 'user' else 'workspace'
+    scope_id = user if scope_type == 'user' else workspace
+    count = await hub.store.clear_scope_memories(scope_type=scope_type, scope_id=scope_id)
+    return {'scope': scope_type, 'scope_id': scope_id, 'cleared': count}
 
 
 @app.get('/api/sessions')

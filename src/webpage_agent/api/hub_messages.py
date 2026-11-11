@@ -20,6 +20,7 @@ import logging
 import time
 import uuid
 
+from webpage_agent.core import memory as memory_module
 from webpage_agent.core import model_choice
 from webpage_agent.core import outcome as outcome_module
 from webpage_agent.core import sandbox
@@ -27,6 +28,7 @@ from webpage_agent.core.config import settings
 from webpage_agent.store.pg_store import TurnRequestConflict
 
 logger = logging.getLogger(__name__)
+_MEMORY_TASKS: set = set()
 
 
 def request_hash(message: str, target: str) -> str:
@@ -547,8 +549,22 @@ class HubSessionMessageMixin:
             finally:
                 connector_scope.reset(scope_token)
 
-        system_prompt = (settings.pi_system_prompt or '') + self._connector_context(
-            connector_ids, tool_objects)
+        private = sandbox.provision(tenant_id, owner_user_id)
+        stored = await self.store.get_workspace(
+            tenant_id=tenant_id, owner_user_id=owner_user_id)
+        if not sandbox.stored_path_ok(stored, private):
+            stored = str(private)
+        try:
+            user_rows = await self.store.recall('user', owner_user_id)
+            workspace_rows = await self.store.recall('workspace', stored)
+        except Exception:                          # noqa: BLE001
+            logger.debug('读取长期记忆失败', exc_info=True)
+            user_rows, workspace_rows = [], []
+        memory_block = memory_module.render_long_term(user_rows, workspace_rows)
+
+        system_prompt = ((settings.pi_system_prompt or '')
+                         + ('\n\n' + memory_block if memory_block else '')
+                         + self._connector_context(connector_ids, tool_objects))
 
         model_token = model_choice.bind(
             owner_user_id, getattr(settings, 'llm_model', '') or '')
@@ -610,11 +626,6 @@ class HubSessionMessageMixin:
                     book = ledger_module.ActionLedger(
                         self.store, turn_id, 1, context=exec_ctx)
                     ledger_token = ledger_module.bind(book)
-            private = sandbox.provision(tenant_id, owner_user_id)
-            stored = await self.store.get_workspace(
-                tenant_id=tenant_id, owner_user_id=owner_user_id)
-            if not sandbox.stored_path_ok(stored, private):
-                stored = str(private)
             state = {
                 'user_input': message,
                 'history': history,
@@ -661,6 +672,16 @@ class HubSessionMessageMixin:
             if not answer:
                 # 无有效答复：如实说明，不落空答复冒充成功
                 return '抱歉，我暂时无法回答这个问题。'
+            if memory_module.has_memory_cue(message):
+                try:
+                    task = asyncio.create_task(memory_module.extract_user_memory(
+                        self.store, scope_id=owner_user_id, tenant_id=tenant_id,
+                        user_message=message, answer=answer,
+                        created_by=owner_user_id))
+                    _MEMORY_TASKS.add(task)
+                    task.add_done_callback(_MEMORY_TASKS.discard)
+                except Exception:                  # noqa: BLE001
+                    logger.debug('调度长期记忆提取失败', exc_info=True)
             return answer
         finally:
             model_choice.reset(model_token)

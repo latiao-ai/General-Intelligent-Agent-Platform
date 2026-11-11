@@ -13,6 +13,7 @@
 - 压缩失败不影响任务：继续用旧摘要，绝不因为压缩把一轮对话搞挂。
 """
 import json
+import re
 
 from webpage_agent.agent import context
 from webpage_agent.core.schemas import SessionMemory
@@ -97,3 +98,80 @@ async def compact(store, session_id: str) -> dict:
     await store.set_memory(session_id, summary=summary, facts=facts, upto=upto)
     return {'summary': summary, 'facts': facts, 'upto': upto,
             'compacted': True, 'folded': len(fold)}
+
+
+def render_long_term(user_rows: list[dict], workspace_rows: list[dict],
+                     max_chars: int = 4000) -> str:
+    """把用户级/工作区长期记忆拼成给模型的 <memory> 块。"""
+    def lines(rows):
+        out = []
+        for row in rows or []:
+            predicate = str(row.get('predicate') or '').strip()
+            value = str(row.get('value') or '').strip()
+            if predicate and value:
+                out.append(f'- {predicate}：{value}')
+        return out
+    user_lines = lines(user_rows)
+    ws_lines = lines(workspace_rows)
+    if not user_lines and not ws_lines:
+        return ''
+    parts = ['<memory>', '以下是跨会话记忆，只作为背景；当前用户输入和当前事实优先。']
+    if user_lines:
+        parts.append('用户长期记忆：')
+        parts.extend(user_lines)
+    if ws_lines:
+        parts.append('当前工作区记忆：')
+        parts.extend(ws_lines)
+    parts.append('</memory>')
+    text = '\n'.join(parts)
+    return text[:max_chars]
+
+
+_MEMORY_CUE = re.compile(
+    r'(记住|记一下|以后都|以后请|始终|总是|不要|偏好|习惯|'
+    r'我的名字|我叫|我喜欢|我不喜欢|remember|always|never)',
+    re.IGNORECASE,
+)
+
+_MEMORY_EXTRACT_SYSTEM = (
+    '你负责从一轮对话中提取**用户长期记忆**。只提取用户明确表达、以后仍然有用的：'
+    '身份、长期偏好、固定规则、长期项目事实。不要提取一次性请求、临时天气、'
+    '工具报错、搜索结果、密码/Token/API Key 等秘密。'
+    '输出 facts：键简短中文，值一句话；最多 6 条；没有就留空。'
+)
+
+
+def has_memory_cue(text: str) -> bool:
+    return bool(_MEMORY_CUE.search(str(text or '')))
+
+
+async def extract_user_memory(store, *, scope_id: str, tenant_id: str,
+                              user_message: str, answer: str,
+                              created_by: str = 'default') -> int:
+    """从一轮对话提取长期记忆并写入 user scope；失败静默。"""
+    import json
+    from webpage_agent.core.schemas import SessionMemory
+    payload = json.dumps({
+        '用户': user_message,
+        '助手': answer,
+    }, ensure_ascii=False)
+    try:
+        result, _ = await structured_call(
+            SessionMemory, _MEMORY_EXTRACT_SYSTEM, payload,
+            model=None, disable_thinking=True)
+        facts = result.model_dump().get('facts') or {}
+    except Exception:                              # noqa: BLE001
+        return 0
+    count = 0
+    for key, value in list(facts.items())[:6]:
+        key = str(key).strip()
+        value = str(value).strip()
+        if not key or not value or len(value) > 500:
+            continue
+        saved = await store.remember(
+            scope_type='user', scope_id=scope_id, subject='用户',
+            predicate=key, value=value, source='auto',
+            created_by=created_by, tenant_id=tenant_id)
+        if saved:
+            count += 1
+    return count

@@ -901,6 +901,57 @@ class PgAuth:
             await conn.commit()
         return memory_id
 
+    async def replace_memories(self, *, scope_type: str, scope_id: str,
+                               facts: dict[str, str], subject: str = '用户',
+                               tenant_id: str = 'default',
+                               created_by: str = 'default') -> int:
+        """用一组键值替换某个作用域的活动记忆（管理面板保存）。"""
+        stamp = now()
+        async with self._lease() as conn:
+            await self._run(conn,
+                "UPDATE memories SET status='superseded', valid_to=%s, updated_at=%s "
+                "WHERE scope_type=%s AND scope_id=%s AND status='active'",
+                (stamp, stamp, scope_type, scope_id))
+            count = 0
+            for key, value in (facts or {}).items():
+                key = str(key).strip()
+                value = str(value).strip()
+                if not key or not value:
+                    continue
+                await self._run(conn,
+                    'INSERT INTO memories (memory_id, tenant_id, scope_type, scope_id, '
+                    'subject, predicate, value, status, version, supersedes, source, '
+                    'created_by, created_at, updated_at) '
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,'active',1,NULL,'manual',%s,%s,%s)",
+                    ('mem_' + uuid.uuid4().hex[:12], tenant_id, scope_type, scope_id,
+                     subject, key, value, created_by, stamp, stamp))
+                count += 1
+            await conn.commit()
+        return count
+
+    async def clear_scope_memories(self, *, scope_type: str, scope_id: str,
+                                   reason: str = 'user_clear') -> int:
+        """清空作用域记忆并写墓碑，避免后台/摘要把已清内容再次写回。"""
+        stamp = now()
+        async with self._lease() as conn:
+            rows = await self._all(conn,
+                "SELECT subject, predicate FROM memories WHERE scope_type=%s AND scope_id=%s "
+                "AND status='active'", (scope_type, scope_id))
+            cur = await self._run(conn,
+                "UPDATE memories SET status='forgotten', valid_to=%s, updated_at=%s "
+                "WHERE scope_type=%s AND scope_id=%s AND status='active'",
+                (stamp, stamp, scope_type, scope_id))
+            for row in rows or []:
+                fact_key = f"{row['subject']}|{row['predicate']}"
+                await self._run(conn,
+                    'INSERT INTO memory_tombstones (tombstone_id, scope_type, scope_id, '
+                    'fact_key, reason, created_at) VALUES (%s,%s,%s,%s,%s,%s) '
+                    'ON CONFLICT DO NOTHING',
+                    ('tmb_' + uuid.uuid4().hex[:10], scope_type, scope_id,
+                     fact_key, reason, stamp))
+            await conn.commit()
+            return cur.rowcount
+
     async def recall(self, scope_type: str, scope_id: str) -> list[dict]:
         """读取该作用域下仍然有效的记忆（被替代/已失效的不返回）。"""
         async with self._lease() as conn:

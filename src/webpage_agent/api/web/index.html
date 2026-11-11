@@ -446,6 +446,7 @@ a{color:var(--brand);text-decoration:none}
 /* ---------------- 弹层 ---------------- */
 .modal{position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;
   padding:20px;background:rgba(17,21,27,.36);backdrop-filter:blur(2px)}
+#memoryModal .modal-card{overflow:auto}
 .modal-card{width:min(640px,100%);max-height:min(82vh,760px);display:flex;flex-direction:column;
   padding:16px 18px;border-radius:16px;background:#fff;box-shadow:0 24px 60px rgba(16,24,40,.24)}
 .modal-head{display:flex;align-items:center;gap:10px;margin-bottom:4px}
@@ -1228,7 +1229,7 @@ body {
         <svg class="ic"><use href="#i-spark"/></svg><span>我的画像</span>
       </button>
       <button class="nav-item" id="memoryBtn">
-        <svg class="ic"><use href="#i-archive"/></svg><span>会话记忆</span>
+        <svg class="ic"><use href="#i-archive"/></svg><span>记忆与进化</span>
       </button>
       <div id="adminCard" hidden>
         <button class="nav-item" id="adminOpen" aria-expanded="false" aria-controls="adminPanel">
@@ -1280,7 +1281,7 @@ body {
       </button>
       <div class="user-menu" id="userMenu" hidden>
         <button id="umProfile"><svg class="ic sm"><use href="#i-spark"/></svg>我的画像</button>
-        <button id="umMemory"><svg class="ic sm"><use href="#i-archive"/></svg>会话记忆</button>
+        <button id="umMemory"><svg class="ic sm"><use href="#i-archive"/></svg>记忆与进化</button>
         <button id="umStatus"><svg class="ic sm"><use href="#i-pulse"/></svg>系统状态</button>
         <div class="sep"></div>
         <button id="umLogin"><svg class="ic sm"><use href="#i-key"/></svg>登录中台</button>
@@ -1623,12 +1624,12 @@ body {
 <div class="modal" id="memoryModal" style="display:none">
   <div class="modal-card">
     <div class="modal-head">
-      <b>会话记忆</b>
+      <b>记忆与进化</b>
       <span class="hint" id="memoryMeta"></span>
       <button class="ghost" id="memoryClose">关闭</button>
     </div>
     <p>
-      更早的对话会被压成这里的摘要与关键事实，用来在长会话里不丢线索。
+      分三层：会话记忆（本轮压缩）、用户长期记忆（跨会话）、工作区记忆（当前目录）。
       原文仍在数据库里，改这里只是改“给模型看的版本”。
     </p>
     <div class="side-label">摘要</div>
@@ -1636,9 +1637,23 @@ body {
     <div class="side-label">关键事实（每行「键：值」）</div>
     <textarea id="memoryFacts" spellcheck="false" style="min-height:90px"></textarea>
     <div class="modal-actions">
-      <button class="warn" id="memoryClear">清空记忆</button>
+      <button class="warn" id="memoryClear">清空会话记忆</button>
       <span class="hint" id="memoryStatus"></span>
-      <button class="primary" id="memorySave">保存</button>
+      <button class="primary" id="memorySave">保存会话记忆</button>
+    </div>
+    <div class="side-label" style="margin-top:16px">用户长期记忆（跨会话，每行「键：值」）</div>
+    <textarea id="userMemoryFacts" spellcheck="false" style="min-height:90px"></textarea>
+    <div class="modal-actions">
+      <button class="warn" id="userMemoryClear">清空用户记忆</button>
+      <span class="hint" id="userMemoryStatus"></span>
+      <button class="primary" id="userMemorySave">保存用户记忆</button>
+    </div>
+    <div class="side-label" style="margin-top:16px">工作区记忆（当前目录，每行「键：值」）</div>
+    <textarea id="workspaceMemoryFacts" spellcheck="false" style="min-height:90px"></textarea>
+    <div class="modal-actions">
+      <button class="warn" id="workspaceMemoryClear">清空工作区记忆</button>
+      <span class="hint" id="workspaceMemoryStatus"></span>
+      <button class="primary" id="workspaceMemorySave">保存工作区记忆</button>
     </div>
   </div>
 </div>
@@ -3278,8 +3293,44 @@ async function loadMemoryForm() {
 async function openMemory() {
   $('memoryStatus').textContent = '';
   $('memoryModal').style.display = 'flex';
-  try { await loadMemoryForm(); }
+  try { await Promise.all([loadMemoryForm(), loadLongTermMemory()]); }
   catch { $('memoryMeta').textContent = '读取失败'; }
+}
+
+async function loadLongTermMemory() {
+  const res = await fetch(API_PREFIX + '/memory');
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  const data = await res.json();
+  $('userMemoryFacts').value = (data.user && data.user.facts_text) || '';
+  $('workspaceMemoryFacts').value = (data.workspace && data.workspace.facts_text) || '';
+}
+
+async function saveLongTermMemory(scope, textareaId, statusId) {
+  $(statusId).textContent = '保存中…';
+  try {
+    const res = await fetch(API_PREFIX + '/memory', {
+      method: 'PUT', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({scope, facts: $(textareaId).value}),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || ('HTTP ' + res.status));
+    await loadLongTermMemory();
+    $(statusId).textContent = `已保存 · ${data.count || 0} 条`;
+  } catch (err) {
+    $(statusId).textContent = '保存失败：' + err.message;
+  }
+}
+
+async function clearLongTermMemory(scope, statusId) {
+  if (!confirm(scope === 'user' ? '清空用户长期记忆？' : '清空当前工作区记忆？')) return;
+  try {
+    const res = await fetch(`${API_PREFIX}/memory?scope=${scope}`, {method: 'DELETE'});
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    await loadLongTermMemory();
+    $(statusId).textContent = '已清空';
+  } catch (err) {
+    $(statusId).textContent = '清空失败：' + err.message;
+  }
 }
 
 function closeMemory() { $('memoryModal').style.display = 'none'; }
@@ -3318,6 +3369,10 @@ $('memoryBtn').onclick = openMemory;
 $('memoryClose').onclick = closeMemory;
 $('memorySave').onclick = saveMemory;
 $('memoryClear').onclick = clearMemory;
+$('userMemorySave').onclick = () => saveLongTermMemory('user', 'userMemoryFacts', 'userMemoryStatus');
+$('workspaceMemorySave').onclick = () => saveLongTermMemory('workspace', 'workspaceMemoryFacts', 'workspaceMemoryStatus');
+$('userMemoryClear').onclick = () => clearLongTermMemory('user', 'userMemoryStatus');
+$('workspaceMemoryClear').onclick = () => clearLongTermMemory('workspace', 'workspaceMemoryStatus');
 $('memoryModal').addEventListener('click', e => {
   if (e.target === $('memoryModal')) closeMemory();
 });
@@ -4513,11 +4568,34 @@ setInterval(async () => {
   /* ---------- 9. 当前身份 / 登录态 ---------- */
   // 游客只摆「登录中台」，登录后才摆「切换账号 / 退出登录」。之前两种状态都摆着
   // 退出登录，游客点下去服务端也只会回 {revoked:false}，页面自然"退不出去"。
-  const auth = { ready: false, authed: false, info: null, platformLogin: false,
+  const auth = { ready: false, authed: false, info: null, platformLogin: null,
                  off: false, required: true,
                  // ?switch=1：刚点过「切换账号」，身份问清后自动弹登录框
-                 switchPending: new URLSearchParams(location.search).has('switch') };
+                 switchPending: new URLSearchParams(location.search).has('switch'),
+                 // ?next=/xxx：从别的页面被送来登录，登录成功后要回去
+                 nextTarget: nextParam(), loginPrompted: false };
   window.WB_AUTH = auth;
+
+  // 只认站内绝对路径：'//evil.com'、'/\evil.com'、'http://...' 这类都丢弃，
+  // 否则一个 ?next= 就能把刚登录的用户送去钓鱼站。
+  function nextParam() {
+    const next = new URLSearchParams(location.search).get('next');
+    if (!next || !next.startsWith('/')) return '';
+    if (next.charAt(1) === '/' || next.indexOf('\\') >= 0) return '';
+    return next;
+  }
+
+  // 被别的页面（管理控制台）送来登录时，直接把登录入口打开，省掉一次点击。
+  // 必须等身份和登录方式都问清楚：platformLogin 还是 null 时贸然跳 SSO，
+  // 会把本该用平台账号的人送去统一身份。
+  function autoLoginForNext() {
+    if (!auth.nextTarget || auth.loginPrompted) return;
+    if (!auth.ready || auth.platformLogin === null) return;
+    if (auth.authed || auth.off) return;
+    auth.loginPrompted = true;
+    if (auth.platformLogin) { openLogin(); return; }
+    location.href = API_PREFIX + '/auth/oidc/login';
+  }
 
   function applyAuth() {
     const authed = auth.authed;
@@ -4567,6 +4645,7 @@ setInterval(async () => {
       : (auth.off ? '本地演示模式 · 无需登录' : '未登录中台 · 点击登录');
     applyAuth();
     maybeAutoLogin();
+    autoLoginForNext();
     if (window.WB_SET_USER) window.WB_SET_USER(authed && d ? d.user_id : '');
     refreshWorkDir();
   }
@@ -4574,8 +4653,8 @@ setInterval(async () => {
   loadIdentity();
   fetch(API_PREFIX + '/auth/platform-login/status', { cache: 'no-store' })
     .then(r => (r.ok ? r.json() : null))
-    .then(d => { auth.platformLogin = !!(d && d.enabled); applyAuth(); maybeAutoLogin(); })
-    .catch(() => { /* 入口关闭时按关闭处理 */ });
+    .then(d => { auth.platformLogin = !!(d && d.enabled); applyAuth(); maybeAutoLogin(); autoLoginForNext(); })
+    .catch(() => { auth.platformLogin = false; autoLoginForNext(); });
 
   /* ---------- 9b. 登录 / 退出 ---------- */
   function openLogin() {
@@ -4628,7 +4707,8 @@ setInterval(async () => {
           ? '首次登录：已自动创建中台账号并完成绑定'
           : '登录成功');
       } catch (e) { /* 忽略 */ }
-      location.replace(location.pathname);
+      // 管理控制台会用 /?next=/admin 把人送来登录，登录完按原路送回去。
+      location.replace(auth.nextTarget || location.pathname);
     } catch (e) {
       err.textContent = e.message || '登录失败，请重试';
     } finally {
