@@ -101,27 +101,6 @@ async def _post(path: str, payload: dict[str, Any], user_ip: str = '') -> dict[s
     return body
 
 
-async def _get(path: str) -> dict[str, Any]:
-    """向短信平台发 GET（仅 send-log 用）。"""
-    url = _base_url() + _BASE_PATH + path
-    try:
-        async with httpx.AsyncClient(timeout=settings.sms_timeout_seconds,
-                                     follow_redirects=False) as client:
-            reply = await client.get(url, headers=_build_headers())
-    except httpx.HTTPError as exc:
-        raise SmsPlatformError('短信平台不可达', status=503) from exc
-    if reply.status_code >= 500:
-        raise SmsPlatformError('短信平台返回异常', status=502,
-                               code=reply.status_code)
-    try:
-        body = reply.json()
-    except ValueError:
-        raise SmsPlatformError('短信平台响应无法解析', status=502) from None
-    if not isinstance(body, dict):
-        raise SmsPlatformError('短信平台响应形状异常', status=502)
-    return body
-
-
 async def get_captcha(user_ip: str) -> dict[str, Any]:
     """获取滑块。返回完整 CommonResult；调用方须同时检查 code==0 且 data.repCode=='0000'。"""
     return await _post('/captcha/get', {'captchaType': 'blockPuzzle'}, user_ip)
@@ -155,8 +134,3 @@ async def verify_code(mobile: str, code: str, user_ip: str = '') -> dict[str, An
     """校验并消费短信验证码。返回完整 CommonResult；调用方须检查 data.valid 严格等于 True。"""
     payload = {'mobile': mobile, 'code': code, 'scene': SCENE_LOGIN}
     return await _post('/verify-code', payload, user_ip)
-
-
-async def send_log(serial_no: str) -> dict[str, Any]:
-    """按 serialNo 查询发送记录。serialNo 必须保持字符串。"""
-    return await _get(f'/send-log?serialNo={serial_no}')

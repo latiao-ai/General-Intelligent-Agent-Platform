@@ -75,7 +75,6 @@ def _normalize_workbuddy(raw: list) -> list[dict]:
             continue
         seen.add(sid)
         publisher = entry.get('publisher') if isinstance(entry.get('publisher'), dict) else {}
-        tags = entry.get('tags') if isinstance(entry.get('tags'), dict) else {}
         suite = ', '.join(str(x) for x in (entry.get('subCategories') or []) if isinstance(x, dict) and x.get('name'))[:80]
         items.append({
             'id': sid,

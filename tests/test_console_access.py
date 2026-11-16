@@ -146,20 +146,36 @@ class DeleteAccountTests(unittest.TestCase):
                       confirm='u_target')
         self.assertEqual(error.exception.status_code, 403)
 
-    def test_confirm_must_match_the_target(self):
-        """确认串对不上就不删——这是防手滑点的最后一道。"""
-        with self.assertRaises(Exception) as error:
-            self.call(Principal(authenticated=True, role='platform_admin'),
-                      confirm='u_other')
-        self.assertEqual(error.exception.status_code, 400)
+    def test_no_typing_confirmation_required(self):
+        """2026-11-12 二次调整：删账号不再要求手打 user_id，一次确认就够。
+
+        confirm 字段仅为兼容老客户端保留，内容不再校验；防误删交给前端
+        带昵称与预计清除条数的 confirm()。
+        """
+        for confirm in ('', 'u_other', '随便写点什么'):
+            with self.subTest(confirm=confirm):
+                response, store = self.call(
+                    Principal(authenticated=True, role='platform_admin',
+                              user_id='u_admin'),
+                    confirm=confirm, purge=True)
+                self.assertTrue(json.loads(response.body)['deleted'])
+                self.assertEqual(len(store.calls), 1)
 
     def test_delete_passes_actor_for_the_audit_trail(self):
         response, store = self.call(
             Principal(authenticated=True, role='platform_admin', user_id='u_admin'),
-            confirm='u_target', reason='离职')
+            confirm='u_target', reason='离职', purge=True)
         self.assertEqual(store.calls[0]['actor_id'], 'u_admin')
         self.assertEqual(store.calls[0]['reason'], '离职')
         self.assertTrue(json.loads(response.body)['deleted'])
+
+    def test_delete_requires_explicit_purge(self):
+        """2026-11-12 起删除 = 清空全部数据，老客户端必须显式确认这个语义。"""
+        with self.assertRaises(Exception) as error:
+            self.call(Principal(authenticated=True, role='platform_admin',
+                                user_id='u_admin'), confirm='u_target')
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertIn('purge', str(error.exception.detail))
 
     def test_only_two_roles_can_be_granted(self):
         """控制台只保留两档：普通用户与超管。operator 仍被识别，但不再授予。"""

@@ -71,6 +71,12 @@ class PiBridgeError(Exception):
     def __init__(self, message: str, *, stderr_tail: str = "") -> None:
         super().__init__(message)
         self.stderr_tail = stderr_tail
+        # 宿主收尾时只把异常类型名透给用户（`api/main.py` 的 except Exception 分支），
+        # 除非异常自带 `safe_message`。这里抛出的是**我们自己写的**固定文案（不含
+        # SDK 原文、密钥或内网地址），所以允许透出——否则 run.error 里只有一个
+        # "PiBridgeError"，连"启动超时"和"子进程已退出"都分不出来，排障没有起点。
+        tail_line = stderr_tail.strip().splitlines()[-1][:200] if stderr_tail.strip() else ''
+        self.safe_message = message + (f'：{tail_line}' if tail_line else '')
 
 
 class PiBridge:

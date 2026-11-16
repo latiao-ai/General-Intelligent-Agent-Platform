@@ -28,12 +28,14 @@ from urllib.parse import urlsplit
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                RedirectResponse, Response, StreamingResponse)
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from webpage_agent.store import idempotency
 from webpage_agent.core import memory as memory_module
 from webpage_agent.core import outcome as outcome_module
 from webpage_agent.observe import runtime_check
+from webpage_agent.observe import log_buffer as log_buffer_module
 from webpage_agent.agent import scene_context as scene_context_module
 from webpage_agent.observe import task_notify
 from webpage_agent.api import auth
@@ -41,6 +43,7 @@ from webpage_agent.api import auth
 # 是因为下面还有个同名的路由函数 `platform_login`。
 from webpage_agent.api import platform_login as platform_login_service
 from webpage_agent.api import sms_login as sms_login_service
+from webpage_agent.api import local_auth as local_auth_service
 from webpage_agent.governance import policies
 from webpage_agent.core import profile
 from webpage_agent.core import sandbox
@@ -55,6 +58,15 @@ from webpage_agent.observe.logging_setup import setup_logging
 logger = logging.getLogger(__name__)
 
 WEB_DIR = Path(__file__).resolve().parent / 'web'
+
+# 新版前端（React + Vite）的构建产物。源码在仓库根的 `frontend/`，
+# `npm run build` 生成到 `frontend/dist`。
+#
+# 迁移策略是"并存"，不是"替换"：老的内联单文件页面继续由 /plaza、/bots 提供，
+# 新页面挂在 /app/* 下。一页迁完、验证过，再把老路由指过来即可，回滚也只是改一行。
+# 发布包里可能不带 frontend/，所以这里只算路径，不做目录存在的断言。
+REPO_ROOT = Path(__file__).resolve().parents[3]
+FRONTEND_DIST = REPO_ROOT / 'frontend' / 'dist'
 
 # 模型调用或外部工具可能上百秒没有任何事件，必须定期发心跳，
 # 否则连接会被中间的代理/网关按空闲超时掐断。
@@ -108,6 +120,16 @@ async def lifespan(app: FastAPI):
             logger.info('已把环境变量里的登录平台登记入库：%s', seeded)
     except Exception:                                   # noqa: BLE001
         logger.warning('登记环境变量登录平台失败（不影响登录）', exc_info=True)
+    # 本地账号：生产配置自检必须在启动期失败，不能等第一个登录请求才发现问题。
+    local_auth_service.startup_check()
+    if local_auth_service.enabled():
+        try:
+            seeded = await local_auth_service.seed_from_env(hub.store)
+            if seeded:
+                logger.info('已从环境变量建立 %s 个本地账号', len(seeded))
+        except Exception:                               # noqa: BLE001
+            logger.warning('建立本地种子账号失败（不影响其他登录方式）',
+                           exc_info=True)
     logger.info('API 启动完成，对账结果 %s，清理过期幂等键 %s 条', stats, purged)
     task_notify.start(settings.database_url)
     from webpage_agent.observe import maintenance
@@ -141,6 +163,30 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title='通用 Agent 执行中台 API', version='2.0', lifespan=lifespan)
+
+
+class _HashedAssets(StaticFiles):
+    """带内容哈希的资源可以长缓存。
+
+    Vite 产出的文件名里带 hash，文件内容一变 URL 就变，所以不会读到旧版本。
+    HTML 反过来必须禁缓存：否则发版后用户拿着旧 HTML 去引用已经被删掉的
+    chunk，页面直接白屏，而且很难查。
+    """
+
+    async def get_response(self, path, scope):  # type: ignore[override]
+        response = await super().get_response(path, scope)
+        if response.status_code == 200:
+            response.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
+        return response
+
+
+# 目录不存在时不挂载：某些部署形态（发布包里不带 frontend/）会走到这里，
+# 让 /app/* 干脆 404，比在启动时抛异常好。
+if (FRONTEND_DIST / 'assets').is_dir():
+    app.mount('/app/assets',
+              _HashedAssets(directory=str(FRONTEND_DIST / 'assets')),
+              name='app-assets')
+
 from webpage_agent.api.oidc import router as oidc_router
 app.include_router(oidc_router)
 from webpage_agent.api.skillhub_api import router as skillhub_router
@@ -163,9 +209,21 @@ app.include_router(addons_router)
 # 真正的触发在 Worker 的调度 tick 里，接口只负责读写定义。
 from webpage_agent.api.schedules_api import router as schedules_router
 app.include_router(schedules_router)
+# 机器人（Bot Mode，docs/bot-mode.md）：花名册 / 规范会话 / 投递收据 / 群聊。
+from webpage_agent.api.bots_api import router as bots_router
+app.include_router(bots_router)
+# Bot 广场（docs/bot-plaza.md）：浏览 / 一键启用 / 投稿。条目是快照，启用是复制，
+# 所以这里只读写 bot_plaza_* 两张表，真正的机器人仍然走上面那套接口。
+from webpage_agent.api.plaza_api import router as plaza_router
+app.include_router(plaza_router)
+# 消息平台（IM 网关，docs/messaging-platforms.md）：渠道配置 / 运行态 / 配对 /
+# 扫码登录 / 平台回调。回调渠道的入站只落 im_inbox，执行在 Worker。
+from webpage_agent.api.messaging_api import router as messaging_router
+app.include_router(messaging_router)
 # 管理控制台：跨租户视角，准入在 console_api.console_access 里判。
 # 与上面 `/api/admin/*`（租户运维）是两套语义，不要合并。
 from webpage_agent.api.console_api import router as console_router
+from webpage_agent.api.console_api import require_trusted_origin
 app.include_router(console_router)
 
 
@@ -202,8 +260,12 @@ async def guard_origin(request: Request, call_next):
     finally:
         # Route template avoids logging object IDs, URL queries or login tickets.
         route = getattr(request.scope.get('route'), 'path', 'unmatched')
+        elapsed = time.monotonic() - started
         logger.info('http_span method=%s route=%s status=%s duration_seconds=%.6f',
-                    request.method, route, status, time.monotonic() - started)
+                    request.method, route, status, elapsed)
+        # 同一份数据再记一次进内存指标：控制台的日志页要算 QPS / P95 / 错误率，
+        # 从日志文本里正则抠数字既慢又脆，直接在这里喂给计数器。
+        log_buffer_module.record_http(status=status, duration=elapsed, route=route)
         telemetry.span_id.reset(span)
         telemetry.trace_id.reset(trace)
 
@@ -269,6 +331,8 @@ class SessionMessageRequest(StrictBody):
     target_task_id: str | None = Field(default=None, max_length=64)
     connector_ids: list[str] | None = Field(default=None, max_length=100)
     addon_selection: dict | None = None
+    # 消息级内容块（技能胶囊）：text / resource_link。回显与消息级技能解析用它。
+    content_blocks: list[dict] | None = None
 
 
 class PlatformContextRequest(StrictBody):
@@ -461,6 +525,60 @@ async def workspace_get(principal=Depends(policies.current_principal)):
         path = await hub.store.get_workspace(
             tenant_id=principal.tenant_id, owner_user_id=principal.user_id)
     return _workspace_view(principal.tenant_id, principal.user_id, path)
+
+
+@app.get('/api/workspace/files')
+async def workspace_files(path: str = Query('.', max_length=1024),
+                          principal=Depends(policies.current_principal)):
+    """列出当前工作区里的文件/目录（只读，供输入框 `@` 引用文件）。
+
+    路径一律相对工作区根；绝对路径、`..`、逃出工作区的符号链接一律拒绝。
+    隐藏文件（`.agent-skills` 等内部物化目录）不返回，避免把内部结构暴露给用户。
+    """
+    if settings.auth_mode == 'ticket' or principal.authenticated:
+        root = Path(await _ensure_private_workspace(
+            principal.tenant_id, principal.user_id))
+    else:
+        raw = await hub.store.get_workspace(
+            tenant_id=principal.tenant_id, owner_user_id=principal.user_id)
+        root = Path(raw) if raw else sandbox.provision(
+            principal.tenant_id, principal.user_id)
+    base = root.resolve()
+    try:
+        folder = sandbox.confine(base, path)
+    except sandbox.SandboxError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    if not folder.is_dir():
+        raise HTTPException(status_code=400, detail='不是目录')
+    entries = []
+    try:
+        children = sorted(folder.iterdir(),
+                          key=lambda p: (not p.is_dir(), p.name.lower()))
+    except OSError:
+        raise HTTPException(status_code=400, detail='目录不可读') from None
+    for entry in children:
+        if len(entries) >= 200:
+            break
+        if entry.name.startswith('.'):
+            continue
+        if entry.is_symlink():
+            kind = 'symlink'
+        elif entry.is_dir():
+            kind = 'dir'
+        else:
+            kind = 'file'
+        try:
+            size = entry.stat().st_size if kind == 'file' else 0
+        except OSError:
+            size = 0
+        try:
+            rel = entry.relative_to(base).as_posix()
+        except ValueError:
+            continue
+        entries.append({'name': entry.name, 'kind': kind, 'size': size,
+                        'path': rel})
+    rel_root = '.' if folder == base else folder.relative_to(base).as_posix()
+    return {'path': rel_root, 'entries': entries}
 
 
 @app.post('/api/workspace')
@@ -890,6 +1008,133 @@ async def sms_login(payload: SmsVerifyRequest, request: Request, response: Respo
             'auth_session_id': row['auth_session_id']}
 
 
+# ---------- 本地账号登录（第 4 种方式，docs/local-account-auth.md） ----------
+# 密码由中台自己校验（scrypt），身份仍写 identities、会话仍由
+# login_platform_identity 建立，所以其余三条登录链路一行都不用改。
+
+class LocalLoginRequest(StrictBody):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class LocalSignupRequest(StrictBody):
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=128)
+    display_name: str = Field(default='', max_length=80)
+
+
+class LocalPasswordRequest(StrictBody):
+    username: str = Field(min_length=1, max_length=64)
+    old_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=1, max_length=128)
+
+
+@app.get('/api/auth/local-login/status')
+async def local_login_status():
+    """前端据此决定是否显示「本地账号」tab；不泄露账号列表或哈希参数。"""
+    return JSONResponse({
+        'enabled': local_auth_service.enabled(),
+        'allow_signup': (local_auth_service.enabled()
+                         and settings.local_auth_allow_signup),
+        'min_length': settings.local_auth_min_length,
+    }, headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/api/auth/local-login')
+async def local_login(payload: LocalLoginRequest, request: Request,
+                      response: Response):
+    """本地账号密码 → 中台会话。失败统一 401，不区分账号不存在/密码错/停用。"""
+    if not local_auth_service.enabled():
+        raise HTTPException(status_code=404, detail='本地账号登录未启用')
+    store = getattr(request.app.state, 'store', None)
+    if store is None:
+        raise HTTPException(status_code=503, detail='身份仓储未就绪')
+    try:
+        token, row = await local_auth_service.sign_in(
+            store, username=payload.username, password=payload.password,
+            client_ip=_client_ip(request),
+            user_agent=request.headers.get('user-agent', ''))
+    except local_auth_service.LocalAuthError as exc:
+        headers = ({'Retry-After': str(exc.retry)} if exc.retry else None)
+        if exc.code:
+            # detail 必须是字符串（前端统一取 data.detail 展示），code 另放一个键。
+            return JSONResponse(
+                status_code=exc.status,
+                content={'detail': exc.detail, 'code': exc.code},
+                headers=headers)
+        raise HTTPException(status_code=exc.status, detail=exc.detail,
+                            headers=headers) from None
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail='账号已停用') from exc
+    except Exception:                                   # noqa: BLE001
+        logger.exception('本地账号登录失败')
+        raise HTTPException(status_code=503, detail='登录失败，请重试') from None
+
+    try:
+        await _ensure_private_workspace(row['tenant_id'], row['user_id'])
+    except Exception:                                   # noqa: BLE001
+        logger.warning('本地账号登录后分配私有目录失败', exc_info=True)
+    _set_session_cookie(response, token, settings.auth_session_ttl)
+    return {'user_id': row['user_id'], 'tenant_id': row['tenant_id'],
+            'role': row['role'], 'platform_id': 'local',
+            'first_login': row['created'],
+            'auth_session_id': row['auth_session_id']}
+
+
+@app.post('/api/auth/local-signup')
+async def local_signup(payload: LocalSignupRequest, request: Request):
+    """自助注册默认关闭；开启也只建号，不自动发会话。"""
+    if not (local_auth_service.enabled() and settings.local_auth_allow_signup):
+        raise HTTPException(status_code=404, detail='未开放自助注册')
+    store = getattr(request.app.state, 'store', None)
+    if store is None:
+        raise HTTPException(status_code=503, detail='身份仓储未就绪')
+    try:
+        name = local_auth_service.normalize_username(payload.username)
+        password = local_auth_service.validate_password(payload.password)
+        row = await store.create_local_account(
+            username=name,
+            password_hash=local_auth_service.hash_password(password),
+            display_name=payload.display_name.strip(),
+            tenant_id=settings.local_auth_tenant_id,
+            identity_provider_id=settings.local_auth_identity_provider_id,
+            created_by='self-signup')
+    except local_auth_service.LocalAuthError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+    except FileExistsError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {'user_id': row['user_id'], 'username': row['username'],
+            'created': True}
+
+
+@app.post('/api/auth/local-login/change-password')
+async def local_change_password(payload: LocalPasswordRequest,
+                                request: Request, response: Response):
+    """凭旧密码改密（配合首次登录强制改密）；成功后撤销该用户全部会话。"""
+    if not local_auth_service.enabled():
+        raise HTTPException(status_code=404, detail='本地账号登录未启用')
+    store = getattr(request.app.state, 'store', None)
+    if store is None:
+        raise HTTPException(status_code=503, detail='身份仓储未就绪')
+    allowed, retry = await store.rate_limit(
+        'auth:local:change:' + _client_ip(request),
+        settings.auth_rate_limit_per_minute)
+    if not allowed:
+        raise HTTPException(status_code=429, detail='尝试过于频繁，请稍后再试',
+                            headers={'Retry-After': str(retry)})
+    try:
+        row = await local_auth_service.change_password(
+            store, username=payload.username,
+            old_password=payload.old_password,
+            new_password=payload.new_password, actor_id='self')
+    except local_auth_service.LocalAuthError as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail) from None
+    _clear_session_cookie(response)
+    return row
+
+
 # ---------- 对象权限 ----------
 # 订阅 SSE、下载产物、读取画像、读取结果全部执行对象权限。
 # 以前只有 /api/runs 与 /api/artifacts 做了检查，其余接口知道 ID 就能读别人的
@@ -975,6 +1220,45 @@ async def index():
                         headers={'Cache-Control': 'no-store, must-revalidate'})
 
 
+@app.get('/bots', response_class=HTMLResponse, include_in_schema=False)
+@app.get('/api/ui/bots', response_class=HTMLResponse, include_in_schema=False)
+async def bots_page():
+    """机器人工作台页面（Bot Mode）。
+
+    独立单文件，不并入 `index.html`：那个文件已经 400KB，机器人面板有自己一套
+    花名册 / 群聊时间线 / 创建对话框，塞进去只会让两边都更难改。两个页面共用
+    同一套 `/api/bots/*` 与 `/api/sessions/*` 接口，数据完全一致。
+    """
+    return HTMLResponse((WEB_DIR / 'bots.html').read_text(encoding='utf-8'),
+                        headers={'Cache-Control': 'no-store, must-revalidate'})
+
+
+@app.get('/plaza', response_class=HTMLResponse, include_in_schema=False)
+@app.get('/api/ui/plaza', response_class=HTMLResponse, include_in_schema=False)
+async def plaza_page():
+    """Bot 广场页面。
+
+    与 `bots.html` 同样是独立单文件：广场是"看 + 一键启用"的场景（分类、卡片、
+    详情抽屉），和工作台（花名册、对话、群聊）节奏完全不同，塞进同一个页面只会
+    让两边都变慢。点「使用」后跳到 `/api/ui/bots?bot=<id>` 直接开始对话。
+    """
+    return HTMLResponse((WEB_DIR / 'plaza.html').read_text(encoding='utf-8'),
+                        headers={'Cache-Control': 'no-store, must-revalidate'})
+
+
+@app.get('/messaging', response_class=HTMLResponse, include_in_schema=False)
+@app.get('/api/ui/messaging', response_class=HTMLResponse, include_in_schema=False)
+async def messaging_page():
+    """消息平台页面（飞书 / 企业微信 / 个人微信）。
+
+    与 `bots.html` 一样是独立单文件：清单驱动的表单、扫码登录、配对审批、运行态
+    刷新都在这里，真正收发消息的是 Worker 进程里的 `MessagingGateway`。
+    """
+    return HTMLResponse(
+        (WEB_DIR / 'messaging.html').read_text(encoding='utf-8'),
+        headers={'Cache-Control': 'no-store, must-revalidate'})
+
+
 @app.get('/admin', response_class=HTMLResponse, include_in_schema=False)
 async def admin_page():
     """管理控制台页面。
@@ -985,6 +1269,82 @@ async def admin_page():
     """
     return HTMLResponse((WEB_DIR / 'admin.html').read_text(encoding='utf-8'),
                         headers={'Cache-Control': 'no-store, must-revalidate'})
+
+
+# --------------------------------------------------------------------------
+# 新版前端页面（React + Vite）
+#
+# 与老的 `/plaza` 并存：同一份 `/api/bot-plaza/*` 数据，两种界面。
+# 这样迁移期间可以并排对比，哪一版有问题就把路由指回另一版，不需要回滚代码。
+# --------------------------------------------------------------------------
+
+def _serve_app_page(name: str) -> HTMLResponse:
+    """返回构建好的页面壳。dist 不存在时给一句能照着做的提示，而不是 500。"""
+    page = FRONTEND_DIST / f'{name}.html'
+    if not page.is_file():
+        return HTMLResponse(
+            '<!doctype html><meta charset="utf-8"><title>前端未构建</title>'
+            '<body style="font:13px/1.7 -apple-system,system-ui;padding:32px;color:#16202e">'
+            '<h1 style="font-size:16px;margin:0 0 8px">新版前端还没构建</h1>'
+            '<p style="color:#42505f;margin:0">在 <code>frontend/</code> 目录执行 '
+            '<code>npm install &amp;&amp; npm run build</code>，然后刷新本页。</p>'
+            '</body>',
+            status_code=503)
+
+    # HTML 必须禁缓存：里面的 chunk 文件名带 hash，发版后旧 HTML 会引用
+    # 已经不存在的文件，表现为白屏，而且缓存住之后很难查。
+    return HTMLResponse(page.read_text(encoding='utf-8'),
+                        headers={'Cache-Control': 'no-store, must-revalidate'})
+
+
+@app.get('/app/plaza', response_class=HTMLResponse, include_in_schema=False)
+async def plaza_page_app():
+    """Bot 广场（新版）。数据接口与老页面完全一致：`/api/bot-plaza/*`。"""
+    return _serve_app_page('plaza')
+
+
+@app.get('/app/bots', response_class=HTMLResponse, include_in_schema=False)
+async def bots_page_app():
+    """机器人工作台（新版）。数据接口与老页面完全一致：`/api/bots/*`、`/api/bot-rooms/*`。
+
+    与 `/bots` 并存：老页面一个字节没改，两套界面读同一份数据，可以并排对比。
+    """
+    return _serve_app_page('bots')
+
+
+@app.get('/app/messaging', response_class=HTMLResponse, include_in_schema=False)
+async def messaging_page_app():
+    """消息平台（新版）。数据接口与老页面完全一致：`/api/messaging/*`。
+
+    与 `/messaging` 并存：老页面一个字节没改，两套界面读同一份数据。
+    """
+    return _serve_app_page('messaging')
+
+
+@app.get('/app/admin', response_class=HTMLResponse, include_in_schema=False)
+async def admin_page_app():
+    """管理控制台（新版）。数据接口与老页面完全一致：`/api/console/*`。
+
+    与 `/admin` 并存：老页面一个字节没改，两套界面读同一份数据。
+    9 个页签按 `#overview` … `#logs` 定位，`?user=<id>` 直达某个人的详情抽屉。
+    """
+    return _serve_app_page('admin')
+
+
+@app.get('/app', response_class=HTMLResponse, include_in_schema=False)
+async def app_root():
+    """访问 /app 直接落到广场，避免得到一个 404。"""
+    return RedirectResponse('/app/plaza', status_code=307)
+
+
+@app.get('/app/hub', response_class=HTMLResponse, include_in_schema=False)
+async def hub_page_app():
+    """主界面（新版）：侧栏会话、对话流、执行过程。
+
+    数据接口与老页面完全一致：`/api/sessions/*`、`/api/sessions/{id}/turns/{turn}/events`。
+    与 `/` 并存：老页面一个字节没改，两套界面读同一份会话。
+    """
+    return _serve_app_page('hub')
 
 
 @app.post('/api/tasks')
@@ -1534,16 +1894,25 @@ async def health_ready():
 
 @app.get('/api/profile')
 async def read_profile(principal=Depends(policies.current_principal)):
-    """当前的用户画像：原文 + 解析后的事实 + 版本号。"""
+    """当前的用户画像：编辑框文本 + 解析后的事实 + 版本号。
+
+    `text` 走 `editable()` 而不是文件原文：`# User Profile` 和 `> Version: n`
+    是文件格式与并发保护用的，摆在用户的编辑框里只是噪音，时间也已经换成了
+    本机时区的可读时间。版本号仍然单独返回，供保存时的乐观锁用。
+    """
     with _profile_scope(principal):
-        return {'text': profile.raw(), 'facts': profile.load(),
+        return {'text': profile.editable(), 'facts': profile.load(),
                 'version': profile.version()}
 
 
 @app.put('/api/profile')
 async def write_profile(payload: ProfileRequest,
                         principal=Depends(policies.current_principal)):
-    """整体覆盖画像。只解析"键：值"行，头部元信息由服务端重写。"""
+    """整体覆盖画像。只解析"键：值"行，头部元信息由服务端重写。
+
+    编辑框第一行的「更新时间」会被解析层剔掉（`profile._RESERVED_KEYS`），
+    用户打开看一眼就保存不会多出一条伪事实。
+    """
     with _profile_scope(principal):
         facts = profile.parse(payload.text)
         try:
@@ -1652,6 +2021,49 @@ async def list_sessions(principal=Depends(policies.current_principal)):
     return {'sessions': await hub.list_sessions(principal=principal)}
 
 
+class SessionRenameRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    title: str
+
+
+@app.patch('/api/sessions/{session_id}')
+async def rename_session(session_id: str, payload: SessionRenameRequest,
+                         principal=Depends(policies.current_principal)):
+    """改侧栏标题。只改展示名，不动消息正文。
+
+    标题写进 `sessions.title`：它非空时优先于"第一条用户消息"，所以改名一直
+    有效，直到用户再改一次。
+    """
+    await _owned_session(session_id, principal)
+    title = payload.title.strip()
+    if not title or len(title) > 80:
+        raise HTTPException(status_code=400, detail='标题不能为空，且不超过 80 字')
+    try:
+        await hub.store.rename_session(session_id, title)
+    except LookupError:
+        raise HTTPException(status_code=404, detail='会话不存在') from None
+    return {'session_id': session_id, 'title': title}
+
+
+@app.delete('/api/sessions/{session_id}')
+async def delete_session(session_id: str,
+                         principal=Depends(policies.current_principal)):
+    """删除任务：会话、消息、运行记录，以及这些运行产出的文件。
+
+    产物目录（`artifacts/<id>`、`artifacts/owners/<t>/<u>/<id>`）和工具结果文件
+    一并删掉；**工作空间目录不动**——空间里可能还有别的任务的文件，按会话删除
+    把整个空间端掉就是数据灾难。
+
+    在跑的 run 会先被取消：不取消的话执行者下一次写回会落空，产物目录却会被
+    重新渲染出来，用户看到"删了又回来了"。
+    """
+    await _owned_session(session_id, principal)
+    try:
+        return await hub.delete_session(session_id)
+    except LookupError:
+        raise HTTPException(status_code=404, detail='会话不存在') from None
+
+
 @app.post('/api/sessions/{session_id}/messages', status_code=202)
 async def post_session_message(session_id: str, payload: SessionMessageRequest,
                                principal=Depends(policies.current_principal)):
@@ -1668,6 +2080,7 @@ async def post_session_message(session_id: str, payload: SessionMessageRequest,
             target_task_id=payload.target_task_id or '', principal=principal,
             connector_ids=payload.connector_ids,
             addon_selection=payload.addon_selection,
+            content_blocks=payload.content_blocks,
             platform_subject=str(getattr(principal, 'subject', '') or ''))
     except TurnRequestConflict:
         raise HTTPException(status_code=409,
@@ -1801,6 +2214,113 @@ async def update_admin_user_status(user_id: str, payload: AdminUserStatusRequest
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return JSONResponse(result, headers={'Cache-Control': 'no-store'})
+
+
+# ---------------- 积分（钱包 / 流水 / 下单） ----------------
+# 余额 = 进账合计 − provider_charges 聚合。单位换算与归集口径见
+# `webpage_agent.store.pg_credits`。这里只做鉴权与形状，不重算金额。
+
+
+class CreditOrderRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    package_id: str = Field(min_length=1, max_length=64)
+    points: int = Field(gt=0, le=10_000_000)
+    # 价格以后端登记为准等于客户端自报，避免"1 分钱买 6 万积分"。
+    price: int = Field(gt=0, le=100_000)
+
+
+# 套餐价目表：与前端 `PACKS` 一致，前端传什么价都按这里的价格下单。
+CREDIT_PACKAGES = {
+    'credits-1000': (1_000, 1_000),
+    'credits-5500': (5_500, 5_000),
+    'credits-11500': (11_500, 10_000),
+    'credits-60000': (60_000, 50_000),
+}
+
+
+@app.get('/api/credits/balance')
+async def credits_balance(principal=Depends(policies.current_principal)):
+    """本人余额。未登录也返回 0 而不是 401：侧栏在登录前就会渲染这一块。"""
+    if not principal.authenticated:
+        return JSONResponse({'balance': 0.0, 'authenticated': False},
+                            headers={'Cache-Control': 'no-store'})
+    detail = await hub.store.credit_balance(principal.tenant_id, principal.user_id)
+    return JSONResponse({
+        'balance': detail['balance'],
+        'granted': detail['granted'],
+        'used': detail['used'],
+        'last_grant_at': detail['last_grant_at'],
+        'authenticated': True,
+        'unit': '积分',
+        # 进账流水与消耗都能查，说明这不是占位值
+        'source': 'ledger',
+    }, headers={'Cache-Control': 'no-store'})
+
+
+@app.get('/api/credits/events')
+async def credits_events(limit: int = Query(20, ge=1, le=200),
+                         principal=Depends(policies.current_principal)):
+    if not principal.authenticated:
+        raise HTTPException(status_code=401, detail='请先登录')
+    items = await hub.store.credit_events(principal.tenant_id, principal.user_id, limit)
+    return JSONResponse({'items': items}, headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/api/credits/orders')
+async def create_credit_order(payload: CreditOrderRequest, request: Request,
+                              principal=Depends(policies.current_principal)):
+    """下单。支付通道没接：只落 pending 订单，**不加积分**。"""
+    if not principal.authenticated:
+        raise HTTPException(status_code=401, detail='请先登录')
+    require_trusted_origin(request)
+    package = CREDIT_PACKAGES.get(payload.package_id)
+    if package is None:
+        raise HTTPException(status_code=400, detail='未知的积分套餐')
+    order = await hub.store.create_credit_order(
+        tenant_id=principal.tenant_id, user_id=principal.user_id,
+        package_id=payload.package_id, points=package[0], price_cents=package[1])
+    raise HTTPException(status_code=503, detail={
+        'message': '支付通道还没接入中台，订单已登记但不会到账',
+        'order_id': order['order_id'], 'status': order['status'],
+    })
+
+
+@app.get('/api/admin/credits')
+async def admin_credits(days: int = Query(7, ge=1, le=90),
+                        principal=Depends(policies.current_principal)):
+    """每个用户的余额、窗口内消耗与每日趋势。租户运维视角。"""
+    if not principal.authenticated or not principal.auth_session_id:
+        raise HTTPException(status_code=401, detail='请先登录')
+    if principal.role != 'operator':
+        raise HTTPException(status_code=403, detail='需要 operator 角色')
+    data = await hub.store.credit_overview(principal.tenant_id, days)
+    return JSONResponse(data, headers={'Cache-Control': 'no-store'})
+
+
+class AdminCreditGrantRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    # 允许负数：人工扣减/冲正也要走同一条流水，而不是直接改余额。
+    points: float = Field(gt=-10_000_000, lt=10_000_000)
+    note: str = Field(default='', max_length=200)
+
+
+@app.post('/api/admin/credits/{user_id}/grant')
+async def admin_credit_grant(user_id: str, payload: AdminCreditGrantRequest,
+                             request: Request,
+                             principal=Depends(policies.current_principal)):
+    if not principal.authenticated or not principal.auth_session_id:
+        raise HTTPException(status_code=401, detail='请先登录')
+    if principal.role != 'operator':
+        raise HTTPException(status_code=403, detail='需要 operator 角色')
+    require_trusted_origin(request)
+    try:
+        result = await hub.store.add_credit_grant(
+            tenant_id=principal.tenant_id, user_id=user_id, points_delta=payload.points,
+            kind='grant' if payload.points > 0 else 'adjust',
+            note=payload.note, operator_id=principal.user_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return JSONResponse(result, headers={'Cache-Control': 'no-store'})

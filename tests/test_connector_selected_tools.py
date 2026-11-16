@@ -194,14 +194,33 @@ class ConfirmationGateTests(_EnvMixin, unittest.IsolatedAsyncioTestCase):
         self.assertIn('HIGH_RISK_CONFIRMATION_REQUIRED', sent[0]['error'])
         runtime._host_caller.call.assert_not_awaited()
 
-    async def test_plain_update_also_asks(self):
-        """按名字不算"高危"的写工具（canvas.node.update）同样要先问。"""
+    async def test_plain_write_runs_without_asking(self):
+        """普通写（canvas.node.update）不再拦确认：只有高风险才打断对话。
+
+        2026-11-11 二次定：连接器选中后工具全部可用，确认只留给删/发布/扣费
+        这类高风险调用。建节点、改节点每步都点一次"确认"，用户会把确认当噪音。
+        """
+        from unittest.mock import AsyncMock
+        from webpage_agent.agent.pi_host_tools import ToolReceipt
         runtime = self.runtime(tool_name=self.UPDATE_NAME, tool_obj=CANVAS_UPDATE,
                                connector_ids=['beeftv'])
         runtime._interactive_chat = True
-        events, _sent = await self._call(runtime, tool_name=self.UPDATE_NAME)
-        self.assertEqual(len([item for item in events
-                              if item.get('type') == 'tool_confirmation_required']), 1)
+        caller = AsyncMock()
+        caller.call = AsyncMock(return_value=ToolReceipt(ok=True, content={'ok': True}))
+        runtime._host_caller = caller
+        events, sent = await self._call(runtime, tool_name=self.UPDATE_NAME)
+        self.assertEqual([item for item in events
+                          if item.get('type') == 'tool_confirmation_required'], [])
+        caller.call.assert_awaited_once()
+        self.assertTrue(sent[0]['ok'])
+
+    async def test_delete_still_asks(self):
+        """破坏性工具照旧先问：这条边界不能因为放开普通写就一起放开。"""
+        from webpage_agent.agent.pi_runtime import _needs_confirmation
+        self.assertTrue(_needs_confirmation(CANVAS_DELETE))
+        self.assertTrue(_needs_confirmation(LTV_DELETE))
+        self.assertFalse(_needs_confirmation(CANVAS_SEARCH))
+        self.assertFalse(_needs_confirmation(CANVAS_UPDATE))
 
     def test_confirmation_must_be_a_short_directive(self):
         """长句里的"确认"不是授权——'确认一下我的画布有几个？' 不能当确认。"""
@@ -230,6 +249,36 @@ class ConfirmationGateTests(_EnvMixin, unittest.IsolatedAsyncioTestCase):
         caller.call.assert_awaited_once()
         self.assertEqual(caller.call.await_args.kwargs['tool_name'], self.TOOL_NAME)
         self.assertTrue(sent[0]['ok'])
+
+
+class CatalogAllToolsTests(_EnvMixin, unittest.IsolatedAsyncioTestCase):
+    """目录装配：选中的 server 一个工具都不能被白名单筛掉。"""
+
+    async def test_selected_connector_gets_every_tool_despite_tiny_whitelist(self):
+        from unittest.mock import AsyncMock
+        from webpage_agent.agent import connector_scope, pi_runtime
+        from webpage_agent.tools import core as tools_core
+
+        # 白名单里只留一个读工具：旧实现下，写工具与其它 server 就全被筛掉。
+        os.environ['PI_READ_TOOL_KEYS'] = '["mcp:beeftv:canvas.search"]'
+        catalog = [CANVAS_SEARCH, CANVAS_DELETE, CANVAS_UPDATE,
+                   LTV_PROJECTS, LTV_DELETE]
+        with patch.object(tools_core, 'mcp_tools',
+                          AsyncMock(return_value=list(catalog))), \
+                patch.object(tools_core, 'discovery_errors', lambda: {}), \
+                connector_scope.scope(['beeftv']):
+            _decls, objs = await pi_runtime.pi_tool_catalog()
+        remote = {getattr(tool, 'tool_key', '') for tool in objs
+                  if str(getattr(tool, 'tool_key', '') or '').startswith('mcp:')}
+        self.assertEqual(remote, {'mcp:beeftv:canvas.search',
+                                  'mcp:beeftv:canvas.node.delete',
+                                  'mcp:beeftv:canvas.node.update'})
+        # 没选中的 server 一个工具都不许混进来
+        self.assertNotIn('mcp:libtv:list_projects', remote)
+
+    async def test_selected_tools_are_all_executable(self):
+        for tool in (CANVAS_SEARCH, CANVAS_DELETE, CANVAS_UPDATE):
+            self.assertTrue(pi_host_tools.tool_allowed(tool, connector_ids=['beeftv']))
 
 
 if __name__ == '__main__':

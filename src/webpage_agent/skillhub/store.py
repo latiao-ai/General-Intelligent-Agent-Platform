@@ -1,7 +1,11 @@
 """技能安装状态（按主体）持久化。
 
-单机中台用 JSON 文件即可：`profile/skillhub/<tenant>__<user>.json`。
+单机中台用 JSON 文件即可：`<SKILLHUB_STATE_DIR>/<tenant>__<user>.json`。
 写入用临时文件 + `os.replace`，避免进程中断留下半份 JSON。
+
+目录**不写死**：这份文件就是"用户装了哪些技能"的唯一记录，删了只能让人重装一遍。
+默认落在 `profile/skillhub`，部署时用 `SKILLHUB_STATE_DIR` 指到挂载卷，
+重装代码/重新发布才不会连它一起清掉。
 """
 from __future__ import annotations
 
@@ -11,7 +15,9 @@ import re
 import threading
 from pathlib import Path
 
-_PROFILE = Path(__file__).resolve().parents[3] / 'profile' / 'skillhub'
+from webpage_agent.core.config import settings
+
+_PROFILE = Path(settings.skillhub_state_dir)
 _LOCK = threading.Lock()
 
 

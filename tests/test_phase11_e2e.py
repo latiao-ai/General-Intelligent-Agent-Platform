@@ -210,8 +210,19 @@ class SessionMessageE2ETests(unittest.IsolatedAsyncioTestCase):
         for tid, goal in (('t1', '做个红色页面'), ('t2', '做个蓝色页面')):
             await self.store.create_task(tid, 's1', goal)
             await self.store.ensure_task_meta(tid, session_id='s1', goal=goal)
-            await self.store.create_run(f'run-{tid}', tid, status='queued',
-                                        runtime_kind=runtime_identity.KIND_LANGGRAPH)
+        # run 直接落库，不走 create_run：后者现在带会话级准入（同会话已有未结束
+        # 目标就拒），而本用例要验证的恰恰是「同会话存在两个未结束任务」时歧义
+        # 追问是否准确。这种状态正常路径不该产生（create_goal 会拦），只能绕过
+        # 准入来构造。
+        from webpage_agent.store.pg_store import now
+        stamp = now()
+        async with self.store._lease() as conn:
+            for tid in ('t1', 't2'):
+                await self.store._run(conn,
+                    'INSERT INTO runs (run_id, task_id, session_id, tenant_id, status, '
+                    'runtime_kind, created_at, updated_at) '
+                    "VALUES (%s, %s, 's1', 'default', 'queued', %s, %s, %s)",
+                    (f'run-{tid}', tid, runtime_identity.KIND_LANGGRAPH, stamp, stamp))
 
         r = await hub.accept_session_message('s1', request_id='r1',
                                              message='把它改绿', principal=principal)

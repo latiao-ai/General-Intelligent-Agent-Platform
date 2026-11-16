@@ -23,12 +23,12 @@ import uuid
 from webpage_agent.core import memory as memory_module
 from webpage_agent.core import model_choice
 from webpage_agent.core import outcome as outcome_module
+from webpage_agent.core import profile as profile_module
 from webpage_agent.core import sandbox
 from webpage_agent.core.config import settings
 from webpage_agent.store.pg_store import TurnRequestConflict
 
 logger = logging.getLogger(__name__)
-_MEMORY_TASKS: set = set()
 
 
 def request_hash(message: str, target: str) -> str:
@@ -198,6 +198,19 @@ def route_message(message: str, *, active_tasks: list[dict] | None = None,
     return {'kind': 'chat', 'target_task_id': '', 'target_run_id': ''}
 
 
+def _transient_reason(reason: str) -> bool:
+    """这条发现失败是"等会儿重试可能就好"，还是"凭据/配置真的有问题"。
+
+    提示词要按这个分叉：上游 503 时让用户去重新授权，他点完还是 503，只会更
+    确定"这系统坏了"。
+    """
+    text = str(reason or '')
+    return any(token in text for token in
+               ('OAuthTransient', 'HTTP 500', 'HTTP 502', 'HTTP 503', 'HTTP 504',
+                'Timeout', 'timeout', 'ConnectError', 'Temporary failure',
+                'Connection reset', '暂时'))
+
+
 def turn_answer(state: dict) -> str:
     """从 Pi 的 state 里取本轮答复；"先问人"的那一轮把问题当答复返回。
 
@@ -230,6 +243,7 @@ class HubSessionMessageMixin:
             target_task_id: str = '', principal=None,
             connector_ids: list[str] | None = None,
             addon_selection: dict | None = None,
+            content_blocks: list | None = None,
             platform_subject: str | None = None) -> dict:
         """接纳一条会话消息，返回 202 形状（不等待模型完成）。
 
@@ -251,6 +265,15 @@ class HubSessionMessageMixin:
         route = route_message(message, active_tasks=active,
                               target_task_id=target_task_id,
                               connectors=connector_ids)
+
+        # 机器人会话一律走 `chat`：机器人是"对话式执行者"，不是任务控制台。
+        # 不这么做的话，"建一个 HTML 报告" 会被 `route_message` 判成 control，
+        # 在 SESSION_TASK_CREATE_ENABLED=false 时直接回一句"能力未开放"——
+        # 用户明明是在跟一个会干活的机器人说话。建任务请去任务工作台。
+        session_row = await self.store.session(session_id) or {}
+        if str(session_row.get('bot_id') or ''):
+            route = {'kind': 'chat', 'target_task_id': '', 'target_run_id': '',
+                     'candidates': [], 'clarification': ''}
 
         # 继续澄清（第十一阶段第 6 点）：存在等待澄清的歧义 turn 时，把「编号/
         # 候选名」回复映射回候选任务，让下一条回答能继续澄清，而不是新建一次歧义。
@@ -314,6 +337,7 @@ class HubSessionMessageMixin:
                 source_turn_id=source_turn_id,
                 connector_ids=connector_ids,
                 addon_selection=merged_addons,
+                content_blocks=content_blocks,
                 platform_subject=platform_subject)
         except TurnRequestConflict:
             raise
@@ -535,7 +559,7 @@ class HubSessionMessageMixin:
         return model, api_key
 
     def _build_pi_runtime(self, *, tools=None, tool_objects=None, system_prompt=None,
-                          connector_ids=None):
+                          connector_ids=None, bot_messenger=None):
         """构造 PiRuntime：受控模型脚本（测试）经环境变量注入，正式链路走真实模型。
 
         `connector_ids` 必须一路带到 `HostToolCaller`：执行工具时 `connector_scope`
@@ -558,7 +582,8 @@ class HubSessionMessageMixin:
                          system_prompt=system_prompt,
                          tools=tools if tools is not None else [],
                          tool_objects=tool_objects,
-                         connector_ids=connector_ids)
+                         connector_ids=connector_ids,
+                         bot_messenger=bot_messenger)
 
     async def _chat_history(self, session_id: str, exclude_turn_id: str,
                             after_id: int = 0) -> list:
@@ -590,18 +615,23 @@ class HubSessionMessageMixin:
             server = mcp_servers.by_id(connector_id)
             names.append(f'{connector_id}（{getattr(server, "title", "") or connector_id}）')
         objects = [tool for tool in (tool_objects or []) if tool is not None]
-        remote_names = [str(getattr(tool, 'name', '') or '') for tool in objects
-                        if str(getattr(tool, 'tool_key', '') or '').startswith('mcp:')]
+        remote_names_all = [str(getattr(tool, 'name', '') or '') for tool in objects
+                            if str(getattr(tool, 'tool_key', '') or '').startswith('mcp:')]
         local_names = [str(getattr(tool, 'name', '') or '') for tool in objects
                        if not str(getattr(tool, 'tool_key', '') or '').startswith('mcp:')]
-        remote_names = [name for name in remote_names if name][:60]
+        remote_names_all = [name for name in remote_names_all if name]
+        remote_names = remote_names_all[:60]
         local_names = [name for name in local_names if name][:20]
         lines = [
             '\n\n【本轮连接器】用户在当前会话选择了以下 MCP 连接器：',
             '、'.join(names),
         ]
         if remote_names:
-            lines.append('已注入的连接器工具：' + '、'.join(remote_names))
+            shown = '、'.join(remote_names)
+            more = (f'（共 {len(remote_names_all)} 个，上面只列了前 {len(remote_names)} 个；'
+                    '没列出来的同样可用，按名字/描述找即可）'
+                    if len(remote_names_all) > len(remote_names) else '')
+            lines.append(f'已注入的连接器工具{more}：{shown}')
         else:
             lines.append('本轮**没有**注入任何连接器工具。')
         if local_names:
@@ -613,19 +643,28 @@ class HubSessionMessageMixin:
         if reasons and not remote_names:
             detail = '；'.join(f'{connector_id}：{reason}'
                                for connector_id, reason in reasons)
-            lines.append(f'连接器工具发现失败（{detail}）。'
-                         '这说明是授权/网络/配置问题，**不是连接器没有这个能力**。'
-                         '如实告诉用户失败原因并请其在连接器面板重新授权或检查配置；'
-                         '不要拿本地工具去凑，也不要断言平台没有列表接口。')
+            if all(_transient_reason(reason) for _, reason in reasons):
+                # 上游抖动 ≠ 授权失效。说错方向，用户会去点一次没用的"重新授权"。
+                lines.append(f'连接器工具本轮没拿到（{detail}）。'
+                             '这是上游或网络**暂时**不可用，不是授权失效：'
+                             '如实告诉用户「稍后重试即可」，不要让他重新授权；'
+                             '也不要用本地工具去凑，不要断言平台没有这个能力。')
+            else:
+                lines.append(f'连接器工具发现失败（{detail}）。'
+                             '这说明是授权/网络/配置问题，**不是连接器没有这个能力**。'
+                             '如实告诉用户失败原因并请其在连接器面板重新授权或检查配置；'
+                             '不要拿本地工具去凑，也不要断言平台没有列表接口。')
         elif reasons:
             detail = '；'.join(f'{connector_id}：{reason}'
                                for connector_id, reason in reasons)
             lines.append(f'注意：以下连接器的部分工具本轮没拿到（{detail}），'
                          '相关能力缺失时如实说明，不要编造调用。')
         lines.append('当用户问“连接了哪些 MCP server”时，以本清单为准，不要说没有暴露。')
-        lines.append('凡是会改动平台数据的工具（建画布/节点、改提示词、删、导出、'
-                     '生成/提交、发布、扣费等），执行前必须先向用户说明要做什么、'
-                     '影响或费用，并等待用户明确回复“确认”；未确认时不要直接调用。')
+        lines.append('凡是会改动平台数据的高风险工具（删除/销毁/发布/部署/导出/扣费/'
+                     '生成提交/取消任务等），执行前必须先向用户说明要做什么、影响或费用，'
+                     '并等待用户明确回复“确认”；未确认时不要直接调用。')
+        lines.append('普通写操作（新建节点、创建项目、更新字段、保存素材等）不必等确认，'
+                     '直接调用；只有高风险调用会真的被宿主拦下来问一句。')
         lines.append('用户回复“确认”之后，直接重新调用刚才那个工具把操作做完：'
                      '不要再复述一遍计划，也不要用文字代替调用。'
                      '用户说的是别的意思（改需求、问问题）时，按新意思走，不要当成确认。')
@@ -633,7 +672,8 @@ class HubSessionMessageMixin:
             lines.append('工具名和用户的说法常常对不上：平台里的"画布"可能对应 projects，'
                          '创建画布可能就是一个创建项目的接口（如 business_post_projects）。'
                          '先用检索类工具核对，再调用最接近的那个——不要因为名字里没有 '
-                         'canvas.create 就断言没有创建接口。写操作会被宿主要求确认，直接调用即可。')
+                         'canvas.create 就断言没有创建接口。写操作直接调用即可，'
+                         '只有高风险操作会被宿主要求确认。')
             lines.append('当用户要求创建画布/节点、生成图片/视频、查看作品或继续创作时，'
                          '必须先调用本轮已注入的连接器工具，不要只给步骤或建议；'
                          '工具返回的 projectId、canvas URL、node ID、图片/视频 URL 要原样保留，'
@@ -688,6 +728,14 @@ class HubSessionMessageMixin:
             tenant_id=tenant_id, owner_user_id=owner_user_id)
         if not sandbox.stored_path_ok(stored, private):
             stored = str(private)
+        # 机器人会话：工作目录换成它自己的家目录（在用户私有根之内）。
+        # 必须在解析 addons 之前算好——技能要物化进这个目录，模型随后用相对路径读。
+        # 同一用户的两个机器人因此不会读到对方的技能目录与产出文件。
+        session_bot_id = str(session_row.get('bot_id') or '')
+        if session_bot_id:
+            from webpage_agent.bot import service as bot_service
+            stored = bot_service.ensure_bot_home(tenant_id, owner_user_id,
+                                                 session_bot_id)
 
         # 会话级选择（专家 / 技能 / 连接器）→ 本轮资源（docs/addons.md）。
         # 解析只读库与磁盘，不发网络请求；MCP 连接仍由后面的工具目录复用。
@@ -743,16 +791,69 @@ class HubSessionMessageMixin:
         except Exception:                          # noqa: BLE001
             logger.debug('读取长期记忆失败', exc_info=True)
             user_rows, workspace_rows = [], []
-        memory_block = memory_module.render_long_term(user_rows, workspace_rows)
+        # 机器人自己的长期记忆（scope_type='bot'）：角色分工需要各自积累。
+        bot_rows = []
+        if session_bot_id:
+            try:
+                bot_rows = await self.store.recall('bot', session_bot_id)
+            except Exception:                      # noqa: BLE001
+                logger.debug('读取机器人记忆失败', exc_info=True)
+        # 用户画像按本轮主体读（显式传 user，不碰 contextvar）：闲聊也要认识这个人，
+        # 否则"我的画像"只在派任务时生效，用户写完偏好回来一问，模型还是不知道。
+        try:
+            profile_facts = profile_module.load(user=owner_user_id)
+        except Exception:                          # noqa: BLE001
+            logger.debug('读取用户画像失败', exc_info=True)
+            profile_facts = {}
+        memory_block = memory_module.render_long_term(
+            user_rows, workspace_rows, bot_rows, override_keys=profile_facts)
 
         session_block = memory_module.render_session_memory(
             session_memory.get('summary') or '', session_memory.get('facts') or {})
-        system_prompt = ((settings.pi_system_prompt or '')
-                         + ('\n\n' + session_block if session_block else '')
-                         + ('\n\n' + memory_block if memory_block else '')
+        # 画像排在长期记忆之后、工具规则之前：它是"这个人是谁"的背景，
+        # 而不是本轮的指令；工具与确认规则仍然贴着用户输入走。
+        background = ((settings.pi_system_prompt or '')
+                      + ('\n\n' + session_block if session_block else '')
+                      + ('\n\n' + memory_block if memory_block else ''))
+        system_prompt = (profile_module.with_profile(background, user=owner_user_id)
                          + str(addons.get('prompt_block') or '')
                          + self._connector_context(connector_ids, tool_objects,
                                                    connector_errors))
+
+        # 能力按会话注入：只有机器人规范会话才追加 `message_bot`。
+        # gate 是会话行上稳定的 `bot_id`（+ 不是群聊房间），所以普通任务的
+        # token 序列一个字节都不变；群聊房间也不给这个工具——房间里由调度器
+        # 决定谁说话，允许模型再点别人会绕过轮次上限。
+        bot_messenger = None
+        if session_bot_id and str(session_row.get('session_kind') or '') != 'bot_room':
+            from webpage_agent.agent import pi_host_tools
+            from webpage_agent.bot import mailbox as mailbox_module
+            peers = [str(item.get('handle') or '') for item in
+                     await self.store.list_bot_rows(
+                         tenant_id=tenant_id, owner_user_id=owner_user_id,
+                         include_hidden=False)]
+            decl = pi_host_tools.bot_message_decl(
+                [name for name in peers if name and name != str(
+                    (addons.get('bot') or {}).get('handle') or '')])
+            tools = list(tools) + [decl]
+            mailbox = mailbox_module.BotMailbox(
+                self.store, max_hops=settings.bot_max_hops)
+            bot_ctx = addons.get('bot') or {}
+            # 本轮是从哪条投递来的？转述深度必须接着上一跳算，否则每一轮都从 0
+            # 重新开始，两个机器人就能无限互发（提示词拦不住，只有计数能）。
+            turn_hop = 0
+            try:
+                rows = await self.store.deliveries_for_turn(turn_id)
+                turn_hop = max((int(row.get('hop') or 0) for row in rows),
+                               default=0)
+            except Exception:                      # noqa: BLE001
+                logger.debug('读取本轮投递深度失败 turn=%s', turn_id, exc_info=True)
+
+            async def bot_messenger(args, _ctx=bot_ctx, _box=mailbox,
+                                    _turn=turn_id, _hop=turn_hop + 1):
+                return await _box.deliver(from_bot=_ctx, to_handle=str(
+                    (args or {}).get('target') or ''), body=str(
+                    (args or {}).get('message') or ''), turn_id=_turn, hop=_hop)
 
         model_token = model_choice.bind(
             owner_user_id,
@@ -761,7 +862,8 @@ class HubSessionMessageMixin:
             runtime = self._build_pi_runtime(
                 tools=tools, tool_objects=tool_objects,
                 system_prompt=system_prompt or None,
-                connector_ids=connector_ids)
+                connector_ids=connector_ids,
+                bot_messenger=bot_messenger)
         except Exception:
             model_choice.reset(model_token)
             if subject_token is not None:
@@ -805,6 +907,7 @@ class HubSessionMessageMixin:
                         run_id=turn_id, tenant_id=tenant_id,
                         owner_user_id=owner_user_id,
                         owner_role=str(claimed.get('owner_role') or 'member'),
+                        session_id=str(claimed.get('session_id') or ''),
                         lease_owner=lease_owner, lease_epoch=lease_epoch,
                         lease_ttl=float(settings.session_turn_lease_seconds))
                 except Exception:                       # noqa: BLE001
@@ -872,16 +975,55 @@ class HubSessionMessageMixin:
             if not answer:
                 # 无有效答复：如实说明，不落空答复冒充成功
                 return '抱歉，我暂时无法回答这个问题。'
-            if memory_module.has_memory_cue(message):
+            # 值不值得记交给模型判断（默认每轮都跑），关键词只用来省成本时才生效。
+            # 以前这里是 has_memory_cue 硬闸门："我来自浙江台州"不命中就整轮跳过，
+            # 模型的回答却已经写着"已记录"——画像和界面从此对不上。
+            #
+            # 抽取从"后台 create_task"改成"done 之前 await"：SSE 在 done 后就关了，
+            # 后台任务再写 turn_event 没人收。代价只是 done 晚一点，回答正文早已
+            # 流式发完，用户看不到额外等待。
+            learned = {}
+            extract_error = ''
+            if memory_module.should_extract(message):
+                budget = float(getattr(settings, 'memory_extract_timeout', 12) or 0)
                 try:
-                    task = asyncio.create_task(memory_module.extract_user_memory(
-                        self.store, scope_id=owner_user_id, tenant_id=tenant_id,
-                        user_message=message, answer=answer,
-                        created_by=owner_user_id))
-                    _MEMORY_TASKS.add(task)
-                    task.add_done_callback(_MEMORY_TASKS.discard)
+                    result = await asyncio.wait_for(
+                        memory_module.extract_user_memory(
+                            self.store, scope_id=owner_user_id, tenant_id=tenant_id,
+                            user_message=message, answer=answer,
+                            created_by=owner_user_id, bot_id=session_bot_id),
+                        timeout=budget if budget > 0 else None)
+                    learned = result.learned
+                    # 抽取函数自己不抛异常，失败原因放在 error 里：这里要原样播报，
+                    # 否则"模型说已记录、画像没动"就只能靠用户自己去面板发现。
+                    extract_error = result.error
+                except asyncio.TimeoutError:
+                    # wait_for 的预算是整段抽取（模型 + 落库）的外层上限，
+                    # 比 provider 单次 attempt_timeout 更粗，所以单独说一句。
+                    extract_error = f'记忆抽取超过 {budget:g} 秒未完成'
+                    logger.warning('长期记忆抽取超时 turn=%s budget=%s', turn_id, budget)
                 except Exception:                  # noqa: BLE001
-                    logger.debug('调度长期记忆提取失败', exc_info=True)
+                    # 抽取失败不能拖死这一轮：答复已经生成，照发；
+                    # CancelledError 不在此列，用户取消照常传播。
+                    extract_error = '记忆抽取调用失败'
+                    logger.warning('长期记忆抽取失败 turn=%s', turn_id, exc_info=True)
+            if learned:
+                # 真实的回执：只播报画像**确实变了**的条目，模型自己说"已记录"不算。
+                try:
+                    await self.store.append_turn_event(turn_id, {
+                        'type': 'memory_learned',
+                        'detail': learned, 'at': time.time()})
+                except Exception:                  # noqa: BLE001
+                    logger.debug('写入 turn memory_learned 失败', exc_info=True)
+            elif extract_error:
+                # 回执的另一半：没记住也要说一声。原来失败是静默的，模型那句
+                # "已记录"成了独白，用户打开画像发现没变，只会觉得整个记忆是假的。
+                try:
+                    await self.store.append_turn_event(turn_id, {
+                        'type': 'memory_extract_failed',
+                        'detail': {'reason': extract_error}, 'at': time.time()})
+                except Exception:                  # noqa: BLE001
+                    logger.debug('写入 turn memory_extract_failed 失败', exc_info=True)
             return answer
         finally:
             model_choice.reset(model_token)

@@ -189,6 +189,9 @@ MCP_PREFIX = mcp_servers.MCP_PREFIX
 _MCP_CACHE: dict = {'at': 0.0, 'tools': [], 'errors': {}, 'signature': (),
                     'capabilities': {}}
 _MCP_TTL = 300.0
+# 发现失败若是"暂时性的"（上游 5xx / 连不上），目录只压 20 秒就重来：
+# 5 分钟的负缓存在上游恢复之后仍然让模型说"连接器用不了"，比不缓存更糟。
+_MCP_TRANSIENT_TTL = 20.0
 _SCOPED_MCP_CACHES: dict = {}
 
 
@@ -217,12 +220,14 @@ def _current_mcp_cache() -> dict:
     return _SCOPED_MCP_CACHES[key]
 
 
-def _signature() -> tuple:
+def _signature(owner_key: str = '') -> tuple:
     # 部署开关、各家规划规则和本机用法都进签名：改了配置，缓存里的工具说明必须立刻失效。
     # 全部连接配置参与失效（包括参数、凭据变化），缓存键不保存明文密钥。
-    body = json.dumps([vars(s) for s in mcp_servers.servers()],
+    # owner_key 必须一起进：用户改自己的连接器，不能等 300s TTL 才生效。
+    body = json.dumps([vars(s) for s in mcp_servers.servers_view(owner_key)],
                       sort_keys=True, default=str)
-    return (settings.deploy_enabled, hashlib.sha256(body.encode()).hexdigest())
+    return (settings.deploy_enabled, hashlib.sha256(body.encode()).hexdigest(),
+            owner_key)
 
 
 async def _subject_token(server, tenant_id: str = '', user_id: str = ''):
@@ -237,19 +242,45 @@ async def _subject_token(server, tenant_id: str = '', user_id: str = ''):
         server, tenant_id=tenant_id, user_id=user_id)
 
 
-async def _discover(server, tenant_id: str = '', user_id: str = '') -> tuple[list[dict], str]:
-    """发现单个服务端的工具。**失败只影响它自己**，不拖垮其他服务端。"""
+def _is_transient(exc: BaseException) -> bool:
+    """这次失败是"过一会儿可能就好"还是"确实坏了"。
+
+    区别对用户很关键：上游 503 只要等两分钟重试；401/缺凭据才需要去重新授权。
+    分错方向会把人引去做一件没用的事。
+    """
+    from webpage_agent.integrations import oauth_client
+    leaf = _unwrap_error(exc)
+    if isinstance(leaf, oauth_client.OAuthTransient):
+        return True
+    status = getattr(leaf, 'status', 0)
+    if not isinstance(status, int) or not status:
+        status = getattr(getattr(leaf, 'response', None), 'status_code', 0)
+    if isinstance(status, int) and status >= 500:
+        return True
+    text = str(leaf)
+    return any(token in text for token in
+               ('Timeout', 'timeout', 'ConnectError', 'Temporary failure',
+                'Connection reset', 'HTTP 502', 'HTTP 503', 'HTTP 504'))
+
+
+async def _discover(server, tenant_id: str = '',
+                    user_id: str = '') -> tuple[list[dict], str, bool]:
+    """发现单个服务端的工具。**失败只影响它自己**，不拖垮其他服务端。
+
+    第三个返回值是"这次失败是不是暂时性的"：暂时性的不写 300s 缓存，否则
+    上游抖动恢复之后，会话里还要再说五分钟"连接器坏了"。
+    """
     try:
         token = await _subject_token(server, tenant_id, user_id)
         if token is None:
-            return await mcp_adapter.list_server_tools(server), ''
-        return await mcp_adapter.list_server_tools(server, token=token), ''
+            return await mcp_adapter.list_server_tools(server), '', False
+        return await mcp_adapter.list_server_tools(server, token=token), '', False
     except Exception as exc:                       # noqa: BLE001
         # 日志留完整堆栈；给界面/健康检查的那一句必须拆到真实原因，否则只剩
         # "ExceptionGroup: unhandled errors in a TaskGroup"——看不出是网络还是鉴权。
         logger.warning('MCP 服务端 %s 工具发现失败：%s', server.id,
                        mcp_adapter.describe_error(exc), exc_info=True)
-        return [], _describe_error(exc)
+        return [], _describe_error(exc), _is_transient(exc)
 
 
 def _type_brief(schema: dict, depth: int = 0) -> str:
@@ -422,12 +453,21 @@ async def mcp_tools(force: bool = False, *, tenant_id: str = '',
     """
     now = time.monotonic()
     cache = _current_mcp_cache()
-    signature = _signature()
+    # 这个主体自己的连接器参与发现与路由。**两个都没传**才算"没有主体"
+    # （CLI、运维脚本、健康检查）：此时只看共享层，不会顺手把某个用户的私有
+    # 服务端拉进来。显式传了 `default` 则是真主体，按 default__default 取。
+    owner_key = (mcp_servers.owner_key_for_values(tenant_id, user_id)
+                 if (tenant_id or user_id) else '')
+    signature = _signature(owner_key)
     if tenant_id or user_id:
         # 目录里含"这个主体能看见哪些工具"，缓存就不能跨主体串用。
         signature = (signature,
                      hashlib.sha256(f'{tenant_id}:{user_id}'.encode()).hexdigest())
-    servers = mcp_servers.servers()
+    servers = mcp_servers.servers_view(owner_key)
+    # 工具名的前缀由"这个主体**配置**了几个服务端"决定，而不是"这次发现了几个"。
+    # 用发现后的数量会让名字随上游抖动而变：某个服务端临时掉线，剩下的工具就
+    # 从 `mcp__a__draw` 变成 `mcp__draw`，已存的计划立刻失效。
+    total = len(servers)
     allowed_tools: dict[str, set[str]] = {}
     if getattr(settings, 'tool_policy_enforced', False):
         # 每次检查绑定和密钥，撤权不能等五分钟 TTL。明文不进入缓存。
@@ -449,7 +489,7 @@ async def mcp_tools(force: bool = False, *, tenant_id: str = '',
             cache.update(at=0.0, tools=[], capabilities={}, signature=())
             raise
     cached = (cache['tools'] and cache.get('signature') == signature
-              and now - cache['at'] < _MCP_TTL)
+              and now - cache['at'] < cache.get('ttl', _MCP_TTL))
     if cached and not force:
         return cache['tools']
 
@@ -465,25 +505,36 @@ async def mcp_tools(force: bool = False, *, tenant_id: str = '',
     capabilities = {server.id: caps
                     for server, caps in zip(servers, capability_lists, strict=True)
                     if caps}
-    total = len(mcp_servers.servers())
     tools: list[Tool] = []
     errors: dict[str, str] = {}
+    retry_soon = False
     # 同上：`discovered` 是 `[_discover(server) for server in servers]` 的 gather 结果
-    for server, (items, error) in zip(servers, discovered, strict=True):
+    for server, result in zip(servers, discovered, strict=True):
+        items, error = result[0], result[1]
+        # 第三项"是否暂时性失败"是后加的：替换 _discover 的假实现只给前两项，
+        # 缺省按"非暂时"处理（照旧走 300s 缓存）。
+        transient = bool(result[2]) if len(result) > 2 else False
         if error:
             errors[server.id] = error
+            retry_soon = retry_soon or transient
             continue
         allow = allowed_tools.get(getattr(server, 'id', ''))
         if allow:
-            items = [item for item in items
-                     if f'mcp:{server.id}:{item.get("name", "")}' in allow]
+            # 凭据里的工具清单只约束**没被用户选中**的服务端。用户把 server 连进
+            # 会话，就是"它的工具全给我用"——再按凭据白名单收窄，就会出现
+            # "连上了却只剩 32 个工具"这种自相矛盾的结果。
+            from webpage_agent.agent import connector_scope
+            if str(getattr(server, 'id', '')) not in set(connector_scope.current() or ()):
+                items = [item for item in items
+                         if f'mcp:{server.id}:{item.get("name", "")}' in allow]
         inner = capabilities.get(server.id) or {}
         for item in items:
             adapted = registry.adapt_mcp_tool(server, item, _make_mcp_runner)
             if adapted is not None:
                 tools.append(adapted)
                 continue
-            name = mcp_servers.tool_name(server, item['name'], total)
+            name = mcp_servers.tool_name(server, item['name'], total,
+                                         owner_key=owner_key)
             schema = item.get('inputSchema') or {'type': 'object', 'properties': {}}
             # 用服务端给的真实描述，而不是拿工具名猜用途
             title = item.get('title') or item['name']
@@ -532,7 +583,8 @@ async def mcp_tools(force: bool = False, *, tenant_id: str = '',
         if stub is not None:
             tools.append(stub)
     cache.update(at=now, tools=tools, errors=errors, signature=signature,
-                 capabilities=capabilities)
+                 capabilities=capabilities,
+                 ttl=(_MCP_TRANSIENT_TTL if retry_soon else _MCP_TTL))
     return tools
 
 
@@ -960,6 +1012,23 @@ def _make_mcp_runner(server_tool_name: str, server=None, adapter=None,
     return run
 
 
+def _subject_kwargs(context) -> dict:
+    """把可信主体翻成 `mcp_tools()` 的关键字。
+
+    没有主体就**什么也不传**：`mcp_tools()` 因此退回"只看共享层"，与旧行为一致，
+    也让各种零参测试桩继续成立。传空串和"不传"在语义上都是"没有主体"，
+    但前者会走进按主体分缓存的分支，没必要。
+    """
+    tenant = str(getattr(context, 'tenant_id', '') or '')
+    user = str(getattr(context, 'user_id', '') or '')
+    kwargs = {}
+    if tenant:
+        kwargs['tenant_id'] = tenant
+    if user:
+        kwargs['user_id'] = user
+    return kwargs
+
+
 async def catalog(context=None) -> list[Tool]:
     """本轮可用的全部工具：本地能力包（注册来的）+ MCP 发现。
 
@@ -971,8 +1040,10 @@ async def catalog(context=None) -> list[Tool]:
     以便单元测试与 CLI 直调继续可用。
     """
     tools = list(registry.registered())
+    # 主体必须一路传下去：MCP 目录里既有"这个用户自己的连接器"，也有"这个用户
+    # 拿到过哪些凭据"。不带主体取目录，等于把默认主体的私有服务端借给所有人用。
     try:
-        tools.extend(await mcp_tools())
+        tools.extend(await mcp_tools(**_subject_kwargs(context)))
     except credentials_module.CredentialMissing:
         if context is None or not settings.tool_policy_enforced:
             raise
@@ -1043,11 +1114,14 @@ async def find_tool(name: str, context=None):
     tool = BUILTIN_BY_NAME.get(name) or registry.snapshot().get(name)
     if tool is not None:
         return tool if context is None or await visible_tools([tool], context) else None
-    tools = await mcp_tools()
+    tools = await mcp_tools(**_subject_kwargs(context))
     exact = next((t for t in tools if t.name == name), None)
     if exact is not None:
         return exact if context is None or await visible_tools([exact], context) else None
-    _, bare = mcp_servers.split_tool_name(name)
+    owner_key = mcp_servers.owner_key_for_values(
+        str(getattr(context, 'tenant_id', '') or ''),
+        str(getattr(context, 'user_id', '') or ''))
+    _, bare = mcp_servers.split_tool_name(name, owner_key=owner_key)
     matches = [t for t in tools if t.name == f'{MCP_PREFIX}{bare}'
                or t.name.endswith(f'__{bare}')
                or t.tool_key.endswith(f':{bare}')]

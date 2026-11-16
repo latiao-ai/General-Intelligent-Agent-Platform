@@ -31,6 +31,11 @@ export TENANT_BUDGET_ENABLED=false
 export MCP_SERVERS='[]'
 # 测试库必须是一次性的：用例会 TRUNCATE 全部业务表。
 export PG_TEST_DSN="${PG_TEST_DSN:-postgresql://${USER}@127.0.0.1:5432/agent_platform_test}"
+# DATABASE_URL 也一起钉到测试库。CI 早就这么做了（见 .github/workflows/ci.yml），
+# 这里漏了会导致：`webpage_agent.api.routes` 在模块级 `hub = Hub()` 里用 open_store()
+# 读 .env 的 DATABASE_URL，于是一批用例悄悄连上开发库 agent_platform 而不是测试库——
+# 表现是"本机能过、CI 也过"，但开发库里会留下测试租户的数据（库里确有一条 tenant-a 会话）。
+export DATABASE_URL="$PG_TEST_DSN"
 
 case "$PG_TEST_DSN" in
   *test*) ;;

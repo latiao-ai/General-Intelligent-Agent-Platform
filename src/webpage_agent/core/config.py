@@ -28,6 +28,11 @@ def _env_flag(name: str, default: str = 'false') -> bool:
 
 # 画布任务的默认系统提示。Pi 生产入口必须带上，否则模型不知道何时停手，
 # 同一检索会换关键词反复调用。PI_SYSTEM_PROMPT 未设置时用这段；设为空字符串则关闭。
+#
+# 两段职责不同，不要混：
+#   「执行规则」管行为边界（少重复检索、何时停手、缺参数就问人）；
+#   「表达方式」管怎么说。只写执行规则时，模型会把输出压成"工具执行汇报"——
+#   英文思考、一句话结论、不排版，读起来像日志而不像在跟人说话。
 DEFAULT_PI_SYSTEM_PROMPT = (
     '你是画布任务执行助手。执行规则：'
     '1) 每个检索意图只调用一次搜索工具，禁止对同一问题换关键词重复搜索；'
@@ -36,6 +41,13 @@ DEFAULT_PI_SYSTEM_PROMPT = (
     '4) 缺少对象、字段或用户必须做的选择时，调用 request_input 停下来问人，'
     '不要猜测、不要空转重试；'
     '5) 写操作只使用宿主给出的对象标识，写完后等待回读核验，不要自行重复写入。'
+    '表达方式：'
+    '1) 用中文思考和作答；思考写给人看的判断和目标，不要复述工具名和参数；'
+    '2) 先给结论再给依据，不复述"我要做什么"，直接说结果；'
+    '3) 用 Markdown 组织内容——小标题、列表、表格、行内代码，让长内容能扫读；'
+    '4) 篇幅跟着问题走：一句话能答完就一句话，不要为了显得完整而扩写；'
+    '5) 不写"好的""当然可以""希望对你有帮助"这类开场白和客套收尾；'
+    '6) 区分事实与推断，不确定就直说不确定，不要用模糊措辞掩盖。'
 )
 
 
@@ -169,9 +181,29 @@ class Settings:
     # 磁盘是唯一事实来源，库里不建技能索引表——避免"目录在、表里没有"这类双写
     # 不一致；列表接口每次直接扫目录，几十个技能的扫描代价可以忽略。
     skills_dir: Path = PROJECT_ROOT / os.getenv('SKILLS_DIR', 'profile/skills')
+    # 技能包仓库：平台技能/远端技能的原件 zip（`<id>/<version>.zip`）。
+    # **发布和安装必须分开**：`skills_dir` 里有目录就等于"已安装"，所以管理员
+    # 发布时只能把包存在这里，等用户点「+」才解包进 `skills_dir`。
+    skillhub_packages_dir: Path = PROJECT_ROOT / os.getenv(
+        'SKILLHUB_PACKAGES_DIR', 'profile/skillhub/packages')
+    # 技能安装状态与平台目录（每个用户装了哪些、管理员发布了哪些）。
+    # 同样必须能挪出代码目录：部署到服务器时指到挂载卷，重装代码才不会把
+    # 用户的安装清单和平台条目一起清空——这两份东西丢了没有任何自动恢复途径。
+    # 默认留在 `profile/skillhub`，与平台目录 JSON 的默认位置一致。
+    skillhub_state_dir: Path = PROJECT_ROOT / os.getenv(
+        'SKILLHUB_STATE_DIR', 'profile/skillhub')
     # 会话级技能物化目录名（相对当前工作目录）。每轮只把**本会话选中的技能**
     # 拷进 `.agent-skills/<session>/`，模型用 read_file 按需读取，不整体塞上下文。
     skills_workspace_dirname: str = os.getenv('SKILLS_WORKSPACE_DIRNAME', '.agent-skills')
+    # 技能包体积上限（MB），**0 = 不限**，默认不限。
+    # 上传入口只有两处（用户技能中心、管理员发版），谁都不希望一个拍出来的
+    # 数字把正常包挡在门外；要护栏的部署自己设。单文件上限必须单独配：
+    # 只放开整包、单文件仍卡 5 MB，会得到"包能传、装不上"的半开状态。
+    skill_max_archive_mb: int = max(0, int(os.getenv('SKILL_MAX_ARCHIVE_MB', '0')))
+    skill_max_member_mb: int = max(0, int(os.getenv('SKILL_MAX_MEMBER_MB', '0')))
+    # 条数上限与体积无关，它是 zip 炸弹的硬指标（4000 个空文件也能耗光 inode），
+    # 所以保留一个默认值，仍然可配。
+    skill_max_members: int = max(1, int(os.getenv('SKILL_MAX_MEMBERS', '4000')))
     # ---------- 连接器 OAuth ----------
     # 授权凭据落盘目录：一个主体一个文件（0600）。不进库，与
     # `credential_ref = file:` 的约定一致；库里只留绑定元信息。
@@ -195,8 +227,24 @@ class Settings:
     db_pool_size: int = max(1, int(os.getenv('DB_POOL_SIZE', '8')))
     # 从池里借连接最多等多久（秒）。等不到就报错，而不是无限期挂住一个请求。
     db_pool_timeout: float = max(1.0, float(os.getenv('DB_POOL_TIMEOUT', '10')))
+    # 等锁上限（毫秒，0=不限）。没有它时 `SELECT ... FOR UPDATE` 会无限期排队：
+    # 一个忘记提交的长事务就能把 8 条池连接逐个耗光，表现为整站卡死而不是某个
+    # 请求变慢。3 秒足够正常的行锁/建议锁争用，超了就报错让调用方重试。
+    db_lock_timeout_ms: int = max(0, int(os.getenv('DB_LOCK_TIMEOUT_MS', '3000')))
+    # 单条语句上限（毫秒，0=不限）。兜住跑飞的查询（漏加 LIMIT 的全表扫、
+    # 大范围 UPDATE），避免它长期占着连接。批量维护类操作可以按环境调大或设 0；
+    # 结构迁移通道单独豁免，见 migrations.apply()。
+    db_statement_timeout_ms: int = max(0, int(os.getenv('DB_STATEMENT_TIMEOUT_MS', '30000')))
     # 用户画像文件（Markdown，人可读可改）。含电话等敏感信息，已在 .gitignore 排除。
     profile_path: Path = PROJECT_ROOT / os.getenv('PROFILE_PATH', 'profile/USER.md')
+    # 闲聊写记忆/画像的触发策略：
+    #   always（默认）每轮都让模型自己判断值不值得记 —— 关键词表永远漏句子；
+    #   cue  只在命关键词时抽（省一次小模型调用，但会漏"我来自台州"这类说法）；
+    #   off  完全关闭自动抽取，画像只由任务规划和手工编辑写入。
+    memory_extract_mode: str = os.getenv('MEMORY_EXTRACT_MODE', 'always').lower()
+    # 抽取的最长等待（秒）。抽取在 turn 结束前完成，慢就等于让用户多等；
+    # 超时就放弃这一轮的画像补充（答复照发），小于等于 0 表示不限。
+    memory_extract_timeout: float = float(os.getenv('MEMORY_EXTRACT_TIMEOUT', '12'))
     deploy_enabled: bool = os.getenv('DEPLOY_ENABLED', 'false').lower() == 'true'
     # ---------- 执行预算（步数/时长/重规划次数必须可配） ----------
     # 计划最多几步。以前是 nodes.py 里的常量，改一次要动代码、也没法按部署环境调。
@@ -318,6 +366,26 @@ class Settings:
     sms_timeout_seconds: float = max(1.0, float(os.getenv('SMS_TIMEOUT_SECONDS', '10')))
     # 短信登录身份源标识。方案 A：手机号作为独立身份源，subject = 手机号。
     sms_identity_provider_id: str = os.getenv('SMS_IDENTITY_PROVIDER_ID', 'sms').strip() or 'sms'
+    # ---------- 本地账号登录（第 4 种方式，docs/local-account-auth.md） ----------
+    # 默认关闭：打开后中台自己校验密码，其余三条登录链路不受影响。
+    local_auth_enabled: bool = _env_flag('LOCAL_AUTH_ENABLED')
+    # 自助注册默认关闭；正式环境只允许超管在控制台建号。
+    local_auth_allow_signup: bool = _env_flag('LOCAL_AUTH_ALLOW_SIGNUP')
+    # 生产环境强制 >= 8（在 api/local_auth.py 启动自检里校验），本机可设 4。
+    local_auth_min_length: int = max(4, int(
+        os.getenv('LOCAL_AUTH_MIN_LENGTH', '8')))
+    # 仅在 local_accounts 为空时执行一次，格式 user:pass[:role]。
+    local_auth_seed_users: str = os.getenv('LOCAL_AUTH_SEED_USERS', '').strip()
+    # 可选 pepper：只从环境变量读，绝不入库；轮换需全量重置密码。
+    local_auth_pepper: str = os.getenv('LOCAL_AUTH_PEPPER', '').strip()
+    local_auth_lock_threshold: int = max(1, int(
+        os.getenv('LOCAL_AUTH_LOCK_THRESHOLD', '5')))
+    local_auth_lock_seconds: int = max(30, int(
+        os.getenv('LOCAL_AUTH_LOCK_SECONDS', '900')))
+    local_auth_identity_provider_id: str = (
+        os.getenv('LOCAL_AUTH_IDP', 'local').strip() or 'local')
+    local_auth_tenant_id: str = (
+        os.getenv('LOCAL_AUTH_TENANT', 'default').strip() or 'default')
     # ---------- 对象权限 ----------
     # owner_user_id='default' 的存量数据是否对所有登录用户可见。
     # 单用户升级期必须为 true；有第二个真实用户后必须改成 false。
@@ -420,6 +488,30 @@ class Settings:
     # 峰值抖动窗口（秒）：0 = 关闭。>0 时按 (任务, occurrence) 确定性散开。
     scheduled_jitter_seconds: float = max(0.0, float(
         os.getenv('SCHEDULED_JITTER_SECONDS', '0')))
+    # ---------- 机器人 / Bot Mode（docs/bot-mode.md） ----------
+    # 总开关：关掉之后机器人面板的写接口返回 403，Worker 也不再泵投递/推进房间。
+    # 默认**开**：它不额外花 token，只有真的给机器人发消息才会跑回合。
+    # 用 `_env_flag` 而不是自己解析：项目里所有开关都只认字面量 true，
+    # 多一套 yes/on 的解析只会让"开了却没生效"更难查。默认 true。
+    bot_mode_enabled: bool = _env_flag('BOT_MODE_ENABLED', 'true')
+    # Worker 的机器人节拍：泵投递 + 推进群聊。比定时任务快——投递是"有人正在等"。
+    bot_tick_seconds: float = max(1.0, float(
+        os.getenv('BOT_TICK_SECONDS', '3')))
+    # 一拍最多派发几条机器人私信、推进几个房间。房间再多也不能饿死其他职责。
+    bot_delivery_batch: int = max(1, int(os.getenv('BOT_DELIVERY_BATCH', '5')))
+    bot_room_batch: int = max(1, int(os.getenv('BOT_ROOM_BATCH', '3')))
+    # 机器人之间最多转述几次（A→B→A→B 之后不再自动回）。见 bot/mailbox.py。
+    bot_max_hops: int = max(0, int(os.getenv('BOT_MAX_HOPS', '2')))
+    # 一次群聊最多几轮 / 几条消息（房间创建时的默认值，可按房间覆盖）。
+    bot_room_max_rounds: int = max(1, int(os.getenv('BOT_ROOM_MAX_ROUNDS', '3')))
+    bot_room_max_messages: int = max(1, int(
+        os.getenv('BOT_ROOM_MAX_MESSAGES', '10')))
+    # Bot 广场（docs/bot-plaza.md）：关掉后广场的投稿/启用接口返回 403，
+    # 页面退化成"只看不装"。已装好的机器人不受影响——它们本来就是用户的机器人。
+    bot_plaza_enabled: bool = _env_flag('BOT_PLAZA_ENABLED', 'true')
+    # 一次列表最多回多少条，防止有人一页把整库拉走。
+    bot_plaza_page_size: int = max(1, min(200, int(
+        os.getenv('BOT_PLAZA_PAGE_SIZE', '60'))))
     # 出站投递（企业微信/飞书/通用 webhook）。
     webhook_timeout_seconds: float = max(1.0, float(
         os.getenv('WEBHOOK_TIMEOUT_SECONDS', '10')))
@@ -427,6 +519,34 @@ class Settings:
     webhook_trust_env: bool = os.getenv('WEBHOOK_TRUST_ENV', 'true').strip().lower() != 'false'
     # 全局默认推送地址；任务自己没配时用它，两边都空就只写运行记录。
     scheduled_default_webhook: str = os.getenv('SCHEDULED_DEFAULT_WEBHOOK', '').strip()
+    # ---------- 消息平台 / IM 网关（docs/messaging-platforms.md） ----------
+    # 总开关：关掉后控制面写接口返回 403，Worker 也不启动任何渠道连接。
+    messaging_enabled: bool = _env_flag('MESSAGING_ENABLED', 'true')
+    # 回调渠道（飞书/企微）要求公网 HTTPS。没有它，这两个渠道状态是
+    # not_configured 而不是"假装连上了"。个人微信走长轮询，不需要。
+    messaging_public_base_url: str = os.getenv(
+        'IM_PUBLIC_BASE_URL', '').strip().rstrip('/')
+    # Worker 的网关节拍：同步配置、领入站、泵出站、写心跳。
+    messaging_tick_seconds: float = max(1.0, float(
+        os.getenv('MESSAGING_TICK_SECONDS', '3')))
+    # 一拍最多领几条入站、并发跑几条。消息是"有人在等"，但不能挤占聊天/业务额度。
+    messaging_inbox_batch: int = max(1, int(
+        os.getenv('MESSAGING_INBOX_BATCH', '3')))
+    messaging_concurrency: int = max(1, int(
+        os.getenv('MESSAGING_CONCURRENCY', '3')))
+    # 一次 IM 回合最多等多久（秒）。超过就回一句"还在处理"，不让用户无限等。
+    messaging_reply_timeout_seconds: float = max(30.0, float(
+        os.getenv('MESSAGING_REPLY_TIMEOUT_SECONDS', '600')))
+    # 入站/出站的重试上限与去重窗口。出站重试不带业务副作用。
+    messaging_inbox_max_attempts: int = max(1, int(
+        os.getenv('MESSAGING_INBOX_MAX_ATTEMPTS', '3')))
+    messaging_outbox_max_attempts: int = max(1, int(
+        os.getenv('MESSAGING_OUTBOX_MAX_ATTEMPTS', '3')))
+    messaging_dedupe_ttl_seconds: float = max(3600.0, float(
+        os.getenv('MESSAGING_DEDUPE_TTL_SECONDS', '86400')))
+    # 网关心跳窗口：超过这么久没有新快照，控制面显示"网关未运行"。
+    messaging_alive_window_seconds: float = max(10.0, float(
+        os.getenv('MESSAGING_ALIVE_WINDOW_SECONDS', '45')))
 
     # 指标输出格式：json（默认）或 prometheus。
     metrics_format: str = (os.getenv('METRICS_FORMAT', 'json')

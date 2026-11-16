@@ -1,10 +1,14 @@
-"""MCP 服务管理：读取/保存用户自定义远程 MCP 配置。
+"""MCP 服务管理：读取/保存**当前登录主体自己的**远程 MCP 配置。
 
 与 WorkBuddy 的 `~/.workbuddy/mcp.json` 同一形态：
 
 ```json
 {"mcpServers": {"name": {"type": "streamable-http", "url": "https://.../mcp"}}}
 ```
+
+但落盘位置不是单一文件，而是
+`<MCP_USER_CONFIG_DIR>/<tenant>__<user>.json`——每个主体一份。以前只有一个
+固定路径，结果"A 加一条连接器，B 的对话里也出现，还带着 A 的鉴权头"。
 
 中台只接受 HTTP/SSE。stdio 需要在本机起进程，属于运维配置（MCP_SERVERS），
 不能让浏览器里的一条 JSON 变成任意命令执行。
@@ -32,12 +36,16 @@ class ConfigBody(BaseModel):
     content: str = Field(max_length=200_000)
 
 
-def _path() -> Path:
-    return mcp_servers.user_config_path()
+def _owner(principal) -> str:
+    return mcp_servers.owner_key_for(principal)
 
 
-def _ensure_file() -> Path:
-    path = _path()
+def _path(principal) -> Path:
+    return mcp_servers.user_config_path(_owner(principal))
+
+
+def _ensure_file(principal) -> Path:
+    path = _path(principal)
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({'mcpServers': {}}, ensure_ascii=False, indent=2) + '\n',
@@ -49,8 +57,8 @@ def _ensure_file() -> Path:
     return path
 
 
-def _read() -> tuple[Path, str]:
-    path = _ensure_file()
+def _read(principal) -> tuple[Path, str]:
+    path = _ensure_file(principal)
     return path, path.read_text(encoding='utf-8')
 
 
@@ -97,15 +105,15 @@ def _validate(content: str) -> dict:
 
 @router.get('/config')
 async def get_config(principal=Depends(policies.current_principal)):
-    path, content = _read()
-    return {'path': str(path), 'content': content}
+    path, content = _read(principal)
+    return {'path': str(path), 'owner': _owner(principal), 'content': content}
 
 
 @router.put('/config')
 async def save_config(body: ConfigBody,
                       principal=Depends(policies.current_principal)):
     _validate(body.content)
-    path = _ensure_file()
+    path = _ensure_file(principal)
     tmp = path.with_suffix('.tmp')
     tmp.write_text(body.content, encoding='utf-8')
     try:
@@ -113,24 +121,44 @@ async def save_config(body: ConfigBody,
     except OSError:
         pass
     os.replace(tmp, path)
-    return {'ok': True, 'path': str(path), 'content': body.content}
+    # 改了自己的连接器，下一轮就必须重新发现，不能等 300s TTL。
+    try:
+        from webpage_agent.tools import core as tools_core
+        tools_core.reset_cache()
+    except Exception:                                # noqa: BLE001
+        pass
+    return {'ok': True, 'path': str(path), 'owner': _owner(principal),
+            'content': body.content}
 
 
 @router.get('/servers')
-async def list_servers(principal=Depends(policies.current_principal)):
-    path, content = _read()
+async def list_servers(include_system: bool = True,
+                       principal=Depends(policies.current_principal)):
+    """列 MCP 服务。
+
+    `include_system=0` 只返回这个主体自己写进配置文件的服务。前端「添加连接器」
+    打开的那个面板是给人管**自己的** MCP 的：ops/platform 下发的服务既不在那份
+    JSON 里、界面上也改不动，混进来只会让人以为能编辑。
+    """
+    path, content = _read(principal)
     try:
         user_names = set((json.loads(content).get('mcpServers') or {}).keys())
     except (ValueError, AttributeError):
         user_names = set()
-    configured = mcp_servers.servers()
+    configured = mcp_servers.servers(owner_key=_owner(principal))
     items = []
     for server in configured:
+        custom = server.id in user_names
+        if not include_system and not custom:
+            continue
         items.append({
             'id': server.id,
             'name': server.title or server.id,
             'transport': server.transport,
             'url': server.url,
-            'source': 'custom' if server.id in user_names else 'system',
+            # scope 决定前端能不能改：ops/platform/shared 归管理员或运维，
+            # 只有 user 是"这个人在这个页面里自己加的"。
+            'scope': server.scope,
+            'source': 'custom' if custom else 'system',
         })
-    return {'path': str(path), 'items': items}
+    return {'path': str(path), 'owner': _owner(principal), 'items': items}

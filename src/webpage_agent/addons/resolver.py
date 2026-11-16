@@ -26,11 +26,15 @@ addon_selection {expert_id, skill_ids, connector_ids, model}
 from __future__ import annotations
 
 import json
+import logging
+import re
 import shutil
 from pathlib import Path
 
 from webpage_agent.addons import experts as experts_module
 from webpage_agent.addons import skills as skills_module
+
+logger = logging.getLogger(__name__)
 
 
 def normalize_selection(raw) -> dict:
@@ -50,6 +54,54 @@ def normalize_selection(raw) -> dict:
     model = str(data.get('model') or '').strip()
     out['model'] = model[:120]
     return out
+
+
+_SKILL_URI_PREFIXES = ('skill://', 'command://')
+# 消息文本里消息级技能胶囊的标记：`@skill:<id>`（id 是磁盘目录名，稳定、无空格）。
+_MENTION_SKILL_RE = re.compile(r'@skill:([a-z0-9][a-z0-9._-]{0,63})')
+
+
+def extract_message_skill_ids(message: str = '', content_blocks=None) -> list[str]:
+    """从消息级内容里提取"这一轮点名要用的技能 id"。
+
+    消息级技能胶囊（`skill://<id>` / `command://<id>` / `@skill:<id>`）与会话级
+    选择叠加：它们是更强的信号——"这一轮请用这个技能"，而不是"会话里可用的技能"。
+
+    优先读结构化 `content_blocks`（id 稳定、无歧义），再兜底扫消息文本里的
+    `skill://<id>` / `command://<id>` / `@skill:<id>` 标记。只返回合法 id，
+    去重并保持顺序；非法/缺失 id 静默丢弃（由渲染层另行提示缺失）。
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def push(raw: str) -> None:
+        skill_id = str(raw or '').strip()
+        if not skill_id or skill_id in seen:
+            return
+        if not skills_module.valid_id(skill_id):
+            return
+        seen.add(skill_id)
+        found.append(skill_id)
+
+    for block in (content_blocks or []):
+        if not isinstance(block, dict) or block.get('type') != 'resource_link':
+            continue
+        uri = str(block.get('uri') or block.get('name') or '')
+        for prefix in _SKILL_URI_PREFIXES:
+            if uri.startswith(prefix):
+                push(uri[len(prefix):])
+                break
+        meta = block.get('_meta') if isinstance(block.get('_meta'), dict) else {}
+        if str(meta.get('mentionType') or meta.get('type') or '') == 'skill':
+            push(meta.get('skillId') or '')
+
+    text = str(message or '')
+    for prefix in _SKILL_URI_PREFIXES:
+        for match in re.finditer(re.escape(prefix) + r'([a-z0-9][a-z0-9._-]{0,63})', text):
+            push(match.group(1))
+    for match in _MENTION_SKILL_RE.finditer(text):
+        push(match.group(1))
+    return found
 
 
 def _clean_ids(values) -> list[str]:
@@ -100,7 +152,8 @@ def merge_selection(current: dict, patch: dict) -> dict:
 
 async def resolve(store, *, session_id: str, tenant_id: str, owner_user_id: str,
                   workspace_dir: str = '', selection: dict | None = None,
-                  materialize: bool = True) -> dict:
+                  materialize: bool = True,
+                  message_skill_ids: list[str] | None = None) -> dict:
     """解析一次 turn 的资源。返回值是纯数据，调用方按需取用。
 
     `materialize=False` 用于只读预览（GET 会话选择）：不重建会话技能目录，
@@ -109,30 +162,61 @@ async def resolve(store, *, session_id: str, tenant_id: str, owner_user_id: str,
     raw = selection if selection is not None else await store.session_addons(session_id)
     addon = normalize_selection(raw)
 
+    # 机器人（Bot Mode）：会话行带 bot_id 才解析。**这里是唯一的注入点**——
+    # 聊天 turn 与业务 run 都走这个函数，所以"人设、默认模型、默认技能、
+    # 默认连接器"只有一份实现（docs/bot-mode.md）。
+    session_row = await store.session(session_id) or {}
+    bot_ctx: dict = {}
+    try:
+        from webpage_agent.bot import service as bot_service
+        bot_ctx = await bot_service.resolve_session_bot(
+            store, session_row, tenant_id=tenant_id, owner_user_id=owner_user_id,
+            materialize=materialize)
+    except Exception:                              # noqa: BLE001
+        # 机器人解析失败不能让整轮聊天失败：退化成"没有机器人"，与旧行为一致。
+        logger.warning('解析会话机器人失败 session=%s', session_id, exc_info=True)
+        bot_ctx = {}
+
     expert = None
     if addon.get('expert_id'):
         expert = await experts_module.get_expert(
             store, addon['expert_id'], tenant_id=tenant_id,
             owner_user_id=owner_user_id)
 
-    # 技能：显式列表优先；没这个键才用专家预设。
+    # 技能：显式列表优先；没这个键才用专家预设；都没有才用机器人默认。
     skills_explicit = 'skill_ids' in addon
     skill_ids = list(addon.get('skill_ids') or ())
     if not skills_explicit and expert:
         skill_ids = list(expert.get('skill_ids') or ())
+    if not skills_explicit and not skill_ids and bot_ctx.get('skill_ids'):
+        skill_ids = list(bot_ctx.get('skill_ids') or ())
+
+    # 消息级技能胶囊：叠加在会话级之上（去重追加）。这是"这一轮点名要用"的
+    # 强信号，不改变 `skills_explicit`（那描述的是会话级是否显式选择）。
+    message_skill_ids = [s for s in (message_skill_ids or []) if s]
+    for skill_id in message_skill_ids:
+        if skill_id not in skill_ids:
+            skill_ids.append(skill_id)
 
     # 连接器：没有这个键 → None（沿用旧行为），有键哪怕是空数组也照办；
     # 专家预设的连接器算"已决定"（用户没单独选时才用），不是"没选"。
     connectors_decided = ('connector_ids' in addon
-                          or bool(expert and expert.get('connector_ids')))
+                          or bool(expert and expert.get('connector_ids'))
+                          or bool(bot_ctx.get('connector_ids')))
     if 'connector_ids' in addon:
         connector_ids: list[str] | None = list(addon.get('connector_ids') or [])
     elif expert and expert.get('connector_ids'):
         connector_ids = list(expert['connector_ids'])
+    elif bot_ctx.get('connector_ids'):
+        # 机器人预设的连接器：用户没单独选时生效。**空列表不算预设**——
+        # 一个没连任何连接器的机器人，不应该把会话变成"一个连接器都不用"
+        # （那会让定时任务里原本可用的连接器突然消失）。
+        connector_ids = list(bot_ctx.get('connector_ids') or [])
     else:
         connector_ids = None
 
-    model = addon.get('model') or str((expert or {}).get('model') or '')
+    model = (addon.get('model') or str((expert or {}).get('model') or '')
+             or str(bot_ctx.get('model') or ''))
 
     materialized = {'dir': '', 'skills': [], 'missing': [],
                     'path': str(Path(workspace_dir or '.') / '.agent-skills')}
@@ -161,10 +245,13 @@ async def resolve(store, *, session_id: str, tenant_id: str, owner_user_id: str,
         materialized = {'dir': '', 'path': str(base), 'skills': [], 'missing': []}
 
     blocks = []
+    if bot_ctx.get('prompt_block'):
+        # 机器人人设放在最前面：身份比"本轮专家"更稳定，也更该被优先读到。
+        blocks.append(str(bot_ctx.get('prompt_block') or ''))
     if expert:
         blocks.append(f"【本轮专家：{expert.get('name') or expert.get('id')}】\n"
                       f"{str(expert.get('system_prompt') or '').strip()}")
-    blocks.append(skills_module.render_prompt(materialized))
+    blocks.append(skills_module.render_prompt(materialized, message_skill_ids))
 
     return {
         'session_id': session_id,
@@ -178,6 +265,7 @@ async def resolve(store, *, session_id: str, tenant_id: str, owner_user_id: str,
         'skills': materialized.get('skills') or [],
         'missing_skill_ids': materialized.get('missing') or [],
         'skills_explicit': skills_explicit,
+        'message_skill_ids': message_skill_ids,
         'skill_dir': materialized.get('dir') or '',
         'skill_dir_path': materialized.get('path') or '',
         'connector_ids': connector_ids,
@@ -186,6 +274,12 @@ async def resolve(store, *, session_id: str, tenant_id: str, owner_user_id: str,
         'connectors_decided': connectors_decided,
         'model': model,
         'prompt_block': '\n\n' + '\n\n'.join(block for block in blocks if block),
+        # 机器人上下文（身份行 / 能力纪元 / 房间）：调用方据此决定工具注入与工作目录。
+        'bot': bot_ctx.get('bot') or None,
+        'bot_id': str(bot_ctx.get('bot_id') or ''),
+        'bot_epoch': str(bot_ctx.get('epoch') or ''),
+        'bot_room': bot_ctx.get('room') or None,
+        'bot_home': str(bot_ctx.get('home') or ''),
     }
 
 
@@ -195,9 +289,14 @@ async def resolve_turn(store, claimed: dict, session_row: dict,
     session_id = str(claimed.get('session_id') or '')
     tenant_id = str(claimed.get('tenant_id') or 'default')
     owner_user_id = str(claimed.get('owner_user_id') or 'default')
+    # 消息级技能胶囊：从这条 turn 的 message 文本里解析（结构化 blocks 已随
+    # message 的 `@skill:<id>` / `skill://<id>` 标记落库，这里按文本兜底即可）。
+    message_skill_ids = extract_message_skill_ids(
+        str(claimed.get('message') or ''))
     resolved = await resolve(store, session_id=session_id, tenant_id=tenant_id,
                              owner_user_id=owner_user_id,
-                             workspace_dir=workspace_dir)
+                             workspace_dir=workspace_dir,
+                             message_skill_ids=message_skill_ids)
     # 老会话没有 addon_selection 里显式连接器、专家也没预设时，仍尊重"这条消息带了
     # connector_ids"：前端在迁移期两套都在写，服务端以显式消息参数为兜底。
     if not resolved.get('connectors_decided'):

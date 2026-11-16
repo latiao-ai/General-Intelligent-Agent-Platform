@@ -562,73 +562,20 @@ class PgAdmin:
 
     async def console_delete_user(self, *, user_id: str, actor_id: str = '',
                                   reason: str = '') -> dict:
-        """彻底删除一个账号。
+        """删除用户 = 删除他的所有信息（purge）。实现见 pg_user_purge.py。
 
-        删的是**账号本身**：`auth_sessions`（凭证）、`identities`（身份绑定）、
-        `app_users`（账号行）。历史会话 / 消息 / 任务**保留**——它们是使用记录，
-        删掉等于销毁审计证据，而"删账号"要解决的是"这个人不能再登录"。
-
-        代价说清楚：删完之后 `sessions.owner_user_id` 指向一个不存在的用户。
-        用户列表不再出现他，概览的活跃用户数也已 join `app_users` 过滤，
-        所以数字仍然自洽；但这些历史数据无法再归属到具体的人。
-
-        三条保护与 `set_user_role` 同一把 advisory 锁：
-        不能删自己、不能删最后一个超管、账号必须存在。
+        2026-11-12 改了语义：旧版本只删三张身份表、保留历史会话与消息，
+        现在按需求级联清空；对任何身份源、任何状态的用户都可用，不要求先停用。
+        保护规则不变：不能删自己、不能删最后一个超管、账号必须存在。
+        审计只留一条 console_user_purge，user_id 以哈希引用保存。
         """
-        if user_id == actor_id:
-            raise ValueError('不能删除自己')
-        stamp = now()
-        async with self._lease() as conn:
-            await self._run(conn, 'SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))',
-                            ('console-role',))
-            user = await self._one(
-                conn,
-                'SELECT user_id, display_name, email, status FROM app_users '
-                'WHERE user_id=%s FOR UPDATE', (user_id,))
-            if user is None:
-                raise LookupError('用户不存在')
-            identities = await self._all(
-                conn,
-                'SELECT tenant_id, role, provider, identity_provider_id, subject '
-                'FROM identities WHERE user_id=%s', (user_id,))
-            if any(row['role'] == 'platform_admin' for row in identities):
-                left = await self._one(
-                    conn,
-                    "SELECT count(DISTINCT user_id) AS n FROM identities "
-                    "WHERE role='platform_admin' AND user_id<>%s", (user_id,))
-                if int((left or {}).get('n') or 0) == 0:
-                    raise ValueError('这是最后一个超管，删掉就没人能再进控制台了')
-            stats = await self._one(
-                conn,
-                'SELECT (SELECT count(*) FROM sessions WHERE owner_user_id=%s) AS sessions, '
-                '       (SELECT count(*) FROM messages m JOIN sessions s '
-                '          ON s.session_id=m.session_id WHERE s.owner_user_id=%s) AS messages, '
-                '       (SELECT count(*) FROM tasks t JOIN sessions s '
-                '          ON s.session_id=t.session_id WHERE s.owner_user_id=%s) AS tasks, '
-                '       (SELECT count(*) FROM auth_sessions '
-                '          WHERE user_id=%s AND revoked_at IS NULL) AS live_sessions',
-                (user_id, user_id, user_id, user_id))
-            await self._run(conn, 'DELETE FROM auth_sessions WHERE user_id=%s', (user_id,))
-            await self._run(conn, 'DELETE FROM identities WHERE user_id=%s', (user_id,))
-            await self._run(conn, 'DELETE FROM app_users WHERE user_id=%s', (user_id,))
-            await self._audit(conn, {
-                'type': 'console_user_delete', 'operator_id': actor_id,
-                'user_id': user_id,
-                'display_name': user['display_name'] or '',
-                'email': user['email'] or '',
-                'previous_status': user['status'],
-                'identities': [{'tenant_id': row['tenant_id'], 'role': row['role'],
-                                'platform': row['identity_provider_id'] or row['provider'],
-                                'subject': row['subject']} for row in identities],
-                'retained': {key: int((stats or {}).get(key) or 0)
-                             for key in ('sessions', 'messages', 'tasks')},
-                'revoked_sessions': int((stats or {}).get('live_sessions') or 0),
-                'reason': reason}, stamp)
-        return {'user_id': user_id, 'deleted': True,
-                'identities': len(identities),
-                'revoked_sessions': int((stats or {}).get('live_sessions') or 0),
-                'retained': {key: int((stats or {}).get(key) or 0)
-                             for key in ('sessions', 'messages', 'tasks')}}
+        result = await self.purge_user(
+            user_id=user_id, actor_id=actor_id, reason=reason)
+        # 兼容老调用方读取的两个字段；retained 现在恒为 0（不再保留历史）。
+        result['deleted'] = True
+        result['revoked_sessions'] = result['purged'].get('auth_sessions', 0)
+        result['retained'] = {'sessions': 0, 'messages': 0, 'tasks': 0}
+        return result
 
     # ---------- 审计 ----------
 

@@ -455,7 +455,9 @@ class MigrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_upgrade_preserves_legacy_data(self):
         async with await psycopg.AsyncConnection.connect(self.dsn) as conn:
             await conn.execute(SCHEMA)
-            await conn.execute("INSERT INTO sessions VALUES ('old','tenant','user','old','old')")
+            await conn.execute("INSERT INTO sessions "
+                               "(session_id, tenant_id, owner_user_id, created_at, updated_at) "
+                               "VALUES ('old','tenant','user','old','old')")
         async with await psycopg.AsyncConnection.connect(self.dsn) as conn:
             changed = await migrations.apply(conn, baseline=SCHEMA, legacy_ids=MIGRATIONS)
             self.assertIn(migrations.BASELINE, changed)

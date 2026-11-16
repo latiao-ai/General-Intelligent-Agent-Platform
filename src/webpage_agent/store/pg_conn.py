@@ -14,6 +14,8 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+import psycopg
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
@@ -37,7 +39,7 @@ class PgConnection:
     def _make_pool(self) -> AsyncConnectionPool:
         size = self._pool_size if self._pool_size is not None else settings.db_pool_size
         return AsyncConnectionPool(
-            self.dsn,
+            self._effective_dsn(),
             min_size=1,
             max_size=max(1, size),
             timeout=settings.db_pool_timeout,
@@ -45,6 +47,51 @@ class PgConnection:
             name='agent-platform',
             open=False,                 # 不在 __init__ 里做 IO：见 ready()
         )
+
+    def _effective_dsn(self) -> str:
+        """把超时参数**并进** DSN 的 `options`，而不是替换它。
+
+        DSN 里的 `options` 常常带着 `search_path`（测试的多 schema 隔离、同库
+        多租户部署都靠它）。用 kwargs 直接传 `options` 会把整串覆盖掉，连接被
+        指到 public schema 上——症状很隐蔽：本该因为"结构过期"报错的启动，因为
+        读到了另一套现成的表而静默通过。
+
+        所以逐项合并，并且 DSN 里已经显式写过的参数不再追加：显式配置优先。
+        """
+        wanted = self._timeout_options()
+        if not wanted:
+            return self.dsn
+        try:
+            info = conninfo_to_dict(self.dsn)
+        except psycopg.Error:
+            return self.dsn
+        existing = str(info.get('options') or '')
+        merged = existing
+        for item in wanted:
+            name = item.split(maxsplit=1)[1].split('=', 1)[0]
+            if name in existing:
+                continue
+            merged = f'{merged} {item}'.strip()
+        if merged == existing:
+            return self.dsn
+        return make_conninfo(self.dsn, options=merged)
+
+    @staticmethod
+    def _timeout_options() -> list[str]:
+        """连接建立时下发的服务端参数（每项形如 `-c name=value`）。
+
+        超时写在连接参数里，而不是每次查询前 `SET`：连接池复用连接，逐次 SET
+        既多余，又会在某条语句失败后留下不一致的会话状态。
+
+        `statement_timeout` 只在会话级生效；迁移通道会自己 `SET LOCAL` 豁免，
+        见 `migrations.apply()`——否则大表建索引会被这条上限砍断。
+        """
+        opts = []
+        if settings.db_lock_timeout_ms:
+            opts.append(f'-c lock_timeout={int(settings.db_lock_timeout_ms)}')
+        if settings.db_statement_timeout_ms:
+            opts.append(f'-c statement_timeout={int(settings.db_statement_timeout_ms)}')
+        return opts
 
     async def ready(self) -> None:
         """打开连接池、建表、对账（幂等）。
@@ -96,6 +143,23 @@ class PgConnection:
             raise
         finally:
             await self._pool.putconn(conn)
+
+    @asynccontextmanager
+    async def _snapshot(self):
+        """只读一致性快照：块内多条 SELECT 看到同一个时间点。
+
+        默认隔离级别是 READ COMMITTED——每条语句各取一份新快照。于是「先数
+        排队中、再数执行中」两次统计之间可以插进一次状态迁移，两个数字加起来
+        对不上账，看的人只能怀疑是不是丢任务了。
+
+        这里显式声明 REPEATABLE READ + READ ONLY：第一条语句建立快照，之后整块
+        都读它。**只用于只读聚合**——在里面写会引出序列化失败，而这份代码没有
+        对应的重试路径。
+        """
+        async with self._lease() as conn:
+            await conn.execute(
+                'SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY')
+            yield conn
 
     # ---------- 单语句小工具：把 await 收在一处 ----------
     # psycopg 的异步游标连 fetchone/fetchall 都要 await，写开就是两层嵌套；
@@ -155,7 +219,9 @@ class PgConnection:
                              "WHERE state IN ('accepted','running','materializing')",
         }
         out = {}
-        async with self._lease() as conn:
+        # 快照读：这 8 个 COUNT 必须属于同一时间点，否则「排队 N + 执行 M」
+        # 会因为中途有人被领取而漏算，健康页看起来像在丢任务。
+        async with self._snapshot() as conn:
             for name, sql in queries.items():
                 row = await self._one(conn, sql)
                 out[name] = int(row['n'] if row else 0)
@@ -214,7 +280,7 @@ class PgConnection:
         `oldest_accepted_age` 是接纳后一直没人领的最长等待秒数——它是
         "消息发出去没回复"最直接的量化指标。
         """
-        async with self._lease() as conn:
+        async with self._snapshot() as conn:
             accepted = await self._one(conn,
                 "SELECT COUNT(*) AS n FROM session_turns "
                 "WHERE status IN ('accepted','retry')")

@@ -9,10 +9,40 @@ import uuid
 
 from webpage_agent.observe import telemetry
 from webpage_agent.core.errors import DecisionBudgetExceeded
-from webpage_agent.store.pg_store import _decode_run, now
+from webpage_agent.store.pg_store import SessionGoalConflict, _decode_run, now
+
+# run 的终态。所有「还有没有未结束目标」的判定都必须用这同一份，
+# 否则两条路径会各自漂移：一条说结束了、另一条还认为在跑。
+TERMINAL_RUN_STATUSES = ('succeeded', 'partially_succeeded', 'failed', 'cancelled')
+_TERMINAL_SQL = "('succeeded','partially_succeeded','failed','cancelled')"
 
 class PgRuns:
     """PgRuns 方法组。见模块说明。"""
+
+    async def _reject_other_open_goal(self, conn, *, session_id: str,
+                                      task_id: str = '') -> None:
+        """同会话已有**别的**未结束目标时抛 `SessionGoalConflict`。
+
+        `create_goal`（开新目标）与 `create_run`（同一目标的再次执行）共用这一
+        判定，避免两条路径各写一套、慢慢漂移。两类 run 不算数：
+
+        - `task_id = run_id` 的 turn 内部执行记录：生命周期归 session_turns 的
+          租约管，历史库里本来就允许同会话并存；
+        - 同一 `task_id` 的旧 run：恢复与补偿就是靠再起一条，拒掉等于把重试
+          路径堵死（v29 一度用部分唯一索引这么做，被真实用例打回来了）。
+
+        调用方必须已经持有 session 行锁，否则两个并发请求会同时读到「没有」。
+        """
+        if not session_id:
+            return
+        row = await self._one(conn,
+            'SELECT task_id, run_id FROM runs '
+            'WHERE session_id=%s AND task_id <> run_id AND task_id <> %s '
+            f'AND status NOT IN {_TERMINAL_SQL} '
+            'ORDER BY created_at LIMIT 1',
+            (session_id, task_id or ''))
+        if row:
+            raise SessionGoalConflict(row['task_id'], row['run_id'])
 
     async def create_run(self, run_id: str, task_id: str, *, budget: dict | None = None,
                    tenant_id: str = 'default', status: str = 'queued',
@@ -32,15 +62,27 @@ class PgRuns:
         stamp = now()
         async with self._lease() as conn:
             await conn.execute('SELECT pg_advisory_xact_lock(hashtext(%s))', ('retention:'+task_id,))
-            await self._run(conn, 'INSERT INTO runs (run_id, task_id, tenant_id, status, '
+            # 与 create_goal 同一把锁、同一个加锁顺序：session → 目标 → run。
+            # 少了这一步，「同会话只能有一个未结束目标」只在新目标的入口成立，
+            # 恢复/补偿这条路径可以绕过去。
+            sid_row = await self._one(
+                conn, 'SELECT session_id FROM tasks WHERE task_id=%s', (task_id,))
+            session_id = str((sid_row or {}).get('session_id') or '')
+            if session_id:
+                await self._one(
+                    conn, 'SELECT session_id FROM sessions WHERE session_id=%s FOR UPDATE',
+                    (session_id,))
+            await self._reject_other_open_goal(conn, session_id=session_id,
+                                               task_id=task_id)
+            await self._run(conn, 'INSERT INTO runs (run_id, task_id, session_id, tenant_id, status, '
                 'budget_json, consumed_json, owner_user_id, owner_role, platform_id, platform_subject, '
                 'runtime_kind, runtime_version, runtime_state_schema, '
                 'created_at, updated_at, trace_id) '
-                'VALUES (%s, %s, %s, %s, %s, %s, %s, %s, '
+                'VALUES (%s, %s, (SELECT session_id FROM tasks WHERE task_id=%s), %s, %s, %s, %s, %s, %s, '
                 "COALESCE(%s, (SELECT platform_id FROM runs WHERE task_id=%s ORDER BY created_at LIMIT 1), ''), "
                 "COALESCE((SELECT platform_subject FROM runs WHERE task_id=%s ORDER BY created_at LIMIT 1), ''), "
                 '%s, %s, %s, %s, %s, %s)',
-                (run_id, task_id, tenant_id, status,
+                (run_id, task_id, task_id, tenant_id, status,
                  json.dumps(budget or {}, ensure_ascii=False), '{}',
                  str(owner_user_id or 'default'), str(owner_role or 'member'),
                  platform_id, task_id, task_id,
@@ -55,10 +97,26 @@ class PgRuns:
             row = await self._one(conn, 'SELECT * FROM runs WHERE run_id=%s', (run_id,))
         return _decode_run(dict(row)) if row else None
 
+    async def open_runs_of(self, session_id: str) -> list[str]:
+        """这条会话里还没收尾的 run。
+
+        删除会话前要先取消它们：run 还在跑的时候删掉会话行，执行器下一次
+        `update_run` 会落空、产物目录也会被重新写回来，留下一堆孤儿文件。
+        turn 内部执行记录（task_id=run_id）同样算在内，它也会写产物。
+        """
+        async with self._lease() as conn:
+            rows = await self._all(
+                conn,
+                'SELECT run_id FROM runs WHERE session_id=%s '
+                "AND status NOT IN ('succeeded','failed','cancelled')",
+                (session_id,))
+        return [str(r['run_id']) for r in rows if r.get('run_id')]
+
     async def create_turn_run(self, *, run_id: str, tenant_id: str,
                               owner_user_id: str, lease_owner: str,
                               lease_epoch: int, lease_ttl: float,
                               owner_role: str = 'member',
+                              session_id: str = '',
                               budget: dict | None = None) -> dict | None:
         """为会话 turn（chat/query）建一条内部执行记录（run 行）。
 
@@ -77,15 +135,15 @@ class PgRuns:
         expires = time.time() + float(lease_ttl)
         async with self._lease() as conn:
             await self._run(conn,
-                'INSERT INTO runs (run_id, task_id, tenant_id, status, '
+                'INSERT INTO runs (run_id, task_id, session_id, tenant_id, status, '
                 'budget_json, consumed_json, owner_user_id, owner_role, '
                 'lease_owner, lease_expires_at, lease_epoch, '
                 'runtime_kind, runtime_version, runtime_state_schema, '
                 'created_at, updated_at, trace_id) '
-                "VALUES (%s, %s, %s, 'running', %s, '{}', %s, %s, "
+                "VALUES (%s, %s, %s, %s, 'running', %s, '{}', %s, %s, "
                 "%s, %s, %s, 'pi', 1, 2, %s, %s, %s) "
                 'ON CONFLICT (run_id) DO NOTHING',
-                (run_id, run_id, tenant_id,
+                (run_id, run_id, session_id or None, tenant_id,
                  json.dumps(budget or {}, ensure_ascii=False), owner_user_id,
                  str(owner_role or 'member'),
                  lease_owner, expires, int(lease_epoch or 0),

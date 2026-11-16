@@ -202,6 +202,29 @@ def confine(root: Path, relative: str) -> Path:
     return resolved
 
 
+def _opened_path(fd: int) -> Path | None:
+    """已打开的 fd → 它的真实路径；拿不到返回 None。
+
+    Linux 走 `/proc/self/fd/<fd>`；macOS 没有 procfs（`/proc/self/fd/5` 读出来是
+    ENOENT，`/dev/fd/5` 也不可 readlink），得靠 `fcntl.F_GETPATH`。
+    以前只写了 Linux 那一路，结果在 macOS 上**每一次** `read_file` / `write_file`
+    都报「无法确认打开的文件」——文件工具整体不可用，技能正文自然读不到。
+    """
+    try:
+        return Path(os.readlink(f'/proc/self/fd/{fd}'))
+    except OSError:
+        pass
+    if sys.platform == 'darwin':
+        try:
+            import fcntl
+            raw = fcntl.fcntl(fd, fcntl.F_GETPATH, b'\0' * 1024)
+        except (OSError, AttributeError):
+            return None
+        text = raw.split(b'\0', 1)[0].decode('utf-8', 'surrogateescape')
+        return Path(text) if text else None
+    return None
+
+
 def open_confined(root: Path, relative: str, flags: int, mode: int = 0o644) -> int:
     """打开文件并再核对一次实际路径，避免检查之后被换成指向外部的符号链接。"""
     path = confine(root, relative)
@@ -211,13 +234,25 @@ def open_confined(root: Path, relative: str, flags: int, mode: int = 0o644) -> i
     except OSError as exc:
         raise SandboxError('无法打开该路径') from exc
     try:
-        opened = Path(os.readlink(f'/proc/self/fd/{fd}')).resolve()
-    except OSError:
+        opened = _opened_path(fd)
+        if opened is None:
+            # 既没有 procfs 也没有 F_GETPATH 的平台：退回 inode 校验。
+            # fd 与刚解析出的路径必须是同一个文件，否则说明检查之后被换掉了。
+            opened_stat = os.fstat(fd)
+            path_stat = os.stat(path)
+            if (opened_stat.st_dev, opened_stat.st_ino) != (path_stat.st_dev,
+                                                            path_stat.st_ino):
+                raise SandboxError('路径越出工作目录')
+            opened = path
+        opened = opened.resolve()
+        if not inside(_real_directory(root), opened):
+            raise SandboxError('路径越出工作目录')
+    except OSError as exc:
         os.close(fd)
-        raise SandboxError('无法确认打开的文件') from None
-    if not inside(_real_directory(root), opened):
+        raise SandboxError('无法确认打开的文件') from exc
+    except SandboxError:
         os.close(fd)
-        raise SandboxError('路径越出工作目录')
+        raise
     return fd
 
 
@@ -230,11 +265,6 @@ def owner_root(tenant_id: str | None = None, user_id: str | None = None) -> Path
         return base
     path = base / 'owners' / segment(str(tenant_id)) / segment(str(user_id))
     return path
-
-
-def relative_owner(tenant_id: str, user_id: str, name: str) -> str:
-    safe = _task_name(name)
-    return f'owners/{segment(tenant_id)}/{segment(user_id)}/{safe}'
 
 
 def task_dir(task_id: str, tenant_id: str | None = None,

@@ -105,7 +105,7 @@ class AddonsApiTests(unittest.IsolatedAsyncioTestCase):
     async def test_create_update_delete_custom_expert(self):
         res = await self.client.post('/api/experts', json={
             'name': '我的写手', 'description': '只写短文案',
-            'system_prompt': '你是短文案专家。', 'skill_ids': ['html-report'],
+            'system_prompt': '你是短文案专家。', 'skill_ids': ['deep-research'],
             'connector_ids': ['beeftv'], 'model': 'deepseek-v4-1-flash'})
         self.assertEqual(res.status_code, 201, res.text)
         expert_id = res.json()['id']

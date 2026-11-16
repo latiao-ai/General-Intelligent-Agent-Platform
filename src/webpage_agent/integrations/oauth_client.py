@@ -19,12 +19,12 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
 import secrets
 import time
-from dataclasses import dataclass
 from urllib.parse import urlencode, urlsplit
 
 import httpx
@@ -37,6 +37,11 @@ _RESOURCE_CACHE: dict[str, tuple[str, float]] = {}
 
 DEFAULT_TIMEOUT = 20.0
 
+# well-known 通常挂在 CDN/网关上，抖一下就是 502/503。一次抖动不该让连接器
+# 看起来"坏了"：重试两次（0.4s / 1.2s）比让用户重新授权便宜得多。
+DISCOVER_ATTEMPTS = 3
+DISCOVER_BACKOFF = (0.4, 1.2)
+
 
 class OAuthError(RuntimeError):
     """授权流程失败。`status` 是对方返回的 HTTP 状态（本地校验失败时为 0）。"""
@@ -47,14 +52,13 @@ class OAuthError(RuntimeError):
         self.status = status
 
 
-@dataclass(frozen=True)
-class OAuthConfig:
-    """一次授权要用到的全部外部参数。来自 `MCP_SERVERS` 条目，不来自代码。"""
-    issuer: str
-    scopes: tuple = ()
-    client_name: str = '智能体中台'
-    resource: str = ''
-    redirect_uri: str = ''
+class OAuthTransient(OAuthError):
+    """授权服务器**暂时**不可用：5xx、连不上、超时。
+
+    与"授权被拒绝"是两件完全不同的事：前者重试可能就好，后者必须让用户重新
+    授权。混成一个类型时，一次 503 会被渲染成"请去连接器面板重新授权"——把
+    上游抖动说成了凭据问题。
+    """
 
 
 async def _request(method: str, url: str, **kwargs) -> httpx.Response:
@@ -76,11 +80,20 @@ def clear_cache() -> None:
     _RESOURCE_CACHE.clear()
 
 
+async def _pause(seconds: float) -> None:
+    """测试里替换掉它，避免真等。"""
+    await asyncio.sleep(seconds)
+
+
 async def discover(issuer: str, *, ttl: int = META_TTL_SECONDS) -> dict:
     """读授权服务器元数据（RFC 8414），读不到再退 OIDC 发现。
 
     两个端点都要试：LibTV 只实现前者，不少企业 IdP 只实现后者。
     只认一次失败就放弃，会把"能用"的环境配成"不能用"。
+
+    5xx / 连不上 / 超时按**暂时**处理：同一个端点重试几次（CDN 抖动通常几百
+    毫秒）。全部失败时抛 `OAuthTransient`，让上层说"稍后重试"，而不是让用户
+    去重新授权——这条路径决定的是"要不要打扰用户"，不能靠猜。
     """
     key = issuer.rstrip('/')
     if not key:
@@ -91,30 +104,47 @@ async def discover(issuer: str, *, ttl: int = META_TTL_SECONDS) -> dict:
         return cached[0]
 
     last_error = ''
+    transient = False
     for suffix in ('oauth-authorization-server', 'openid-configuration'):
-        try:
-            res = await _request('GET', _well_known(key, suffix),
-                                 headers={'accept': 'application/json'})
-        except Exception as exc:                     # noqa: BLE001
-            last_error = f'{type(exc).__name__}: {exc}'
-            continue
-        if res.status_code != 200:
-            last_error = f'HTTP {res.status_code}'
-            continue
-        try:
-            meta = res.json()
-        except ValueError:
-            last_error = '返回的不是 JSON'
-            continue
-        if not isinstance(meta, dict):
-            last_error = '元数据不是对象'
-            continue
-        if not meta.get('authorization_endpoint') or not meta.get('token_endpoint'):
-            last_error = '缺少 authorization_endpoint / token_endpoint'
-            continue
-        _META_CACHE[key] = (meta, now + ttl)
-        return meta
-    raise OAuthError(f'读取授权服务器元数据失败：{last_error or "未知原因"}')
+        for attempt in range(DISCOVER_ATTEMPTS):
+            try:
+                res = await _request('GET', _well_known(key, suffix),
+                                     headers={'accept': 'application/json'})
+            except Exception as exc:                 # noqa: BLE001
+                last_error = f'{type(exc).__name__}: {exc}'
+                transient = True
+            else:
+                if res.status_code >= 500:
+                    # 网关/上游过载：值得重试，不能当成"元数据不合格"。
+                    last_error = f'HTTP {res.status_code}'
+                    transient = True
+                else:
+                    transient = False
+                    if res.status_code != 200:
+                        last_error = f'HTTP {res.status_code}'
+                        break                    # 404/401 之类：换下一个端点
+                    try:
+                        meta = res.json()
+                    except ValueError:
+                        last_error = '返回的不是 JSON'
+                        break
+                    if not isinstance(meta, dict):
+                        last_error = '元数据不是对象'
+                        break
+                    if (not meta.get('authorization_endpoint')
+                            or not meta.get('token_endpoint')):
+                        last_error = '缺少 authorization_endpoint / token_endpoint'
+                        break
+                    _META_CACHE[key] = (meta, now + ttl)
+                    return meta
+            if attempt + 1 < DISCOVER_ATTEMPTS:
+                await _pause(DISCOVER_BACKOFF[min(attempt,
+                                                  len(DISCOVER_BACKOFF) - 1)])
+    error_type = OAuthTransient if transient else OAuthError
+    detail = last_error or '未知原因'
+    if transient:
+        detail += '（上游暂时不可用，稍后重试即可，不需要重新授权）'
+    raise error_type(f'读取授权服务器元数据失败：{detail}')
 
 
 async def discover_resource(issuer: str, *, fallback: str = '') -> str:

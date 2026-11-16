@@ -221,22 +221,32 @@ async def pi_tool_catalog(*, tenant_id: str = '',
             return parts[1] if len(parts) >= 3 else ''
         mcp = [tool for tool in mcp if _mcp_server_id(tool) in allowed]
     selected = set(allowed_connectors) if allowed_connectors is not None else None
+    kept_remote = 0
     for tool in mcp:
-        key = getattr(tool, 'tool_key', '') or ''
+        key = str(getattr(tool, 'tool_key', '') or '')
         effect = str(getattr(tool, 'effect', '') or 'unknown')
         parts = key.split(':', 2)
         server_id = parts[1] if len(parts) >= 3 else ''
-        # 用户在当前会话显式选中了连接器：该服务端的工具**全部**注入（含写工具），
-        # 不再要求每个工具都出现在全局白名单里。执行口用同一把尺子放行
-        # （pi_host_tools.tool_allowed），写操作由 _needs_confirmation 在执行前
-        # 拦住并要求用户确认，而不是在目录里隐藏。
-        # 没选连接器时才退回全局白名单（PI_READ_TOOL_KEYS / PI_WRITE_TOOL_KEYS）。
-        if selected is not None and server_id in selected:
+        if selected is None:
+            # 没有"选中集合"的是业务 run 那条老路（聊天一定会显式传 connector_ids），
+            # 沿用全局白名单：PI_WRITE_TOOL_KEYS 点名过的写工具 + PI_READ_TOOL_KEYS
+            # 里的只读工具。这条分支的存在只是为了不改变受治理 run 的既有行为。
+            ok = key in write_keys or (effect == 'read' and key in read_keys)
+        else:
+            # 选中即全量：用户把这个 MCP server 连进会话，就是授权智能体使用它的
+            # 工具——读、写、危险工具**一个不少**地声明给模型，白名单在这条路上
+            # 完全不参与。以前这里还留着一句 `elif key in write_keys`，于是"没选中
+            # 的 server 的写工具"也会被塞进目录，而选中的 server 反而要跟白名单
+            # 讨价还价（libtv 只进 32 个）——两把尺子量同一件事，必然对不上。
+            # 安全边界在调用前：_needs_confirmation 对高风险工具拦一道，用户回
+            # "确认"后照常执行；不在目录里藏工具。
+            ok = server_id in selected
+        if ok:
             tool_objects.append(tool)
-        elif key in write_keys:
-            tool_objects.append(tool)
-        elif selected is None and key in read_keys and effect == 'read':
-            tool_objects.append(tool)
+            kept_remote += 1
+    if selected:
+        logger.info('连接器已选中 %s：注入其全部 %s 个工具（不按白名单筛选）',
+                    sorted(selected), kept_remote)
 
     # 名字先收成供应商允许的字符集，声明与执行目录用同一份名字。
     tool_objects = sanitize_tool_names(tool_objects)
@@ -298,16 +308,24 @@ def _high_risk_tool(tool) -> bool:
 
 
 def _needs_confirmation(tool) -> bool:
-    """交互式聊天里，执行前必须让用户确认的工具。
+    """交互式聊天里，执行前必须让用户确认的工具：**只认高风险**。
 
-    产品约定是"写操作一律先确认"，不是"只有名字里带 delete/generate 的才确认"：
-    `canvas.node.update` 改的是用户的画布，`canvas.nodes.create` 会落到平台资源上，
-    它们按名字都不算"高危"，但都不是只读。只按名字判定会漏掉一大片写操作，
-    用户看到的就是"没问我就改了画布"。
+    产品约定（2026-11-11 二次确认）：连接器一旦被选中，它的工具全部可用、也用得动；
+    打断对话的只有"高风险"——删/毁/发布/部署/导出/扣费/生成提交这类会改平台数据、
+    花钱、或对外产生影响的调用。普通的创建、更新（建节点、改节点、存素材）直接执行，
+    不再每次点一遍"确认"，否则用户建三张图要点三次，体验就成了障碍。
 
-    只读工具（effect=read）不打断对话——查画布、搜素材、看任务状态都直接执行。
+    判据见 `_high_risk_tool`：effect=destructive 一律确认；effect 未知（服务端没报）
+    一律确认；effect=write 时按名字里的高风险动词判（delete/publish/pay/generate…）。
+    只读工具（effect=read）永不打断。
+
+    想回到"写操作一律先确认"的旧口径：设 `PI_CONFIRM_ALL_WRITES=true`。
     """
-    return str(getattr(tool, 'effect', '') or 'unknown').lower() != 'read'
+    import os as _os
+    raw = (_os.environ.get('PI_CONFIRM_ALL_WRITES') or '').strip().lower()
+    if raw in ('1', 'true', 'yes', 'on'):
+        return str(getattr(tool, 'effect', '') or 'unknown').lower() != 'read'
+    return _high_risk_tool(tool)
 
 
 def _extract_tool_urls(value, limit: int = 12) -> list[str]:
@@ -409,6 +427,7 @@ class PiRuntime:
         tool_runner: ToolExecutor | None = None,
         tool_objects: list | None = None,
         connector_ids: list | tuple | None = None,
+        bot_messenger=None,
     ) -> None:
         self._bridge = bridge
         # tool_executor 是测试注入的假工具替身；host_caller 是真实受治理调用对象
@@ -434,6 +453,10 @@ class PiRuntime:
         self._connector_ids_explicit = connector_ids is not None
         self._connector_ids = tuple(
             str(item) for item in (connector_ids or ()) if str(item).strip())
+        # Bot Mode：`message_bot` 的宿主实现（`(args) -> dict` 的协程）。
+        # 只有机器人会话会给它；普通会话是 None，于是这个工具根本不在目录里，
+        # 即使模型硬造一个名字也会在 `_allowed_tool` 那道闸被拒。
+        self._bot_messenger = bot_messenger
         self._model = model or {
             "id": "deepseek-v4-1-flash",
             "base_url": "https://www.hi-x.cn/v1",
@@ -867,6 +890,51 @@ class PiRuntime:
                 return
             await self._park_for_input(
                 bridge, state, call_id, tool_name, question)
+            return
+
+        if tool_name == pi_host_tools.BOT_MESSAGE_NAME:
+            # 宿主工具：写一张投递收据（幂等），不等待对方回合。
+            # 它**不是**业务副作用，所以不走 governed_call；但也正因为它绕过了
+            # 账本，安全边界放在注入侧：只有带 bot_id 的会话才有这个工具，
+            # 且目标只在本主体名下的机器人里解析（见 bot/mailbox.py）。
+            if self._bot_messenger is None:
+                await self._send_tool_error(
+                    bridge, call_id,
+                    'BOT_MESSAGE_UNAVAILABLE：当前会话没有开放 message_bot，'
+                    '这一步没有执行。请直接回答用户。')
+                return
+            target = str((args or {}).get('target') or '').strip()
+            body = str((args or {}).get('message') or '').strip()
+            if not target or not body:
+                await self._send_tool_error(
+                    bridge, call_id, 'target 与 message 都不能为空')
+                return
+            limit = max(1, int(getattr(settings, 'run_max_tool_calls', 40) or 40))
+            if self._tool_calls >= limit:
+                raise RecursionBudgetExceeded('这一轮已经用满步数预算', limit=limit)
+            self._tool_calls += 1
+            await _emit_tool_call(tool_name, args)
+            try:
+                receipt = await self._bot_messenger({'target': target,
+                                                     'message': body})
+            except Exception as exc:               # noqa: BLE001
+                await self._send_tool_error(
+                    bridge, call_id, f'投递失败：{type(exc).__name__}')
+                return
+            ok = str((receipt or {}).get('status') or '') not in (
+                'refused', 'failed')
+            result = receipt if ok else None
+            error = None if ok else str((receipt or {}).get('detail')
+                                        or (receipt or {}).get('reason')
+                                        or '投递被拒绝')
+            reply = proto.make_message(
+                bridge.execution_id, 'tool_result', call_id=call_id, ok=ok,
+                result=result, error=error)
+            await bridge.send(reply)
+            if ok:
+                await _emit_tool_result(tool_name, receipt)
+                self._call_trace.append({'tool': tool_name,
+                                         'step_id': call_id, 'args': {}})
             return
 
         limit = max(1, int(getattr(settings, 'run_max_tool_calls', 40) or 40))

@@ -146,6 +146,36 @@ def _lock(key: str) -> asyncio.Lock:
     return lock
 
 
+def _cached_meta(creds: dict) -> dict | None:
+    """凭据里记下的 token 端点。有它就不必再问一次 well-known。
+
+    刷新 token 只需要 `token_endpoint` 一个地址，而那个地址一年也不变。
+    以前每次刷新都要先做一次元数据发现：授权服务器抖一下（503），一小时一次的
+    刷新就整条挂死，连接器看起来"坏了"，用户被引导去重新授权——而真正的原因
+    只是一次可以重试的网关抖动。
+    """
+    endpoint = str(creds.get('token_endpoint') or '').strip()
+    if not endpoint:
+        return None
+    return {'token_endpoint': endpoint,
+            'authorization_endpoint': str(creds.get('authorization_endpoint') or '')}
+
+
+def remember_meta(meta: dict, *, tenant_id: str, user_id: str,
+                  server_id: str, creds: dict | None = None) -> dict:
+    """把发现到的端点并进凭据文件，供下次刷新直接使用（不存 token 之外的秘密）。"""
+    endpoint = str((meta or {}).get('token_endpoint') or '').strip()
+    base = dict(creds or load(tenant_id=tenant_id, user_id=user_id,
+                              server_id=server_id))
+    if not endpoint or endpoint == str(base.get('token_endpoint') or ''):
+        return base
+    base['token_endpoint'] = endpoint
+    if (meta or {}).get('authorization_endpoint'):
+        base['authorization_endpoint'] = str(meta['authorization_endpoint'])
+    save(tenant_id=tenant_id, user_id=user_id, server_id=server_id, data=base)
+    return base
+
+
 async def _refresh(creds: dict, *, server, tenant_id: str, user_id: str,
                    server_id: str) -> str:
     """用 refresh_token 换新 access_token 并写回。失败就清凭据、要求重新授权。"""
@@ -156,7 +186,12 @@ async def _refresh(creds: dict, *, server, tenant_id: str, user_id: str,
             f'「{server.title or server_id}」的授权已过期且没有 refresh_token，请重新授权',
             server_id=server_id)
     issuer = str(creds.get('issuer') or getattr(server, 'oauth_issuer', '') or '')
-    meta = await oauth_client.discover(issuer)
+    meta = _cached_meta(creds)
+    if meta is None:
+        # 老凭据文件里没有端点，才去问一次；拿到后立刻记下来。
+        meta = await oauth_client.discover(issuer)
+        creds = remember_meta(meta, tenant_id=tenant_id, user_id=user_id,
+                              server_id=server_id, creds=creds)
     resource = (str(creds.get('service') or '')
                 or getattr(server, 'oauth_resource', '')
                 or getattr(server, 'url', ''))

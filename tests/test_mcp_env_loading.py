@@ -61,12 +61,20 @@ class McpServersEnvLoadingTests(unittest.TestCase):
         self.assertNotIn('INVARIANT_BROKEN', completed.stderr, completed.stderr)
         self.assertEqual(completed.returncode, 0, completed.stderr)
 
-    def test_no_env_file_yields_empty_catalog_without_error(self):
-        """没有 `.env` 时应当是空清单而不是异常——确认上面那条不是因为报错才过。"""
+    def test_no_env_file_contributes_no_ops_server(self):
+        """没有 `.env` 时不应凭空多出运维服务端，也不应报错。
+
+        这里不再断言"整张表为空"：`servers()` 现在无论如何都会合并平台目录
+        （控制台发布的连接器）——以前 `MCP_SERVERS` 为空会提前 return，把平台
+        连接器和用户自建的连接器一起跳过，那是 bug 而不是不变量。这条用例要
+        证明的是"环境没加载"，所以只要求 `probe` 不出现、`LAST_ERROR` 为空。
+        """
         completed = subprocess.run(
             [sys.executable, '-c',
              'from webpage_agent.integrations import mcp_servers\n'
-             'assert mcp_servers.servers() == [], mcp_servers.servers()\n'],
+             'ids = [s.id for s in mcp_servers.servers()]\n'
+             'assert "probe" not in ids, ids\n'
+             'assert not mcp_servers.LAST_ERROR, mcp_servers.LAST_ERROR\n'],
             cwd=ROOT,
             env={'APP_ENV': 'production', 'PATH': os.environ.get('PATH', ''),
                  'PYTHONPATH': str(ROOT / 'src')},

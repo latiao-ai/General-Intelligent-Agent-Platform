@@ -169,10 +169,6 @@ def enforcement_enabled() -> bool:
     return bool(settings.tool_policy_enforced)
 
 
-def cache_ttl() -> float:
-    return float(getattr(settings, 'credential_cache_ttl', 30.0) or 0.0)
-
-
 # ---------- 发现过滤（P2） ----------
 
 def visible_to(policy: ToolPolicy | None, tool_key: str, *, tenant_id: str,

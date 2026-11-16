@@ -96,13 +96,19 @@ from webpage_agent.store.pg_auth import PgAuth
 from webpage_agent.store.pg_tasks import PgTasks
 from webpage_agent.store.pg_runs import PgRuns
 from webpage_agent.store.pg_budget import PgBudget
+from webpage_agent.store.pg_credits import PgCredits
 from webpage_agent.store.pg_actions import PgActions
 from webpage_agent.store.pg_jobs import PgJobs
 from webpage_agent.store.pg_schedules import PgSchedules
 from webpage_agent.store.pg_addons import PgAddons
+from webpage_agent.store.pg_bots import PgBots
+from webpage_agent.store.pg_plaza import PgPlaza
+from webpage_agent.store.pg_messaging import PgMessaging
 from webpage_agent.store.pg_governance import PgGovernance
 from webpage_agent.store.pg_admin import PgAdmin
 from webpage_agent.store.pg_platforms import PgPlatforms
+from webpage_agent.store.pg_local_accounts import PgLocalAccounts
+from webpage_agent.store.pg_user_purge import PgUserPurge
 
 
 class PostgresStore(
@@ -110,13 +116,19 @@ class PostgresStore(
     PgAuth,
     PgAdmin,
     PgPlatforms,
+    PgLocalAccounts,
+    PgUserPurge,
     PgTasks,
     PgRuns,
     PgBudget,
+    PgCredits,
     PgActions,
     PgJobs,
     PgSchedules,
     PgAddons,
+    PgBots,
+    PgPlaza,
+    PgMessaging,
     PgGovernance,
     GovernanceStore,
 ):

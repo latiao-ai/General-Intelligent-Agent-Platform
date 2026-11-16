@@ -49,6 +49,11 @@ class _FakeRequest:
         return item
 
 
+async def _noop(*_args, **_kwargs):
+    """替掉 `oauth_client._pause`：用例不必真的等退避。"""
+    return None
+
+
 class PkceAndUrlTests(unittest.TestCase):
     def test_pkce_is_s256(self):
         import base64
@@ -101,6 +106,32 @@ class DiscoveryTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(oauth_client, '_request', fake):
             with self.assertRaises(oauth_client.OAuthError):
                 await oauth_client.discover('https://mcp.example.test')
+
+    async def test_discover_retries_transient_5xx(self):
+        """网关抖一下就退回"连接器坏了"，是最贵的一种误判：用户会去重新授权。"""
+        fake = _FakeRequest([_Resp(503, {}), _Resp(200, META)])
+        with patch.object(oauth_client, '_request', fake), \
+                patch.object(oauth_client, '_pause', _noop):
+            meta = await oauth_client.discover('https://mcp.example.test')
+        self.assertEqual(meta['token_endpoint'], META['token_endpoint'])
+        self.assertEqual(len(fake.calls), 2)
+
+    async def test_discover_marks_exhausted_5xx_as_transient(self):
+        fake = _FakeRequest([_Resp(503, {}) for _ in range(6)])
+        with patch.object(oauth_client, '_request', fake), \
+                patch.object(oauth_client, '_pause', _noop):
+            with self.assertRaises(oauth_client.OAuthTransient) as ctx:
+                await oauth_client.discover('https://mcp.example.test')
+        self.assertIn('503', str(ctx.exception))
+
+    async def test_discover_404_is_not_transient(self):
+        """404 是配置问题（issuer 写错了），重试没有意义，也不该说"稍后重试"。"""
+        fake = _FakeRequest([_Resp(404, {}), _Resp(404, {})])
+        with patch.object(oauth_client, '_request', fake), \
+                patch.object(oauth_client, '_pause', _noop):
+            with self.assertRaises(oauth_client.OAuthError) as ctx:
+                await oauth_client.discover('https://mcp.example.test')
+        self.assertNotIsInstance(ctx.exception, oauth_client.OAuthTransient)
 
     async def test_register_client_is_public_and_pkce_only(self):
         fake = _FakeRequest([_Resp(201, {'client_id': 'new-id'})])
@@ -208,6 +239,31 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         data = oauth_store.load(tenant_id='t1', user_id='u1', server_id='libtv')
         self.assertEqual(data['tokens']['access_token'], 'at-new')
         self.assertEqual(data['tokens']['refresh_token'], 'rt-new')
+
+    async def test_refresh_reuses_stored_token_endpoint(self):
+        """端点已经落盘时，刷新不该再打一次 well-known。
+
+        以前每次刷新都要先发现一次元数据：授权服务器 503 一次，一小时一次的
+        刷新就整条挂死，连接器看起来"坏了"。
+        """
+        oauth_store.save(
+            tenant_id='t1', user_id='u1', server_id='libtv',
+            data={'client_id': 'cid', 'issuer': META['issuer'],
+                  'token_endpoint': META['token_endpoint'],
+                  'service': 'https://mcp.example.test/mcp',
+                  'tokens': {'access_token': 'at-old', 'refresh_token': 'rt-old',
+                             'expires_at': int(time.time() * 1000) - 1000}})
+        fake = _FakeRequest([_Resp(200, {'access_token': 'at-new',
+                                         'expires_in': 3600})])
+        server = mcp_servers.Server(id='libtv', transport='streamable_http',
+                                    url='https://mcp.example.test/mcp',
+                                    auth='oauth', oauth_issuer=META['issuer'])
+        with patch.object(oauth_client, '_request', fake):
+            token = await oauth_store.ensure_access_token(
+                server=server, tenant_id='t1', user_id='u1', server_id='libtv')
+        self.assertEqual(token, 'at-new')
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.calls[0]['url'], META['token_endpoint'])
 
     async def test_revoked_refresh_clears_credentials(self):
         self._write(expires_at=int(time.time() * 1000) - 1000)

@@ -139,7 +139,10 @@ async def _default_querier(store, task: dict, contract):
         store, tenant_id=str(task.get('tenant_id') or 'default'),
         user_id=str(task.get('owner_user_id') or 'default'),
         server_id=server_id, platform_id=str((run or {}).get('platform_id') or ''))
-    server = mcp_servers.by_id(server_id) if server_id else None
+    server = mcp_servers.by_id(
+        server_id, owner_key=mcp_servers.owner_key_for_values(
+            str(task.get('tenant_id') or 'default'),
+            str(task.get('owner_user_id') or 'default'))) if server_id else None
     if protocol:
         return await mcp_adapter.task_status(
             str(task.get('remote_task_id') or ''), server=server, token=token)

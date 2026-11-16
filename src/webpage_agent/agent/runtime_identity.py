@@ -49,10 +49,6 @@ def default_kind() -> str:
     return KIND_PI
 
 
-def known_kind(kind: str) -> bool:
-    return str(kind or '').strip().lower() in KNOWN_KINDS
-
-
 def version_for_kind(kind: str) -> int:
     return {
         KIND_LANGGRAPH: LANGGRAPH_RUNTIME_VERSION,
@@ -107,18 +103,6 @@ class IncompatibleRuntimeVersion(RuntimeError):
         self.field = field
         self.stored = stored
         self.current = current
-
-
-async def resolve_kind(store, run_id: str) -> str:
-    """从库里读已存归属；无 store / 无 run_id 时回默认 Pi。
-
-    这只是读取。存量 `langgraph` 不会在这里被执行：执行入口要走
-    `prepare_execution`，能改挂才改挂，不能改挂就停在待核实。
-    """
-    if store is None or not run_id:
-        return default_kind()
-    identity = await store.runtime_identity(run_id)
-    return identity['kind']
 
 
 def legacy_resume_safe(facts: dict | None) -> bool:

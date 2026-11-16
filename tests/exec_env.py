@@ -33,7 +33,11 @@ _SESSION_DATA = tempfile.TemporaryDirectory(prefix='agent-test-data-')
 object.__setattr__(settings, 'artifact_dir', Path(_SESSION_DATA.name) / 'artifacts')
 object.__setattr__(settings, 'profile_path', Path(_SESSION_DATA.name) / 'profile' / 'USER.md')
 
-TEST_TABLES = ('scheduled_task_runs', 'scheduled_tasks',
+TEST_TABLES = ('bot_plaza_installs', 'bot_plaza_items', 'bot_room_tasks',
+               'bot_room_events', 'bot_rooms', 'bot_deliveries', 'bot_sections',
+               'bots', 'im_events', 'im_login_state', 'im_outbox',
+               'im_inbox', 'im_processed', 'im_pairing', 'im_sessions',
+               'im_runtime', 'im_channels', 'scheduled_task_runs', 'scheduled_tasks',
                'memory_tombstones', 'memories', 'background_jobs', 'artifacts',
                'action_attempts', 'actions', 'steps', 'plans', 'run_snapshots',
                'run_inputs', 'run_input_processing', 'run_decisions',
@@ -258,6 +262,8 @@ def override_settings(**changes):
                'webpage_agent.capabilities.answers', 'webpage_agent.capabilities.publishing',
                'webpage_agent.core.sources', 'webpage_agent.api.auth', 'webpage_agent.governance.policies', 'webpage_agent.core.files',
                'webpage_agent.observe.observation', 'webpage_agent.agent.run_inputs', 'webpage_agent.integrations.mcp_servers',
+               'webpage_agent.messaging.gateway', 'webpage_agent.messaging.bridge',
+               'webpage_agent.api.messaging_api', 'webpage_agent.messaging.registry',
                'webpage_agent.integrations.mcp_adapter', 'webpage_agent.core.profile', 'webpage_agent.store.idempotency')
     stack = ExitStack()
     stack.enter_context(patch('webpage_agent.core.config.settings', fake))

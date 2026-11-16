@@ -486,6 +486,15 @@ class Hub(HubSessionMixin, HubSessionMessageMixin, HubInputsMixin,
             from webpage_agent.addons import resolver as addons_resolver
             from webpage_agent.addons import scope as addons_scope
             session_row = await self.store.session(record.session_id) or {}
+            # 机器人会话：业务 run 也落在它自己的家目录里（与聊天 turn 同一条规则）。
+            if str(session_row.get('bot_id') or ''):
+                from webpage_agent.bot import service as bot_service
+                stored = bot_service.ensure_bot_home(
+                    record.tenant_id, record.owner_user_id,
+                    str(session_row.get('bot_id')))
+                await self.store.set_workspace(
+                    tenant_id=record.tenant_id,
+                    owner_user_id=record.owner_user_id, path=stored)
             raw_connectors = session_row.get('connector_ids_json')
             if raw_connectors in (None, ''):
                 selected_connectors = None          # 旧会话：沿用全部已配置工具

@@ -58,6 +58,12 @@ WRITE_TOOL_KEYS: tuple[str, ...] = ()
 # 不是业务工具，不走 governed_call，也不占用写白名单。
 REQUEST_INPUT_NAME = 'request_input'
 
+# 机器人之间的私信工具（Bot Mode）。和 request_input 一样是宿主工具：
+# 它写的是"投递收据"，不是外部副作用，所以不走 governed_call、不占写白名单。
+# **只在机器人规范会话里注入**（gate 是会话行上稳定的 `bot_id`），普通任务
+# 看不到这个工具，token 序列不变（docs/bot-mode.md §能力按会话注入）。
+BOT_MESSAGE_NAME = 'message_bot'
+
 # 第九阶段保留别名（向后兼容旧测试引用）：只读白名单。
 READ_TOOL_KEYS = SYNC_READ_TOOL_KEYS
 
@@ -158,6 +164,38 @@ def tool_allowed(tool, *, connector_ids: list | tuple | None = None) -> bool:
     return False
 
 
+def bot_message_decl(peers: list[str] | None = None) -> dict:
+    """`message_bot` 的工具声明。`peers` 只用于描述，不参与校验。"""
+    hint = ''
+    names = [str(item) for item in (peers or []) if str(item).strip()]
+    if names:
+        hint = '；当前队友：' + '、'.join(f'@{item}' for item in names[:20])
+    return {
+        'name': BOT_MESSAGE_NAME,
+        'description': (
+            '给队友机器人发一条异步消息（私信）。调用后立刻返回「已受理」，'
+            '对方的答复之后会作为一条新消息出现在本会话里——不要在等待期间反复重发。'
+            '只在需要队友的专业能力时使用，一次只发给一个最相关的队友。'
+            + hint
+        ),
+        'parameters': {
+            'type': 'object',
+            'additionalProperties': False,
+            'properties': {
+                'target': {
+                    'type': 'string',
+                    'description': '队友的 handle（不带 @），例如 researcher',
+                },
+                'message': {
+                    'type': 'string',
+                    'description': '要对方处理的具体请求；写清背景、要什么产出、截止口径',
+                },
+            },
+            'required': ['target', 'message'],
+        },
+    }
+
+
 def request_input_decl() -> dict:
     """缺参时让模型停下来问人的宿主工具声明。"""
     return {
@@ -191,6 +229,14 @@ MAX_SOURCES = 8
 # `sources: []`，模型据此回答"你账号下有 0 个画布"。
 MAX_MCP_CALLS = 4
 MAX_MCP_RESULT_CHARS = 12000
+
+# 本地文件工具（read_file / list_dir）回执给模型的上限。
+# 这两类工具的产物是 `text` / `entries`，不是"检索来源"——以前被回执归一直接
+# 丢掉，工具明明成功（ok=true），模型收到的却只有 `status: searched /
+# total_sources: 0`，于是断言"目录是空的、技能正文读不到"，转而开始猜路径。
+MAX_FILE_TEXT_CHARS = 20000
+MAX_DIR_ENTRIES = 200
+
 
 # 合并回宿主 state 时允许写入的**认可字段**（白名单）。工具返回的增量里只有这些
 # 键会被合并，其余（status、phase 等内部字段）一律丢弃，避免任意结果覆盖身份、
@@ -280,6 +326,41 @@ def _source_excerpt(doc: dict) -> dict:
     }
 
 
+def _file_result_excerpt(updates: dict) -> dict:
+    """本地文件工具的结果摘要：read_file 的正文、list_dir 的目录项、write_file 的落盘。
+
+    `path` 一律回带，让模型能核对"我读的到底是不是这个路径"——路径错了要立刻
+    看得出来，而不是拿一个空结果反推"目录没东西"。
+    """
+    out: dict = {'path': str(updates.get('path') or '')}
+    if 'text' in updates:
+        text = str(updates.get('text') or '')
+        out['chars'] = len(text)
+        out['text'] = text[:MAX_FILE_TEXT_CHARS]
+        if len(text) > MAX_FILE_TEXT_CHARS:
+            out['truncated'] = True
+            out['total_chars'] = len(text)
+            out['hint'] = ('文件超过单次回执上限，只带回开头部分；'
+                           '需要后续内容时缩小范围分段读取，不要拿半截正文下结论')
+        elif updates.get('truncated'):
+            out['truncated'] = True
+            out['hint'] = '文件超过读取工具的单次上限，只带回开头部分'
+    if 'entries' in updates:
+        entries = [item for item in (updates.get('entries') or [])
+                   if isinstance(item, dict)]
+        out['entries'] = [{'name': str(item.get('name') or ''),
+                           'kind': str(item.get('kind') or '')}
+                          for item in entries[:MAX_DIR_ENTRIES]]
+        out['total_entries'] = len(entries)
+    if 'written' in updates:
+        out['written'] = [str(item) for item in (updates.get('written') or [])][:20]
+        try:
+            out['bytes'] = int(updates.get('bytes') or 0)
+        except (TypeError, ValueError):
+            out['bytes'] = 0
+    return out
+
+
 def _receipt_content(updates: dict, tool_name: str) -> dict:
     """把一次只读工具的 state 增量归一成给模型的内容。
 
@@ -296,14 +377,20 @@ def _receipt_content(updates: dict, tool_name: str) -> dict:
     documents = updates.get('documents') or []
     errors = updates.get('errors') or []
     mcp_calls = updates.get('mcp_calls') or []
+    # 文件工具不是"检索"：它的产物是 text / entries，不能按 documents 归一。
+    file_payload = any(key in updates for key in ('text', 'entries', 'written'))
     result = {
         'tool': tool_name,
         # MCP 调用没有"检索阶段"这回事：状态写 ok，别拿 searched 冒充。
-        'status': str(updates.get('status') or ('ok' if mcp_calls else 'searched')),
+        # 文件工具同理——读完就是读完了，写 `searched` 会让模型以为"什么也没搜到"。
+        'status': str(updates.get('status')
+                      or ('ok' if (mcp_calls or file_payload) else 'searched')),
         'sources': [_source_excerpt(d) for d in documents[:MAX_SOURCES]
                     if isinstance(d, dict)],
         'total_sources': len(documents),
     }
+    if file_payload:
+        result.update(_file_result_excerpt(updates))
     if errors:
         result['errors'] = [{'stage': e.get('stage'), 'type': e.get('type')}
                             for e in errors if isinstance(e, dict)]

@@ -40,3 +40,10 @@ openmontage-zh-mcp/
 .ruff_cache/
 .mypy_cache/
 .pytest_cache/
+
+# 前端（Vite + React）依赖与构建产物
+# dist 不入库：它是可再生产物，而且每次构建都会留下带新哈希的旧文件，
+# 存进版本库只会不断堆积。部署前在 frontend/ 下跑 npm install && npm run build。
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/

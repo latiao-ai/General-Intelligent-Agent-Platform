@@ -135,6 +135,17 @@ LGPL 对"以库形式使用"的要求：
 - 若将来升级任一依赖，请重新生成本文件；许可证会随版本变（例如某个包从 BSD 换成
   Apache）。清单的版本必须与 `requirements.lock.txt` 完全一致才有意义。
 
+## 随源码 vendored 的第三方代码
+
+以下代码**不在** `requirements.lock.txt` 里，而是原样放进仓库（`vendoring`），
+因为它只服务于一个很小的功能（二维码矩阵），且引入 pip 包会带来额外依赖。
+
+| 文件 | 来源 | 许可证 | 用途 |
+|---|---|---|---|
+| `src/webpage_agent/messaging/vendor/qrcodegen.py` | [Project Nayuki QR-Code-generator](https://www.nayuki.io/page/qr-code-generator-library) | MIT | 个人微信 iLink 扫码登录的二维码矩阵；SVG 由本项目自己拼 |
+
+MIT 许可证正文保留在该文件头部（版权声明 + 许可声明）。分发时不要删除它。
+
 ## 本项目自己的许可证
 
 仓库里**没有** `LICENSE` 文件，`pyproject.toml` 也没写 `license` 字段——也就是说

@@ -19,7 +19,8 @@ from webpage_agent.store.pg_store import now
 # 用户可改的字段。调度器内部状态（next_run_at / lease_* / last_*）不在白名单里：
 # 让接口能改下一次触发时间，等于让人手写一个"永远不触发"的任务。
 USER_FIELDS = ('name', 'prompt', 'enabled', 'schedule_type', 'rrule', 'scheduled_at',
-               'valid_from', 'valid_until', 'connector_ids_json', 'delivery_json')
+               'valid_from', 'valid_until', 'connector_ids_json', 'delivery_json',
+               'bot_id')
 # 调度器可以推进的字段（都过租约门禁）。
 TICK_FIELDS = ('next_run_at', 'next_attempt_at', 'last_run_at', 'last_status',
                'last_error_code', 'last_error_message', 'consecutive_failures',
@@ -56,7 +57,8 @@ class PgSchedules:
                    'platform_id', 'platform_subject', 'name', 'prompt', 'enabled',
                    'schedule_type', 'rrule', 'scheduled_at', 'valid_from',
                    'valid_until', 'next_run_at', 'next_attempt_at',
-                   'connector_ids_json', 'delivery_json', 'created_at', 'updated_at')
+                   'connector_ids_json', 'delivery_json', 'bot_id',
+                   'created_at', 'updated_at')
         values = (fields['schedule_id'], fields.get('tenant_id', 'default'),
                   fields.get('owner_user_id', 'default'),
                   fields.get('owner_role', 'member'),
@@ -68,7 +70,7 @@ class PgSchedules:
                   float(fields.get('next_attempt_at') or 0.0),
                   json.dumps(fields.get('connector_ids') or [], ensure_ascii=False),
                   json.dumps(fields.get('delivery') or {}, ensure_ascii=False),
-                  stamp, stamp)
+                  str(fields.get('bot_id') or ''), stamp, stamp)
         placeholders = ', '.join(['%s'] * len(columns))
         async with self._lease() as conn:
             row = await self._one(conn,

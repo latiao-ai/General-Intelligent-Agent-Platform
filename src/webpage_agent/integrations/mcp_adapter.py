@@ -612,34 +612,80 @@ def rejected_without_apply(reason: str, server=None) -> bool:
     return text.endswith(REJECTED_SUFFIXES)
 
 
+# MCP 网关只回一行纯文本错误时，错误码长这样：
+#   Error executing tool read_project: INVALID_PROJECT_ID: Use the canvas UUID,
+#   not its numeric ID
+# 只认「全大写 + 下划线」的 token，避免把 UUID / HTTP 这类普通大写词当成原因码。
+PLAIN_ERROR_CODE = re.compile(r'\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b')
+# 网关自己加的前缀，剥掉后才拿得到真正的错误码与说明
+PLAIN_ERROR_PREFIX = re.compile(r'^\s*(?:error executing tool|tool)\s+\S+\s*:\s*', re.I)
+
+# 入口校验被拒时统一附上的纠偏提示。真实事故：同一轮 4 个接口因共用同一个
+# 错误的 projectId 全部 isError，旧文案只说「执行结果待核对，请查看服务端日志」，
+# 模型据此把「共享参数错误」误判成「服务端整体故障」，既不敢重试，还让用户去
+# 查 500/403 日志。错误文案必须自己说清是哪一类问题，不能让模型去猜。
+REJECTION_HINT = ('入口校验/鉴权阶段被拒：本次请求没有落地，请核对参数与凭据，'
+                  '尤其是同一轮多个接口共用的字段；这不是服务端故障')
+
+
+def plain_error_details(text: str) -> tuple[str, str]:
+    """从明文 MCP 错误里取 (原因码, 首行说明)；取不到码时返回空码。
+
+    只取首行：网关常把整段 traceback 拼在后面，展示出去既看不懂又泄漏路径。
+    """
+    lines = [line.strip() for line in (text or '').splitlines() if line.strip()]
+    if not lines:
+        return '', ''
+    prefix = PLAIN_ERROR_PREFIX.match(lines[0])
+    body = lines[0][prefix.end():] if prefix else lines[0]
+    code = PLAIN_ERROR_CODE.search(body)
+    return (code.group(1).lower() if code else ''), body.strip()
+
+
 def result_payload(result, server=None):
     if getattr(result, 'isError', False):
-        # MCP isError can carry a structured, user-facing validation error.
-        # Preserve its reason so a rejected request is not mistaken for an
-        # uncertain write. Unstructured/transport failures remain uncertain.
-        error = getattr(result, 'structuredContent', None)
-        if not isinstance(error, dict):
-            for block in getattr(result, 'content', ()):
-                if getattr(block, 'type', None) != 'text':
-                    continue
+        # isError 有两类载体：结构化 JSON（reason/message）和网关拼的一行纯文本。
+        # 两者都必须把「原因码 + 可读原因」带出去，且只有明确的参数/前置条件
+        # 拒绝才能标成 failed_confirmed。旧实现只认 JSON，明文错误一律压成
+        # 「执行结果待核对，请查看服务端日志」：错误码与原因全丢，确定性也错标
+        # 成 unknown —— 参数写错被当成服务端故障（见 test_mcp_plain_text_errors）。
+        blocks = [str(getattr(block, 'text', ''))
+                  for block in (getattr(result, 'content', ()) or ())
+                  if getattr(block, 'type', None) == 'text'
+                  and str(getattr(block, 'text', '') or '').strip()]
+        structured = getattr(result, 'structuredContent', None)
+        error = structured if isinstance(structured, dict) else None
+        if error is None:
+            for text in blocks:
                 try:
-                    error = json.loads(block.text)
+                    parsed = json.loads(text)
                 except (ValueError, TypeError):
                     continue
-                if isinstance(error, dict):
+                if isinstance(parsed, dict):
+                    error = parsed
                     break
+
+        reason = ''
+        message = ''
         if isinstance(error, dict):
-            reason = str(error.get('reason') or '').strip()
-            message = error.get('message')
-            # Only explicit parameter/precondition rejections establish that
-            # the attempted write did not happen. Never expose raw traceback.
-            if rejected_without_apply(reason, server) and isinstance(message, str) and message.strip():
-                first_line = message.strip().splitlines()[0][:180]
-                raise MCPToolFailure(first_line, reason)
-        detail = ''
-        if isinstance(error, dict) and error.get('reason'):
-            detail = f'（服务端原因：{error.get("reason")}）'
-        raise RuntimeError('MCP 工具返回 isError，执行结果待核对，请查看服务端日志' + detail)
+            reason = str(error.get('reason') or error.get('code') or '').strip()
+            raw_message = error.get('message')
+            if isinstance(raw_message, str) and raw_message.strip():
+                message = raw_message.strip().splitlines()[0][:180]
+        else:
+            # 明文错误：只取首行，绝不把后面的 traceback 带进界面
+            reason, body = plain_error_details('\n'.join(blocks)[:400])
+            message = body[:180] if reason else ''
+
+        if reason and rejected_without_apply(reason.lower(), server) and message:
+            raise MCPToolFailure(f'{message}｜{REJECTION_HINT}', reason.lower())
+
+        # 其余一律 unknown：请求可能已经落地，不能自动重发。原因码要留下，
+        # 但不能带服务端原文（常含内部路径/traceback）；也不再说「查看服务端
+        # 日志」——那句会把参数错误误导成服务端故障。
+        detail = f'（原因码：{reason}）' if reason else ''
+        raise RuntimeError(
+            'MCP 工具返回 isError，服务端未确认本次调用是否执行' + detail)
     payload = getattr(result, 'structuredContent', None)
     if payload is None:
         for block in result.content:

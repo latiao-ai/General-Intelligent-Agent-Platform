@@ -61,8 +61,12 @@ def main():
             print(f'同一局域网访问：http://{address}:{args.port}', flush=True)
         else:
             print(f'请用本机局域网 IP 访问：http://<本机IP>:{args.port}', flush=True)
+    # access_log=False：同一请求已经被 guard_origin 里的 `http_span` 记了一遍，
+    # 而且那一条带 route 模板、状态码和耗时，比 uvicorn 的 `INFO: ip - "GET ..."`
+    # 信息多。两份都留着只会让日志量翻倍、grep 出双份结果。
+    # 要临时看回原始访问日志：uvicorn --access-log，或把这里改回 True。
     uvicorn.run('webpage_agent.api.routes:app', host='0.0.0.0' if args.lan else (args.host or '127.0.0.1'),
-                port=args.port, reload=args.reload)
+                port=args.port, reload=args.reload, access_log=False)
 
 
 if __name__ == '__main__':

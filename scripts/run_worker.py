@@ -251,7 +251,8 @@ async def drain_runs_spawned(hub: Hub, worker_id: str) -> list[asyncio.Task]:
 
 
 async def main_loop(hub: Hub, worker_id: str, once: bool,
-                    jobs_only: bool, interval: float) -> None:
+                    jobs_only: bool, interval: float,
+                    gateway=None) -> None:
     from webpage_agent.observe import runtime_check
     problems = runtime_check.issues()
     if problems:
@@ -275,6 +276,12 @@ async def main_loop(hub: Hub, worker_id: str, once: bool,
     # 定时任务的下一次 tick（单调时钟）。**不要**用 `await asyncio.sleep(30)`：
     # 这个主循环同时负责领取业务 run，睡 30s 会一起拖慢。
     next_schedule_tick = time.monotonic()
+    # 机器人节拍：泵投递 + 推进群聊。跟定时任务分开计时——投递是"有人在等"，
+    # 需要更快的节拍；两者都不阻塞下面的 run / turn 领取。
+    next_bot_tick = time.monotonic()
+    # 消息平台：渠道同步、入站消费、出站重试。与机器人节拍同样独立计时——
+    # 用户在 IM 里等回复，不能被业务 run 的领取节奏拖慢。
+    next_messaging_tick = time.monotonic()
 
     while True:
         # 1. 后台作业（session_summary 等，快速领取执行）
@@ -300,6 +307,31 @@ async def main_loop(hub: Hub, worker_id: str, once: bool,
                     worked += 1
             except Exception:                      # noqa: BLE001
                 logger.exception('定时任务 tick 失败')
+
+        # 2c. 机器人：投递泵 + 群聊调度。失败不影响主循环。
+        if not jobs_only and time.monotonic() >= next_bot_tick:
+            next_bot_tick = time.monotonic() + settings.bot_tick_seconds
+            try:
+                from webpage_agent.bot import tick as bot_tick
+                stats = await bot_tick.tick(hub.store, worker_id)
+                if any(stats.values()):
+                    logger.info('机器人 tick：%s', stats)
+                    worked += 1
+            except Exception:                      # noqa: BLE001
+                logger.exception('机器人 tick 失败')
+
+        # 2d. 消息平台（飞书/企微/个人微信）：同步配置、领入站、泵出站。
+        if (not jobs_only and gateway is not None
+                and time.monotonic() >= next_messaging_tick):
+            next_messaging_tick = (
+                time.monotonic() + settings.messaging_tick_seconds)
+            try:
+                stats = await gateway.tick()
+                if any(stats.values()):
+                    logger.info('消息平台 tick：%s', stats)
+                    worked += 1
+            except Exception:                      # noqa: BLE001
+                logger.exception('消息平台 tick 失败')
 
         # 3. 聊天 turn 与业务 run：各自领取 + 派发，不等待完成
         if not jobs_only:
@@ -353,6 +385,7 @@ async def run_worker(worker_id: str, once: bool, jobs_only: bool,
     """
     hub = Hub(owner_id=worker_id)
     background: list[asyncio.Task] = []
+    gateway = None
     try:
         ready = getattr(hub.store, 'ready', None)
         if callable(ready):
@@ -370,13 +403,36 @@ async def run_worker(worker_id: str, once: bool, jobs_only: bool,
         if _settings.turn_watchdog_enabled:
             background.append(asyncio.create_task(
                 watchdog.loop(hub.store), name='watchdog'))
-        await main_loop(hub, worker_id, once, jobs_only, interval)
+        if not once and not jobs_only and _settings.messaging_enabled:
+            from webpage_agent.messaging.gateway import MessagingGateway
+            gateway = MessagingGateway(hub, worker_id=worker_id)
+
+            async def _start_messaging() -> None:
+                # 多副本部署里只有一个 Worker 能拿到选主锁。抢不到不代表永远
+                # 不该起——主副本退出后，这个循环会在 15 秒内接手。
+                while True:
+                    try:
+                        if await gateway.start():
+                            return
+                    except Exception:              # noqa: BLE001
+                        logger.exception('启动消息网关失败（不影响执行器）')
+                    await asyncio.sleep(15)
+
+            background.append(asyncio.create_task(
+                _start_messaging(), name='messaging-start'))
+        await main_loop(hub, worker_id, once, jobs_only, interval,
+                        gateway=gateway)
     finally:
         for task in background:
             task.cancel()
         for task in background:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+        if gateway is not None:
+            try:
+                await gateway.stop()
+            except Exception:                      # noqa: BLE001
+                logger.debug('关闭消息网关失败', exc_info=True)
         from webpage_agent.integrations.mcp_adapter import close_stdio_sessions
         await close_stdio_sessions()
         await hub.store.close()

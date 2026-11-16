@@ -77,7 +77,11 @@ async def bearer_for(store, *, tenant_id: str, user_id: str,
     if str(credentials_module.scope_of(binding).get('auth') or '') == 'oauth':
         from webpage_agent.core import oauth_store
         from webpage_agent.integrations import mcp_servers
-        server = mcp_servers.by_id(server_id)
+        # 这里必须带主体：用户自己的连接器和运维配的可能同名，不带主体就只能
+        # 取到共享层那一条，刷新出来的 token 会挂到别人的服务端上。
+        server = mcp_servers.by_id(
+            server_id,
+            owner_key=mcp_servers.owner_key_for_values(tenant_id, user_id))
         if server is None:
             raise credentials_module.CredentialMissing(
                 f'服务端 {server_id} 已不在 MCP_SERVERS 配置里，OAuth 凭据无从刷新')

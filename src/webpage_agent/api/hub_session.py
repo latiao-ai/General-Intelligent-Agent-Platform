@@ -178,6 +178,30 @@ class HubSessionMixin:
                 'from_task': picked['task_id'],
                 'candidates': len(candidates)}
 
+    async def delete_session(self, session_id: str) -> dict:
+        """删除任务：先掐掉在跑的 run，再删库和磁盘上的产物。
+
+        顺序不能反。run 还在跑的时候先删行，执行者下一次写回会落空，产物目录
+        却会被重新渲染出来——用户看到的现象是"删了又回来了"。
+
+        取消失败不阻断删除：会话是用户的东西，不能因为一个远端执行者不理我们
+        就永远删不掉。失败只记日志。
+        """
+        for task in list(self.tasks.values()):
+            if task.session_id == session_id and task.live:
+                task._task.cancel()
+        for run_id in await self.store.open_runs_of(session_id):
+            try:
+                await self.cancel_run(run_id)
+            except Exception:                          # noqa: BLE001
+                logger.warning('删除会话前取消 run 失败 session=%s run=%s',
+                               session_id, run_id, exc_info=True)
+        result = await self.store.delete_session(session_id)
+        for key, task in list(self.tasks.items()):
+            if task.session_id == session_id:
+                self.tasks.pop(key, None)
+        return result
+
     async def stop_session(self, session_id: str, message: str,
                      principal=None) -> TaskRecord:
         """把"暂停/停止"当成控制指令：掐掉在跑的任务，不启动新流程。

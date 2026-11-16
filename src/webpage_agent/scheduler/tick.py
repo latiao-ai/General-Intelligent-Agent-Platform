@@ -344,6 +344,16 @@ async def _finish(hub, occurrence: dict, *, status: str, code: str,
     schedule = await store.schedule(schedule_id)
     if schedule is None:
         return False
+    # 例行任务（Routines）：归属某个机器人时，结果投递回它的规范会话。
+    # 与 webhook 投递**互不替代**：一个是"机器人自己知道"，一个是"人收到通知"。
+    if str(schedule.get('bot_id') or ''):
+        from webpage_agent.bot import routines
+        try:
+            await routines.deliver_routine(store, schedule=schedule,
+                                           occurrence=occurrence, summary=summary,
+                                           status=status)
+        except Exception:                      # noqa: BLE001
+            logger.exception('例行任务 %s 投递回机器人失败', schedule_id)
     return await delivery_module.enqueue(
         store, schedule, occurrence, notify=notify, status=status, code=code,
         message=message, summary=summary)

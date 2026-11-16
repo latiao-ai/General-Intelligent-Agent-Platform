@@ -46,6 +46,16 @@ VALID_TRANSPORTS = {'streamable_http', 'sse', 'stdio'}
 # 连接器授权方式：空 = 静态 token；oauth = 按登录主体走授权码流程。
 VALID_AUTH_MODES = {'', 'oauth'}
 
+# 条目归属。这决定"谁能看见它"以及"工具名要不要带前缀"。
+#   ops      —— `.env` 的 MCP_SERVERS，运维配置，全站可见
+#   platform —— 控制台发布的平台连接器，全站可见
+#   shared   —— 旧的全局单文件（MCP_USER_CONFIG_FILE），全站可见（兼容期）
+#   user     —— 某个登录主体自己的连接器，只有他自己看得见
+SCOPE_OPS = 'ops'
+SCOPE_PLATFORM = 'platform'
+SCOPE_SHARED = 'shared'
+SCOPE_USER = 'user'
+
 # 配置解析失败时的最后一次错误，供 /api/health 与排障看
 LAST_ERROR: str = ''
 
@@ -118,6 +128,12 @@ class Server:
     # 这两个值属于"应用级"配置（全中台一份），不是用户凭据。
     oauth_client_id: str = ''
     oauth_client_secret_ref: str = ''
+    # ---------- 归属 ----------
+    # `scope` 见文件头的 SCOPE_* 常量；`owner_key` 只在 scope=user 时有值，
+    # 形如 `tenant__user`。两者一起决定"这条配置属于谁"：只有 user 条目按
+    # 登录主体隔离，其余都是全站共享。
+    scope: str = SCOPE_OPS
+    owner_key: str = ''
 
 
 def _legacy_server() -> Server | None:
@@ -174,7 +190,8 @@ def _json_object(raw: str) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def _from_entry(entry: dict) -> Server | None:
+def _from_entry(entry: dict, *, scope: str = SCOPE_OPS,
+                owner_key: str = '') -> Server | None:
     if not isinstance(entry, dict):
         logger.warning('MCP_SERVERS 里有非对象条目，已跳过：%r', entry)
         return None
@@ -257,6 +274,8 @@ def _from_entry(entry: dict) -> Server | None:
         oauth_client_secret_ref=str(oauth.get('client_secret_ref') or '').strip(),
         default=bool(entry.get('default')),
         title=str(entry.get('title') or ''),
+        scope=scope,
+        owner_key=owner_key,
     )
 
 
@@ -267,43 +286,99 @@ def _from_entry(entry: dict) -> Server | None:
 #   {"mcpServers": {"name": {"type": "streamable-http", "url": "...", "headers": {}}}}
 # 中台只接受 HTTP/SSE；stdio 等本地进程由运维通过 MCP_SERVERS 配置，避免
 # 浏览器里的一条 JSON 变成任意命令执行。
-_USER_CONFIG_ENV = 'MCP_USER_CONFIG_FILE'
+#
+# **一个主体一个文件**：`<MCP_USER_CONFIG_DIR>/<tenant>__<user>.json`。
+# 历史包袱是这里原来只有一个固定路径（`profile/mcp.json`），于是"用户自定义"
+# 实际是"部署级自定义"——A 加一条，B 的对话里也会出现，B 还能用 A 的鉴权头
+# 去调 A 的私有网关。改成按主体分文件之后，`servers(owner_key=...)` 才是
+# 某个用户真正看得见的集合。
+_USER_CONFIG_ENV = 'MCP_USER_CONFIG_FILE'      # 旧的全局单文件（兼容期仍认）
+_USER_DIR_ENV = 'MCP_USER_CONFIG_DIR'         # 按主体隔离的目录
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+_OWNER_UNSAFE = re.compile(r'[^0-9A-Za-z_.-]')
+# 单用户部署（AUTH_MODE=off）与老配置迁移都落在这个主体名下。
+DEFAULT_OWNER = 'default__default'
 
 
-def user_config_path() -> Path:
+def owner_key_for_values(tenant_id: str = '', user_id: str = '') -> str:
+    """把 (租户, 用户) 压成一个能当文件名的 key。
+
+    写法与 `api/connectors_api._key` 一致：连接配置和连接状态（开关）必须落在
+    同一个主体名下，否则会出现"配置是他的、开关是别人的"。
+    """
+    tenant = str(tenant_id or 'default').strip() or 'default'
+    user = str(user_id or 'default').strip() or 'default'
+    return _OWNER_UNSAFE.sub('_', f'{tenant}__{user}')[:120]
+
+
+def owner_key_for(principal) -> str:
+    """从请求主体取 owner_key。没有主体 → 空串（只看共享配置）。"""
+    if principal is None:
+        return ''
+    return owner_key_for_values(getattr(principal, 'tenant_id', ''),
+                                getattr(principal, 'user_id', ''))
+
+
+def legacy_config_path() -> Path | None:
+    """旧的全局单文件。**只有显式配了 MCP_USER_CONFIG_FILE 才算数。**
+
+    不显式配就不读：否则部署机上遗留的 `profile/mcp.json` 会继续变成
+    "所有人的连接器"，这正是要修掉的那个问题。
+    """
     raw = os.getenv(_USER_CONFIG_ENV, '').strip()
+    return Path(raw).expanduser() if raw else None
+
+
+def user_config_dir() -> Path:
+    raw = os.getenv(_USER_DIR_ENV, '').strip()
     if raw:
         return Path(raw).expanduser()
-    return _REPO_ROOT / 'profile' / 'mcp.json'
+    return _REPO_ROOT / 'profile' / 'mcp-users'
 
 
-def _user_server_entries() -> list[Server]:
-    path = user_config_path()
+def user_config_path(owner_key: str = '') -> Path:
+    """某个主体自己的配置文件（**写入**用这个路径）。
+
+    没有主体上下文时（运维脚本、CLI）落回旧单文件，保持原来的行为。
+    """
+    key = str(owner_key or '').strip()
+    if not key:
+        legacy = legacy_config_path()
+        return legacy if legacy is not None else user_config_dir() / f'{DEFAULT_OWNER}.json'
+    return user_config_dir() / f'{key}.json'
+
+
+def _read_server_map(path: Path) -> dict:
+    """读一个 `{"mcpServers": {...}}` 文件。坏文件只记错，不炸整张表。"""
     try:
         data = json.loads(path.read_text(encoding='utf-8'))
     except FileNotFoundError:
-        return []
+        return {}
     except (OSError, ValueError) as exc:
         global LAST_ERROR
-        LAST_ERROR = f'用户 MCP 配置读取失败：{type(exc).__name__}'
+        LAST_ERROR = f'MCP 连接器配置读取失败（{path.name}）：{type(exc).__name__}'
         logger.warning(LAST_ERROR)
-        return []
+        return {}
     raw = data.get('mcpServers') if isinstance(data, dict) else None
-    if not isinstance(raw, dict):
-        return []
+    return raw if isinstance(raw, dict) else {}
+
+
+def _entries_from_map(raw: dict, *, scope: str,
+                      owner_key: str = '') -> list[Server]:
     out: list[Server] = []
     for name, entry in raw.items():
         if not isinstance(entry, dict) or entry.get('disabled') is True:
             continue
-        if str(entry.get('command') or '').strip() or str(entry.get('type') or '').lower() == 'stdio':
-            logger.warning('用户 MCP %s 使用 stdio，中台只接受 HTTP/SSE，已跳过', name)
+        if (str(entry.get('command') or '').strip()
+                or str(entry.get('type') or '').lower() == 'stdio'):
+            logger.warning('MCP %s（%s）使用 stdio，中台只接受 HTTP/SSE，已跳过',
+                           name, owner_key or scope)
             continue
         kind = str(entry.get('type') or 'streamable-http').strip().lower()
         transport = 'sse' if kind == 'sse' else 'streamable_http'
         url = str(entry.get('url') or '').strip()
         if not url:
-            logger.warning('用户 MCP %s 缺少 url，已跳过', name)
+            logger.warning('MCP %s 缺少 url，已跳过', name)
             continue
         headers = entry.get('headers')
         headers = headers if isinstance(headers, dict) else {}
@@ -311,19 +386,94 @@ def _user_server_entries() -> list[Server]:
             'id': str(name), 'transport': transport, 'url': url,
             'headers': {str(k): str(v) for k, v in headers.items()},
             'title': str(entry.get('title') or name),
-        })
+        }, scope=scope, owner_key=owner_key)
         if server:
             out.append(server)
     return out
 
 
+def _shared_server_entries() -> list[Server]:
+    """兼容期的全局单文件。仍对全体用户可见，优先级低于平台连接器。"""
+    path = legacy_config_path()
+    if path is None:
+        return []
+    return _entries_from_map(_read_server_map(path), scope=SCOPE_SHARED)
 
-def servers() -> list[Server]:
-    """当前配置的服务端列表。
 
-    每次读环境变量、不做缓存：解析成本是一次小 JSON，换来的是"改配置立刻生效"，
-    测试里也不用清缓存。
+def _user_server_entries(owner_key: str = '') -> list[Server]:
+    """某个主体自己的连接器。owner_key 为空 = 没有主体上下文，返回空。
+
+    以前这里读的是一个固定路径，所以"谁改一次、全站生效"。现在每个主体
+    一个文件，路径里带 `tenant__user`，用户之间不可能互相看见。
     """
+    key = str(owner_key or '').strip()
+    if not key:
+        return []
+    path = user_config_path(key)
+    if not path.exists() and key == DEFAULT_OWNER and legacy_config_path() is None:
+        # 迁移：老部署把用户连接器写在 `profile/mcp.json`。给 default 主体读
+        # 一次存量，别人拿不到；这个主体一旦有了自己的文件就不再回看。
+        # 显式配了 MCP_USER_CONFIG_FILE 的部署不做这步——那已经声明了"我就用
+        # 全局单文件"，再往某个主体名下暗送一份会变成两套来源打架。
+        legacy = _REPO_ROOT / 'profile' / 'mcp.json'
+        if legacy.exists():
+            path = legacy
+    return _entries_from_map(_read_server_map(path), scope=SCOPE_USER,
+                             owner_key=key)
+
+
+
+def remove_user_server(owner_key: str, server_id: str) -> bool:
+    """从某个主体的配置里删掉一条。返回是否真的删了。
+
+    只动 user 作用域的那个文件：运维（ops）、平台（platform）、兼容期共享层
+    的条目不该被用户页面上的一个请求改掉——那些不归他管。
+    """
+    key = str(owner_key or '').strip()
+    if not key:
+        return False
+    path = user_config_path(key)
+    raw = _read_server_map(path)
+    if str(server_id) not in raw:
+        return False
+    raw.pop(str(server_id))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps({'mcpServers': raw}, ensure_ascii=False, indent=2) + '\n',
+                   encoding='utf-8')
+    try:
+        os.chmod(tmp, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    return True
+
+
+def _platform_server_entries() -> list[Server]:
+    """控制台发布的平台连接器（`store/platform_catalog`），对全体用户可见。
+
+    它们和 `MCP_SERVERS` 里的条目是同一类东西——真实的服务端连接参数——所以
+    只在这里转成 `Server` 就够了：工具发现、连接开关、OAuth 授权都不必另写分支。
+    """
+    from webpage_agent.store import platform_catalog
+
+    out: list[Server] = []
+    for row in platform_catalog.enabled_connectors():
+        oauth = {'issuer': row.get('oauth_issuer') or '',
+                 'scopes': row.get('oauth_scopes') or ()}
+        server = _from_entry({
+            'id': row.get('id'), 'transport': row.get('transport') or DEFAULT_TRANSPORT,
+            'url': row.get('url'), 'headers': row.get('headers') or {},
+            'title': row.get('name') or row.get('id'),
+            'auth': row.get('auth') or '', 'oauth': oauth,
+        }, scope=SCOPE_PLATFORM)
+        if server is not None:
+            out.append(server)
+    return out
+
+
+def _ops_server_entries() -> list[Server]:
+    """运维配置：`MCP_SERVERS` / `MCP_SERVERS_FILE` / 旧的 `MCP_*` 单项变量。"""
     global LAST_ERROR
     raw = os.getenv('MCP_SERVERS', '').strip()
     filename = os.getenv('MCP_SERVERS_FILE', '').strip()
@@ -377,18 +527,55 @@ def servers() -> list[Server]:
             continue
         seen.add(server.id)
         unique.append(server)
-    for server in _user_server_entries():
-        # 系统配置优先；用户不能覆盖运维配置，避免同名静默替换鉴权。
-        if server.id in seen:
-            logger.warning('用户 MCP %s 与系统配置重名，已忽略用户项', server.id)
-            continue
-        seen.add(server.id)
-        unique.append(server)
     return unique
 
 
-def by_id(server_id: str) -> Server | None:
-    return next((s for s in servers() if s.id == server_id), None)
+def servers(*, owner_key: str = '') -> list[Server]:
+    """当前调用者能看见的服务端集合。
+
+    `owner_key` 为空 = 没有登录主体（运维脚本、健康检查、CLI）：只有全站共享的
+    那几类。给了 `owner_key` 才并上**这个主体自己的**连接器。
+
+    优先级：MCP_SERVERS（运维）> 平台目录（控制台）> 兼容期全局单文件 > 用户自建。
+    用户永远不能覆盖上面三层——同名静默替换等于把「同一个工具」换成另一个服务端。
+
+    每次读文件、不做缓存：解析成本是一次小 JSON，换来的是"改配置立刻生效"，
+    测试里也不用清缓存。
+    """
+    merged: list[Server] = []
+    seen: set[str] = set()
+    for server in (_ops_server_entries()
+                   + _platform_server_entries()
+                   + _shared_server_entries()
+                   + _user_server_entries(owner_key)):
+        if server.id in seen:
+            logger.warning('MCP 连接器 %s（%s）与更高优先级的配置重名，已忽略',
+                           server.id, server.scope)
+            continue
+        seen.add(server.id)
+        merged.append(server)
+    return merged
+
+
+def servers_view(owner_key: str = '') -> list[Server]:
+    """不带主体时走**无参调用** `servers()`。
+
+    看起来只是省一个关键字，实际是给调用方留的形状：老代码、测试桩、运维脚本
+    里大量存在 `servers()` 这种零参替换（`patch.object(..., lambda: [...])`）。
+    把它们全部改成必须传 `owner_key` 是一次没有收益的破坏；而没有主体时
+    "只看共享层"本来就是 `servers()` 的默认语义。
+    """
+    return servers(owner_key=owner_key) if owner_key else servers()
+
+
+def by_id(server_id: str, *, owner_key: str = '') -> Server | None:
+    """按 id 取服务端。**默认只查共享层**，用户自建的必须带 owner_key。
+
+    这个默认值是刻意的：`by_id('github')` 不带主体时，两个用户各有一个
+    `github` 就无从判断该返回谁。宁可返回 None（上层走既有兜底），
+    也不能随机拿到别人的地址和鉴权头。
+    """
+    return next((s for s in servers(owner_key=owner_key) if s.id == server_id), None)
 
 
 def deploy_server() -> Server | None:
@@ -400,32 +587,41 @@ def deploy_server() -> Server | None:
     return items[0] if items else None
 
 
-def tool_name(server: Server, name: str, total: int | None = None) -> str:
+def tool_name(server: Server, name: str, total: int | None = None,
+              *, owner_key: str = '') -> str:
     """生成对模型暴露的工具名。
 
     单服务端不加前缀，是为了不破坏已保存的计划与既有提示词；多服务端必须加，
     否则 `mcp__delete_site` 属于谁无法判断。
+
+    **用户自建的一律带前缀**：两个用户各自有一个叫 `github` 的连接器是常态，
+    走"只有一个就不加前缀"的捷径会让 `mcp__search` 这种名字根本回指不到主人
+    （拆分时拿不到 server，只能落到默认部署服务端上）。
     """
-    count = len(servers()) if total is None else total
+    if getattr(server, 'scope', SCOPE_OPS) == SCOPE_USER:
+        return f'{MCP_PREFIX}{server.id}__{name}'
+    count = len(servers_view(owner_key)) if total is None else total
     if count <= 1:
         return f'{MCP_PREFIX}{name}'
     return f'{MCP_PREFIX}{server.id}__{name}'
 
 
-def split_tool_name(name: str) -> tuple[Server | None, str]:
-    """把工具名拆回 (服务端, 原始工具名)；没带前缀时服务端为 None。"""
+def split_tool_name(name: str, *, owner_key: str = '') -> tuple[Server | None, str]:
+    """把工具名拆回 (服务端, 原始工具名)；没带前缀或没权限时服务端为 None。"""
     body = name[len(MCP_PREFIX):] if name.startswith(MCP_PREFIX) else name
     if '__' in body:
         head, rest = body.split('__', 1)
-        server = by_id(head)
+        server = by_id(head, owner_key=owner_key)
         if server is not None:
             return server, rest
     return None, body
 
 
 def status() -> dict:
+    """健康检查用：全站共享的那几层。用户自建的不进这里（不按主体出报表）。"""
     items = servers()
     return {'servers': [{'id': s.id, 'transport': s.transport,
+                         'scope': getattr(s, 'scope', SCOPE_OPS),
                          'default': s.default or (i == 0 and len(items) == 1)}
                         for i, s in enumerate(items)],
             'count': len(items), 'error': LAST_ERROR}

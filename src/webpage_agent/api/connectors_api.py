@@ -53,6 +53,16 @@ def _ids(principal) -> tuple[str, str]:
             str(getattr(principal, 'user_id', 'default') or 'default'))
 
 
+def _owner(principal) -> str:
+    """这个主体的连接器配置落在谁名下。
+
+    连接**配置**（profile/mcp-users/<key>.json）和连接**状态**（开关）必须用
+    同一个 key，否则会出现"配置是他的、开关是别人的"——两个用户都点开开关时
+    尤其明显。
+    """
+    return mcp_servers.owner_key_for(principal)
+
+
 def _load(principal) -> dict:
     path = _STATE_DIR / f'{_key(principal)}.json'
     try:
@@ -83,7 +93,8 @@ def _reset_tool_cache() -> None:
         pass
 
 
-def _server_view(server, state: dict, *, tenant: str = '', user: str = '') -> dict:
+def _server_view(server, state: dict, *, tenant: str = '', user: str = '',
+                 description: str = '') -> dict:
     row = state.get(server.id) or {}
     auth_mode = str(getattr(server, 'auth', '') or '')
     oauth_ready = True
@@ -102,8 +113,14 @@ def _server_view(server, state: dict, *, tenant: str = '', user: str = '') -> di
     return {
         'id': server.id,
         'name': server.title or server.id,
+        # 控制台发布时写的简介，用户端详情弹窗直接展示（别的来源没有这段文字）
+        'description': description,
         'transport': server.transport,
         'auth': auth_mode,
+        # ops/platform/shared 归运维或管理员；只有 user 是这个用户在面板里自己加的，
+        # 前端据此决定要不要显示「删除」。
+        'scope': getattr(server, 'scope', 'ops'),
+        'removable': getattr(server, 'scope', 'ops') == 'user',
         'configured': True,
         'authorized': oauth_ready,
         'need_authorize': auth_mode == 'oauth' and not oauth_ready,
@@ -117,11 +134,18 @@ def _server_view(server, state: dict, *, tenant: str = '', user: str = '') -> di
 
 @router.get('')
 async def list_connectors(principal=Depends(policies.current_principal)):
+    from webpage_agent.store import platform_catalog
+
     state = _load(principal)
     tenant, user = _ids(principal)
-    servers = mcp_servers.servers()
+    # 只有这个主体看得见的集合：共享层 + 他自己的自建连接器。
+    servers = mcp_servers.servers(owner_key=_owner(principal))
     configured = {server.id for server in servers}
-    items = [_server_view(server, state, tenant=tenant, user=user)
+    # 平台连接器的简介存在目录里，`Server` 上没有这个字段——按 id 补一份。
+    blurbs = {row['id']: str(row.get('description') or '')
+              for row in platform_catalog.enabled_connectors()}
+    items = [_server_view(server, state, tenant=tenant, user=user,
+                          description=blurbs.get(server.id, ''))
              for server in servers]
     for item in catalog.CONNECTORS:
         if item.get('id') in configured:
@@ -277,7 +301,7 @@ def _page(title: str, message: str, *, ok: bool, server_id: str = '') -> HTMLRes
 async def oauth_start(connector_id: str, request: Request,
                       principal=Depends(policies.current_principal)):
     """返回授权页地址。前端用新窗口打开，不要整页跳走。"""
-    server = mcp_servers.by_id(connector_id)
+    server = mcp_servers.by_id(connector_id, owner_key=_owner(principal))
     if server is None:
         raise HTTPException(status_code=404, detail='该连接器还没有配置 MCP_SERVERS')
     if str(getattr(server, 'auth', '') or '') != 'oauth':
@@ -309,7 +333,10 @@ async def oauth_callback(connector_id: str, request: Request,
     if not code:
         return _page('授权失败', '回调里没有 code 参数。', ok=False)
 
-    server = mcp_servers.by_id(connector_id)
+    server = mcp_servers.by_id(
+        connector_id,
+        owner_key=mcp_servers.owner_key_for_values(
+            str(row.get('tenant_id') or ''), str(row.get('user_id') or '')))
     if server is None:
         return _page('授权失败', '该连接器已从配置里移除。', ok=False)
 
@@ -333,6 +360,10 @@ async def oauth_callback(connector_id: str, request: Request,
         'redirect_uri': str(row.get('redirect_uri') or ''),
         'issuer': issuer,
         'service': str(getattr(server, 'url', '') or ''),
+        # 端点一并落盘：以后刷新 token 不必再问一次 well-known，授权服务器抖动
+        # 一次不会再让整条链挂死。
+        'token_endpoint': str(meta.get('token_endpoint') or ''),
+        'authorization_endpoint': str(meta.get('authorization_endpoint') or ''),
         'scope': tokens.get('scope') or ' '.join(
             str(x) for x in (getattr(server, 'oauth_scopes', ()) or ())),
         'tokens': tokens,
@@ -380,7 +411,7 @@ async def oauth_callback(connector_id: str, request: Request,
 async def oauth_revoke(connector_id: str, request: Request,
                        principal=Depends(policies.current_principal)):
     """撤销本主体的授权：删凭据文件，并把绑定标成 inactive。"""
-    server = mcp_servers.by_id(connector_id)
+    server = mcp_servers.by_id(connector_id, owner_key=_owner(principal))
     if server is None:
         raise HTTPException(status_code=404, detail='连接器不存在')
     tenant, user = _ids(principal)
@@ -412,7 +443,7 @@ async def oauth_revoke(connector_id: str, request: Request,
 @router.post('/{connector_id}/connect')
 async def connect_connector(connector_id: str,
                             principal=Depends(policies.current_principal)):
-    server = mcp_servers.by_id(connector_id)
+    server = mcp_servers.by_id(connector_id, owner_key=_owner(principal))
     if server is None:
         raise HTTPException(status_code=404,
                             detail='该连接器还没有配置 MCP_SERVERS，请先在 .env 添加服务端')
@@ -455,7 +486,7 @@ async def connect_connector(connector_id: str,
 @router.post('/{connector_id}/disconnect')
 async def disconnect_connector(connector_id: str,
                                principal=Depends(policies.current_principal)):
-    if mcp_servers.by_id(connector_id) is None:
+    if mcp_servers.by_id(connector_id, owner_key=_owner(principal)) is None:
         raise HTTPException(status_code=404, detail='连接器不存在')
     state = _load(principal)
     previous = state.get(connector_id) or {}
@@ -466,9 +497,34 @@ async def disconnect_connector(connector_id: str,
     return {'id': connector_id, 'enabled': False}
 
 
+@router.delete('/{connector_id}')
+async def delete_connector(connector_id: str,
+                           principal=Depends(policies.current_principal)):
+    """删除**自己加的**连接器。
+
+    只允许删自己那份配置里的条目。运维（MCP_SERVERS）、控制台发布的平台连接器、
+    兼容期的全局单文件都不归用户管——那些要删得走各自的入口。
+    """
+    server = mcp_servers.by_id(connector_id, owner_key=_owner(principal))
+    if server is None:
+        raise HTTPException(status_code=404, detail='连接器不存在')
+    if getattr(server, 'scope', '') != 'user':
+        raise HTTPException(status_code=403,
+                            detail='该连接器由运维或管理员配置，不能在用户端删除')
+    if not mcp_servers.remove_user_server(_owner(principal), connector_id):
+        raise HTTPException(status_code=404, detail='连接器不存在')
+    state = _load(principal)
+    state.pop(connector_id, None)
+    _save(principal, state)
+    _reset_tool_cache()
+    return {'id': connector_id, 'deleted': True}
+
+
 @router.get('/{connector_id}/tools')
 async def connector_tools(connector_id: str,
                           principal=Depends(policies.current_principal)):
+    if mcp_servers.by_id(connector_id, owner_key=_owner(principal)) is None:
+        raise HTTPException(status_code=404, detail='连接器不存在')
     row = _load(principal).get(connector_id) or {}
     return {'id': connector_id, 'enabled': bool(row.get('enabled')),
             'tools': int(row.get('tools') or 0),

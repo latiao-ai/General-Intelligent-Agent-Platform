@@ -53,7 +53,7 @@ EXPERTS = [
 2. 任务有多步时，先列出 3~6 步的计划，再逐步执行；每步做完用一句话说明进展。
 3. 能用工具验证的结论就调工具验证，不靠记忆下判断。
 4. 交付时给出可直接使用的东西：链接、文件名、表格或结论段落。""",
-        skill_ids=('deep-research', 'html-report'),
+        skill_ids=('deep-research', 'sources-page'),
     ),
     _expert(
         'exp-research', '深度检索', '🔎', '#e8f1ff',
@@ -77,7 +77,7 @@ EXPERTS = [
 2. 素材不足时先补检索；不要用套话填空。
 3. 结构：一句话结论 → 关键发现（3~5 条）→ 依据与数据 → 风险与建议。
 4. 需要交付文件时，生成完整的 HTML/Markdown 文件并给出路径或链接，而不是只在聊天里贴片段。""",
-        skill_ids=('html-report', 'industry-report', 'weekly-report'),
+        skill_ids=('industry-report', 'weekly-report'),
     ),
     _expert(
         'exp-data', '数据分析', '📊', '#eefaf0',
@@ -114,7 +114,7 @@ EXPERTS = [
 2. 单文件优先：一个 HTML 内联样式和脚本，双击就能打开，减少依赖。
 3. 交付可运行的产物，并说明怎么打开、怎么改；部署类操作先确认再执行。
 4. 界面要能直接用：有加载态、有空态、出错有提示，不要只有"假页面"。""",
-        skill_ids=('deploy-online', 'html-report'),
+        skill_ids=('deploy-online',),
     ),
 ]
 

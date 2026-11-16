@@ -13,7 +13,7 @@ import psycopg
 
 from webpage_agent.core.config import settings
 from webpage_agent.observe import telemetry
-from webpage_agent.store.pg_store import SessionGoalConflict, now
+from webpage_agent.store.pg_store import now
 
 class PgTasks:
     """PgTasks 方法组。见模块说明。"""
@@ -80,14 +80,10 @@ class PgTasks:
                                       'WHERE session_id=%s FOR UPDATE', (session_id,))
             if (session['tenant_id'], session['owner_user_id']) != (tenant_id, owner_user_id):
                 raise PermissionError('会话不属于当前主体')
-            current = await self._one(conn,
-                'SELECT r.task_id, r.run_id FROM tasks t JOIN tasks_meta m '
-                'ON m.task_id=t.task_id JOIN runs r ON r.run_id=m.current_run_id '
-                "WHERE t.session_id=%s AND r.status NOT IN "
-                "('succeeded','partially_succeeded','failed','cancelled') "
-                'ORDER BY r.created_at LIMIT 1', (session_id,))
-            if current:
-                raise SessionGoalConflict(current['task_id'], current['run_id'])
+            # 会话级准入：同会话已有别的未结束目标就拒。session 行锁已经在上面
+            # 拿到（`FOR UPDATE`），所以这里是"锁后再查"，两个并发请求不会都
+            # 读到"没有"。判定与 create_run 共用同一份实现。
+            await self._reject_other_open_goal(conn, session_id=session_id)
             await self._run(conn, 'INSERT INTO tasks '
                 '(task_id,session_id,message,status,created_at,updated_at) '
                 "VALUES (%s,%s,%s,'queued',%s,%s)",
@@ -98,9 +94,10 @@ class PgTasks:
                 (task_id, tenant_id, owner_user_id, message, run_id, stamp,
                  json.dumps(scene or {}, ensure_ascii=False)))
             await self._run(conn, 'INSERT INTO runs '
-                '(run_id,task_id,tenant_id,status,owner_user_id,owner_role,platform_id,platform_subject,created_at,updated_at,trace_id,runtime_kind,runtime_version,runtime_state_schema) '
-                "VALUES (%s,%s,%s,'queued',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (run_id, task_id, tenant_id, owner_user_id, owner_role, platform_id, platform_subject, stamp, stamp,
+                '(run_id,task_id,session_id,tenant_id,status,owner_user_id,owner_role,platform_id,platform_subject,created_at,updated_at,trace_id,runtime_kind,runtime_version,runtime_state_schema) '
+                "VALUES (%s,%s,%s,%s,'queued',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (run_id, task_id, session_id, tenant_id, owner_user_id, owner_role,
+                 platform_id, platform_subject, stamp, stamp,
                  telemetry.trace_id.get() or uuid.uuid4().hex,
                  runtime_kind, runtime_version, runtime_state_schema))
             # 用户消息：来源 turn 已经存过用户消息时，避免重复保存（聊天里的「建任务」

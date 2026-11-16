@@ -29,12 +29,13 @@ CREATE TABLE IF NOT EXISTS user_workspaces (
     PRIMARY KEY (tenant_id, owner_user_id)
 );
 CREATE TABLE IF NOT EXISTS messages (
-    id         BIGSERIAL PRIMARY KEY,
-    session_id TEXT NOT NULL,
-    role       TEXT NOT NULL,
-    content    TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    dedupe_key TEXT NOT NULL DEFAULT ''
+    id             BIGSERIAL PRIMARY KEY,
+    session_id     TEXT NOT NULL,
+    role           TEXT NOT NULL,
+    content        TEXT NOT NULL,
+    content_blocks TEXT NOT NULL DEFAULT '',
+    created_at     TEXT NOT NULL,
+    dedupe_key     TEXT NOT NULL DEFAULT ''
 );
 CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_dedupe
     ON messages(session_id, dedupe_key) WHERE dedupe_key <> '';
@@ -81,6 +82,9 @@ CREATE TABLE IF NOT EXISTS tasks_meta (
 CREATE TABLE IF NOT EXISTS runs (
     run_id              TEXT PRIMARY KEY,
     task_id             TEXT NOT NULL,
+    -- 会话锚点：业务 run 从哪个会话发起。turn 内部执行记录（task_id = run_id）
+    -- 也回填，供按会话排查；但下面的唯一索引只约束业务 run。
+    session_id          TEXT,
     tenant_id           TEXT NOT NULL DEFAULT 'default',
     status              TEXT NOT NULL,
     plan_version        INTEGER NOT NULL DEFAULT 0,
@@ -101,6 +105,13 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 CREATE INDEX IF NOT EXISTS idx_runs_task ON runs(task_id);
 CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status, lease_expires_at);
+-- 按会话查活跃 run：以前要 join tasks + tasks_meta 才能回答「这个会话还有没有
+-- 未结束的目标」，现在一次索引扫描就够。
+CREATE INDEX IF NOT EXISTS idx_runs_session ON runs(session_id, status);
+-- 这里**故意没有**「一会话一活跃 run」的唯一索引：一个目标允许多次执行尝试
+-- （create_run 用于恢复与补偿），旧 run 未必已到终态，硬约束会把合法的重试
+-- 拒掉。这条不变量由 create_goal / create_run 共用的守卫维持，见
+-- PgRuns._reject_other_open_goal()。
 
 -- ---------- 计划（文档 §6.1） ----------
 CREATE TABLE IF NOT EXISTS plans (
@@ -682,6 +693,7 @@ ALTER TABLE runs ADD COLUMN IF NOT EXISTS runtime_state_schema INTEGER NOT NULL 
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS dedupe_key TEXT NOT NULL DEFAULT '';
 CREATE UNIQUE INDEX IF NOT EXISTS uq_messages_dedupe
     ON messages(session_id, dedupe_key) WHERE dedupe_key <> '';
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_blocks TEXT NOT NULL DEFAULT '';
 
 -- 费用明细的完整快照。v2 里那张表是给「已经记过基线、还没有这张表」的存量库建的，
 -- 而且建完就不再执行。用途和估算标记必须写在这里，verify_schema 才认得出
@@ -870,6 +882,410 @@ CREATE TABLE IF NOT EXISTS experts (
 );
 CREATE INDEX IF NOT EXISTS idx_experts_owner
     ON experts(tenant_id, owner_user_id, created_at);
+
+-- ---------- 本地账号登录（docs/local-account-auth.md） ----------
+-- 只存凭据与失败计数。账号状态以 app_users.status 为唯一真相，这里不重复存，
+-- 避免两处状态打架；身份绑定仍写 identities（identity_provider_id='local'）。
+-- 一期只允许 tenant_id='default'：identities 的主键 (provider, subject) 是
+-- 全局唯一的，跨租户同名会撞主键。要支持多租户得先改 subject 编码。
+CREATE TABLE IF NOT EXISTS local_accounts (
+    username             TEXT NOT NULL,
+    tenant_id            TEXT NOT NULL DEFAULT 'default',
+    user_id              TEXT NOT NULL,
+    password_hash        TEXT NOT NULL,
+    password_algo        TEXT NOT NULL DEFAULT 'scrypt-16384-8-1',
+    password_updated_at  TEXT NOT NULL,
+    failed_count         INTEGER NOT NULL DEFAULT 0,
+    locked_until         DOUBLE PRECISION NOT NULL DEFAULT 0,
+    must_change_password INTEGER NOT NULL DEFAULT 0,
+    last_login_at        TEXT,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL,
+    created_by           TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (tenant_id, username)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_local_accounts_user
+    ON local_accounts(user_id);
+
+-- ---------- 机器人（Bot Mode，docs/bot-mode.md） ----------
+-- 一台中台里的每个机器人都不是一个新进程，而是一行身份 + 一个规范会话 +
+-- 一份自己的记忆作用域。隔离靠 (bot_id) 这个键，不靠进程：同一份 Worker 服务
+-- 所有机器人，每轮按会话行上的 bot_id 作用域化人设、模型、技能与记忆。
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS bot_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS room_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_kind TEXT NOT NULL DEFAULT 'task';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '';
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS hidden INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS capability_epoch TEXT NOT NULL DEFAULT '';
+-- 「标题即身份」在本项目的落地：机器人没有 session-id 指针，规范会话由
+-- (bot_id, session_kind='bot_chat') 唯一索引解析 → 幂等、可重建、跨客户端一致。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sessions_bot_chat
+    ON sessions(bot_id) WHERE session_kind = 'bot_chat';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_sessions_bot_room
+    ON sessions(bot_id, room_id) WHERE session_kind = 'bot_room';
+CREATE INDEX IF NOT EXISTS idx_sessions_bot
+    ON sessions(bot_id, session_kind);
+
+CREATE TABLE IF NOT EXISTS bots (
+    bot_id             TEXT PRIMARY KEY,
+    tenant_id          TEXT NOT NULL DEFAULT 'default',
+    owner_user_id      TEXT NOT NULL DEFAULT 'default',
+    handle             TEXT NOT NULL DEFAULT '',
+    name               TEXT NOT NULL,
+    title              TEXT NOT NULL DEFAULT '',
+    description        TEXT NOT NULL DEFAULT '',
+    soul               TEXT NOT NULL DEFAULT '',
+    model              TEXT NOT NULL DEFAULT '',
+    skill_ids_json     TEXT NOT NULL DEFAULT '[]',
+    connector_ids_json TEXT NOT NULL DEFAULT '[]',
+    section_id         TEXT NOT NULL DEFAULT '',
+    icon               TEXT NOT NULL DEFAULT '🤖',
+    color              TEXT NOT NULL DEFAULT '#eef4ff',
+    shape              TEXT NOT NULL DEFAULT 'circle',
+    image              TEXT NOT NULL DEFAULT '',
+    pinned             INTEGER NOT NULL DEFAULT 0,
+    hidden             INTEGER NOT NULL DEFAULT 0,
+    status             TEXT NOT NULL DEFAULT 'active',
+    ui_json            TEXT NOT NULL DEFAULT '{}',
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_bots_handle
+    ON bots(owner_user_id, handle);
+CREATE INDEX IF NOT EXISTS idx_bots_owner
+    ON bots(tenant_id, owner_user_id, created_at);
+
+-- 分区只是花名册的展示维度：成员归属跟随机器人（bots.section_id），
+-- 分区名与顺序单独一张表，避免"空分区"在机器人行里无处安放。
+CREATE TABLE IF NOT EXISTS bot_sections (
+    section_id    TEXT PRIMARY KEY,
+    tenant_id     TEXT NOT NULL DEFAULT 'default',
+    owner_user_id TEXT NOT NULL DEFAULT 'default',
+    name          TEXT NOT NULL,
+    position      INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_bot_sections_name
+    ON bot_sections(owner_user_id, name);
+
+-- 机器人之间的投递收据（邮箱）。**不是**"发出去就算成功"：一行一个 delivery_id，
+-- 幂等键由发送方生成，重试复用同一个 id；状态机见 docs/bot-mode.md。
+CREATE TABLE IF NOT EXISTS bot_deliveries (
+    delivery_id   TEXT PRIMARY KEY,
+    tenant_id     TEXT NOT NULL DEFAULT 'default',
+    owner_user_id TEXT NOT NULL DEFAULT 'default',
+    from_bot      TEXT NOT NULL DEFAULT '',
+    to_bot        TEXT NOT NULL,
+    kind          TEXT NOT NULL DEFAULT 'dm',
+    room_id       TEXT NOT NULL DEFAULT '',
+    body          TEXT NOT NULL DEFAULT '',
+    hop           INTEGER NOT NULL DEFAULT 0,
+    max_hops      INTEGER NOT NULL DEFAULT 2,
+    status        TEXT NOT NULL DEFAULT 'queued',
+    turn_id       TEXT NOT NULL DEFAULT '',
+    session_id    TEXT NOT NULL DEFAULT '',
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    reason        TEXT NOT NULL DEFAULT '',
+    result        TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bot_deliveries_inbox
+    ON bot_deliveries(to_bot, status);
+CREATE INDEX IF NOT EXISTS idx_bot_deliveries_turn
+    ON bot_deliveries(turn_id);
+
+-- 群聊：房间 + append-only 事件日志 + 每步一个 task。
+-- 调度归 Worker（租约 + 代次栅栏），关掉浏览器也照常推进。
+CREATE TABLE IF NOT EXISTS bot_rooms (
+    room_id          TEXT PRIMARY KEY,
+    tenant_id        TEXT NOT NULL DEFAULT 'default',
+    owner_user_id    TEXT NOT NULL DEFAULT 'default',
+    name             TEXT NOT NULL,
+    topic            TEXT NOT NULL DEFAULT '',
+    members_json     TEXT NOT NULL DEFAULT '[]',
+    max_rounds       INTEGER NOT NULL DEFAULT 3,
+    max_messages     INTEGER NOT NULL DEFAULT 10,
+    round_no         INTEGER NOT NULL DEFAULT 0,
+    status           TEXT NOT NULL DEFAULT 'open',
+    next_seq         INTEGER NOT NULL DEFAULT 1,
+    lease_owner      TEXT NOT NULL DEFAULT '',
+    lease_expires_at DOUBLE PRECISION NOT NULL DEFAULT 0,
+    lease_generation BIGINT NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bot_rooms_owner
+    ON bot_rooms(tenant_id, owner_user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS bot_room_events (
+    room_id      TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    event_id     TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    actor        TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (room_id, seq),
+    UNIQUE (room_id, event_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bot_room_events_kind
+    ON bot_room_events(room_id, kind);
+
+CREATE TABLE IF NOT EXISTS bot_room_tasks (
+    task_id    TEXT PRIMARY KEY,
+    room_id    TEXT NOT NULL,
+    epoch      INTEGER NOT NULL DEFAULT 1,
+    round_no   INTEGER NOT NULL,
+    position   INTEGER NOT NULL,
+    bot_id     TEXT NOT NULL,
+    turn_id    TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'running',
+    reason     TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (room_id, epoch, round_no, position)
+);
+CREATE INDEX IF NOT EXISTS idx_bot_room_tasks_open
+    ON bot_room_tasks(room_id, status);
+CREATE INDEX IF NOT EXISTS idx_bot_room_tasks_turn
+    ON bot_room_tasks(turn_id);
+
+-- 例行任务（routines）：定时任务归属某个机器人时，结果投递回它的规范会话。
+ALTER TABLE scheduled_tasks ADD COLUMN IF NOT EXISTS bot_id TEXT NOT NULL DEFAULT '';
+
+-- ---------- 机器人广场（docs/bot-plaza.md） ----------
+-- 条目存的是**发布那一刻的快照**（人设/技能/连接器/模型），不是指向 bots 的指针：
+-- 投稿人之后再改自己的机器人，不应该悄悄改掉别人已经看到的版本；
+-- 要更新广场版本，重新投稿一次（version+1，重新进入评审）。
+CREATE TABLE IF NOT EXISTS bot_plaza_items (
+    item_id            TEXT PRIMARY KEY,
+    slug               TEXT NOT NULL DEFAULT '',
+    source_bot_id      TEXT NOT NULL DEFAULT '',
+    publisher_user_id  TEXT NOT NULL DEFAULT '',
+    publisher_tenant   TEXT NOT NULL DEFAULT 'default',
+    name               TEXT NOT NULL,
+    handle             TEXT NOT NULL DEFAULT '',
+    title              TEXT NOT NULL DEFAULT '',
+    description        TEXT NOT NULL DEFAULT '',
+    soul               TEXT NOT NULL DEFAULT '',
+    model              TEXT NOT NULL DEFAULT '',
+    skill_ids_json     TEXT NOT NULL DEFAULT '[]',
+    connector_ids_json TEXT NOT NULL DEFAULT '[]',
+    icon               TEXT NOT NULL DEFAULT '🤖',
+    color              TEXT NOT NULL DEFAULT '#eef4ff',
+    shape              TEXT NOT NULL DEFAULT 'circle',
+    image              TEXT NOT NULL DEFAULT '',
+    category           TEXT NOT NULL DEFAULT 'general',
+    tags_json          TEXT NOT NULL DEFAULT '[]',
+    readme             TEXT NOT NULL DEFAULT '',
+    starters_json      TEXT NOT NULL DEFAULT '[]',
+    scope              TEXT NOT NULL DEFAULT 'tenant',
+    status             TEXT NOT NULL DEFAULT 'draft',
+    featured           INTEGER NOT NULL DEFAULT 0,
+    position           INTEGER NOT NULL DEFAULT 0,
+    install_count      INTEGER NOT NULL DEFAULT 0,
+    view_count         INTEGER NOT NULL DEFAULT 0,
+    review_note        TEXT NOT NULL DEFAULT '',
+    reviewed_by        TEXT NOT NULL DEFAULT '',
+    reviewed_at        TEXT NOT NULL DEFAULT '',
+    version            INTEGER NOT NULL DEFAULT 1,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_bot_plaza_slug
+    ON bot_plaza_items(slug);
+CREATE INDEX IF NOT EXISTS idx_bot_plaza_listing
+    ON bot_plaza_items(status, scope, position, created_at);
+CREATE INDEX IF NOT EXISTS idx_bot_plaza_publisher
+    ON bot_plaza_items(publisher_tenant, publisher_user_id, created_at);
+
+-- 安装登记：一个用户对同一条目只装一次。install 行是"装过没有"的唯一事实，
+-- 不靠 bots.ui_json 里的标记——那样查一次列表要扫全部机器人行。
+CREATE TABLE IF NOT EXISTS bot_plaza_installs (
+    install_id    TEXT PRIMARY KEY,
+    item_id       TEXT NOT NULL,
+    bot_id        TEXT NOT NULL DEFAULT '',
+    tenant_id     TEXT NOT NULL DEFAULT 'default',
+    owner_user_id TEXT NOT NULL DEFAULT 'default',
+    item_version  INTEGER NOT NULL DEFAULT 1,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    UNIQUE (tenant_id, owner_user_id, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bot_plaza_installs_item
+    ON bot_plaza_installs(item_id);
+
+-- 积分钱包：只记"进账"（充值/赠送/人工调整），消耗按 provider_charges 实时聚合，
+-- 不落流水。余额 = 进账合计 − 已用合计，见 webpage_agent.store.pg_credits。
+CREATE TABLE IF NOT EXISTS credit_grants (
+    grant_id      TEXT PRIMARY KEY,
+    tenant_id     TEXT NOT NULL,
+    user_id       TEXT NOT NULL,
+    amount_micros BIGINT NOT NULL,
+    kind          TEXT NOT NULL DEFAULT 'grant',
+    note          TEXT NOT NULL DEFAULT '',
+    operator_id   TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_credit_grants_user
+    ON credit_grants(tenant_id, user_id, created_at);
+CREATE TABLE IF NOT EXISTS credit_orders (
+    order_id    TEXT PRIMARY KEY,
+    tenant_id   TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    package_id  TEXT NOT NULL,
+    points      BIGINT NOT NULL,
+    price_cents INTEGER NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  TEXT NOT NULL,
+    paid_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_credit_orders_user
+    ON credit_orders(tenant_id, user_id, created_at);
+
+-- 消息平台（IM 网关）：配置面（im_channels）、运行态快照（im_runtime）、
+-- 入站队列（im_inbox）与幂等表、配对、会话映射、出站队列、iLink 登录态、
+-- 审计事件。运行态放库里：API 进程只读、Worker 进程单写，两个进程看到同一份。
+-- 存量库由 v26_messaging 建出来；这里保持新库快照完整。
+CREATE TABLE IF NOT EXISTS im_channels (
+    tenant_id          TEXT NOT NULL,
+    owner_user_id      TEXT NOT NULL,
+    channel_id         TEXT NOT NULL,
+    -- 一个机器人一个 IM 应用：同渠道同 owner 下可以有多份配置。'' = 存量那一份。
+    instance_id        TEXT NOT NULL DEFAULT '',
+    enabled            INTEGER NOT NULL DEFAULT 0,
+    config_json        TEXT NOT NULL DEFAULT '{}',
+    bot_id             TEXT NOT NULL DEFAULT '',
+    dm_policy          TEXT NOT NULL DEFAULT 'pair',
+    group_policy       TEXT NOT NULL DEFAULT 'mention',
+    allowed_users_json TEXT NOT NULL DEFAULT '[]',
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, owner_user_id, channel_id, instance_id)
+);
+
+CREATE TABLE IF NOT EXISTS im_runtime (
+    tenant_id     TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    channel_id    TEXT NOT NULL,
+    instance_id   TEXT NOT NULL DEFAULT '',
+    state         TEXT NOT NULL DEFAULT '',
+    detail        TEXT NOT NULL DEFAULT '',
+    error_code    TEXT NOT NULL DEFAULT '',
+    fingerprint   TEXT NOT NULL DEFAULT '',
+    worker_id     TEXT NOT NULL DEFAULT '',
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, owner_user_id, channel_id, instance_id)
+);
+
+CREATE TABLE IF NOT EXISTS im_inbox (
+    inbox_id      TEXT PRIMARY KEY,
+    platform      TEXT NOT NULL,
+    tenant_id     TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    instance_id   TEXT NOT NULL DEFAULT '',
+    message_id    TEXT NOT NULL,
+    payload_json  TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'queued',
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    next_at       DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    UNIQUE (platform, tenant_id, owner_user_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_im_inbox_due
+    ON im_inbox(status, next_at);
+
+CREATE TABLE IF NOT EXISTS im_processed (
+    platform   TEXT NOT NULL,
+    tenant_id  TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    created_at DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (platform, tenant_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS idx_im_processed_time
+    ON im_processed(created_at);
+
+CREATE TABLE IF NOT EXISTS im_pairing (
+    tenant_id     TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    platform      TEXT NOT NULL,
+    instance_id   TEXT NOT NULL DEFAULT '',
+    user_id       TEXT NOT NULL,
+    chat_id       TEXT NOT NULL DEFAULT '',
+    code_hash     TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT 'pending',
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    expires_at    DOUBLE PRECISION NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, owner_user_id, platform, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS im_sessions (
+    tenant_id     TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    platform      TEXT NOT NULL,
+    instance_id   TEXT NOT NULL DEFAULT '',
+    chat_id       TEXT NOT NULL,
+    chat_type     TEXT NOT NULL DEFAULT 'dm',
+    session_id    TEXT NOT NULL,
+    generation    INTEGER NOT NULL DEFAULT 1,
+    bot_id        TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, owner_user_id, platform, instance_id, chat_id)
+);
+CREATE INDEX IF NOT EXISTS idx_im_sessions_owner
+    ON im_sessions(tenant_id, owner_user_id, platform, instance_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS im_outbox (
+    outbox_id        TEXT PRIMARY KEY,
+    tenant_id        TEXT NOT NULL,
+    owner_user_id    TEXT NOT NULL,
+    channel_id       TEXT NOT NULL,
+    instance_id      TEXT NOT NULL DEFAULT '',
+    platform_chat_id TEXT NOT NULL,
+    sent_key         TEXT NOT NULL,
+    text             TEXT NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'queued',
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    next_at          DOUBLE PRECISION NOT NULL DEFAULT 0,
+    last_error       TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    UNIQUE (tenant_id, owner_user_id, channel_id, sent_key)
+);
+CREATE INDEX IF NOT EXISTS idx_im_outbox_due
+    ON im_outbox(status, next_at);
+
+CREATE TABLE IF NOT EXISTS im_login_state (
+    tenant_id     TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    channel_id    TEXT NOT NULL,
+    state_json    TEXT NOT NULL DEFAULT '{}',
+    updated_at    TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, owner_user_id, channel_id)
+);
+
+CREATE TABLE IF NOT EXISTS im_events (
+    event_id      BIGSERIAL PRIMARY KEY,
+    tenant_id     TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    channel_id    TEXT NOT NULL,
+    instance_id   TEXT NOT NULL DEFAULT '',
+    direction     TEXT NOT NULL DEFAULT '',
+    chat_id_hash  TEXT NOT NULL DEFAULT '',
+    message_id    TEXT NOT NULL DEFAULT '',
+    status        TEXT NOT NULL DEFAULT '',
+    error_code    TEXT NOT NULL DEFAULT '',
+    created_at    TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_im_events_channel
+    ON im_events(tenant_id, owner_user_id, channel_id, instance_id, event_id DESC);
 
 """
 # 时间单位约定：

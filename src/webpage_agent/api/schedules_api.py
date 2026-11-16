@@ -66,6 +66,9 @@ class ScheduleBody(BaseModel):
     enabled: bool = True
     connector_ids: list[str] | None = None
     delivery: DeliveryConfig | None = None
+    # 例行任务（Routines）：归属某个机器人时，结果投递回它的规范会话。
+    # 不传 = 普通定时任务（跑业务 run，结果按 delivery 配置出站）。
+    bot_id: str = ''
 
 
 class SchedulePatch(BaseModel):
@@ -80,6 +83,7 @@ class SchedulePatch(BaseModel):
     enabled: bool | None = None
     connector_ids: list[str] | None = None
     delivery: DeliveryConfig | None = None
+    bot_id: str | None = None
 
 
 # ---------- 校验与转换 ----------
@@ -181,6 +185,8 @@ def _view(row: dict) -> dict:
         'consecutive_failures': int(row.get('consecutive_failures') or 0),
         'connector_ids': row.get('connector_ids') or [],
         'delivery': delivery,
+        # 例行任务归属的机器人；空串 = 普通定时任务。
+        'bot_id': row.get('bot_id') or '',
         'created_at': row.get('created_at'),
         'updated_at': row.get('updated_at'),
     }
@@ -241,7 +247,8 @@ async def create_schedule(payload: ScheduleBody,
         scheduled_at=payload.scheduled_at, valid_from=payload.valid_from,
         valid_until=payload.valid_until,
         next_run_at=next_run_at if payload.enabled else None,
-        connector_ids=payload.connector_ids, delivery=_delivery_json(payload.delivery))
+        connector_ids=payload.connector_ids, delivery=_delivery_json(payload.delivery),
+        bot_id=str(payload.bot_id or ''))
     return _view(row)
 
 
@@ -272,6 +279,9 @@ async def patch_schedule(schedule_id: str, payload: SchedulePatch,
         fields['valid_until'] = payload.valid_until
     if payload.enabled is not None:
         fields['enabled'] = bool(payload.enabled)
+    if payload.bot_id is not None:
+        # 空串表示"取消归属机器人"（回到普通定时任务），所以不能只判 truthy。
+        fields['bot_id'] = str(payload.bot_id or '')
     # connector/delivery 在仓储里是 *_json 列，这里直接按列名编码。
     if payload.connector_ids is not None:
         fields['connector_ids_json'] = json.dumps(payload.connector_ids,

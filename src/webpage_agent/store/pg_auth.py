@@ -427,11 +427,44 @@ class PgAuth:
             await self._run(conn, 'UPDATE sessions SET updated_at=%s WHERE session_id=%s', (stamp, session_id))
             await conn.commit()
 
+    async def rename_session(self, session_id: str, title: str) -> None:
+        """改侧栏里显示的标题。**不碰消息**：标题只是展示名。
+
+        `sessions.title` 非空时优先于"第一条用户消息"，所以改名会一直生效，
+        直到用户再改一次（不是把消息正文改掉）。
+        """
+        async with self._lease() as conn:
+            cur = await self._run(
+                conn, 'UPDATE sessions SET title=%s WHERE session_id=%s',
+                (title, session_id))
+            if not cur.rowcount:
+                raise LookupError('会话不存在')
+            await conn.commit()
+
+    async def touch_session(self, session_id: str) -> None:
+        """把会话的 updated_at 推到当前：侧栏/花名册按它排序。"""
+        async with self._lease() as conn:
+            await self._run(conn, 'UPDATE sessions SET updated_at=%s '
+                                  'WHERE session_id=%s', (now(), session_id))
+            await conn.commit()
+
     async def messages(self, session_id: str) -> list[dict]:
         async with self._lease() as conn:
-            rows = await self._all(conn, 'SELECT role, content FROM messages WHERE session_id=%s ORDER BY id',
-                (session_id,))
-        return [{'role': r['role'], 'content': r['content']} for r in rows]
+            rows = await self._all(conn, 'SELECT role, content, content_blocks '
+                                         'FROM messages WHERE session_id=%s ORDER BY id',
+                                   (session_id,))
+        out = []
+        for r in rows:
+            blocks = []
+            try:
+                parsed = json.loads(r.get('content_blocks') or '[]')
+                if isinstance(parsed, list):
+                    blocks = parsed
+            except (TypeError, ValueError):
+                blocks = []
+            out.append({'role': r['role'], 'content': r['content'],
+                        'content_blocks': blocks})
+        return out
 
     async def messages_after(self, session_id: str, after_id: int = 0) -> list[dict]:
         """取 id 大于 after_id 的消息（带 id），供压缩与增量历史使用。"""
@@ -455,6 +488,7 @@ class PgAuth:
                           clarification: str = '',
                           connector_ids: list | None = None,
                           addon_selection: dict | None = None,
+                          content_blocks: list | None = None,
                           platform_subject: str | None = None) -> dict:
         """用户消息 + 待执行 turn + 接纳事件同事务提交。
 
@@ -508,10 +542,14 @@ class PgAuth:
                  json.dumps([str(x) for x in (connector_ids or [])], ensure_ascii=False),
                  0, tenant_id, owner_user_id,
                  str(owner_role or 'member'), stamp, stamp))
-            # 用户消息（同事务）
-            await self._run(conn, 'INSERT INTO messages (session_id, role, content, created_at, dedupe_key) '
-                'VALUES (%s,%s,%s,%s,%s)',
-                (session_id, 'user', message, stamp, f'turn:{turn_id}'))
+            # 用户消息（同事务）。content_blocks 存结构化内容块（技能胶囊回显用）。
+            content_blocks_json = json.dumps(
+                content_blocks or [], ensure_ascii=False)
+            await self._run(conn, 'INSERT INTO messages '
+                '(session_id, role, content, content_blocks, created_at, dedupe_key) '
+                'VALUES (%s,%s,%s,%s,%s,%s)',
+                (session_id, 'user', message, content_blocks_json, stamp,
+                 f'turn:{turn_id}'))
             msg_row = await self._one(conn,
                 'SELECT id FROM messages WHERE session_id=%s AND dedupe_key=%s',
                 (session_id, f'turn:{turn_id}'))
@@ -856,6 +894,10 @@ class PgAuth:
         where, params = [
             'NOT EXISTS (SELECT 1 FROM scheduled_task_runs o '
             'WHERE o.session_id=s.session_id)'], []
+        # 机器人会话（规范会话 / 房间会话）不进普通侧栏：它们是「机器人」面板的
+        # 专属入口（docs/bot-mode.md），混进任务列表会让"我的任务"里出现一堆
+        # 没有业务目标的对话，而且同一个问题会在两处被回答两次。
+        where.append('s.hidden=0')
         if tenant_id:
             where.append('s.tenant_id=%s')
             params.append(tenant_id)
@@ -868,6 +910,7 @@ class PgAuth:
         clause = (' WHERE ' + ' AND '.join(where)) if where else ''
         async with self._lease() as conn:
             rows = await self._all(conn, 'SELECT s.session_id, s.created_at, s.updated_at, '
+                '  s.title AS explicit_title, '
                 '  (SELECT COUNT(*) FROM messages m WHERE m.session_id=s.session_id) '
                 '    AS message_count, '
                 '  (SELECT content FROM messages m WHERE m.session_id=s.session_id '
@@ -877,7 +920,12 @@ class PgAuth:
         out = []
         for r in rows:
             first = (r['first_message'] or '').strip()
-            title = (first[:24] + '…') if len(first) > 24 else (first or '新会话')
+            explicit = str(r.get('explicit_title') or '').strip()
+            # 显式标题优先（机器人会话会写自己的名字）；否则沿用"取第一条用户消息"。
+            if explicit:
+                title = explicit
+            else:
+                title = (first[:24] + '…') if len(first) > 24 else (first or '新会话')
             out.append({'session_id': r['session_id'],
                         'title': title,
                         'message_count': r['message_count'],

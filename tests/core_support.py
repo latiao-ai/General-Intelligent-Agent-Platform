@@ -13,7 +13,11 @@ from tests.exec_env import valid_test_dsn
 
 # 项目只支持 PostgreSQL，测试也跟着只跑 PG：没有 PG_TEST_DSN 就逐条跳过。
 PG_DSN = os.getenv('PG_TEST_DSN', '')
-TEST_TABLES = ('scheduled_task_runs', 'scheduled_tasks',
+TEST_TABLES = ('im_events', 'im_login_state', 'im_outbox',
+               'im_inbox', 'im_processed', 'im_pairing', 'im_sessions',
+               'im_runtime', 'im_channels', 'bot_room_tasks', 'bot_room_events', 'bot_rooms',
+               'bot_deliveries', 'bot_sections', 'bots',
+               'scheduled_task_runs', 'scheduled_tasks',
                'memory_tombstones', 'memories', 'background_jobs', 'artifacts',
                'action_attempts', 'actions', 'steps', 'plans', 'run_snapshots',
                'run_inputs', 'run_input_processing', 'run_decisions',
