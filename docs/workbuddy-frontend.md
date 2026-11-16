@@ -1,5 +1,12 @@
 # WorkBuddy 风格前端改造说明
 
+> **已被取代（2026-11-13）**：当前的设计系统与改法见
+> [前端设计系统（paper & ink）](frontend-design-system.md)。本文是当时那一版覆盖层的记录。
+
+> **状态（2026-11-13 清理）**：本文描述的 `workbuddy.html` 与 `index.legacy-*.html` 已删除——
+> 改造稿已并入 `index.html`，两份副本没有任何路由引用，属于过期残留。
+> 下文保留为当时的改造记录，不要再按它 `cp workbuddy.html index.html`。
+>
 > 产物：`src/webpage_agent/api/web/workbuddy.html`（新文件，不覆盖现有 `index.html`）
 > 方式：在原单文件页面上追加一层 WorkBuddy 设计覆盖（`<style id="wb-workbuddy-theme">`），**JS / API / 路由全部不动**。
 

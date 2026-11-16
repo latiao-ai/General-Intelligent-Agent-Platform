@@ -221,17 +221,102 @@ GET /api/v1/skills/{slug}?namespace=
 
 ![远端 SkillHub](assets/workbuddy/skillhub-remote.png)
 
+## 4.2 平台技能包（带 references / scripts）
+
+控制台发布的平台技能有两种形态：
+
+| 形态 | 用户安装后拿到 | 什么时候用 |
+|---|---|---|
+| 只有正文（`prompt`） | 按元数据**生成**一份 `SKILL.md` | 纯提示词技能 |
+| 带技能包（zip） | 整包解出 `SKILL.md` + `references/` + `scripts/` | 正文里要模型读附件、跑脚本 |
+
+**发布和安装是两步，仓库也是两个**：
+
+```text
+管理控制台「上传技能包」
+  └─ POST /api/console/platform/skills/{id}/package   (multipart)
+       └─ profile/skillhub/packages/<id>/<version>.zip   ← 发布只落这里
+用户点「+」安装
+  └─ install_skill → _platform_package() → install_archive()
+       └─ profile/skills/<id>/                          ← 安装才落这里
+```
+
+不能合成一步：`skillhub_api._decorate()` 把"磁盘上有目录"当作**已安装**，
+所以发布阶段往 `SKILLS_DIR` 写文件，等于绕过安装、让所有用户凭空多出已装技能。
+
+要点：
+
+- 上传时就用 `skills.inspect_archive()` 校验（必须有 `SKILL.md`、路径不许穿越），
+  与安装时的解析是同一套——不会出现"上传成功、安装报错"；
+- 包里没有 `frontmatter.description` 时用目录条目的简介补，别整包拒绝；
+- 拖文件夹进来时前端把一堆 `File` + 相对路径传上来，服务端压成 zip
+  （浏览器里手搓 zip 的 CRC 一旦写错，表现为"上传成功但解不开"）；
+- 包被删/换了机器时安装**退回生成模式**，只少附属文件，不会失败；
+- 版本号不让人填、也不在控制台显示：换一版就是替换包原件，不需要人维护一个
+  永远停在 `1.0.0` 的数字。
+
+### 4.1 换包之后：包指纹 + 覆盖同步
+
+安装是**幂等的一次性动作**（`_write_skill()` 见目录就报"已存在"），所以管理端
+补传的包不会自己落到已经装过的目录里。线上表现就是：管理端列着 6 个文件，用户
+详情页"技能包内容 · 1 个文件"——那份是当年没有包时**按元数据生成**的 `SKILL.md`。
+
+版本号救不了这件事（它常年停在 `1.0.0`），所以用**包指纹**：
+
+- 上传时算 `sha256(payload)[:16]`，记进目录条目的 `package_digest`；
+- 落地时把同一个指纹写进 `<SKILLS_DIR>/<id>/.package.json`（隐藏文件，不进
+  `file_tree`，模型读不到），`skills_lib.installed_package()` 读它；
+- 两边指纹不一致 = 磁盘上是旧包。
+
+对齐有三个触发点，**用户都不需要点任何东西**：
+
+| 触发 | 代码 | 说明 |
+|---|---|---|
+| 管理端上传/换包 | `console_api.console_upload_platform_package()` | 存完包立刻 `sync_installed()`，响应里的 `sync` 字段带落地文件数 |
+| 用户打开技能中心 | `skillhub_api._catalog_items()` | 列表时比对指纹，不一致就补包（兜"上传时同步失败/包从别处拷来"） |
+| 用户点一次安装 | `_materialize_skill() → _sync_if_stale()` | 装过了也检查指纹，不再"见目录就返回" |
+
+两条硬边界：**没人装过就绝不建目录**（那等于绕过安装、让所有人凭空多一个技能）；
+**同步只动包里的文件**，`.state.json` 的启停状态和用户自己加的文件都不碰，
+上一版有、这一版没有的附件会按旧指纹清掉。
+
+手工兜底：`POST /api/console/platform/skills/{id}/sync`（控制台技能包卡片上的
+「重新同步」）。没装过时返回 `installed=false`，不会借机装一份。
+
+**目录里存的是相对路径**（`word/1.2.0.zip`，相对 `SKILLHUB_PACKAGES_DIR`）。
+存绝对路径在本地跑得好好的，一搬到服务器整份 JSON 就全部指向不存在的文件，
+而安装"找不到包就按正文生成"，表现成技能包静默失效、还没人报错。
+读取一律走 `platform_catalog.package_path()`（相对路径按包仓库解析，老的绝对
+路径原样认，找不到返回 `None`）。
+
+**包内容可以在控制台里核对**（不用解开 zip 找）：
+
+| 接口 | 作用 |
+|---|---|
+| `GET /api/console/platform/skills/{id}/package` | 包内文件清单（相对技能根）+ 大小 + 是否二进制 |
+| `GET /api/console/platform/skills/{id}/package/file?path=` | 单个文件的文本内容（256 KB 上限） |
+| `POST /api/console/platform/skills/{id}/sync` | 把当前包重新解到已装目录（自动同步失败时的手动兜底） |
+
+两个接口都走安装时同一套解析，所以列出来的文件就是用户装完会落地的文件。
+
+存储位置可改：`SKILLHUB_PACKAGES_DIR`（默认 `profile/skillhub/packages`）。
+
 ## 5. 安装状态
 
 两个层次，别混：
 
-1. **"已安装"记录**（本节的 JSON）：路径 `profile/skillhub/<tenant>__<user>.json`，
+1. **"已安装"记录**（本节的 JSON）：路径 `<SKILLHUB_STATE_DIR>/<tenant>__<user>.json`，
    结构 `{"installed": ["deep-research", ...], "custom": [ ... ]}`；写入用临时文件 +
    `os.replace`，避免半份 JSON。它只决定技能中心里的按钮状态。
+
+   目录可配（`SKILLHUB_STATE_DIR`，默认 `profile/skillhub`）：这份文件是"用户装了
+   哪些技能"的唯一记录，丢了只能让人重装一遍，所以部署时必须指到挂载卷上。
+   同一目录下的 `platform_catalog.json` 用 `PLATFORM_CATALOG_FILE` 单独指定。
 2. **磁盘技能包**（`SKILLS_DIR/<id>/SKILL.md`）：这才是会话里真正能用的东西。
-   安装目录条目时会生成一份最小 `SKILL.md`；上传/导入直接产生技能包。
+   安装目录条目时**优先解技能包**（见 4.2），没有包才生成一份最小 `SKILL.md`；
+   上传/导入直接产生技能包。
    `GET /api/skills` 会把磁盘上存在但目录里没有的技能也列出来（`source=user`），
-   并把磁盘元信息覆盖到条目上（`on_disk / enabled / files`）。
+   并把磁盘元信息覆盖到条目上（`on_disk / enabled / files / file_tree`）。
 
 **只留 id 不留文件的存量数据**：老版本安装只记了 id，`on_disk=false`，
 条目会带 `need_files=true`——重新点一次安装即可生成技能文件。

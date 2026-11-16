@@ -18,6 +18,9 @@ python -m scripts.serve_api --lan --port 8000
 
 规划故障如何恢复、完整模型请求如何限制上下文，见 [模型请求与恢复策略](model-request-policy.md)。
 
+日志写到哪里、怎么用 trace 号把一次请求从 API 串到 Worker、控制台的「日志」页看什么，
+见 [日志与运行态](logging-and-observability.md)。
+
 按用户目标生成计划、从已接入的能力里选工具、逐步执行并记录每一次外部调用的中台。
 执行内核与业务解耦：**网页检索、资料转 HTML、发布到 MCP 服务器**只是当前接入的
 一个业务能力包，换成工单/文件/数据库查询只需增加能力包，不动内核。
@@ -376,6 +379,8 @@ python -m scripts.migrate
 | 迁移 | `schema_migrations` | 有序迁移版本，已应用版本不重复执行 |
 | 生产治理 | `api_rate_windows` / `tenant_usage_days` / `provider_charges` | 跨进程限流、租户日预算、provider 请求费用台账 |
 | 专家 | `experts` + `sessions.addon_selection` | 自定义专家（提示词 + 预设技能/连接器/模型）与会话级资源选择 |
+| 机器人 | `bots` / `bot_sections` / `bot_deliveries` / `bot_rooms` / `bot_room_events` / `bot_room_tasks` + `sessions.bot_id` | 机器人身份、投递收据、群聊事件日志与单步任务；见 [机器人（Bot Mode）](bot-mode.md) |
+| 消息平台 | `im_channels` / `im_runtime` / `im_inbox` / `im_processed` / `im_pairing` / `im_sessions` / `im_outbox` / `im_login_state` / `im_events` | 飞书 / 企业微信 / 个人微信的渠道配置、运行态、入站出站队列与配对；见 [消息平台](messaging-platforms.md) |
 
 > 技能**不进库**：`SKILLS_DIR/<id>/SKILL.md` 是唯一事实来源，每轮只把会话选中的
 > 技能物化进工作目录，模型按需读取。设计与优先级见

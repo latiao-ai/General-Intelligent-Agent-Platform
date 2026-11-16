@@ -78,10 +78,10 @@ MCP 服务管理弹窗：
 
 ## 2. 中台实现
 
-### 2.1 同形态配置文件
+### 2.1 同形态、但**按主体分文件**
 
 ```text
-profile/mcp.json
+profile/mcp-users/<tenant>__<user>.json
 {
   "mcpServers": {
     "my-mcp": {
@@ -93,7 +93,22 @@ profile/mcp.json
 }
 ```
 
-可用 `MCP_USER_CONFIG_FILE` 覆盖路径。
+目录可用 `MCP_USER_CONFIG_DIR` 覆盖，默认 `profile/mcp-users`。
+
+**为什么不是单文件**：这里原来就一个 `profile/mcp.json`，于是"A 在页面上加了
+一个连接器，B 的对话里也出现，还带着 A 的 `X-Api-Key` 去调 A 的私有网关"。
+配置归属必须跟身份走，落盘路径里就得有 `tenant__user`。
+
+三条约定：
+
+- 路径里的 key 与连接状态（开关）用同一套写法（`owner_key_for` /
+  `connectors_api._key`），否则会出现"配置是他的、开关是别人的"；
+- 用户条目**优先级最低**，动不了运维与平台连接器；
+- 用户自建的连接器工具名**一律带前缀**（`mcp__<id>__<tool>`）。不带前缀的名字
+  拆分时拿不到 server，两个用户各有一个 `github` 时会静默路由到别人家。
+
+兼容期还剩一个全局单文件：显式配了 `MCP_USER_CONFIG_FILE` 时，其中条目
+对所有用户可见（`scope=shared`）。新部署不要用它；老部署把它拆进上面的目录。
 
 ### 2.2 安全边界
 
@@ -110,15 +125,24 @@ profile/mcp.json
 
 ### 2.3 注册表合并
 
-`mcp_servers.servers()` 每次读取：
+`mcp_servers.servers(owner_key=...)` 每次读取四层：
 
-1. 系统 `MCP_SERVERS` / `MCP_SERVERS_FILE`；
-2. 用户 `profile/mcp.json` 的远程项；
-3. **系统 id 优先**，用户不能同名覆盖运维配置。
+| 顺序 | 来源 | scope | 谁能看见 |
+|---|---|---|---|
+| 1 | `MCP_SERVERS` / `MCP_SERVERS_FILE` | `ops` | 全站 |
+| 2 | 控制台发布的平台连接器 | `platform` | 全站 |
+| 3 | `MCP_USER_CONFIG_FILE`（兼容期） | `shared` | 全站 |
+| 4 | `<MCP_USER_CONFIG_DIR>/<tenant>__<user>.json` | `user` | **只有本人** |
+
+**前者优先**，用户不能同名覆盖运维配置。
+
+`owner_key` 为空 = 没有登录主体（运维脚本、健康检查、CLI），此时**只有前三层**。
+这个默认值是刻意的：`by_id('github')` 不带主体时，两个用户各有一个 `github`
+就无从判断该返回谁；宁可返回 `None`，也不能随机拿到别人的地址和鉴权头。
 
 新增的 server 会自动出现在：
 
-- `/api/connectors`；
+- `/api/connectors`（只列这个主体看得见的那几层）；
 - 输入框连接器面板；
 - 会话级连接器选择；
 - Pi 工具目录（选中后注入）。
@@ -126,9 +150,10 @@ profile/mcp.json
 ### 2.4 API
 
 ```text
-GET  /api/mcp/config     读取路径和原始 JSON
-PUT  /api/mcp/config     校验并保存
-GET  /api/mcp/servers    系统 + 自定义合并列表
+GET  /api/mcp/config     读取**本主体**的路径和原始 JSON
+PUT  /api/mcp/config     校验并保存（保存后立即失效工具目录缓存）
+GET  /api/mcp/servers    本主体可见列表，带 scope / source
+DELETE /api/connectors/{id}  删除**自己加的**连接器（ops/platform/shared 一律 403）
 ```
 
 ### 2.5 UI：连接器页负责添加和授权

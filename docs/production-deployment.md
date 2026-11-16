@@ -60,6 +60,22 @@ API 和 Worker 都使用 PostgreSQL 领取运行与租约 fencing。每个进程
 
 多副本部署须将 `ARTIFACT_DIR` 和 `PROFILE_PATH` 指向各副本可见的共享存储，并保持相同绝对挂载路径（旧产物仍可能包含绝对引用）。当前没有 S3 后端，不应把各主机各自的本地目录当成共享存储。
 
+技能中心这几份可变数据**默认落在代码目录**（`<项目>/profile/...`），生产必须显式挪到挂载卷，否则重新发布/重装代码会静默清空：
+
+```bash
+SKILLS_DIR=/var/lib/webpage-agent/skills
+SKILLHUB_PACKAGES_DIR=/var/lib/webpage-agent/skillhub/packages
+SKILLHUB_STATE_DIR=/var/lib/webpage-agent/skillhub
+PLATFORM_CATALOG_FILE=/var/lib/webpage-agent/skillhub/platform_catalog.json
+```
+
+- `SKILLS_DIR`：已安装技能的磁盘副本，丢了用户要重新装；
+- `SKILLHUB_PACKAGES_DIR`：管理员上传的技能包原件，丢了用户装到的只剩正文（正文里提到的 `references/`、`scripts/` 不存在）。目录里存的是相对路径，整个目录搬走不用改数据；
+- `SKILLHUB_STATE_DIR`：每个用户的安装清单（`<tenant>__<user>.json`），丢了没有任何自动恢复途径；
+- `PLATFORM_CATALOG_FILE`：管理员发布的技能/连接器条目。
+
+迁移时 `rsync -a` 四个位置过去、`chown` 给服务账号即可；与 systemd 单元的 `ReadWritePaths=/var/lib/webpage-agent` 对齐。**多副本同样要共享存储**：A 副本收上传、B 副本点安装会找不到包，而安装侧"找不到包就按正文生成"不会报错。
+
 ## 执行器可用性：消息不能"发出去没人回"
 
 聊天与查询都是**接纳与执行分离**的：`POST /api/sessions/{id}/messages` 只把用户消息与一条 `accepted` 的 turn 写进库并返 202，真正的模型调用由 Worker 领取执行。这个设计换来了解耦，也带来一个必须显式处理的风险：

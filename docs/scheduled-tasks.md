@@ -366,7 +366,7 @@ occurrence.summary，注册即生效（`capabilities/` 的约定就是"加一个
 
 ## 7. UI
 
-只动 `index.html`（`workbuddy.html` 是过期副本，无路由引用，**不要碰**）。五个**纯追加**插入点：
+只动 `index.html`（`workbuddy.html` 已删除：它是过期副本，无路由引用）。五个**纯追加**插入点：
 
 | 位置 | 内容 | 行数 |
 | --- | --- | --- |

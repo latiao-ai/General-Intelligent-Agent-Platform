@@ -123,7 +123,9 @@ addon_selection
 对齐 WorkBuddy 的 `assertSkillUploadFrontmatterValid`：
 
 - 包里必须有 `SKILL.md`，且 frontmatter 里有 `description`（它是唯一进上下文的元信息）；
-- 拒绝 `../` / 绝对路径 / 符号链接（zip/tar 都校验），单文件 5 MB、整包 20 MB；
+- 拒绝 `../` / 绝对路径 / 符号链接（zip/tar 都校验）；体积上限**默认不限**，
+  由 `SKILL_MAX_ARCHIVE_MB`（整包）/ `SKILL_MAX_MEMBER_MB`（单文件）配置，0 = 不限，
+  条数上限 `SKILL_MAX_MEMBERS`（默认 4000）是 zip 炸弹的硬指标，不随体积放开；
 - 多个 `SKILL.md` 视为歧义，直接拒绝（否则"装哪个"要靠猜）。
 
 ### 第一条消息就带选择
