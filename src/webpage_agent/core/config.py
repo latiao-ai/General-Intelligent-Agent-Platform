@@ -386,6 +386,28 @@ class Settings:
         os.getenv('LOCAL_AUTH_IDP', 'local').strip() or 'local')
     local_auth_tenant_id: str = (
         os.getenv('LOCAL_AUTH_TENANT', 'default').strip() or 'default')
+    # ---------- 中台作为 OIDC 身份提供方（api/idp.py） ----------
+    # 中台自己签发 id_token，子平台作为 OIDC 客户端接入。这是"中台在上、子平台
+    # 在下"的落地方式：身份主数据留在 app_users，不再需要外部 IdP 组件。
+    idp_enabled: bool = _env_flag('IDP_ENABLED')
+    # **必须显式配置，且与外部访问地址逐字节一致。**
+    # 子平台的 OIDC 客户端会拿这个值和 discovery 文档里的 issuer 比对，靠请求头
+    # 推断会因反向代理改写 host/端口而永远验不过。末尾不带斜杠。
+    idp_issuer: str = os.getenv('IDP_ISSUER', '').strip().rstrip('/')
+    # 客户端注册表：{"client_id": {"secret": "...", "redirect_uris": ["..."]}}。
+    # secret 为空表示公开客户端，仅靠 PKCE 保护；redirect_uris 是**精确匹配**白名单，
+    # 不做前缀匹配——开放重定向是这条链路上最容易出的洞。
+    idp_clients_raw: str = os.getenv('IDP_CLIENTS', '').strip()
+    # id_token 有效期（秒）。子平台只在登录瞬间验一次，不需要长窗口。
+    idp_id_token_ttl: int = max(60, int(
+        os.getenv('IDP_ID_TOKEN_TTL', '300')))
+    # 授权码有效期（秒）。一次性，取出即删，与 id_token 生命周期解耦。
+    idp_code_ttl: int = max(30, int(os.getenv('IDP_CODE_TTL', '120')))
+    # 签名私钥落盘路径。默认放 secrets/（已在 .gitignore 中排除）。
+    idp_key_path: str = os.getenv(
+        'IDP_KEY_PATH', 'secrets/idp_signing_key.pem').strip()
+    # 未登录时把用户送去哪里。留空表示用中台首页（带 next 参数回跳）。
+    idp_login_path: str = os.getenv('IDP_LOGIN_PATH', '/').strip() or '/'
     # ---------- 对象权限 ----------
     # owner_user_id='default' 的存量数据是否对所有登录用户可见。
     # 单用户升级期必须为 true；有第二个真实用户后必须改成 false。

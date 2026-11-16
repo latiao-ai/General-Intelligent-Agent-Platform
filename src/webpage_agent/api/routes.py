@@ -44,6 +44,7 @@ from webpage_agent.api import auth
 from webpage_agent.api import platform_login as platform_login_service
 from webpage_agent.api import sms_login as sms_login_service
 from webpage_agent.api import local_auth as local_auth_service
+from webpage_agent.api import idp as idp_service
 from webpage_agent.governance import policies
 from webpage_agent.core import profile
 from webpage_agent.core import sandbox
@@ -122,6 +123,9 @@ async def lifespan(app: FastAPI):
         logger.warning('登记环境变量登录平台失败（不影响登录）', exc_info=True)
     # 本地账号：生产配置自检必须在启动期失败，不能等第一个登录请求才发现问题。
     local_auth_service.startup_check()
+    # OIDC 身份提供方：issuer 与路由路径不一致这类错误在启动期暴露，
+    # 否则子平台只会看到"服务发现失败"，排查方向完全跑偏。
+    idp_service.startup_check()
     if local_auth_service.enabled():
         try:
             seeded = await local_auth_service.seed_from_env(hub.store)
@@ -189,6 +193,11 @@ if (FRONTEND_DIST / 'assets').is_dir():
 
 from webpage_agent.api.oidc import router as oidc_router
 app.include_router(oidc_router)
+# 中台作为 OIDC 身份提供方（api/idp.py）：子平台用这里签发的 id_token 建本地
+# 会话。路径固定 /api/idp，必须与 IDP_ISSUER 的路径部分一致（启动自检会校验）。
+# 与上面 oidc_router 方向相反：那个是中台作为客户端去登录别人。
+from webpage_agent.api.idp import router as idp_router
+app.include_router(idp_router)
 from webpage_agent.api.skillhub_api import router as skillhub_router
 from webpage_agent.api.skillhub_api import registry_router
 from webpage_agent.api.skillhub_registry_api import router as registry_api_router
