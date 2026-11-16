@@ -1,0 +1,147 @@
+@import "tailwindcss";
+
+/* =============================================================================
+ * 设计令牌 — 唯一来源
+ *
+ * 这份文件是 DESIGN.md 里 frontmatter 的可执行版本。规则：
+ *   1. 任何颜色/字号/圆角/阴影都必须在这里定义，组件里不许写字面量色值。
+ *   2. 一页只能有一份令牌表。历史上 5 个 HTML 各自 2–4 份 :root 互相覆盖，
+ *      .btn 高度被改了五次，最终"系统"变成"最后一个声明赢"。
+ *   3. indigo 这个名字留给 Tailwind 自带的调色板；品牌色叫 signal。
+ * ========================================================================== */
+
+@theme {
+  /* ---- 色彩：纸与墨 ---- */
+  --color-paper: #ffffff;
+  --color-rail: #f4f6f9;
+  --color-sunken: #eef1f5;
+  --color-line: #e3e8ef;
+  --color-line-strong: #cfd8e4;
+
+  --color-ink: #16202e;
+  --color-ink-2: #42505f;
+  --color-muted: #5d6b7a;
+
+  /* ---- 色彩：唯一信号色（任一屏占比 ≤10%） ---- */
+  --color-signal: #33557f;
+  --color-signal-deep: #28436a;
+  --color-signal-wash: #eef2f8;
+
+  /* ---- 色彩：状态（只用于标记"有事发生"） ---- */
+  --color-ok: #17795f;
+  --color-ok-wash: #eaf5f0;
+  --color-warn: #8a5a11;
+  --color-warn-wash: #fbf3e4;
+  --color-danger: #b03a3a;
+  --color-danger-wash: #fcefee;
+
+  /* ---- 字族 ---- */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "PingFang SC", monospace;
+
+  /* ---- 字阶：11 是底线，相邻级差 ≥1.25× ---- */
+  --text-label: 11px;
+  --text-label--line-height: 1.4;
+  --text-secondary: 12px;
+  --text-secondary--line-height: 1.6;
+  --text-body: 13px;
+  --text-body--line-height: 1.65;
+  --text-title: 16px;
+  --text-title--line-height: 1.4;
+  --text-headline: 20px;
+  --text-headline--line-height: 1.35;
+
+  /* ---- 圆角：表达物理量级，不是风格 ---- */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+
+  /* ---- 阴影：静止不投影，投影只回答交互 ---- */
+  --shadow-lift: 0 1px 2px rgb(16 24 40 / 0.05);
+  --shadow-hover: 0 8px 18px -10px rgb(18 38 46 / 0.2), 0 2px 4px rgb(18 38 46 / 0.04);
+  --shadow-overlay: 0 28px 64px -28px rgb(18 38 46 / 0.42), 0 2px 8px rgb(18 38 46 / 0.06);
+
+  /* ---- 动效 ---- */
+  --ease-standard: cubic-bezier(0.22, 0.72, 0.32, 1);
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: var(--text-body);
+    line-height: 1.65;
+  }
+
+  /* 键盘用户必须看得见自己在哪 */
+  :focus-visible {
+    outline: 2px solid var(--color-signal);
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+
+  /* 一屏只有一条滚动条，落在主体区 */
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-line-strong);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 999px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-muted);
+    border: 3px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer utilities {
+  /* 发丝线：用 1px 分区，不靠阴影 */
+  .hairline-b {
+    box-shadow: inset 0 -1px 0 var(--color-line);
+  }
+  .hairline-t {
+    box-shadow: inset 0 1px 0 var(--color-line);
+  }
+
+  /* 骨架屏：只在加载中脉动，且尊重 reduced-motion */
+  .skeleton {
+    background: var(--color-sunken);
+    border-radius: var(--radius-md);
+    animation: skeleton-pulse 1.4s var(--ease-standard) infinite;
+  }
+  @keyframes skeleton-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.55;
+    }
+  }
+}
